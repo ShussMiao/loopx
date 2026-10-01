@@ -47,13 +47,15 @@ def _read_thread(
         )
     except OSError:
         raise HostObservationError("host_observer_unavailable") from None
-    messages: queue.Queue = queue.Queue(maxsize=129)
+    assert process.stdin is not None and process.stdout is not None
+    stdin, stdout = process.stdin, process.stdout
+    messages: queue.Queue[object] = queue.Queue(maxsize=129)
 
     def read() -> None:
         total = 0
         try:
             for _ in range(128):
-                line = process.stdout.readline(_MAX_BYTES - total + 1)
+                line = stdout.readline(_MAX_BYTES - total + 1)
                 total += len(line)
                 if not line or total > _MAX_BYTES:
                     break
@@ -72,11 +74,11 @@ def _read_thread(
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
 
-    def send(payload: dict) -> None:
-        process.stdin.write((json.dumps(payload) + "\n").encode())
-        process.stdin.flush()
+    def send(payload: dict[str, Any]) -> None:
+        stdin.write((json.dumps(payload) + "\n").encode())
+        stdin.flush()
 
-    def receive(request_id: int) -> dict:
+    def receive(request_id: int) -> dict[str, Any]:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -88,9 +90,10 @@ def _read_thread(
             if not isinstance(message, dict):
                 raise HostObservationError("host_observer_response_invalid")
             if message.get("id") == request_id:
-                if "error" in message or not isinstance(message.get("result"), dict):
+                result = message.get("result")
+                if "error" in message or not isinstance(result, dict):
                     raise HostObservationError("host_observer_read_failed")
-                return message["result"]
+                return result
             # Never answer host requests, including requests for approval.
             if "id" in message:
                 raise HostObservationError("host_observer_response_invalid")
@@ -122,11 +125,11 @@ def _read_thread(
             process.kill()
         process.wait()
         reader.join(timeout=1)
-        process.stdin.close()
-        process.stdout.close()
+        stdin.close()
+        stdout.close()
 
 
-def _input_text(item: dict) -> str | None:
+def _input_text(item: dict[str, Any]) -> str | None:
     if item.get("type") == "userMessage":
         content = item.get("content")
         if (
@@ -182,11 +185,7 @@ def observe_codex_app_delivery(
         raise HostObservationError("host_selected_turn_incomplete")
     # The initial input must carry the envelope. Later steering cannot repair it.
     first_input = next(
-        (
-            i
-            for i, item in enumerate(items)
-            if item.get("type") in _INPUT
-        ),
+        (i for i, item in enumerate(items) if item.get("type") in _INPUT),
         None,
     )
     matches = []

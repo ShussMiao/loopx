@@ -317,7 +317,9 @@ async function execute(ws: Workspace, caller: ParityCaller): Promise<JsonObject>
 
 /** Replace the temporary runtime root inside an envelope with a stable placeholder. */
 export function normalize(value: unknown, runtimeRoot: string): JsonObject {
-  return JSON.parse(JSON.stringify(value).split(JSON.stringify(runtimeRoot).slice(1, -1)).join(RUNTIME_ROOT_PLACEHOLDER));
+  const text = JSON.stringify(value)
+    .split(JSON.stringify(runtimeRoot).slice(1, -1)).join(RUNTIME_ROOT_PLACEHOLDER);
+  return JSON.parse(text);
 }
 
 export async function observeRow(row: ParityRow): Promise<Observation> {

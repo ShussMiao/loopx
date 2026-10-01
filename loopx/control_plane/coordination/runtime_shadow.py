@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..effect_runtime import effect_runtime_result
+from .local_authority_shadow_projection import source_effect_runtime_result as effect_runtime_result
 from .coordination_state_contract_generated import (
+    COORDINATION_RUNTIME_SHADOW_EXACT_BOOTSTRAP_REQUEST_SCHEMA,
     COORDINATION_RUNTIME_SHADOW_BOOTSTRAP_REQUEST_SCHEMA as RUNTIME_SHADOW_BOOTSTRAP_REQUEST_SCHEMA_VERSION,
     COORDINATION_RUNTIME_SHADOW_BOOTSTRAP_RESULT_SCHEMA,
     COORDINATION_RUNTIME_SHADOW_COMMIT_REQUEST_SCHEMA as RUNTIME_SHADOW_REQUEST_SCHEMA_VERSION,
@@ -27,7 +28,9 @@ from .coordination_state_contract_generated import (
     COORDINATION_RUNTIME_SHADOW_ROLLBACK_RESULT_SCHEMA,
     COORDINATION_RUNTIME_SHADOW_TODO_READ_REQUEST_SCHEMA as RUNTIME_SHADOW_TODO_READ_REQUEST_SCHEMA_VERSION,
     COORDINATION_RUNTIME_SHADOW_TODO_READ_RESULT_SCHEMA,
-    LOCAL_AUTHORITY_SHADOW_TRANSACTION_PROJECTION_SCHEMA,
+    LOCAL_AUTHORITY_SHADOW_CONFIG_SCHEMA,
+    LOCAL_COORDINATION_PROMOTION_REVIEW_REQUEST_SCHEMA,
+    LOCAL_COORDINATION_PROMOTION_REVIEW_RESULT_SCHEMA,
 )
 
 
@@ -38,6 +41,7 @@ RUNTIME_SHADOW_BOOTSTRAP_METHOD = "coordination.runtime_shadow.bootstrap"
 RUNTIME_SHADOW_ROLLBACK_METHOD = "coordination.runtime_shadow.rollback"
 RUNTIME_SHADOW_QUALIFY_METHOD = "coordination.runtime_shadow.qualify"
 RUNTIME_SHADOW_TODO_READ_METHOD = "coordination.runtime_shadow.todo_read_candidate"
+LOCAL_AUTHORITY_PROMOTION_REVIEW_METHOD = "coordination.local_authority.promotion_review"
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,135 @@ class CoordinationRuntimeShadowConfig:
     enabled: bool
     provider: str | None
     reason_code: str
+
+
+def local_authority_shadow_summary(goal: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Recognize retained config without granting it a writer or capture lineage."""
+    coordination = goal.get("coordination") if isinstance(goal, Mapping) else None
+    if not isinstance(coordination, Mapping) or "authority_shadow" not in coordination:
+        return {"enabled": False, "mode": None, "status": "disabled"}
+    raw = coordination["authority_shadow"]
+    valid = (isinstance(raw, Mapping) and set(raw) == {"schema_version", "mode"}
+             and raw.get("schema_version") == LOCAL_AUTHORITY_SHADOW_CONFIG_SCHEMA
+             and raw.get("mode") == "file_one_way")
+    return {"enabled": False, "mode": raw.get("mode") if isinstance(raw, Mapping) else None,
+            "status": "retired" if valid else "invalid", "configured": True,
+            "replacement": "coordination_runtime_shadow"}
+
+
+def validate_local_authority_shadow_change(enable_file: bool, clear: bool) -> None:
+    if enable_file and clear:
+        raise ValueError("--local-authority-shadow-file cannot be combined with --clear-local-authority-shadow")
+    if enable_file:
+        raise ValueError(
+            "local_authority_shadow_retired: post-commit observation is retired; "
+            "clear it with --clear-local-authority-shadow; explicitly configure "
+            "--coordination-runtime-shadow-file and run coordination-shadow bootstrap "
+            "before transaction-bound capture. Retained observations are not migration evidence."
+        )
+
+
+def apply_local_authority_shadow_change(goal: dict[str, Any], enable_file: bool, clear: bool) -> None:
+    validate_local_authority_shadow_change(enable_file, clear)
+    if not clear:
+        return
+    coordination = goal.get("coordination")
+    if isinstance(coordination, dict):
+        coordination.pop("authority_shadow", None)
+        if not coordination:
+            goal.pop("coordination", None)
+
+
+def coordination_shadow_summaries(
+    goal: Mapping[str, Any] | None,
+) -> dict[str, dict[str, object]]:
+    """Report the active capture configuration and any retired observation setting."""
+
+    return {
+        "local_authority_shadow": local_authority_shadow_summary(
+            goal
+        ),
+        "coordination_runtime_shadow": coordination_runtime_shadow_summary(goal),
+    }
+
+
+def validate_coordination_shadow_changes(
+    local_enable_file: bool,
+    local_clear: bool,
+    runtime_enable_file: bool,
+    runtime_clear: bool,
+) -> None:
+    """Reject retired activation before any registry mutation."""
+
+    validate_local_authority_shadow_change(
+        local_enable_file, local_clear
+    )
+    validate_coordination_runtime_shadow_change(runtime_enable_file, runtime_clear)
+
+
+def apply_coordination_shadow_changes(
+    goal: dict[str, Any],
+    local_enable_file: bool,
+    local_clear: bool,
+    runtime_enable_file: bool,
+    runtime_clear: bool,
+) -> None:
+    """Clear retired settings and configure the transaction-bound shadow independently."""
+
+    apply_local_authority_shadow_change(
+        goal, local_enable_file, local_clear
+    )
+    apply_coordination_runtime_shadow_change(goal, runtime_enable_file, runtime_clear)
+
+
+def coordination_runtime_shadow_summary(
+    goal: Mapping[str, Any] | None,
+) -> dict[str, object]:
+    """Project the transaction-bound shadow configuration for operators."""
+
+    config = resolve_coordination_runtime_shadow_config(goal)
+    return {
+        "enabled": config.enabled,
+        "provider": config.provider,
+        "status": "enabled" if config.enabled else config.reason_code,
+    }
+
+
+def validate_coordination_runtime_shadow_change(
+    enable_file: bool,
+    clear: bool,
+) -> None:
+    if enable_file and clear:
+        raise ValueError(
+            "--coordination-runtime-shadow-file cannot be combined with "
+            "--clear-coordination-runtime-shadow"
+        )
+
+
+def apply_coordination_runtime_shadow_change(
+    goal: dict[str, Any],
+    enable_file: bool,
+    clear: bool,
+) -> None:
+    """Apply the explicit transaction-bound file-shadow opt-in."""
+
+    if not enable_file and not clear:
+        return
+    coordination = (
+        goal.get("coordination") if isinstance(goal.get("coordination"), dict) else {}
+    )
+    if clear:
+        coordination.pop("runtime_shadow", None)
+    else:
+        coordination["runtime_shadow"] = {
+            "enabled": True,
+            "schema_version": RUNTIME_SHADOW_CONFIG_SCHEMA_VERSION,
+            "provider": "file_v0",
+        }
+    if coordination:
+        goal["coordination"] = coordination
+    else:
+        goal.pop("coordination", None)
 
 
 def resolve_coordination_runtime_shadow_config(
@@ -109,63 +242,90 @@ def build_todo_runtime_shadow_projection(
 ) -> dict[str, object]:
     """Build the complete source projection using the capture partition rules."""
 
-    from .local_authority_shadow_projection import canonical_bytes, canonical_value, todo_partition_projection
-    from .coordination_state_contract import (
-        TODO_CANONICAL_READ_RECORD_FIELDS,
-        TODO_CANONICAL_READ_RECORD_SCHEMA_VERSION,
-    )
+    from .local_authority_shadow_projection import project_coordination_source
 
-    compact = todo_partition_projection(handoff_mode=handoff_mode, todos=todos if isinstance(todos, list) else [])["todos"]
-    current_todo_ids = {str(item["todo_id"]) for item in compact}
-    compact_leases: list[dict[str, object]] = []
-    if isinstance(leases, list):
-        for item in leases:
-            if not isinstance(item, Mapping):
-                continue
-            todo_id = item.get("todo_id")
-            if not isinstance(todo_id, str) or not todo_id:
-                continue
-            # The legacy lease directory is an append-retained history while a
-            # canonical coordination head models only the current Todo graph.
-            # Retired lease files stay on disk for audit, but projecting them
-            # without their retired Todo would create an invalid orphan edge.
-            if todo_id not in current_todo_ids:
-                continue
-            compact_leases.append(canonical_value(dict(item)))
-    compact_leases.sort(key=lambda item: str(item["todo_id"]))
-    todo_records_sha256 = hashlib.sha256(canonical_bytes(compact)).hexdigest()
-    return {
-        "schema_version": LOCAL_AUTHORITY_SHADOW_TRANSACTION_PROJECTION_SCHEMA,
-        "goal_id": goal_id,
-        "source_authority": "legacy_markdown_and_task_lease",
-        "handoff_mode": handoff_mode,
-        "todos": compact,
-        "leases": compact_leases,
-        "todo_read_model": {
-            "schema_version": TODO_CANONICAL_READ_RECORD_SCHEMA_VERSION,
-            "todo_count": len(compact),
-            "records_sha256": todo_records_sha256,
-            "contract_fields": list(TODO_CANONICAL_READ_RECORD_FIELDS),
-        },
-        "partitions": {"todos": None, "leases": None},
-    }
+    return project_coordination_source({
+        "kind": "snapshot", "goal_id": goal_id, "handoff_mode": handoff_mode,
+        "read_model_schema": "loopx_todo_canonical_read_record_v0",
+        "todos": todos, "leases": [] if leases is None else leases,
+    })
+
+
+def capture_todo_archive_dependencies(todos: list[dict[str, Any]], state_text: str) -> list[dict[str, Any]]:
+    """Use the same bounded capture for bootstrap and subsequent writer outbox."""
+    from ..todos.active_state_todo_parser import parse_todo_source
+    from ..todos.contract import normalize_todo_task_class
+    from ..todos.todo_summary import structured_todo_item, canonical_todo_read_record
+
+    _, archived, _ = parse_todo_source(state_text)
+    # No prose or wide diagnostics cross the selection transport budget.
+    capture_fields = ("todo_id", "role", "task_class", "status", "done", "archive_state", "resume_when",
+        "decision_scope", "decision_outcome", "global_gate", "blocks_agent", "bound_agent", "goal_bound",
+        "successor_todo_ids", "superseded_by", "unblocks_todo_id")
+    archive_facts = []
+    for item in archived:
+        facts = {key: item[key] for key in capture_fields if key in item}
+        # Keep the compatibility read class separate from recorded authority.
+        # Do not transport private prose or infer a missing role from it.
+        if item.get("role") == "agent" and item.get("task_class") is None:
+            facts["legacy_task_class"] = normalize_todo_task_class(None,
+                text=str(item.get("text") or ""), action_kind=item.get("action_kind"))
+        archive_facts.append(facts)
+    capture = effect_runtime_result("todo.archive.capture_dependencies", {
+        "schema_version": "todo_archive_dependency_capture_request_v2",
+        "active": [{key: item[key] for key in capture_fields if key in item} for item in todos],
+        "archived": archive_facts,
+    })
+    if not isinstance(capture, dict) or capture.get("schema_version") != "todo_archive_dependency_capture_result_v1":
+        raise ValueError("invalid archived dependency capture result")
+    result = list(todos)
+    for selected in capture["records"]:
+        item = archived[selected["index"]]
+        result.append(canonical_todo_read_record(structured_todo_item(
+            {**item, "task_class": selected["task_class"]}, role=selected["role"],
+            source_section=item["source_section"], archive_state="archive")))
+    return result
 
 
 def build_runtime_shadow_source_snapshot(
     *, goal: Mapping[str, Any], runtime_root: Path, state_path: Path,
     registry_path: Path,
 ) -> tuple[dict[str, object], dict[str, object]]:
+    """Bind the supplied Goal and every derived fact to one registry observation."""
+    from ...agent_registry import registered_agent_ids_for_goal
+    from ...registry import find_registry_goal
+    from ..projects.registry_codec import load_project_registry
+    from .authority_source_capture import authority_registry_source
+    from .shadow_management import ShadowManagementError
+
+    with authority_registry_source(registry_path) as witness:
+        registry = load_project_registry(registry_path)
+        current = find_registry_goal(registry, str(goal["id"]))
+        if current is None or current != dict(goal):
+            raise ShadowManagementError("source_registry_changed_retry")
+        projection, snapshot = _build_runtime_shadow_source_snapshot(
+            goal=current, runtime_root=runtime_root, state_path=state_path,
+            registry_path=registry_path, registry=registry,
+        )
+        snapshot["registry_source"] = {
+            **witness, "registered_agents": registered_agent_ids_for_goal(current),
+        }
+    return projection, snapshot
+
+
+def _build_runtime_shadow_source_snapshot(
+    *, goal: Mapping[str, Any], runtime_root: Path, state_path: Path,
+    registry_path: Path, registry: dict[str, Any],
+) -> tuple[dict[str, object], dict[str, object]]:
     """Project exactly the bytes carried by one ephemeral source precondition.
 
     TS takes the shared source locks and verifies every byte/inventory before
     publishing a baseline or a bounded qualification result.
     """
-    from ...event_sourced_state import build_state_projection, normalize_state_event, render_active_state_sections
     from ...rollout_event_log import ROLLOUT_EVENT_SCHEMA_VERSION, rollout_event_log_path
-    from ...history import load_registry
     from ...paths import resolve_runtime_root
     from ...state_refresh import resolve_goal_state
-    from ..status.active_state_projection import state_event_log_candidates
+    from ..goals.legacy_event_source import state_event_log_candidates
     from ..todos.active_state_todo_parser import parse_active_state_todos
     from ..todos.goal_todo_projection import todo_summaries_from_fields
     from ..todos.handoff_mode import goal_handoff_mode
@@ -189,7 +349,7 @@ def build_runtime_shadow_source_snapshot(
 
     rollout_bytes = read_evidence(rollout_event_log_path(runtime_root, goal_id))
     rollout_events: list[dict[str, Any]] = []
-    for line in (rollout_bytes or b"").decode("utf-8").splitlines():
+    for line in (rollout_bytes or b"").decode("utf-8").split("\n"):
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
@@ -197,22 +357,18 @@ def build_runtime_shadow_source_snapshot(
         if isinstance(value, dict) and value.get("schema_version") == ROLLOUT_EVENT_SCHEMA_VERSION:
             rollout_events.append(value)
 
-    # Use the production candidate selection and projection semantics. A log
-    # with no Todo projection is harmless; an unbound Todo overlay is a hold.
+    # Preserve absent/empty source witnesses; reject retired sources before publishing.
     for path in state_event_log_candidates(dict(goal), state_path=state_path):
         data = read_evidence(path)
         if not data:
             continue
-        events = [normalize_state_event(json.loads(line)) for line in data.decode("utf-8").splitlines() if line.strip()]
-        rendered = render_active_state_sections(build_state_projection(events, goal_id=goal_id))
-        fields = parse_active_state_todos(rendered, goal=dict(goal), state_path=state_path, item_limit=None, rollout_events=rollout_events)
-        if any(fields.get(f"{role}_todos") for role in ("user", "agent")):
-            raise ShadowManagementError("event_log_writer_not_bound")
+        raise ShadowManagementError("legacy_todo_event_source_retired",
+            "legacy_todo_event_source_retired: preserve and export legacy Todo events with a compatible older release before migration")
 
     fields = parse_active_state_todos(state_text, goal=dict(goal), state_path=state_path, item_limit=None, rollout_events=rollout_events)
-    todos = todo_summaries_from_fields(fields=fields, source="markdown_active_state", projection_fields={},
-        projection_overlay=None, rollout_events=rollout_events, roles=["user", "agent"], status=None,
+    todos = todo_summaries_from_fields(fields=fields, source="markdown_active_state", rollout_events=rollout_events, roles=["user", "agent"], status=None,
         todo_id=None, agent_id=None, limit=None).todos
+    todos = capture_todo_archive_dependencies(todos, state_text)
     leases: list[dict[str, Any]] = []
     inventory: list[dict[str, object]] = []
     for path in sorted((runtime_root / "goals" / goal_id / "task-leases").glob("*.json")):
@@ -223,7 +379,6 @@ def build_runtime_shadow_source_snapshot(
         inventory.append({"name": path.name, "bytes_sha256": "sha256:" + hashlib.sha256(data).hexdigest()})
     projection = build_todo_runtime_shadow_projection(goal_id=goal_id, todos=todos, leases=leases,
         handoff_mode=goal_handoff_mode(state_text))
-    registry = load_registry(registry_path)
     registered_root = resolve_runtime_root(registry, None, registry_path=registry_path)
     _, _, registered_state = resolve_goal_state(registry=registry, goal_id=goal_id,
         project_override=None, state_file_override=None)
@@ -297,6 +452,7 @@ def bootstrap_coordination_runtime_shadow(
     source_version: str,
     projection: Mapping[str, Any],
     source_snapshot: Mapping[str, Any] | None = None,
+    goal_ref: Mapping[str, Any] | None,
     runtime_invoker: RuntimeInvoker = effect_runtime_result,
 ) -> dict[str, object]:
     """Import one legacy baseline into an empty shadow without promoting it."""
@@ -310,14 +466,34 @@ def bootstrap_coordination_runtime_shadow(
             "primary_writeback_preserved": True,
             "decision_read_from_shadow": False,
         }
+    exact_ref: dict[str, str] | None = None
+    if goal_ref is not None:
+        from ..goals.source_session_registry_state import exact_goal_ref
+
+        exact_ref = exact_goal_ref(
+            str(goal_ref.get("goal_id") or ""),
+            str(goal_ref.get("goal_instance_id") or ""),
+        )
+        if (
+            exact_ref["goal_id"] != goal_id
+            or goal is None
+            or goal.get("id") != goal_id
+            or goal.get("goal_instance_id") != exact_ref["goal_instance_id"]
+        ):
+            raise ValueError("shadow bootstrap GoalRef does not match its Goal")
     request = {
-        "schema_version": RUNTIME_SHADOW_BOOTSTRAP_REQUEST_SCHEMA_VERSION,
+        "schema_version": (
+            COORDINATION_RUNTIME_SHADOW_EXACT_BOOTSTRAP_REQUEST_SCHEMA
+            if exact_ref is not None
+            else RUNTIME_SHADOW_BOOTSTRAP_REQUEST_SCHEMA_VERSION
+        ),
         "runtime_root": str(runtime_root.expanduser().absolute()),
         "goal_id": goal_id,
         "source_snapshot": dict(source_snapshot or {}),
         "operation_id": operation_id,
         "source_version": source_version,
         "projection": dict(projection),
+        **({"goal_ref": exact_ref} if exact_ref is not None else {}),
     }
     try:
         result = runtime_invoker(RUNTIME_SHADOW_BOOTSTRAP_METHOD, request)
@@ -500,6 +676,76 @@ def qualify_coordination_runtime_shadow(
             "qualified": False,
             "primary_writeback_preserved": True,
             "decision_read_from_shadow": False,
+        }
+    return dict(result)
+
+
+def review_local_coordination_authority_promotion(
+    *,
+    goal: Mapping[str, Any] | None,
+    runtime_root: Path,
+    goal_id: str,
+    operation_id: str,
+    projection: Mapping[str, Any],
+    source_snapshot: Mapping[str, Any],
+    minimum_operations: int,
+    required_event_kinds: list[str],
+    handoff_mode_migration: str | None = None,
+    registered_agents: list[str] | None = None,
+    execute: bool,
+    runtime_invoker: RuntimeInvoker = effect_runtime_result,
+) -> dict[str, object]:
+    """Preview or atomically apply the reviewed whole-Goal coordination-authority cutover."""
+
+    config = resolve_coordination_runtime_shadow_config(goal)
+    if not config.enabled:
+        return {
+            "schema_version": LOCAL_COORDINATION_PROMOTION_REVIEW_RESULT_SCHEMA,
+            "status": "disabled",
+            "executed": False,
+            "reason_code": config.reason_code,
+            "legacy_writer_fenced": False,
+            "legacy_fallback_used": False,
+        }
+    request = {
+        "schema_version": LOCAL_COORDINATION_PROMOTION_REVIEW_REQUEST_SCHEMA,
+        "runtime_root": str(runtime_root.expanduser().absolute()),
+        "goal_id": goal_id,
+        "operation_id": operation_id,
+        "projection": dict(projection),
+        "source_snapshot": dict(source_snapshot),
+        "minimum_operations": minimum_operations,
+        "required_event_kinds": list(required_event_kinds),
+        **(
+            {
+                "handoff_mode_migration": handoff_mode_migration,
+                "registered_agents": list(registered_agents or []),
+            }
+            if handoff_mode_migration is not None
+            else {}
+        ),
+        "execute": execute,
+    }
+    try:
+        result = runtime_invoker(LOCAL_AUTHORITY_PROMOTION_REVIEW_METHOD, request)
+    except Exception as exc:
+        return {
+            "schema_version": LOCAL_COORDINATION_PROMOTION_REVIEW_RESULT_SCHEMA,
+            "status": "failed",
+            "executed": False,
+            "reason_code": "promotion_review_runtime_unavailable",
+            "reason": str(exc),
+            "legacy_writer_fenced": False,
+            "legacy_fallback_used": False,
+        }
+    if not isinstance(result, Mapping):
+        return {
+            "schema_version": LOCAL_COORDINATION_PROMOTION_REVIEW_RESULT_SCHEMA,
+            "status": "failed",
+            "executed": False,
+            "reason_code": "promotion_review_runtime_result_invalid",
+            "legacy_writer_fenced": False,
+            "legacy_fallback_used": False,
         }
     return dict(result)
 

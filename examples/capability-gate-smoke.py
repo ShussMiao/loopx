@@ -187,7 +187,8 @@ def main() -> int:
         "primary_blocked_todo_id"
     ] == "todo_capability_1", p0_fallback
     assert p0_fallback["recommended_action"] == p0_validate["text"], p0_fallback
-    assert "choose one of 2 capability-runnable todo(s)" in p0_fallback["protocol_action_packet"]["summary"], p0_fallback
+    assert "choose one of 2 capability-runnable todo(s)" in p0_fallback["interaction_contract"]["agent_channel"]["primary_action"], p0_fallback
+    assert "protocol_action_packet" not in p0_fallback, p0_fallback
 
     fallback = build_quota_should_run(
         status_payload([p0_benchmark, p0_network, p1_gpu, p1_docs]),
@@ -210,7 +211,8 @@ def main() -> int:
     assert fallback["capability_gate"]["blocked_candidates"][1]["missing_capabilities"] == ["network"], fallback
     assert fallback["capability_gate"]["blocked_candidates"][2]["missing_capabilities"] == ["gpu_runner"], fallback
     assert fallback["recommended_action"] == p1_docs["text"], fallback
-    assert "choose one of 1 capability-runnable todo(s)" in fallback["protocol_action_packet"]["summary"], fallback
+    assert "choose one of 1 capability-runnable todo(s)" in fallback["interaction_contract"]["agent_channel"]["primary_action"], fallback
+    assert "protocol_action_packet" not in fallback, fallback
 
     repair_candidate = build_quota_should_run(
         status_payload([p0_repair_benchmark_bridge, p0_benchmark, p1_docs]),

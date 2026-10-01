@@ -4,8 +4,8 @@ import { Fragment, type ReactNode } from "react";
  * Minimal, safe Markdown renderer for visible Agent prose.
  * Builds React nodes directly (no dangerouslySetInnerHTML), so raw HTML in
  * model output renders as inert text. Supports the subset LoopX Agents
- * actually emit in chat: fenced code, inline code, bold, links, headings,
- * and ordered/unordered lists.
+ * actually emit in chat and reports: fenced code, inline code, bold, links,
+ * headings, ordered/unordered lists and tables.
  */
 
 const INLINE_PATTERN = /(`[^`\n]+`)|(\*\*[^*\n]+(\*[^*\n]*)?\*\*)|(\[[^\]\n]{1,120}\]\(https?:\/\/[^)\s]+\))/g;
@@ -37,12 +37,17 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
 
 type Block =
   | { type: "code"; text: string }
+  | { type: "table"; headers: string[]; rows: string[][] }
   | { type: "heading"; level: number; text: string }
   | { type: "list"; ordered: boolean; items: string[] }
   | { type: "paragraph"; lines: string[] };
 
 const UNORDERED = /^\s*[-*•]\s+(.*)$/;
 const ORDERED = /^\s*\d{1,2}[.、)]\s+(.*)$/;
+
+function tableCells(line: string) {
+  return line.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "").split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, "|"));
+}
 
 function parseBlocks(text: string): Block[] {
   const lines = text.split("\n");
@@ -77,6 +82,21 @@ function parseBlocks(text: string): Block[] {
       blocks.push({ type: "heading", level: marks, text: heading[1].trim() });
       i += 1;
       continue;
+    }
+    if (line.includes("|") && i + 1 < lines.length) {
+      const headers = tableCells(line), separators = tableCells(lines[i + 1]);
+      if (headers.length === separators.length && separators.every(cell => /^:?-{3,}:?$/.test(cell))) {
+        flushParagraph();
+        const rows: string[][] = [];
+        i += 2;
+        while (i < lines.length && lines[i].includes("|")) {
+          const cells = tableCells(lines[i]);
+          if (cells.length !== headers.length) break;
+          rows.push(cells); i++;
+        }
+        blocks.push({type: "table", headers, rows});
+        continue;
+      }
     }
     if (UNORDERED.test(line) || ORDERED.test(line)) {
       flushParagraph();
@@ -114,6 +134,12 @@ export function MarkdownText({ text }: { text: string }) {
         }
         if (block.type === "heading") {
           return <p className={`personal-md-heading is-h${block.level}`} key={key}>{renderInline(block.text, key)}</p>;
+        }
+        if (block.type === "table") {
+          return <div className="personal-md-table-scroll" tabIndex={0} key={key}><table>
+            <thead><tr>{block.headers.map((cell, n) => <th scope="col" key={n}>{renderInline(cell, `${key}-h${n}`)}</th>)}</tr></thead>
+            <tbody>{block.rows.map((row, n) => <tr key={n}>{row.map((cell, c) => <td key={c}>{renderInline(cell, `${key}-${n}-${c}`)}</td>)}</tr>)}</tbody>
+          </table></div>;
         }
         if (block.type === "list") {
           const items = block.items.map((item, itemIndex) => <li key={`${key}-${itemIndex}`}>{renderInline(item, `${key}-${itemIndex}`)}</li>);

@@ -6,6 +6,13 @@ from typing import Any
 
 from ..configuration_transaction import configuration_payload_revision
 
+from .progress_review.policy import (
+    PROGRESS_REVIEW_MAX_DRIFT_THRESHOLD,
+    PROGRESS_REVIEW_MIN_DRIFT_THRESHOLD,
+    PROGRESS_REVIEW_MODES,
+    PROGRESS_REVIEW_SIGNALS,
+)
+
 CAPABILITY_CONFIGURATION_CATALOG_SCHEMA = "capability_configuration_catalog_v0"
 CAPABILITY_CONFIGURATION_EDITOR_SCHEMA = "capability_configuration_editor_v0"
 CAPABILITY_CONFIGURATION_RESOLUTION_SCHEMA = "capability_configuration_resolution_v0"
@@ -23,6 +30,17 @@ def _configuration_value(
     return deepcopy({str(key): item for key, item in value.items()})
 
 
+def _steward_executor_editor_options() -> tuple[list[str], list[str]]:
+    """Return the steward editor's option lists from their owning namespace."""
+
+    from .steward_executor.machine_defaults import (
+        steward_executor_endpoints,
+        steward_reasoning_efforts,
+    )
+
+    return sorted(steward_executor_endpoints()), list(steward_reasoning_efforts())
+
+
 def _field(
     key: str,
     label: str,
@@ -30,6 +48,7 @@ def _field(
     *,
     description: str = "",
     required: bool = False,
+    nullable: bool = False,
     minimum: int | None = None,
     maximum: int | None = None,
     options: Sequence[str] = (),
@@ -47,6 +66,8 @@ def _field(
         field["maximum"] = maximum
     if options:
         field["options"] = list(options)
+    if nullable:
+        field["nullable"] = True
     return field
 
 
@@ -57,10 +78,20 @@ def capability_configuration_editor(
 ) -> dict[str, Any]:
     """Return the provider-neutral editor contract consumed by every UI scope."""
 
+    # The steward namespace owns its closed vocabulary, so the editor offers the
+    # same values instead of restating them: a form cannot submit an executor or
+    # effort the owning namespace would reject.
+    steward_endpoints, steward_efforts = _steward_executor_editor_options()
     definitions: dict[str, dict[str, Any]] = {
+        "goal_storage": {
+            "supported_scopes": ["machine"], "writable_scopes": ["machine"],
+            "fields": [_field("new_goal_provider", "New Goal storage target (after promotion)", "select",
+                              options=["file", "sqlite"], required=True,
+                              description="Fixed at creation. Existing Goals need a separate backed-up migration; this setting does not promote them.")],
+        },
         "todo_replan_cadence": {
-            "supported_scopes": ["goal"],
-            "writable_scopes": ["goal"],
+            "supported_scopes": ["machine", "goal"],
+            "writable_scopes": ["machine", "goal"],
             "fields": [
                 _field(
                     "completed_todos",
@@ -71,7 +102,8 @@ def capability_configuration_editor(
                     required=True,
                     description=(
                         "Default 5 in both turn modes. Use 2 or 3 for earlier review; "
-                        "5 restores the default. Counts this Agent's advancement work."
+                        "the Goal editor writes an explicit override. Counts this "
+                        "Agent's advancement work."
                     ),
                 ),
             ],
@@ -100,6 +132,91 @@ def capability_configuration_editor(
                     description="IANA timezone, for example Asia/Shanghai.",
                     required=True,
                 ),
+                _field(
+                    "schedule",
+                    "Calendar reports",
+                    "periodic_report_schedule",
+                    nullable=True,
+                    description="Optional daily or weekly schedule. Unset preserves stage-only reports.",
+                ),
+            ],
+        },
+        "manager_runtime": {
+            "supported_scopes": ["machine"],
+            "writable_scopes": ["machine"],
+            "fields": [
+                _field(
+                    "runtime_profile",
+                    "Runtime profile",
+                    "select",
+                    options=["restricted", "trusted_owner"],
+                    required=True,
+                    description=(
+                        "Restricted uses only the scoped LoopX read model. Trusted owner "
+                        "enables normal host tools under this persistent machine grant; "
+                        "protected operations keep their own authority checks."
+                    ),
+                ),
+            ],
+        },
+        "steward_executor": {
+            "supported_scopes": ["machine"],
+            "writable_scopes": ["machine"],
+            "fields": [
+                _field(
+                    "selection_policy",
+                    "Selection policy",
+                    "select",
+                    options=["preferred", "pinned", "flexible"],
+                    required=True,
+                    description=(
+                        "Preferred supplies a default and permits an explicit user "
+                        "choice. Pinned rejects another executor. Flexible permits "
+                        "automatic fallback only inside the eligible pool."
+                    ),
+                ),
+                _field(
+                    "executor_endpoint",
+                    "Primary steward executor",
+                    "select",
+                    options=steward_endpoints,
+                    required=True,
+                    description=(
+                        "The executor this machine's steward channel answers on: the "
+                        "interactive CLI login, or the operator-billed managed host. "
+                        "The choice outranks the Chat service environment."
+                    ),
+                ),
+                _field(
+                    "eligible_endpoints",
+                    "Flexible eligible executors",
+                    "string_list",
+                    description=(
+                        "One authorized executor id per line. Required only for "
+                        "flexible selection; include the primary executor."
+                    ),
+                ),
+                _field(
+                    "executor_model",
+                    "Model",
+                    "text",
+                    nullable=True,
+                    description=(
+                        "Optional model for the selected executor. Leave blank to keep "
+                        "the executor's own default."
+                    ),
+                ),
+                _field(
+                    "executor_reasoning_effort",
+                    "Reasoning effort",
+                    "select",
+                    options=steward_efforts,
+                    nullable=True,
+                    description=(
+                        "Optional reasoning effort for the selected executor. Leave "
+                        "blank to keep the executor's own default."
+                    ),
+                ),
             ],
         },
         "multi_subagent": {
@@ -107,6 +224,18 @@ def capability_configuration_editor(
             "writable_scopes": ["goal"],
             "fields": [
                 _field("enabled", "Enabled", "boolean"),
+                _field(
+                    "model",
+                    "Child model",
+                    "text",
+                    description="For example gpt-5.6-luna. Blank clears the child model preference.",
+                ),
+                _field(
+                    "reasoning_effort",
+                    "Child reasoning effort",
+                    "text",
+                    description="For example max. Host support is checked at launch; requires a child model.",
+                ),
                 _field(
                     "max_children",
                     "Maximum children",
@@ -119,6 +248,17 @@ def capability_configuration_editor(
                     "Allowed responsibility domains",
                     "string_list",
                     description="One bounded, public-safe domain per line.",
+                ),
+                _field(
+                    "execution_config",
+                    "Delegation bindings",
+                    "text",
+                    nullable=True,
+                    description=(
+                        "Repo-relative ignored JSON under .loopx/config/. It exposes "
+                        "only authorized, public-safe route status to planning; it "
+                        "does not grant a binding."
+                    ),
                 ),
             ],
         },
@@ -153,15 +293,84 @@ def capability_configuration_editor(
             ],
         },
         "change_quality_qualification": {
-            "supported_scopes": ["goal"],
-            "writable_scopes": ["goal"],
+            "supported_scopes": ["machine", "goal"],
+            "writable_scopes": ["machine", "goal"],
             "fields": [
                 _field("enabled", "Enabled", "boolean"),
                 _field("safe_fix", "Allow one bounded safe-fix pass", "boolean"),
                 _field("strict_receipt", "Require an exact-diff receipt", "boolean"),
             ],
         },
+        "progress_review": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": ["goal"],
+            "fields": [
+                _field(
+                    "mode",
+                    "Mode",
+                    "select",
+                    options=PROGRESS_REVIEW_MODES,
+                    required=True,
+                    description=(
+                        "off records nothing; shadow records typed receipts only; "
+                        "assist lets consecutive drift receipts raise the existing "
+                        "autonomous replan obligation. No pause or gate authority."
+                    ),
+                ),
+                _field(
+                    "signal",
+                    "Drift signal",
+                    "select",
+                    options=PROGRESS_REVIEW_SIGNALS,
+                    description=(
+                        "Which receipt judgment counts as drift: the Noul behavior/"
+                        "acceptance pair or the Choice relation/increment pair."
+                    ),
+                ),
+                _field(
+                    "drift_threshold",
+                    "Consecutive drift receipts before an obligation",
+                    "number",
+                    minimum=PROGRESS_REVIEW_MIN_DRIFT_THRESHOLD,
+                    maximum=PROGRESS_REVIEW_MAX_DRIFT_THRESHOLD,
+                ),
+                _field(
+                    "contract_revision",
+                    "Pinned goal contract revision",
+                    "text",
+                    nullable=True,
+                    description=(
+                        "sha256 of the observer basis the receipts must be bound to; "
+                        "printed by `loopx-jev drift init`. assist raises nothing "
+                        "without it, and receipts for other revisions are stale."
+                    ),
+                ),
+            ],
+        },
+        "pull_request_review": {
+            "supported_scopes": ["machine", "goal"],
+            "writable_scopes": ["machine", "goal"],
+            "fields": [
+                _field("wait_for_ci", "Wait for CI", "boolean", description="When disabled, use local validation without querying or waiting for CI. This grants no merge authority."),
+                _field(
+                    "review_priority",
+                    "Review priority",
+                    "select",
+                    options=("other-developers-first", "owner-first"),
+                    required=True,
+                    description=(
+                        "Default ranks actionable PRs whose author differs from the "
+                        "authenticated reviewer before the reviewer's own PRs."
+                    ),
+                ),
+            ],
+        },
         "local_authority_shadow": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": [],
+            "fields": [],
+        },
+        "coordination_runtime_shadow": {
             "supported_scopes": ["goal"],
             "writable_scopes": ["goal"],
             "fields": [_field("enabled", "Enabled", "boolean")],
@@ -173,12 +382,28 @@ def capability_configuration_editor(
         },
         "reward_memory": {
             "supported_scopes": ["goal"],
-            "writable_scopes": [],
-            "fields": [],
-            "read_only_reason": (
-                "This capability requires a reviewed ignored provider binding and an "
-                "explicit Agent allowlist. Configure it through the capability CLI."
-            ),
+            "writable_scopes": ["goal"],
+            "fields": [
+                _field(
+                    "config_path",
+                    "Local-private configuration path",
+                    "text",
+                    description=(
+                        "Repo-relative ignored JSON under .loopx/config/. The path "
+                        "is accepted only as write input and is never returned. Leave "
+                        "blank to retain an existing binding."
+                    ),
+                ),
+                _field(
+                    "enabled_agents",
+                    "Enabled Goal Agents",
+                    "string_list",
+                    description=(
+                        "One already registered Goal-local Agent id per line. Private "
+                        "bindings currently accept exactly one Agent."
+                    ),
+                ),
+            ],
         },
         "lark_event_inbox": {
             "supported_scopes": ["goal"],
@@ -300,6 +525,8 @@ def _machine_catalog_entry(
         entry["machine_current"] = deepcopy(namespace["current"])
     if isinstance(namespace.get("configuration_template"), Mapping):
         entry["default"] = deepcopy(namespace["configuration_template"])
+    if isinstance(namespace.get("documentation"), Mapping):
+        entry["documentation"] = deepcopy(namespace["documentation"])
     return capability_id, entry
 
 
@@ -328,7 +555,7 @@ def _merge_goal_feature(
     entry["available_scopes"] = [*entry["available_scopes"], "goal"]
     entry["goal_feature_id"] = capability_id
     entry["availability"] = feature.get("availability")
-    for field in ("default", "current", "documentation"):
+    for field in ("default", "current", "documentation", "context_contribution"):
         if isinstance(feature.get(field), Mapping):
             entry[field] = deepcopy(feature[field])
     entry["configuration_editor"] = capability_configuration_editor(

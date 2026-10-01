@@ -9,6 +9,7 @@ import type {
 } from "./personal-workspace-model";
 import { localizedAttentionAge, useWorkspaceI18n } from "./i18n";
 import { CompletedTaskLane } from "./completed-task-lane";
+import { MarkdownText } from "./markdown";
 
 function TaskLane({
   children,
@@ -105,6 +106,7 @@ function TaskLane({
  */
 export function GoalTasksView({
   historyEnabled = false,
+  historyRefreshRevision = 0,
   goal,
   items,
   onDraftTaskFromMessage,
@@ -116,6 +118,7 @@ export function GoalTasksView({
   userTodos,
 }: {
   historyEnabled?: boolean;
+  historyRefreshRevision?: number;
   goal: WorkspaceGoal;
   items: WorkspaceTimelineItem[];
   onDraftTaskFromMessage?: (message: string) => void;
@@ -139,7 +142,7 @@ export function GoalTasksView({
     .filter((todo) => todo.goalId === goal.goalId)
     .map((todo) => ({ ...todo, goalTitle: goal.title }));
   const priorityRank = (todo: WorkspaceGoal["agentTodos"][number]) =>
-    todo.priority === "P0" ? 0 : todo.priority === "P1" ? 1 : todo.priority === "P2" ? 2 : 3;
+    todo.priority === "P0" ? 0 : todo.priority === "P1" ? 1 : todo.priority === "P2" ? 2 : todo.priority === "P3" ? 3 : todo.priority === "P4" ? 4 : 50;
   const agentLanes = useMemo(() => {
     const lanes = new Map((goal.agentLanes ?? []).map((lane) => [lane.agentId, lane]));
     for (const todo of goal.agentTodos) {
@@ -179,7 +182,7 @@ export function GoalTasksView({
   return (
     <section aria-label={t("header.tasks")} className={`personal-task-board${listView ? " is-list-view" : ""}`}>
       <header className="personal-task-view-toolbar">
-        <div><strong>{t("header.tasks")}</strong><span>{t("tasks.viewDescription")}</span></div>
+        <div><strong>{t("header.tasks")}</strong></div>
         <div className="personal-task-view-switch" role="group" aria-label={t("tasks.viewLabel")}>
           <button type="button" aria-pressed={listView} onClick={() => setListView(true)}>{t("tasks.listView")}</button>
           <button type="button" aria-pressed={!listView} onClick={() => setListView(false)}>{t("tasks.boardView")}</button>
@@ -189,7 +192,7 @@ export function GoalTasksView({
         <section aria-label={t("tasks.agentLaneFilter")} className="personal-task-lane-filter">
           <div>
             <Bot size={15} />
-            <span><strong>{t("tasks.agentLane")}</strong><small>{t("tasks.agentLaneDescription")}</small></span>
+            <span><strong>{t("tasks.agentLane")}</strong></span>
           </div>
           <label>
             <span className="sr-only">{t("tasks.agentLaneFilter")}</span>
@@ -209,12 +212,8 @@ export function GoalTasksView({
         <section aria-label={t("tasks.chatRecent")} className="personal-task-chat-receipt">
           <span className="personal-task-chat-icon"><MessageSquareText size={18} /></span>
           <div>
-            <header><strong>{replyPending ? t("tasks.chatPending") : latestReply ? t("tasks.chatAgentReplied") : t("tasks.chatRecent")}</strong><small>{goal.agentLabel ?? goal.agentId}</small></header>
-            <p className="is-user"><b>{t("common.you")}</b>{latestUserMessage.text}</p>
-            {latestReply && !latestReply.pending ? <p className="is-assistant"><b>{t("common.agent")}</b>{latestReply.text}</p> : null}
-            <small>{replyPending
-              ? t("tasks.chatPendingDescription")
-              : t("tasks.chatUnchangedDescription")}</small>
+            <header><strong>{replyPending ? t("tasks.chatPending") : latestReply ? t("tasks.chatAgentReplied") : t("tasks.chatRecent")}</strong><small>{latestReply?.returnDelivery ? t("tasks.chatReturn") : latestReply?.agentLabel}</small></header>
+            <div className="personal-task-reply-preview"><MarkdownText text={replyPending ? t("tasks.chatPendingDescription") : (latestReply?.text ?? latestUserMessage.text).trim().split(/\r?\n/, 1)[0]} /></div>
           </div>
           <footer>
             <button onClick={onOpenChat} type="button"><MessageSquareText size={14} />{t("tasks.chatViewReply")}</button>
@@ -286,7 +285,7 @@ export function GoalTasksView({
         ))}
         {!scheduleItems.length ? <p className="personal-task-empty">{t("tasks.emptySchedules")}</p> : null}
       </TaskLane>
-      <CompletedTaskLane key={`${goal.goalId}:${selectedLaneId}:${historyEnabled}`} goal={goal} agentId={selectedLaneId} seed={doneAgentTodos} enabled={historyEnabled} listView={listView} onSelect={onSelect} />
+      <CompletedTaskLane key={`${goal.goalId}:${selectedLaneId}:${historyEnabled}`} goal={goal} agentId={selectedLaneId} seed={doneAgentTodos} refreshRevision={historyRefreshRevision} enabled={historyEnabled} listView={listView} onSelect={onSelect} />
       </div>
       {isEmpty ? (
         <p className="personal-task-empty">

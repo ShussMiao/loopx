@@ -18,7 +18,8 @@
 - `loopx doctor` 报告安装可用；
 - 项目存在 `.loopx/registry.json`；
 - 项目存在 `.codex/goals/<goal-id>/ACTIVE_GOAL_STATE.md`；
-- `loopx status` 能显示 active state、当前 Gate 和下一项 Agent Todo；
+- `loopx status` 能显示 active state 和当前 frontier；首连不会生成 onboarding todo，
+  第一个交付 todo 由 Agent 与你确认后写入；
 - `.loopx/` 与 `.codex/goals/` 不会进入 Git；
 - 再次连接会按精确 `goal_id` 复用已有 Goal，而不是覆盖目标；
 - 新接入的执行者使用 fresh `agent_id`，除非用户明确授权 takeover。
@@ -120,7 +121,7 @@ next_action: <one concrete next step>
 要求：
 
 - Python 3.11 或更高版本；
-- Node.js 22.6 或更高版本，用于 LoopX 自动管理的 TypeScript Effect runtime；
+- Node.js 22.22.3 或更高版本，用于 LoopX 自动管理的 TypeScript Effect runtime；
 - macOS/Linux shell，或 Windows PowerShell 7；
 - 一个已有 Git 项目。
 
@@ -200,6 +201,11 @@ loopx start-goal \
 
 这个命令生成 guided transaction packet。它默认是预览，不应被理解为已经完成 Todo 写回、Host
 激活和 Agent Turn。Agent 或 Host 集成需要按 packet 执行计划、状态写回与启动步骤。
+
+`connect` / `bootstrap` 只登记 Goal 并写入 active state：它不会生成首连 onboarding todo、
+owner 决策门禁或 Host loop opt-in 门禁。首连之后状态里没有可执行的 agent todo，第一个交付
+todo 由 Agent 或已接入的 domain adapter 写入，避免自动化从生成的 onboarding 队列而不是
+调用方自己的工作队列开始。
 
 ### 先选择 Goal，再选择 Agent
 
@@ -319,6 +325,18 @@ loopx configure-goal --goal-id <goal-id> --change-quality-enabled --execute
 对于 `multi_subagent`、Explore Graph、Explore Harness、Reward Memory、Lark inbox 等功能，读取
 当前 help 和 catalog delta，不要从名称猜参数。始终按“读 catalog -> preview -> 检查 delta ->
 execute -> readback”执行。
+
+配置入口可以使用全局 registry，但 Goal 的配置权威仍是 `source_registry` 指向的项目源。
+CLI 和前端设置的读取、预览、版本检查与写入都先解析该源，再同步全局投影；
+`--runtime-root` 选择投影目标，不改变配置权威。源不可读取时会报错，不会退回镜像写入并声称成功。
+这样后续项目同步不会撤销刚刚保存的设置。
+
+Configuration entry points may use the global registry, but the Goal's configuration authority
+remains the project registry identified by `source_registry`. CLI and frontend reads, previews,
+revision checks and writes resolve that source before synchronizing the global projection.
+`--runtime-root` selects the projection target, not a different authority. An unreadable source
+fails explicitly instead of falling back to a mirror write, so later project synchronization
+cannot undo a successfully saved setting.
 
 Todo 中的 `required_capabilities` 表示执行前必须已有的能力；`target_capabilities` 表示当前 Todo
 正在建设、修复或验证的能力。缺失 target 可以进入 repair mode，不能反过来阻止建设它的 Todo。

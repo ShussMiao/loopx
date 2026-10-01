@@ -1,31 +1,23 @@
 export type ProjectionMessageKey =
-  | "projection.agentAdvancingGoal"
+  | "projection.agentWorkQueued"
   | "projection.agentIdle"
   | "projection.agentNeedsDecision"
   | "projection.agentPreparingNextStep"
   | "projection.agentStopped"
   | "projection.agentWaitingExternal"
   | "projection.confirmAgentDecision"
-  | "projection.events24h"
   | "projection.firstReadOnlyAdapterCheck"
-  | "projection.goalVerified"
-  | "projection.latestRun"
-  | "projection.latestValidation"
   | "projection.nextUpdatePending"
-  | "projection.publicSafeProjection"
   | "projection.refreshState"
-  | "projection.runEvidenceAvailable"
-  | "projection.runRecorded"
   | "projection.statusRefreshNeeded"
-  | "projection.todoStatusUpdated"
-  | "projection.validationRecorded";
+  | "projection.todoStatusUpdated";
 
 export type ProjectionTranslate = (
   key: ProjectionMessageKey,
   values?: Record<string, string | number>,
 ) => string;
 
-export type ProjectionAgentStatus = "advancing" | "idle" | "needs_you" | "stopped" | "waiting_external";
+export type ProjectionAgentStatus = "queued" | "idle" | "needs_you" | "stopped" | "waiting_external";
 
 function cleanProjectionText(value: string | null | undefined) {
   return (value ?? "").replace(/\s+/gu, " ").trim();
@@ -62,33 +54,11 @@ export function projectionSentence(
 
 export function agentStatusSentence(status: ProjectionAgentStatus, t: ProjectionTranslate) {
   const keyByStatus: Record<ProjectionAgentStatus, ProjectionMessageKey> = {
-    advancing: "projection.agentAdvancingGoal",
+    queued: "projection.agentWorkQueued",
     idle: "projection.agentIdle",
     needs_you: "projection.agentNeedsDecision",
     stopped: "projection.agentStopped",
     waiting_external: "projection.agentWaitingExternal",
   };
   return t(keyByStatus[status]);
-}
-
-export function runEvidenceCopy(
-  {
-    eventCount,
-    hasArtifact,
-    hasLatestValidation,
-  }: {
-    eventCount: number;
-    hasArtifact: boolean;
-    hasLatestValidation: boolean;
-  },
-  t: ProjectionTranslate,
-) {
-  return {
-    label: t(hasLatestValidation ? "projection.latestValidation" : "projection.latestRun"),
-    metadata: eventCount > 0
-      ? t("projection.events24h", { count: eventCount })
-      : hasArtifact
-        ? t("projection.runEvidenceAvailable")
-        : t("projection.publicSafeProjection"),
-  };
 }

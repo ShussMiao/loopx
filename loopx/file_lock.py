@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
+import stat
 import tempfile
 import time
 import importlib
@@ -122,6 +124,28 @@ def _lock_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.lock")
 
 
+def _open_lock_descriptor(path: Path, *, flags: int) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow and path.is_symlink():
+        raise OSError(errno.ELOOP, "lock path must not be a symlink", str(path))
+    descriptor = os.open(path, flags | no_follow, 0o600)
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = os.lstat(path)
+        if (
+            not stat.S_ISREG(descriptor_stat.st_mode)
+            or stat.S_ISLNK(path_stat.st_mode)
+            or descriptor_stat.st_dev != path_stat.st_dev
+            or descriptor_stat.st_ino != path_stat.st_ino
+            or getattr(descriptor_stat, "st_nlink", 1) != 1
+        ):
+            raise OSError(errno.EINVAL, "lock path must be a regular file", str(path))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def lock_holder_path(path: Path) -> Path:
     lock_path = _lock_path(path)
     if os.name == "nt":
@@ -147,6 +171,11 @@ def _identity(
 ) -> dict[str, object]:
     return {
         "pid": os.getpid(),
+        # A pid is only meaningful on the machine that wrote this record. Two
+        # hosts sharing one runtime root can both read the holder, so the record
+        # names its own machine and a reader never has to guess which host a pid
+        # belongs to. The name is a sanitized label, not a path or a secret.
+        "host": lock_holder_host_label(),
         "agent_id": _safe_label(
             agent_id or os.environ.get("LOOPX_AGENT_ID"),
             fallback="unknown",
@@ -239,34 +268,109 @@ def _mark_released(
         pass
 
 
-def _read_holder_record(lock_path: Path) -> dict[str, object]:
-    try:
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    allowed = {
+_HOLDER_RECORD_FIELDS = frozenset(
+    {
         "schema_version",
         "lock_id",
         "policy",
+        "host",
         "pid",
         "agent_id",
         "operation",
         "acquired_at",
         "released_at",
     }
-    return {key: payload[key] for key in allowed if key in payload}
+)
+
+
+def _filter_holder_record(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    return {key: payload[key] for key in _HOLDER_RECORD_FIELDS if key in payload}
+
+
+def _read_holder_record(lock_path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return _filter_holder_record(payload)
+
+
+def lock_holder_host_label() -> str:
+    """The machine label a holder record carries; readers compare against it."""
+
+    return _safe_label(socket.gethostname(), fallback="unknown")
+
+
+# Liveness of a lock's last holder, read from its record alone. The kernel lock
+# is never probed: a probe would hold the lock for an instant, and a real
+# single-flight acquisition racing that instant would be refused for nothing.
+LOCK_HOLDER_LIVE = "live"
+LOCK_HOLDER_RELEASED = "released"
+LOCK_HOLDER_DEAD = "dead"
+LOCK_HOLDER_FOREIGN_HOST = "foreign_host"
+LOCK_HOLDER_UNREADABLE = "unreadable"
+LOCK_HOLDER_ABSENT = "absent"
+LOCK_HOLDER_LIVENESS_STATES = (
+    LOCK_HOLDER_LIVE,
+    LOCK_HOLDER_RELEASED,
+    LOCK_HOLDER_DEAD,
+    LOCK_HOLDER_FOREIGN_HOST,
+    LOCK_HOLDER_UNREADABLE,
+    LOCK_HOLDER_ABSENT,
+)
+
+
+def lock_holder_liveness(path: Path) -> tuple[str, dict[str, object]]:
+    """Classify the last holder of one lock without touching the kernel lock.
+
+    Returns the liveness state and the filtered holder record. ``released``
+    means the holder wrote ``released_at`` on a clean exit; ``dead`` means the
+    record names this machine and the pid is gone, which is what a crashed or
+    killed holder leaves behind; ``foreign_host`` means the pid cannot be
+    checked from here; ``unreadable`` means a lock file exists but carries no
+    parseable record, for example mid-acquisition. Only ``live`` is evidence of
+    a running holder, and even that is pid liveness, not the kernel lock: a
+    reused pid can keep a crashed holder looking alive until the next holder
+    overwrites the record.
+    """
+
+    holder_path = lock_holder_path(path)
+    try:
+        text = holder_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return LOCK_HOLDER_ABSENT, {}
+    except OSError:
+        return LOCK_HOLDER_UNREADABLE, {}
+    try:
+        record = _filter_holder_record(json.loads(text))
+    except ValueError:
+        return LOCK_HOLDER_UNREADABLE, {}
+    if not record:
+        return LOCK_HOLDER_UNREADABLE, {}
+    released_at = record.get("released_at")
+    if isinstance(released_at, str) and released_at:
+        return LOCK_HOLDER_RELEASED, record
+    if record.get("host") != lock_holder_host_label():
+        return LOCK_HOLDER_FOREIGN_HOST, record
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return LOCK_HOLDER_UNREADABLE, record
+    return (LOCK_HOLDER_LIVE if process_is_alive(pid) else LOCK_HOLDER_DEAD), record
 
 
 def _operator_action(holder: dict[str, object], *, retry_mode: str) -> dict[str, object]:
     return {
         "required": True,
         "action": "inspect_lock_holder",
+        # The pid is only meaningful on this host: naming it stops an operator
+        # from hunting for a process id that cannot exist on another machine.
+        "holder_host": holder.get("host"),
         "holder_pid": holder.get("pid"),
         "retry_mode": retry_mode,
         "steps": [
-            "Inspect the recorded holder PID and operation.",
+            "Inspect the recorded holder host, PID and operation on that host.",
             "Confirm the process is stalled before terminating it.",
             "Retry according to retry_mode after the holder exits.",
             "Do not delete the lock file; the kernel lock is authoritative.",
@@ -282,10 +386,9 @@ def _append_incident(path: Path, record: dict[str, object]) -> bool:
         + "\n"
     ).encode("utf-8")
     try:
-        descriptor = os.open(
+        descriptor = _open_lock_descriptor(
             incident_path,
-            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-            0o600,
+            flags=os.O_APPEND | os.O_CREAT | os.O_WRONLY,
         )
         try:
             os.write(descriptor, encoded)
@@ -399,7 +502,10 @@ def exclusive_file_lock(
     lock_path = _lock_path(path)
     holder_path = lock_holder_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = _open_lock_descriptor(
+        lock_path,
+        flags=os.O_CREAT | os.O_RDWR,
+    )
     with os.fdopen(descriptor, "r+", encoding="utf-8") as lock_file:
         started = time.monotonic()
         started_at = _utc_now_iso()
@@ -457,7 +563,10 @@ def try_exclusive_file_lock(
     lock_path = _lock_path(path)
     holder_path = lock_holder_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = _open_lock_descriptor(
+        lock_path,
+        flags=os.O_CREAT | os.O_RDWR,
+    )
     with os.fdopen(descriptor, "r+", encoding="utf-8") as lock_file:
         if not _try_acquire_kernel_lock(lock_file):
             yield None
@@ -876,8 +985,20 @@ def release_cross_runtime_mutation_lock(path: Path, *, token: str) -> bool:
     )
 
 
+def cross_runtime_lock_witness(path: Path) -> dict[str, object]:
+    """Internal handoff of a lock held by this process, never an Agent token.
+
+    The native effect must claim and recheck it before using adapted facts.
+    Its final save owns release; Python's later release is token-checked.
+    """
+    owner = _read_effect_mutation_owner(_effect_mutation_lock_path(path))
+    if owner is None or owner.get("pid") != os.getpid():
+        raise RuntimeError("checkpoint handoff requires the caller's held mutation lock")
+    return {"target": str(path.resolve()), **owner}
+
+
 @contextmanager
-def exclusive_cross_runtime_file_lock(
+def exclusive_mutation_file_lock(
     path: Path,
     *,
     policy: LockAcquisitionPolicy | str = LockAcquisitionPolicy.MUTATION,
@@ -886,13 +1007,7 @@ def exclusive_cross_runtime_file_lock(
     agent_id: str | None = None,
     operation: str | None = None,
 ) -> Iterator[Path]:
-    """Hold the TypeScript mutation lock, then the existing Python lock.
-
-    This is a bounded migration lock for state whose writers span both
-    runtimes. TypeScript coordinates through exclusive creation of
-    ``<target>.ts-effect.lock``; Python keeps its kernel lock underneath so
-    existing diagnostics and Python-to-Python exclusion remain unchanged.
-    """
+    """Hold the existing TypeScript mutation marker and its token/claim protocol."""
 
     selected_policy = _policy(policy)
     defaults = LOCK_POLICIES[selected_policy]
@@ -956,15 +1071,7 @@ def exclusive_cross_runtime_file_lock(
         break
 
     try:
-        with exclusive_file_lock(
-            path,
-            policy=selected_policy,
-            timeout_seconds=timeout,
-            poll_interval_seconds=poll_interval,
-            agent_id=agent_id,
-            operation=operation,
-        ) as lock_path:
-            yield lock_path
+        yield effect_lock_path
     finally:
         _release_effect_mutation_lock(
             effect_lock_path,
@@ -974,3 +1081,39 @@ def exclusive_cross_runtime_file_lock(
             # original exception; stale-owner recovery handles a later retry.
             suppress_errors=True,
         )
+
+
+@contextmanager
+def exclusive_cross_runtime_file_lock(
+    path: Path,
+    *,
+    policy: LockAcquisitionPolicy | str = LockAcquisitionPolicy.MUTATION,
+    timeout_seconds: float | None = None,
+    poll_interval_seconds: float | None = None,
+    agent_id: str | None = None,
+    operation: str | None = None,
+) -> Iterator[Path]:
+    """Source writers retain their existing order: mutation marker, then kernel."""
+    with exclusive_mutation_file_lock(
+        path, policy=policy, timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds, agent_id=agent_id, operation=operation,
+    ):
+        with exclusive_file_lock(
+            path, policy=policy, timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds, agent_id=agent_id, operation=operation,
+        ) as lock_path:
+            yield lock_path
+
+
+@contextmanager
+def exclusive_run_index_lock(path: Path, *, operation: str) -> Iterator[Path]:
+    """Goal indexes use kernel then marker, matching existing quota adapters.
+
+    Native writers take only the marker, never the kernel lock. Python callers
+    must enter here before any source lock; no index path may use the reverse
+    order from exclusive_cross_runtime_file_lock. A native checkpoint effect
+    claims the marker until append completes, including after caller exit.
+    """
+    with exclusive_file_lock(path, operation=operation) as lock_path:
+        with exclusive_mutation_file_lock(path, operation=operation):
+            yield lock_path

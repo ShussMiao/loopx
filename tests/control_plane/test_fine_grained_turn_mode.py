@@ -272,6 +272,9 @@ def test_fine_heartbeat_rule_is_opt_in_only() -> None:
     assert "one or more causally related" in fine["task_body"]
     assert "settle the turn once" in fine["task_body"]
     assert "Protocol/setup and capability re-entry" in fine["task_body"]
+    assert "independently verifiable checkpoint" in fine["task_body"]
+    assert "small verifiable checkpoint" not in fine["task_body"]
+    assert "After each completion inspect fresh evidence" in fine["task_body"]
 
 
 def test_heartbeat_cli_reads_sticky_fine_mode_from_registry(tmp_path: Path) -> None:
@@ -322,7 +325,9 @@ def test_heartbeat_cli_reads_sticky_fine_mode_from_registry(tmp_path: Path) -> N
     )
     payload = json.loads(completed.stdout)
 
-    assert payload["turn_mode"] == "fine_grained"
+    assert payload["schema_version"] == "heartbeat_agent_input_v1"
+    assert "turn_mode" not in payload
+    assert "turn_granularity" not in payload
     assert FINE_GRAINED_TURN_RULE in payload["task_body"]
 
 

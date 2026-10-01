@@ -6,17 +6,22 @@
   <meta name="theme-color" content="#fafafa">
   <title>从一次性 Agent 到长程控制面 · LoopX</title>
   <meta name="description" content="LoopX 如何用目标、状态内核与 Effect Program，让工作跨越会话、吸收人类判断，并从中断中恢复。">
-  <link rel="canonical" href="https://huangruiteng.github.io/loopx/blog/zh/from-one-shot-agents-to-long-horizon-control/">
-  <link rel="alternate" hreflang="en" href="https://huangruiteng.github.io/loopx/blog/from-one-shot-agents-to-long-horizon-control/">
-  <link rel="alternate" hreflang="zh-CN" href="https://huangruiteng.github.io/loopx/blog/zh/from-one-shot-agents-to-long-horizon-control/">
-  <link rel="alternate" hreflang="x-default" href="https://huangruiteng.github.io/loopx/blog/from-one-shot-agents-to-long-horizon-control/">
+  <link rel="canonical" href="https://loopx-project.github.io/loopx/blog/zh/from-one-shot-agents-to-long-horizon-control/">
+  <link rel="alternate" hreflang="en" href="https://loopx-project.github.io/loopx/blog/from-one-shot-agents-to-long-horizon-control/">
+  <link rel="alternate" hreflang="zh-CN" href="https://loopx-project.github.io/loopx/blog/zh/from-one-shot-agents-to-long-horizon-control/">
+  <link rel="alternate" hreflang="x-default" href="https://loopx-project.github.io/loopx/blog/from-one-shot-agents-to-long-horizon-control/">
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="LoopX">
   <meta property="og:locale" content="zh_CN">
   <meta property="og:title" content="从一次性 Agent 到长程控制面">
   <meta property="og:description" content="LoopX 如何用目标、状态内核与 Effect Program，让工作跨越会话、吸收人类判断，并从中断中恢复。">
-  <meta property="og:url" content="https://huangruiteng.github.io/loopx/blog/zh/from-one-shot-agents-to-long-horizon-control/">
-  <meta name="twitter:card" content="summary">
+  <meta property="og:url" content="https://loopx-project.github.io/loopx/blog/zh/from-one-shot-agents-to-long-horizon-control/">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta property="og:image" content="https://loopx-project.github.io/loopx/blog/assets/long-horizon-control-zh.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="从一次性 Agent 到长程控制面：最大化 Agent 产出，最小化人的注意力投入。">
+  <meta name="twitter:image" content="https://loopx-project.github.io/loopx/blog/assets/long-horizon-control-zh.png">
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="../../../blog/blog.css">
 </head>
@@ -41,6 +46,7 @@
 <div class="article-layout">
   <aside class="toc"><details open><summary>本文目录</summary><nav aria-label="文章目录"><a href="#objective">1. 最大化 Agent 产出，最小化人的注意力投入</a>
 <a href="#control-plane">2. 语义控制面要保存什么</a>
+<a href="#joint-decision">2.1 控制面与模型的共同决策</a>
 <a href="#state-kernel">3. 外置状态，可重建的展示面</a>
 <a href="#agent-interface">4. 帮助 Agent 决定下一步的 CLI</a>
 <a href="#effects">5. Effect Program：恢复实际发生过的事</a>
@@ -70,14 +76,12 @@
 <h2>2. 语义控制面要保存什么</h2>
 <p>模型的工作上下文有限。压缩和 Subagent 可以缓解上下文压力，但一段总结无法可靠地执行所有权、并发、权限和幂等规则。跨 Session 的项目需要持续回答：</p>
 <ul><li>当前目标是什么，怎样才算验收通过？</li><li>哪些事实和人类决策仍然有效？</li><li>每项工作由谁负责，哪些动作已获得授权？</li><li>某个外部操作究竟有没有发生？</li><li>下一轮是否值得继续消耗资源，结束后又该做什么？</li></ul>
-<p>这些问题定义了 Semantic Control Plane。把 Agent Stack 按恢复对象分成四层，可以看清它的位置。</p>
-<figure class="stack"><ol>
-<li><b>04 · 语义控制面</b><span>目标、证据、权限、验收、重新规划</span></li>
-<li><b>03 · 工作协作</b><span>Todo、Claim、Lease、Handoff</span></li>
-<li><b>02 · 持久化工作流</b><span>步骤、重试、等待、恢复</span></li>
-<li><b>01 · 执行底座</b><span>进程、容器、会话、工作区</span></li>
-</ol><figcaption>每层保存不同的工作状态，可以组合使用。</figcaption></figure>
-<p>Runtime 恢复运行环境；LoopX 保存 Agent 正在做什么、为什么做、已经证明了什么，以及下一步是否合法。Codex Thread、Claude Code Session 和 CLI Runner 都可以成为这块共同事实面周围可替换的 Worker。</p>
+<p>这些问题定义了 Semantic Control Plane。它拥有的是持久化的边界、授权、验收和状态迁移，而不是把所有领域判断都从模型手里收回。把 Agent Stack 按恢复对象分成四层，可以看清它的位置。</p>
+<figure class="architecture-figure" id="architecture-position" aria-labelledby="position-caption">
+<div class="architecture-viewport" role="region" aria-label="LoopX 在 Agentic Software 中的位置" tabindex="0"><a href="../../images/long-horizon-control/position-zh.svg" target="_blank" rel="noopener"><img src="../../images/long-horizon-control/position-zh.svg" alt="LoopX 在 Agentic Software 中的位置" loading="lazy" decoding="async" width="1280" height="850" /></a></div>
+<figcaption id="position-caption"><b>A / LoopX 在 Agentic Software 中的位置</b> — LoopX 与 Agent/Harness 双向交换边界和证据；工作流与运行环境恢复不同层次的状态。 <a href="../../images/long-horizon-control/position-zh.svg" target="_blank" rel="noopener">打开原图 ↗</a><span class="architecture-hint">窄屏可横向滑动；打开原图放大查看。</span></figcaption>
+</figure>
+<p>Runtime 恢复运行环境；LoopX 保存 Agent 正在做什么、为什么做、已经证明了什么，以及下一步是否合法。Codex Thread、Claude Code Session 和 CLI Runner 都可以成为这块共同事实面周围可替换的 Worker。这里的 Worker 只描述执行边界，不表示模型只是没有判断力的执行器：模型仍在边界内负责理解、假设和路线选择。</p>
 <p>四个概念有助于精确描述进展：</p>
 <pre><code>Turn       = 一次有界执行窗口
 Result     = 一轮返回的产物或观察
@@ -86,8 +90,18 @@ Progress   = 与验收相关的持久状态迁移</code></pre>
 <p>一段有说服力的回答属于 Result。相关验证和状态迁移被接受后，它才能成为项目进展。具体定义见<a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/docs/architecture.md">架构与术语</a>。</p>
 
 <h3>与工作流引擎、Memory 的关系</h3>
-<p>已有系统解决了持久化的重要部分。<a href="https://docs.langchain.com/oss/python/langgraph/persistence">LangGraph 的 Checkpoint</a>保存图状态，支持恢复、人类介入与时间回溯；<a href="https://docs.temporal.io/activities">Temporal Activity</a>隔离外部工作，安全重试仍需应用自身的幂等设计。LoopX 增加项目层的判断：什么证据满足验收，哪个 Actor 有权提交变化，当前路线是否还值得继续。</p>
+<p>已有系统解决了持久化的重要部分。<a href="https://docs.langchain.com/oss/python/langgraph/persistence">LangGraph 的 Checkpoint</a>保存图状态，支持恢复、人类介入与时间回溯；<a href="https://docs.temporal.io/activities">Temporal Activity</a>隔离外部工作，安全重试仍需应用自身的幂等设计。LoopX 将项目层的边界和判定持久化：什么证据满足验收，哪个 Actor 有权提交变化，以及当前路线是否还允许继续；具体假设与技术路线仍由模型和领域能力提出、比较并解释。</p>
 <p>Memory 帮助找回有用的事实，Authority 决定该事实此刻能否支持行动。记住 Owner 曾批准一次发布，有助于理解上下文；把它当成以后每次发布的授权，就会出错。同样，忠实恢复一条已经过时的计划，可能在运行层面非常可靠，却耗尽剩余预算。恢复时需要保留目标，并重新判断路线。</p>
+
+<h3 id="joint-decision">控制面与模型的共同决策</h3>
+<p>把 Goal 和 Todo 从对话上下文中外置，放进一个跨 Session 的状态存储，有助于恢复事实与边界；但这不等于 Kernel 自动生成完整路线。LoopX 将决策拆成互补的责任：Kernel 固化不可含糊的约束，模型在约束内进行语义推理，Capability 验证提议，Kernel 再接受或拒绝持久迁移。</p>
+<div class="table-scroll"><table><thead><tr><th>责任</th><th>控制面负责</th><th>模型与领域能力负责</th></tr></thead><tbody>
+<tr><td>可执行边界</td><td>Admission、Scope、Claim、Lease、Quota、Gate、证据新鲜度、Receipt 与 Writeback</td><td>在允许的空间内选择下一步，不绕过这些边界</td></tr>
+<tr><td>语义判断</td><td>保存目标、验收条件、当前有效状态和已接受的迁移</td><td>理解目标，解释证据，提出假设、权衡和技术路线</td></tr>
+<tr><td>共同闭环</td><td>根据验证结果接受或拒绝状态变化，并让下一轮继承</td><td>把判断提交为可验证的 Proposal，并根据新事实修正路线</td></tr>
+</tbody></table></div>
+<p>因此，Accepted Transition 不是 Kernel 重新发明了模型的判断，而是把经过能力验证、权限检查和身份核对的 Proposal 纳入持久事实；洞察本身仍来自模型、领域工具和人的判断。</p>
+<p>因此，“有状态的分布式作业系统”是一个有用的比喻，但它描述的是生命周期、恢复和结算边界，不是一个替模型思考的中央 Planner。模型不是可以修改权威状态的唯一主人，也不是只能照单执行的哑 Worker；它是共同决策闭环中的语义提议者。</p>
 
 </section>
 <section id="state-kernel">
@@ -104,21 +118,19 @@ Progress   = 与验收相关的持久状态迁移</code></pre>
   → Quota 与当前可执行 Frontier</code></pre>
 <p>人的决策也进入同一套持久模型。“等我 Review”“这条路线可以继续”都有具体范围。<a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/docs/reference/protocols/decision-scope-v0.md">Decision Scope 契约</a>将权限绑定到 Action、Lane、Goal 或 Project。一条路径等待时，不依赖该决策且已经获得授权的工作仍可继续。</p>
 <p>完成同样需要明确边界。关闭 Todo 只是一个局部工作的证据，不会自动满足整个 Goal。如果可执行 Frontier 已经耗尽，Acceptance 仍然开放，系统需要新的路线，或者有证据支持的 No-follow-up 结论。</p>
-<figure class="diagram" aria-labelledby="truth-caption">
-<p class="diagram-label">01 / 共同事实面</p>
-<div class="diagram-node"><b>人的目标与判断</b><span>验收条件 · 有范围的决策</span></div>
-<div class="connector" aria-hidden="true">↓</div>
-<div class="diagram-node kernel"><b>Canonical State / 状态内核</b><span>目标 · 证据 · 权限 · 当前有效路线</span></div>
-<div class="diagram-branch"><span>↓ 选择与授权</span><span>↓ 只读投影</span></div>
-<div class="diagram-pair"><div class="diagram-node"><b>Quota → Agent → Capability</b><span>执行有界工作，获得 Provider 回读</span></div><div class="diagram-node"><b>Status / Dashboard</b><span>展示事实，不自行授予权限</span></div></div>
-<div class="return-path">↳ 观察 → 验证 Proposal → Kernel 接受迁移 ↺</div>
-<figcaption id="truth-caption">工作结果必须回到共同事实面。看板上的“完成”和 Agent 的叙述，都不能代替已接受的迁移。</figcaption></figure>
+<figure class="architecture-figure" id="architecture-components" aria-labelledby="components-caption">
+<div class="architecture-viewport" role="region" aria-label="语义控制面的组件与反馈" tabindex="0"><a href="../../images/long-horizon-control/components-zh.svg" target="_blank" rel="noopener"><img src="../../images/long-horizon-control/components-zh.svg" alt="语义控制面的组件与反馈" loading="lazy" decoding="async" width="1200" height="1020" /></a></div>
+<figcaption id="components-caption"><b>B / 语义控制面的组件与反馈</b> — 目标、范围、预算与工作协作约束执行；证据经验证后才能支持迁移。图中连线表示职责与信息流，各域保留自己的状态所有权。 <a href="../../images/long-horizon-control/components-zh.svg" target="_blank" rel="noopener">打开原图 ↗</a><span class="architecture-hint">窄屏可横向滑动；打开原图放大查看。</span></figcaption>
+</figure>
+
 <p>回到推理加速，“发布前等我确认”的范围是 Release，不会抹去分析 Profile 或验证兼容性的授权。一个有用的投影可以同时展示：内核候选通过局部检查、服务级延迟目标尚未证实、发布等待决策。一个“Blocked”会藏起可推进的分析，一个“Done”又会藏起尚未关闭的验收缺口。</p>
 
 </section>
 <section id="agent-interface">
-<h2>4. 帮助 Agent 决定下一步的 CLI</h2>
+<h2>4. 帮助 Agent 在合法空间内决定下一步的 CLI</h2>
 <p>可以把 LoopX 直观理解为一张可执行 Kanban。卡片有稳定身份、依赖、Claim、Scope、Evidence 和 Successor。移动卡片意味着申请一次可验证的状态迁移，看板展示的是这份契约。</p>
+<p>Agent-facing Kanban 还需要回答四个问题：状态怎样合法推进，Agent 依据什么有界上下文决策，Task 做完后怎样重新判断 Goal，以及某条路径等待时其他工作能否继续。它们决定了看板能否成为可接手的协作契约，而不仅是进度展示。具体实践见<a href="../agent-facing-kanban/">《LoopX：长程 Agent 的原生 Kanban》</a>。</p>
+<p>它帮助 Agent 在合法空间内决定下一步，而不是给出一条不可偏离的唯一路线。<code>next_cli_actions</code>、推荐路线和 Planning Horizon 是 Guidance；只有由 Typed Contract 执行的权限、Gate、Quota、Claim、Lease 与验收边界，才是 Hard Boundary。</p>
 <p>CLI 将工作连续性写进交互。完成任务时，可以创建后继、链接已有后继，或在验收满足后记录结构化 No-follow-up 理由。这样，一次局部成功不会让更大的任务链断线。具体规则见 <a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/docs/project-agent-todo-contract.md">Todo Contract</a>。</p>
 <p>Interaction Contract 分开表达“人需要听到什么”和“Agent 必须做什么”。通知通道可以安静，同时要求 Agent 执行一段有界工作。反过来，状态要求等待时，调度器唤醒也可以合法地不产生工作。</p>
 <p>这同时保护 Human 和 Agent 的注意力。Human-facing View 突出值得判断的新问题；Agent-facing View 给出当前权限、下一步、验证和停止条件。双方都不应靠读完全部历史对话来重建当前事实。</p>
@@ -170,8 +182,12 @@ Progress   = 与验收相关的持久状态迁移</code></pre>
 </section>
 <section id="planning">
 <h2>6. 何时执行、等待与重新规划</h2>
-<h3>Quota 编译本轮决策</h3>
-<p><code>quota should-run</code> 在算力预算之前，先处理健康与安全、Operator Gate、Evidence Wait 和 Focus Wait，再结合当前工作、Capability、Workspace 与 Scheduler 状态生成 Interaction Contract。结果可能允许有界工作、指出决策 Gate、保持等待、限制交付或要求修复。详见 <a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/docs/quota-allocation.md">Quota Allocation</a>。</p>
+<h3>Quota 编译 Interaction Contract，而不是完整领域计划</h3>
+<p><code>quota should-run</code> 在算力预算之前，先处理健康与安全、Operator Gate、Evidence Wait 和 Focus Wait，再结合当前工作、Capability、Workspace 与 Scheduler 状态生成 Interaction Contract。它判断现在能不能做、是否要等、是否需要人、是否需要修复，并限制本轮执行边界；它不替模型决定应该采用哪一个技术假设或完整路线。详见 <a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/docs/quota-allocation.md">Quota Allocation</a>。</p>
+<figure class="architecture-figure" id="architecture-controller" aria-labelledby="controller-caption">
+<div class="architecture-viewport" role="region" aria-label="长程推进的决策回路" tabindex="0"><a href="../../images/long-horizon-control/controller-zh.svg" target="_blank" rel="noopener"><img src="../../images/long-horizon-control/controller-zh.svg" alt="长程推进的决策回路" loading="lazy" decoding="async" width="1280" height="1190" /></a></div>
+<figcaption id="controller-caption"><b>C / 长程推进的决策回路</b> — 每轮用有效回执与新鲜决策重新选择路由。停止一次迭代不等于 Goal 终止，虚线表示外层处理后重新评估。 <a href="../../images/long-horizon-control/controller-zh.svg" target="_blank" rel="noopener">打开原图 ↗</a><span class="architecture-hint">窄屏可横向滑动；打开原图放大查看。</span></figcaption>
+</figure>
 <p>经过验证的持久写回先于 Quota Spend。Quiet Skip、Preflight Failure 和 Dry-run 不计为 Delivery Spend。即使 Refresh 已经选出下一项动作，Spend Record 仍应归因到刚完成的工作。</p>
 <h3>围绕当前任务的有界 Planning Horizon</h3>
 <p>Typed Planning Inventory 支撑多个视图。Action Portfolio 给出少量当前候选；Planning Horizon 展示附近的 Successor、依赖、Resume 关系和 Acceptance Gap；按需 Todo Detail 展开冷路径；Task Graph 提供诊断视图。</p>
@@ -211,6 +227,7 @@ Progress   = 与验收相关的持久状态迁移</code></pre>
 <tr><td>Lease</td><td>带时间边界的执行占用</td><td>永久所有权或 Gate 已满足</td></tr>
 <tr><td>Lifecycle Authority</td><td>谁能完成、替代、重新分配或覆盖</td><td>由 Claim 推导出的额外权限</td></tr>
 </tbody></table></div>
+<p>生命周期权威不等于语义判断权威。拥有 Lease 的 Agent 可以执行有界工作，但不会因此获得修改 Goal 方向或绕过验收的权力。</p>
 <p>跨 Host 后，这些区别更重要。Shared Goal Authority 将语义迁移规则与存储分开：Authority 层拥有 Revision、Lease Epoch、Receipt 和冲突判断；Storage Provider 提供 Load、Compare-and-put 与 Durability。Storage Generation、Authority Revision 与 Lease Epoch 描述不同事实，需要分别标识。</p>
 <p><a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/docs/architecture/rfcs/shared-goal-authority-state-provider-v0.zh-CN.md">Shared Goal Authority RFC</a> 与 <a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/loopx/control_plane/coordination/authority_store.ts">Authority Store 实现</a>记录了这项工作。跨 Host 产品化仍在持续验证；接口存在，不代表任意分布式数字团队已经成为开箱即用的产品。</p>
 <figure class="diagram" aria-labelledby="handoff-caption"><p class="diagram-label">04 / 交接产物与边界</p><div class="diagram-pair"><div class="diagram-node"><b>Peer A / 内核仓库</b><span>固定内核修订 · 数值边界 · 性能结果清单</span></div><div class="diagram-node"><b>Peer B / Serving 仓库</b><span>检查接口兼容性 · 回放并发负载</span></div></div><div class="connector" aria-hidden="true">↓</div><div class="diagram-node kernel"><b>共同目标 / 接受证据</b><span>身份、Claim 与有范围的生命周期权限分别检查</span></div><div class="connector" aria-hidden="true">↓</div><div class="diagram-node"><b>Release / 仍需对应授权</b></div><figcaption id="handoff-caption">消费方返回兼容性与负载证据。交接不会赋予完成 Peer 任务或发布版本的额外权限。</figcaption></figure>
@@ -234,20 +251,18 @@ Readback → Capability 验证 → Kernel 状态迁移</code></pre>
 <h2>10. 证据能回答什么</h2>
 <p>一个运行很久的项目，与一次更好的 Benchmark 结果，证明的是不同事情。Showcase 可以展示 Turn、等待、Review 和恢复之间的连续性，经过的项目时间不等于连续推理时间。Benchmark 回答某个系统在指定条件下完成了什么。</p>
 <p>更广泛的研究也说明设置值得认真对待。OpenAI 报告，UK AISI 的 Cyber Range 评测把 Token 预算从 10M 提高到 100M 后，性能提升最高达 59%。这是该评测设置下的结果，不是 LoopX 的结果，也不意味着运行越久一定越好；它支持把 Harness 与预算一起测量。参见 <a href="https://openai.com/index/trustworthy-third-party-evaluations-foundations/">OpenAI 的评测方法讨论</a>。</p>
-<h3>SWE-Marathon：收益、成本与失败的接入模式</h3>
-<p><a href="../../../benchmarks/swe-marathon/?lang=zh">LoopX 公开研究</a>由 <a href="https://github.com/huangruiteng/loopx/pull/3838">BouwenZhou 贡献</a>，在 SWE-Marathon v1.1 的 15 个匹配任务上比较五种模式，共 75 次 Trial，每个任务、每种模式各一次。模型为 GPT-5.6 Sol，Reasoning Effort 为 high；Codex 0.151.0、LoopX 0.5.3、Harbor 0.20.0，Timeout Multiplier 为 0.3。这是历史实验版本，与本文其他部分引用的实现修订分开理解。</p>
+<h3>SWE-Marathon：保留结果与成本</h3>
+<p><a href="../../../benchmarks/swe-marathon/?lang=zh">LoopX 公开研究</a>由 <a href="https://github.com/huangruiteng/loopx/pull/3838">BouwenZhou 贡献</a>，在 SWE-Marathon v1.1 的 15 个匹配任务上保留三种模式的结果，共 45 次 Trial，每个任务、每种模式各一次。模型为 GPT-5.6 Sol，Reasoning Effort 为 high；Codex 0.151.0、LoopX 0.5.3、Harbor 0.20.0，Timeout Multiplier 为 0.3。这是历史实验版本，与本文其他部分引用的实现修订分开理解。</p>
 <div class="table-scroll"><table class="benchmark-table"><caption>每格一次 Trial；成本为 15 个任务的美元总额，已取整</caption><thead><tr><th>模式</th><th>二值成功</th><th>平均连续分</th><th>总成本</th></tr></thead><tbody>
 <tr><td>裸 Codex</td><td>4 / 15</td><td>0.710</td><td>$368</td></tr>
 <tr><td>Codex 原生 Goal</td><td>4 / 15</td><td>0.767</td><td>$533</td></tr>
-<tr><td>原生 Goal + LoopX（SSH）</td><td>4 / 15</td><td>0.773</td><td>$696</td></tr>
-<tr><td>codex-cli 接入 LoopX</td><td>3 / 15</td><td>0.655</td><td>$419</td></tr>
 <tr><td>LoopX + 外部 Heartbeat</td><td>5 / 15</td><td>0.778</td><td>$830</td></tr>
 </tbody></table></div>
-<p>Heartbeat 相比原生 Goal 多完成一个任务，平均连续分提高 0.011，总成本增加约 56%。codex-cli 模式更差，并出现一次构建失败；该失败保留在共同分母中。研究提出，有人值守的 Host 模式与无人续跑之间的错配，可能解释部分表现，但这是待验证假设，没有被实验单独隔离。<a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/benchmark/swe-marathon/README.md">设置与局限</a> · <a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/benchmark/swe-marathon/data.json">固定版本的聚合数据</a>。</p>
+<p>Heartbeat 相比原生 Goal 多完成一个任务，平均连续分提高 0.011，总成本增加约 56%。更正：SSH Goal 与 Codex CLI 两组分数及行为比较已撤回，等待重新验证；不据此判断这两种模式的能力，私有原始记录保留。<a href="https://github.com/huangruiteng/loopx/blob/main/benchmark/swe-marathon/README.md">设置与局限</a> · <a href="https://github.com/huangruiteng/loopx/blob/main/benchmark/swe-marathon/data.json">更正后的聚合数据</a>。</p>
 <p>这是多项机制同时变化的探索性比较。每格没有重复 Trial，无法据此估计波动；相对裸 Codex 的较大部分提升，在原生 Goal 基线中已经出现。表格支持继续研究续跑方式和接入质量，尚不足以证明 LoopX 的普遍增益，或每项内核机制的效率。</p>
 <h3>一个继续验证有价值的案例</h3>
-<p><a href="https://github.com/huangruiteng/loopx/pull/3887">Wanli-Lee 贡献的 Case Insight 投影</a>进一步给出了具体例子。zstd-decoder 任务中，裸 Codex 在 52 步、六个可见 Fixture 后停止，最终评测通过 37 个隐藏检查中的 25 个。SSH LoopX 模式用了 135 步，通过 37/37；Heartbeat 模式用了 453 步，构建 156 项验收检查，也通过 37/37。数字来自<a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/benchmark/swe-marathon/case_insights.json">公开聚合 Case 分析</a>，描述的是这些运行中的观察。</p>
-<figure class="diagram" aria-labelledby="verification-caption"><p class="diagram-label">06 / 更多执行，需要更好的停止条件</p><div class="diagram-pair"><div class="diagram-node"><b>可见样例通过</b><span>在已观察的边界停下</span><strong>裸 Codex：25 / 37</strong></div><div class="diagram-node"><b>扩大验证范围</b><span>探查可见样例之外的要求</span><strong>SSH 与 Heartbeat：37 / 37</strong></div></div><figcaption id="verification-caption">同一任务中的描述性对照。步骤数量与验证策略同时变化，无法单独识别哪项干预造成差异。</figcaption></figure>
+<p><a href="https://github.com/huangruiteng/loopx/pull/3887">Wanli-Lee 贡献的 Case Insight 投影</a>进一步给出了具体例子。zstd-decoder 任务中，裸 Codex 在 52 步、六个可见 Fixture 后停止，最终评测通过 37 个隐藏检查中的 25 个。Heartbeat 模式用了 453 步，构建 156 项验收检查，通过 37/37。数字来自<a href="https://github.com/huangruiteng/loopx/blob/main/benchmark/swe-marathon/case_insights.json">公开聚合 Case 分析</a>，描述的是这些运行中的观察。</p>
+<figure class="diagram" aria-labelledby="verification-caption"><p class="diagram-label">06 / 更多执行，需要更好的停止条件</p><div class="diagram-pair"><div class="diagram-node"><b>可见样例通过</b><span>在已观察的边界停下</span><strong>裸 Codex：25 / 37</strong></div><div class="diagram-node"><b>扩大验证范围</b><span>探查可见样例之外的要求</span><strong>Heartbeat：37 / 37</strong></div></div><figcaption id="verification-caption">同一任务中的描述性对照。步骤数量与验证策略同时变化，无法单独识别哪项干预造成差异。</figcaption></figure>
 <p>值得检验的假设是：额外 Turn 在产生新证据和修复时有价值。持续重读相同计划，也能消耗更多预算，却未必改善结果。工程目标是让停止条件对验收缺口、失败假设与边际收益下降敏感。</p>
 <p>后续实验需要重复匹配 Trial，报告波动与每次成功的成本，并分别改变续跑策略、证据保留和恢复机制。中断 Effect、Peer 交接也需要专项验证。<a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/docs/architecture/rfcs/long-horizon-harness-benchmark-research-program-v0.zh-CN.md">研究计划</a>描述了更大的评测空间。一个有希望的案例，值得用更严谨的实验继续追问。</p>
 </section>
@@ -262,6 +277,7 @@ loopx status</code></pre>
 <ol><li><b>选择可观察的结果。</b>推理项目先固定工作负载、质量边界、延迟目标与基线，再交给 Agent。</li><li><b>说明权限边界。</b>分别约定开发、实验花费和发布权限，同时为独立工作提供足够范围。</li><li><b>检查一个完整周期。</b>看 Selection、执行、验证、Writeback 和 Successor；确认新 Session 能恢复当前事实。</li><li><b>试一次等待与纠偏。</b>等待远程结果时允许独立分析，并纠正一个不充分的性能结论；检查下一轮是否同时继承等待条件和反馈。</li><li><b>沿证据支持的方向扩展。</b>为可分离工作加入 Peer，观察协调成本、重复失败和注意力消耗。</li></ol>
 <p>短小、明确、能在一个 Session 内舒服完成的任务，现有 Agent 可能已经足够好。当连续性、有范围的决策、证据和协作本身变成反复要做的工作时，LoopX 才更有价值。它增加的开销，应当在真实项目里赚回来。</p>
 <p>我的长期愿望，是一支能跨项目、跨 Host 持续工作的数字团队，同时让指挥它的人看得懂、改得动。这是要继续建设和验证的方向，不代表所有环节都已完成。开源也改变了项目本身：其他开发者会带来不同任务、失败方式和质量标准。更好的 LoopX，应当从这些具体需求里长出来。</p>
+<div class="case-note"><b>LoopX 不声称什么</b><ul><li>控制面能自动产生高质量洞察；</li><li>模型永远可靠；</li><li>PostgreSQL Provider 已经是完整的生产托管服务；</li><li>状态持久化等同于无限自治；</li><li>所有领域决策都能被 Kernel 确定性化。</li></ul></div>
 
 </section>
 
@@ -273,7 +289,7 @@ loopx status</code></pre>
 <ul>
 <li><a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/docs/architecture.md">LoopX 架构</a>：目标、状态与执行边界的整体设计。实际使用可从<a href="../../../docs/book/">开发者手册</a>开始。</li>
 <li><a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/loopx/control_plane/effect_program.ts">Effect Program 实现</a>与<a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/tests/control_plane_ts/effect_program.test.ts">对应测试</a>：核对结算顺序、Receipt、重放与中断恢复。</li>
-<li><a href="../../../benchmarks/swe-marathon/?lang=zh">SWE-Marathon 双语研究简报</a>与<a href="https://github.com/huangruiteng/loopx/blob/41a35880fc63ed8b51696e08ec1f17b5369b1a4b/benchmark/swe-marathon/data.json">固定版本的聚合数据</a>：阅读五种模式的实验设置、结果、成本和局限。</li>
+<li><a href="../../../benchmarks/swe-marathon/?lang=zh">SWE-Marathon 双语研究简报</a>与<a href="https://github.com/huangruiteng/loopx/blob/main/benchmark/swe-marathon/data.json">更正后的聚合数据</a>：阅读三个保留模式的实验设置、结果、成本和局限。</li>
 </ul>
 <h3 id="agent-loop-reading">Agent Loop 与函数式编程</h3>
 <p>齐梦星空的小红书系列（2026 年 5 月），从带 Effect 的计算出发讨论工具调用与组合：</p>
@@ -290,7 +306,7 @@ loopx status</code></pre>
 </ul>
 </section>
 
-  <p class="edition">本文为公开博客改编版。文中的实现引用固定到 <a href="https://github.com/huangruiteng/loopx/tree/41a35880fc63ed8b51696e08ec1f17b5369b1a4b">41a3588</a>；使用说明请以当前文档为准。</p>
+  <p class="edition">本文为公开博客改编版。原文实现引用固定到 <a href="https://github.com/huangruiteng/loopx/tree/41a35880fc63ed8b51696e08ec1f17b5369b1a4b">41a3588</a>；新增架构图 A–C 依据 <a href="https://github.com/huangruiteng/loopx/tree/503991dd216211db6427047dc0c958d411128771">503991d</a>。使用说明请以当前文档为准。</p>
   </article>
 </div>
 </main>

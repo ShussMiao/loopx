@@ -78,6 +78,11 @@ provider-specific routing data. This runtime contract is not itself a new
 capability registry entry; providers advertise stable caller outcomes through
 their existing extension and capability surfaces.
 
+Manager group bindings additionally apply the bilingual
+[context-capture and Turn-authority contract](protocols/lark-manager-context-authority-v0.md):
+an unaddressed message may be retained as bounded non-authoritative context,
+but only typed provider addressing may enqueue or steer a Turn.
+
 For asynchronous sources, the same module provides an owner-local incremental
 inbox runtime. A provider translates a bounded page into
 `agent_external_connector_event_v0` envelopes and calls the capture operation
@@ -901,6 +906,45 @@ bound to both that interpreter and the resolved module source. This lets a
 clean source checkout and a local LoopX release activate bundled providers
 without separately installing a console script; catalog discovery remains
 declarative and does not import the module.
+
+Because discovery is declarative, a declared launch target is only shape-checked
+until activation. The public smoke
+`examples/extension-entrypoint-surface-smoke.py` is a repository-scoped coverage
+guard for that gap rather than an activation check: without importing provider
+code it resolves the declared `python_module`, the `entrypoint` console script,
+each hook adapter `factory`, and each presentation `view_validator` for every
+bundled and co-located manifest in this repository against the source tree, so a
+renamed or removed entrypoint fails in the same change that removes it instead
+of at the user's first activation. It does not cover an edited or third-party
+manifest, and detection is structural: an attribute the scanner cannot see, for
+example one installed through `getattr`, is reported as unresolved.
+
+### Local executable locations
+
+Successful executable install/upgrade and doctor operations save the selected
+absolute launcher path in the host-local revision state, separately from the
+portable manifest. When that launcher is a symlink, identity checks still hash
+the final executable artifact while the launcher directory remains the child
+process PATH prefix. Enable, rollback, update-time revalidation and invocation
+use that revision's saved location instead of rediscovering a same-named
+executable on the current shell PATH. File-identity checks remain mandatory; a
+missing saved executable does not fall back to another PATH entry. Package
+upgrades resolve and verify the new revision's executable through the explicit
+upgrade workflow. Bundled `python_module` providers continue using the current
+LoopX interpreter and retain their existing identity checks.
+
+For executable providers, only the child process prepends the executable's
+directory to PATH, so tools installed in the same environment remain available.
+No complete environment, credentials, package contents, or local path is added
+to the public manifest or doctor result. An explicitly supplied execution
+environment remains the base environment; only this PATH prefix is added.
+
+Legacy installations without a saved location require one successful
+`loopx extension doctor <extension-id> --execute` with the provider environment
+available on PATH. Read-only doctor calls do not migrate state. Subsequent
+revalidation can run from the desktop's minimal PATH. If an executable is moved,
+restore its registered location or explicitly upgrade its local manifest to
+point to the new executable; do not hide the failure by disabling the extension.
 
 ## Scope Boundaries
 

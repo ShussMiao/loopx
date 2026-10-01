@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal, get_args
 
 from ...control_plane.runtime.public_safety import public_safe_compact_text
+from ...public_safe_text import (
+    MODULE_QUALIFIED_SURFACE_PATTERN as SURFACE_RE,
+    PUBLIC_SAFE_REFERENCE_PATTERN as TOKEN_RE,
+)
 from ..context_providers import build_context_provider
 from ..context_providers.base import (
     ContextProvider,
@@ -16,7 +20,13 @@ from ..context_providers.base import (
     canonical_context_text,
     opaque_provider_ref,
 )
+from ..context_providers.openviking import classify_openviking_scope
 from .candidate_review import REWARD_MEMORY_REVIEW_SCHEMA_VERSION
+from .experience_quality import (
+    normalize_procedural_experience,
+    procedural_experience_digest,
+    procedural_experience_quality,
+)
 from .registry import IDENTITY_SCOPE_FIELDS, normalize_reward_memory_corpus
 
 
@@ -43,8 +53,6 @@ DURABLE_RECALL_CLASSES = {
     "soft_preference",
     "procedural_experience",
 }
-TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$")
-SURFACE_RE = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$")
 MAX_QUERY_STEPS = 3
 MAX_RESULTS = 8
 MAX_SETUP_HINT = 500
@@ -58,6 +66,8 @@ class RewardMemoryRecallItem:
     candidate_ref: str
     target_class: str
     content_summary: str
+    experience: Mapping[str, Any] | None = None
+    experience_digest: str = ""
     content_digest: str = ""
 
 
@@ -67,11 +77,42 @@ class RewardMemoryRecallSession:
 
     public_packet: dict[str, Any]
     items: tuple[RewardMemoryRecallItem, ...] = ()
+    filtered_items: tuple["RewardMemoryFilteredRecallItem", ...] = ()
+
+
+@dataclass(frozen=True)
+class RewardMemoryFilteredRecallItem:
+    """One private provider hit rejected by a typed recall qualification gate."""
+
+    memory_ref: str
+    reason_code: str
+
+
+@dataclass(frozen=True)
+class _ActiveItemDecision:
+    item: RewardMemoryRecallItem | None
+    reason_code: str | None
 
 
 RewardMemoryApplier = Callable[
     [Any, tuple[RewardMemoryRecallItem, ...]], Mapping[str, Any]
 ]
+
+
+RecallInputErrorCode = Literal[
+    "freshness_age_invalid", "freshness_context_invalid",
+    "read_authority_checkpoint_missing", "read_authority_checkpoint_invalid",
+]
+
+
+class RewardMemoryRecallInputError(ValueError):
+    """An existing SDK input rejection with an allowlisted, non-content code."""
+
+    def __init__(self, reason_code: RecallInputErrorCode, message: str) -> None:
+        if reason_code not in get_args(RecallInputErrorCode):
+            raise ValueError("unsupported recall input error code")
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 def _token(value: object, label: str) -> str:
@@ -181,7 +222,12 @@ def build_active_reward_memory_record(
     expires_at = record["lifecycle"].get("expires_at")
     if expires_at:
         active_lifecycle["expires_at"] = expires_at
-    return {
+    experience = record.get("experience")
+    quality = procedural_experience_quality(
+        target_class=str(record.get("target_class") or ""),
+        experience=experience,
+    )
+    active = {
         "schema_version": REWARD_MEMORY_ACTIVE_RECORD_SCHEMA_VERSION,
         "activation_ref": activation_ref,
         "activated_at": activated,
@@ -191,6 +237,7 @@ def build_active_reward_memory_record(
         "content_summary": _compact(
             record.get("content_summary"), "content_summary", limit=500
         ),
+        "experience_quality": quality,
         "scope": dict(record["scope"]),
         "source": dict(record["source"]),
         "review": dict(reviewed_candidate["review"]),
@@ -204,28 +251,26 @@ def build_active_reward_memory_record(
         "provider_write_performed": False,
         "external_writes_performed": False,
     }
+    if experience is not None:
+        active["experience"] = normalize_procedural_experience(experience)
+    return active
 
 
 def _authority_checkpoint(
     raw: object, *, corpus: Mapping[str, Any], request: Mapping[str, Any]
 ) -> tuple[dict[str, Any], list[str]]:
     if not isinstance(raw, Mapping):
-        raise ValueError("read_authority_checkpoint must be an object")
-    checkpoint = {
-        "verified": _boolean(raw, "verified"),
-        "corpus_id": _token(raw.get("corpus_id"), "checkpoint.corpus_id"),
-        "workspace_ref": _token(raw.get("workspace_ref"), "checkpoint.workspace_ref"),
-        "project_ref": _token(raw.get("project_ref"), "checkpoint.project_ref"),
-        "surface_id": _token(raw.get("surface_id"), "checkpoint.surface_id"),
-        "read_authority": _token(
-            raw.get("read_authority"), "checkpoint.read_authority"
-        ),
-        "source_ref": _optional_token(raw.get("source_ref"), "checkpoint.source_ref"),
-    }
-    for field in IDENTITY_SCOPE_FIELDS:
-        expected_scope = corpus["scope"].get(field)
-        if expected_scope:
-            checkpoint[field] = _optional_token(raw.get(field), f"checkpoint.{field}")
+        raise RewardMemoryRecallInputError(
+            "read_authority_checkpoint_missing" if raw is None else "read_authority_checkpoint_invalid",
+            "read_authority_checkpoint must be an object",
+        )
+    try:
+        checkpoint = _normalize_authority_checkpoint(raw, corpus=corpus)
+    except ValueError as exc:
+        raise RewardMemoryRecallInputError(
+            "read_authority_checkpoint_missing" if not raw else "read_authority_checkpoint_invalid",
+            str(exc),
+        ) from exc
     reasons: list[str] = []
     expected = {
         "corpus_id": corpus["corpus_id"],
@@ -250,22 +295,48 @@ def _authority_checkpoint(
     return checkpoint, reasons
 
 
+def _normalize_authority_checkpoint(
+    raw: Mapping[str, Any], *, corpus: Mapping[str, Any],
+) -> dict[str, Any]:
+    checkpoint = {
+        "verified": _boolean(raw, "verified"),
+        "corpus_id": _token(raw.get("corpus_id"), "checkpoint.corpus_id"),
+        "workspace_ref": _token(raw.get("workspace_ref"), "checkpoint.workspace_ref"),
+        "project_ref": _token(raw.get("project_ref"), "checkpoint.project_ref"),
+        "surface_id": _token(raw.get("surface_id"), "checkpoint.surface_id"),
+        "read_authority": _token(
+            raw.get("read_authority"), "checkpoint.read_authority"
+        ),
+        "source_ref": _optional_token(raw.get("source_ref"), "checkpoint.source_ref"),
+    }
+    for field in IDENTITY_SCOPE_FIELDS:
+        expected_scope = corpus["scope"].get(field)
+        if expected_scope:
+            checkpoint[field] = _optional_token(raw.get(field), f"checkpoint.{field}")
+    return checkpoint
+
+
 def _freshness_reasons(
     corpus: Mapping[str, Any], freshness: Mapping[str, Any]
 ) -> list[str]:
     reasons: list[str] = []
     mode = corpus["freshness"]["mode"]
-    source_truth_current = _boolean(freshness, "source_truth_current")
-    source_revision = _optional_token(
-        freshness.get("source_revision"), "freshness_context.source_revision"
-    )
+    try:
+        source_truth_current = _boolean(freshness, "source_truth_current")
+        source_revision = _optional_token(
+            freshness.get("source_revision"), "freshness_context.source_revision"
+        )
+    except ValueError as exc:
+        raise RewardMemoryRecallInputError("freshness_context_invalid", str(exc)) from exc
     age_seconds = freshness.get("age_seconds")
     if age_seconds is not None and (
         isinstance(age_seconds, bool)
         or not isinstance(age_seconds, int)
         or age_seconds < 0
     ):
-        raise ValueError("freshness_context.age_seconds must be a non-negative integer")
+        raise RewardMemoryRecallInputError(
+            "freshness_age_invalid", "freshness_context.age_seconds must be a non-negative integer",
+        )
     if mode in {"source_truth_bound", "execution_bound"} and not source_truth_current:
         reasons.append("source_truth_not_current")
     if mode in {"revision_bound", "session_archive_bound"} and (
@@ -358,7 +429,7 @@ def build_reward_memory_recall_request(
     ):
         raise ValueError(f"limit must be between 1 and {MAX_RESULTS}")
     if not isinstance(request.get("freshness_context"), Mapping):
-        raise ValueError("freshness_context must be an object")
+        raise RewardMemoryRecallInputError("freshness_context_invalid", "freshness_context must be an object")
     if _boolean(request, "raw_content_captured"):
         raise ValueError("recall requests must not capture raw content")
 
@@ -468,7 +539,112 @@ def normalize_reward_memory_provider_binding(
             raise ValueError("actor_peer_id must match the peer-scoped provider URI")
     if actor_peer_id:
         binding["actor_peer_id"] = actor_peer_id
+    if binding["provider_id"] == "openviking":
+        provider_scope = classify_openviking_scope(binding["scope_ref"])
+        visibility = str((corpus.get("privacy") or {}).get("visibility") or "")
+        peer_ref = str((corpus.get("scope") or {}).get("peer_ref") or "")
+        agent_ref = (
+            peer_ref.removeprefix("agent:") if peer_ref.startswith("agent:") else ""
+        )
+        if visibility == "private" and provider_scope.visibility != "private":
+            raise ValueError(
+                "private Reward Memory cannot bind to public OpenViking resources"
+            )
+        if visibility == "private" and not provider_scope.actor_binding_required:
+            raise ValueError(
+                "private Reward Memory requires an actor-bound peer OpenViking scope"
+            )
+        if visibility == "private" and not agent_ref:
+            raise ValueError(
+                "private Reward Memory corpus requires scope.peer_ref=agent:<agent_id>"
+            )
+        if (
+            agent_ref
+            and provider_scope.actor_scope_id is not None
+            and provider_scope.actor_scope_id != actor_peer_id
+        ):
+            raise ValueError(
+                "private Reward Memory provider scope must match actor_peer_id"
+            )
     return binding
+
+
+def _active_item_decision(
+    item: ContextProviderItem,
+    corpus: Mapping[str, Any],
+    *,
+    surface_id: str,
+    observed_at: str,
+) -> _ActiveItemDecision:
+    try:
+        envelope = json.loads(item.content)
+    except json.JSONDecodeError:
+        return _ActiveItemDecision(None, "record_contract_filtered")
+    if not isinstance(envelope, Mapping):
+        return _ActiveItemDecision(None, "record_contract_filtered")
+    scope = envelope.get("scope")
+    lifecycle = envelope.get("lifecycle")
+    if (
+        envelope.get("schema_version") != REWARD_MEMORY_ACTIVE_RECORD_SCHEMA_VERSION
+        or envelope.get("corpus_id") != corpus["corpus_id"]
+        or envelope.get("target_class") != corpus["class_id"]
+    ):
+        return _ActiveItemDecision(None, "record_contract_filtered")
+    if (
+        not isinstance(scope, Mapping)
+        or not _scope_matches({"scope": scope}, corpus)
+        or surface_id not in set(scope.get("surface_ids") or [])
+    ):
+        return _ActiveItemDecision(None, "scope_filtered")
+    if not isinstance(lifecycle, Mapping) or lifecycle.get("state") != "active":
+        return _ActiveItemDecision(None, "lifecycle_filtered")
+    expires_at = lifecycle.get("expires_at")
+    if expires_at:
+        try:
+            expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return _ActiveItemDecision(None, "expiry_filtered")
+        if expires.tzinfo is None or observed.tzinfo is None or observed >= expires:
+            return _ActiveItemDecision(None, "expiry_filtered")
+    experience = envelope.get("experience")
+    if envelope.get("target_class") == "procedural_experience" and experience is None:
+        return _ActiveItemDecision(None, "legacy_contract_missing")
+    try:
+        quality = procedural_experience_quality(
+            target_class=str(envelope.get("target_class") or ""),
+            experience=experience,
+        )
+    except ValueError:
+        return _ActiveItemDecision(None, "quality_filtered")
+    if quality["passed"] is not True:
+        return _ActiveItemDecision(None, "quality_filtered")
+    try:
+        normalized_experience = (
+            normalize_procedural_experience(experience)
+            if experience is not None
+            else None
+        )
+        recall_item = RewardMemoryRecallItem(
+            memory_ref=item.resource_ref,
+            candidate_ref=_token(envelope.get("candidate_ref"), "candidate_ref"),
+            target_class=str(envelope["target_class"]),
+            content_summary=_compact(
+                envelope.get("content_summary"), "content_summary", limit=500
+            ),
+            experience=normalized_experience,
+            experience_digest=(
+                procedural_experience_digest(normalized_experience)
+                if normalized_experience is not None
+                else ""
+            ),
+            content_digest=hashlib.sha256(
+                canonical_context_text(item.content).encode("utf-8")
+            ).hexdigest(),
+        )
+    except (TypeError, ValueError):
+        return _ActiveItemDecision(None, "record_contract_filtered")
+    return _ActiveItemDecision(recall_item, None)
 
 
 def _active_item(
@@ -478,45 +654,14 @@ def _active_item(
     surface_id: str,
     observed_at: str,
 ) -> RewardMemoryRecallItem | None:
-    try:
-        envelope = json.loads(item.content)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(envelope, Mapping):
-        return None
-    scope = envelope.get("scope")
-    lifecycle = envelope.get("lifecycle")
-    if (
-        envelope.get("schema_version") != REWARD_MEMORY_ACTIVE_RECORD_SCHEMA_VERSION
-        or envelope.get("corpus_id") != corpus["corpus_id"]
-        or envelope.get("target_class") != corpus["class_id"]
-        or not isinstance(scope, Mapping)
-        or not _scope_matches({"scope": scope}, corpus)
-        or surface_id not in set(scope.get("surface_ids") or [])
-        or not isinstance(lifecycle, Mapping)
-        or lifecycle.get("state") != "active"
-    ):
-        return None
-    expires_at = lifecycle.get("expires_at")
-    if expires_at:
-        try:
-            expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-            observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        if expires.tzinfo is None or observed.tzinfo is None or observed >= expires:
-            return None
-    return RewardMemoryRecallItem(
-        memory_ref=item.resource_ref,
-        candidate_ref=_token(envelope.get("candidate_ref"), "candidate_ref"),
-        target_class=str(envelope["target_class"]),
-        content_summary=_compact(
-            envelope.get("content_summary"), "content_summary", limit=500
-        ),
-        content_digest=hashlib.sha256(
-            canonical_context_text(item.content).encode("utf-8")
-        ).hexdigest(),
-    )
+    """Compatibility wrapper for callers that only need the qualified item."""
+
+    return _active_item_decision(
+        item,
+        corpus,
+        surface_id=surface_id,
+        observed_at=observed_at,
+    ).item
 
 
 def execute_reward_memory_recall(
@@ -549,6 +694,22 @@ def execute_reward_memory_recall(
         "provider_id": binding["provider_id"],
         "result_count": 0,
         "results": [],
+        "provider_item_count": 0,
+        "filtered_item_count": 0,
+        "filtered_reason_counts": {},
+        "duplicate_item_count": 0,
+        "empty_cause": None,
+        "legacy_record_maintenance": {
+            "status": "not_required",
+            "record_count": 0,
+            "record_refs": [],
+            "allowed_actions": [],
+            "migration_path": None,
+            "retirement_path": None,
+            "write_authority_required": True,
+            "provider_write_performed": False,
+            "exact_readback_verified": False,
+        },
         "result_readback_verified": False,
         "provider_call_count": 0,
         "automatic_recall": False,
@@ -576,10 +737,56 @@ def execute_reward_memory_recall(
         }
     )
     results: list[RewardMemoryRecallItem] = []
+    filtered_items: list[RewardMemoryFilteredRecallItem] = []
     seen: set[str] = set()
+    seen_provider_refs: set[str] = set()
+    filtered_reason_counts: Counter[str] = Counter()
+    duplicate_item_count = 0
     provider_calls = 0
     provider_status = "completed"
     reason_code: str | None = None
+
+    def filter_projection() -> dict[str, Any]:
+        legacy_refs = sorted(
+            {
+                opaque_provider_ref(
+                    provider=binding["provider_id"],
+                    namespace=binding["namespace"],
+                    resource_ref=item.memory_ref,
+                )
+                for item in filtered_items
+                if item.reason_code == "legacy_contract_missing"
+            }
+        )
+        return {
+            "provider_item_count": len(seen_provider_refs),
+            "filtered_item_count": len(filtered_items),
+            "filtered_reason_counts": {
+                key: filtered_reason_counts[key]
+                for key in sorted(filtered_reason_counts)
+            },
+            "duplicate_item_count": duplicate_item_count,
+            "legacy_record_maintenance": {
+                "status": "owner_action_required" if legacy_refs else "not_required",
+                "record_count": len(legacy_refs),
+                "record_refs": legacy_refs,
+                "allowed_actions": ["migrate", "retire"] if legacy_refs else [],
+                "migration_path": (
+                    "ingest_validated_replacement_then_retire_legacy"
+                    if legacy_refs
+                    else None
+                ),
+                "retirement_path": (
+                    "declared_retirement_authority_write_then_exact_readback"
+                    if legacy_refs
+                    else None
+                ),
+                "write_authority_required": True,
+                "provider_write_performed": False,
+                "exact_readback_verified": False,
+            },
+        }
+
     for query in request["queries"]:
         provider_calls += 1
         try:
@@ -607,13 +814,24 @@ def execute_reward_memory_recall(
             reason_code = "provider_result_readback_unverified"
             break
         for provider_item in retrieval.items:
-            active = _active_item(
+            if provider_item.resource_ref in seen_provider_refs:
+                duplicate_item_count += 1
+                continue
+            seen_provider_refs.add(provider_item.resource_ref)
+            decision = _active_item_decision(
                 provider_item,
                 corpus,
                 surface_id=request["surface_id"],
                 observed_at=request["observed_at"],
             )
+            active = decision.item
             if active is None:
+                filtered = RewardMemoryFilteredRecallItem(
+                    memory_ref=provider_item.resource_ref,
+                    reason_code=str(decision.reason_code or "quality_filtered"),
+                )
+                filtered_items.append(filtered)
+                filtered_reason_counts[filtered.reason_code] += 1
                 continue
             if active.candidate_ref in seen:
                 continue
@@ -627,6 +845,7 @@ def execute_reward_memory_recall(
     if provider_status == "provider_unavailable":
         return RewardMemoryRecallSession(
             public_packet=base_packet
+            | filter_projection()
             | {
                 "status": provider_status,
                 "reason_code": reason_code,
@@ -635,6 +854,13 @@ def execute_reward_memory_recall(
             }
         )
     status = "completed" if results else "empty"
+    empty_cause = None
+    if not results:
+        empty_cause = (
+            "provider_returned_no_items"
+            if not seen_provider_refs
+            else "all_provider_items_filtered"
+        )
     expose_summary = corpus["privacy"]["visibility"] == "public_safe"
     public_results = [
         {
@@ -646,21 +872,30 @@ def execute_reward_memory_recall(
             "candidate_ref": item.candidate_ref,
             "target_class": item.target_class,
             "content_summary": item.content_summary if expose_summary else None,
+            "experience_quality": (
+                procedural_experience_quality(
+                    target_class=item.target_class,
+                    experience=item.experience,
+                )
+            ),
             "content_exposed": expose_summary,
         }
         for item in results
     ]
     return RewardMemoryRecallSession(
         public_packet=base_packet
+        | filter_projection()
         | {
             "status": status,
             "reason_code": None if results else "no_active_exact_corpus_results",
+            "empty_cause": empty_cause,
             "result_count": len(results),
             "results": public_results,
             "result_readback_verified": bool(results),
             "provider_call_count": provider_calls,
         },
         items=tuple(results),
+        filtered_items=tuple(filtered_items),
     )
 
 

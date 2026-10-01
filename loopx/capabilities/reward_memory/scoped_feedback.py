@@ -31,6 +31,7 @@ _EVENT_FIELDS = {
     "revision_ref",
     "target_class",
     "content_summary",
+    "experience",
     "source",
     "reasoning",
     "guard_context",
@@ -92,6 +93,7 @@ def build_scoped_feedback_reward_memory_candidate(
         {
             "target_class": raw.get("target_class"),
             "content_summary": raw.get("content_summary"),
+            "experience": raw.get("experience"),
             "source": raw.get("source"),
             "scope": {
                 "workspace_ref": raw.get("workspace_ref"),

@@ -7,12 +7,16 @@ from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
+# Re-exported for the existing callers of this module; the shapes themselves are
+# decided once, in ``identity_shapes``.
+from .identity_shapes import (  # noqa: F401
+    LARK_CHAT_ID_SEARCH as CHAT_ID_PATTERN,
+    LARK_MESSAGE_ID_SEARCH as MESSAGE_ID_PATTERN,
+    LARK_OPEN_ID_SEARCH as OPEN_ID_PATTERN,
+)
 from .presentation.kanban import CommandRunner
 
-CHAT_ID_PATTERN = re.compile(r"oc_[A-Za-z0-9_-]+")
-MESSAGE_ID_PATTERN = re.compile(r"om_[A-Za-z0-9_-]+")
 APP_ID_PATTERN = re.compile(r"cli_[A-Za-z0-9_-]+")
-OPEN_ID_PATTERN = re.compile(r"ou_[A-Za-z0-9_-]+")
 SAFE_PROFILE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 REQUIRED_GOAL_TOPIC_SCOPES = ("im:message", "im:message:readonly")
 REQUIRED_BOT_GROUP_HISTORY_SCOPES = (
@@ -113,8 +117,7 @@ def contains_exact_field(
         if str(payload.get(key) or "") == expected:
             return True
         return any(
-            contains_exact_field(value, key, expected)
-            for value in payload.values()
+            contains_exact_field(value, key, expected) for value in payload.values()
         )
     if isinstance(payload, list):
         return any(contains_exact_field(value, key, expected) for value in payload)
@@ -131,7 +134,9 @@ def payload_contains_text(payload: Any, expected: str) -> bool:
 
 def payload_contains_exact(payload: Any, expected: str) -> bool:
     if isinstance(payload, Mapping):
-        return any(payload_contains_exact(value, expected) for value in payload.values())
+        return any(
+            payload_contains_exact(value, expected) for value in payload.values()
+        )
     if isinstance(payload, list):
         return any(payload_contains_exact(value, expected) for value in payload)
     return isinstance(payload, str) and payload == expected
@@ -143,8 +148,14 @@ def call(
 ) -> Mapping[str, Any]:
     try:
         return runner(args, None, 30)
+    except subprocess.TimeoutExpired:
+        # The command ran and was killed, so a provider write it had already
+        # started is neither proven nor excluded. Carry the fact instead of
+        # folding it into a bare failure the callers would read as a verdict.
+        return {"returncode": 1, "stdout": "", "stderr": "", "timed_out": True}
     except (OSError, subprocess.SubprocessError):
-        return {"returncode": 1, "stdout": "", "stderr": ""}
+        # The command never started, so no provider write can have happened.
+        return {"returncode": 1, "stdout": "", "stderr": "", "spawn_failed": True}
 
 
 def profile_args(profile: str | None) -> list[str]:
@@ -235,16 +246,10 @@ def goal_topic_message_permissions(
     payload = json_payload(result)
     granted_raw = payload.get("granted")
     granted_items = granted_raw if isinstance(granted_raw, list) else []
-    granted = {
-        str(scope)
-        for scope in granted_items
-        if isinstance(scope, str)
-    }
+    granted = {str(scope) for scope in granted_items if isinstance(scope, str)}
     missing = [scope for scope in REQUIRED_GOAL_TOPIC_SCOPES if scope not in granted]
     ready = bool(
-        result.get("returncode") == 0
-        and payload.get("ok") is True
-        and not missing
+        result.get("returncode") == 0 and payload.get("ok") is True and not missing
     )
     return {
         "ready": ready,
@@ -421,6 +426,7 @@ def message_readback_verified(
     message_id: str,
     expected_text: str,
     expected_chat_id: str | None = None,
+    expected_goal_id: str | None = None,
 ) -> bool:
     result = call(
         runner,
@@ -441,6 +447,44 @@ def message_readback_verified(
         ),
     )
     payload = json_payload(result)
+    if expected_goal_id is not None:
+        # Topic roots and the earlier Goal control messages use different exact
+        # line markers. Verify the marker in this message, never in a sibling
+        # record returned by a batched provider response.
+        markers = {f"Goal ID: {expected_goal_id}", f"LoopX Goal: {expected_goal_id}"}
+
+        def has_marker(value: Any) -> bool:
+            if isinstance(value, Mapping):
+                return any(has_marker(item) for item in value.values())
+            if isinstance(value, list):
+                return any(has_marker(item) for item in value)
+            if not isinstance(value, str):
+                return False
+            if markers.intersection(line.strip() for line in value.splitlines()):
+                return True
+            try:
+                decoded = json.loads(value)
+            except (ValueError, TypeError):
+                return False
+            return isinstance(decoded, (dict, list)) and has_marker(decoded)
+
+        def matching_record(value: Any) -> bool:
+            if isinstance(value, Mapping):
+                if value.get("message_id") == message_id:
+                    return bool(
+                        not value.get("deleted")
+                        and (
+                            expected_chat_id is None
+                            or value.get("chat_id") == expected_chat_id
+                        )
+                        and has_marker(value.get("body") or value.get("content"))
+                    )
+                return any(matching_record(item) for item in value.values())
+            return isinstance(value, list) and any(
+                matching_record(item) for item in value
+            )
+
+        return result.get("returncode") == 0 and matching_record(payload)
     return bool(
         result.get("returncode") == 0
         and contains_exact_field(payload, "message_id", message_id)

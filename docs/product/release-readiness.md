@@ -56,7 +56,7 @@ its own updater.
 For contributors, keep the clone-plus-canary path:
 
 ```bash
-git clone https://github.com/huangruiteng/loopx ~/loopx
+git clone https://github.com/loopx-project/loopx ~/loopx
 ~/loopx/scripts/install-local.sh
 loopx doctor
 loopx-canary doctor
@@ -115,14 +115,23 @@ versions may still match while the installed source commit is behind.
 
 Use `loopx update check --ref main` for archive maintainer qualification. Its
 `runtime_activation_qualification` result compares the release-manifest source
-commit with the trusted source lineage reported by `loopx doctor`:
+commit with the selected ref's current GitHub commit. `source_commit_check`
+records the bounded read; an unavailable lookup does not turn equal package
+versions or a locally cached ref into an up-to-date claim:
 
 - `runtime_active` means the installed commit is the target commit or contains it;
 - `release_or_install_successor_required` means the installed commit is behind
   or diverged, so a release/install successor must remain explicit;
-- `activation_qualification_required` means commit lineage is unavailable or
-  belongs to a different `repo/ref`; the runtime-active claim must fail closed
-  until identity is refreshed.
+- `activation_qualification_required` means the selected commit differs without
+  proven ancestry, the ref lookup is unavailable, or archive identity is not
+  established; the runtime-active claim must fail closed until qualified.
+
+A pinned full commit SHA is its own trusted target, so
+`loopx update check --ref <40-hex-commit>` qualifies against the installed
+manifest source commit without waiting for a branch lineage lookup. Installed
+and pinned commits match: the receipt is `runtime_active`. They differ: the
+receipt stays `activation_qualification_required` and names the installed
+commit difference instead of the generic lineage message.
 
 Closing a PR monitor after latest-`main` validation is valid, but the closeout
 must not say the fix is active in the installed runtime unless this receipt is
@@ -143,13 +152,36 @@ Before moving `stable`, maintainers should:
 
 - bump `loopx.__version__` and `pyproject.toml` together when user-visible
   release behavior changes;
+- before freezing the candidate, align the existing canonical help catalog,
+  generated versioned manpage and current developer-book release checkpoint;
+  run the documentation preflight below without changing historical examples;
 - create or verify the matching Git tag, for example `v0.1.3`;
+- for host Goal/prompt changes, explicitly run the
+  [release-only native Goal regression](../development/testing-and-quality.md#release-only-native-goal-regression--仅发布前的原生-goal-回归)
+  in a supported Codex environment; record an unavailable environment as
+  `skipped`, not a live pass. Never enable paid model execution in default PR CI;
+- for conversational intake/routing changes, run the
+  [public intake evaluation](use-cases/steward/golden-queries.md#gq01-conversational-preparation-variant)
+  on the release candidate for the default and newly advertised model profiles,
+  with at least two repeats. Record the exact commit, model/settings, prompt/case
+  hashes, usage, failures and skips. Paid calls belong to release qualification,
+  never routine PR work, per-commit checks or heartbeats; ordinary development
+  uses offline regressions and affected browser scenarios. A skipped profile is
+  not qualified, and provider failures must remain visible;
 - fast-forward `stable` to that tagged commit after the release canary passes;
 - confirm `release.json`, `loopx doctor`, and `loopx update check` report the
   same package version and tag;
 - tell existing users to run `loopx update check`, then
   `loopx update apply` when the check recommends or when they want to
   refresh to the named stable release.
+
+Run the existing documentation preflight from the candidate worktree:
+
+```bash
+uv run --extra test python scripts/render-manpage.py --output man/loopx.1
+uv run --extra test python examples/cli-help-manpage-smoke.py
+uv run --extra test python examples/dev-book-publication-smoke.py
+```
 
 The release workflow builds a wheel and source distribution from the tagged
 commit. Its release assets include a canonical `SHA256SUMS` file, and GitHub
@@ -158,8 +190,8 @@ manifest. Verify a downloaded bundle before installation:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify loopx-X.Y.Z-py3-none-any.whl --repo huangruiteng/loopx
-gh attestation verify loopx-X.Y.Z.tar.gz --repo huangruiteng/loopx
+gh attestation verify loopx-X.Y.Z-py3-none-any.whl --repo loopx-project/loopx
+gh attestation verify loopx-X.Y.Z.tar.gz --repo loopx-project/loopx
 ```
 
 The checksum proves that the downloaded bytes match the release manifest. The
@@ -171,7 +203,7 @@ PyPI publication is an explicit, fail-closed extension of the same build. The
 release workflow publishes only when maintainers have configured all of these:
 
 - a PyPI project named `loopx` with a Trusted Publisher for
-  `huangruiteng/loopx` and `.github/workflows/release-artifacts.yml`;
+  `loopx-project/loopx` and `.github/workflows/release-artifacts.yml`;
 - a protected GitHub environment named `pypi` that matches the Trusted
   Publisher configuration;
 - the repository variable `PYPI_PUBLISH_ENABLED=true`.
@@ -550,6 +582,103 @@ path, and canary route rather than as a user-facing release baseline.
   and frozen bundles install the same version-bound workflow skills as package
   distributions. The exact-tag Python, PyPI, macOS, Windows, signed-update,
   public-smoke, and live-model gates passed before `stable` fast-forwarded.
+- `v1.0.2` on 2026-09-09 11:22 +08:00: single-owner Todo authority and
+  recovery release at the matching `v1.0.2` tag (`a5374d5b`). Promoted Todo
+  terminal transitions commit through one TypeScript-owned provider
+  transaction; missing generated Todo projections recover without making
+  Markdown authoritative; and long-history, Desktop, DSH, and managed-skill
+  paths gain bounded reads and clearer recovery diagnostics. The published
+  wheel, source distribution, macOS, Windows, checksum, update, and PyPI
+  artifacts were verified against the exact release source before promotion.
+- `v1.0.3` on 2026-09-11 11:53 +08:00: native monitor observation and consumer
+  closure release at the matching `v1.0.3` tag (`0496975e`). Native monitor
+  observations and their successors commit atomically through one typed
+  transaction, and completed history stays out of target-key selection (#4187);
+  quota unifies typed scope selection without erasing user gates, and the
+  scheduler hint accepts canonical Base64 transport; archived history preserves
+  decision and resume semantics (#4184); the manager keeps concrete Core
+  findings in progress reports behind scoped evidence reads (#4213, #4218);
+  Goal Channels extract runtime command ownership (#4154) and deliver manager
+  terminal failure receipts (#4217); and iteration-fresh host dispatch plus
+  typed upstream terminal errors land through #4126 and #4215. The published
+  wheel, source distribution, macOS, Windows, checksum, update, and PyPI
+  artifacts were verified against the exact release source before promotion.
+- `v1.0.4` on 2026-09-15 14:19 +08:00: bounded local authority storage,
+  human-confirmed operations, and a wider typed kernel release at the matching
+  `v1.0.4` tag (`b6d877b0c`). The opt-in SQLite authority provider keeps its
+  retained state log bounded with compact operation deltas plus periodic
+  checkpoints, separates storage, head, and continuity integrity, and migrates
+  V1 -> V2 as one idempotent, fail-closed transaction with a plan/execute
+  operator command (#4408, #4328, #4121); PostgreSQL authority admission
+  becomes a service-owned boundary whose authority ladder runs against a real
+  server in CI (#4334, #4399). Goal Channel operations ship as human-confirmed
+  typed actions whose review decision travels with the operation instead of
+  being re-derived per surface (#4275, #4364, #4132), and Todo, quota, lease,
+  monitor, and decision-scope rules converge on shared typed owners (#4273,
+  #4289, #4292, #4348, #4351). The published wheel, source distribution,
+  macOS, Windows, checksum, signed-update, and PyPI artifacts were verified
+  against the exact release source before `stable` fast-forwarded.
+- `v1.0.5` on 2026-09-16 03:14 +08:00: first-connect registration and explicit
+  host selection hot-fix release at the matching `v1.0.5` tag (`0c3971fea`).
+  `connect`/`bootstrap` register the goal and write the active state only, so a
+  freshly connected goal is immediately eligible instead of parking on a
+  generated owner gate, and the eight first-connect bootstrap options plus the
+  `onboarding_*` payload fields and the `adapter.connection_validation`
+  annotation are removed (#4465). Managed execution is selected rather than
+  inferred: the managed Turn host (#4443, #4451) and the steward channel
+  endpoint (#4446, #4419) come from explicit configuration, PR-review CI
+  waiting is configurable per machine or goal (#4452) under a documented review
+  frame (#4434), and update activation is qualified from an immutable source
+  commit (#4460) while the serving runtime publishes its identity with a
+  restart path (#4423). Quota window-slot spend clamps against the voids that
+  target it (#4384), the held coordination fence survives an authority-source
+  change (#4429), and a goal frontier missing its final-outcome claims is
+  diagnosed (#4341). Community contributions cover text-mode subprocess
+  decoding (#4396), stale executor revisions rejected before persisting
+  (#4398), CLI dash options (#4428), manager delegation reconciliation (#4372),
+  window-slot clamping (#4384), the semantic vocabulary registry and its
+  governance (#4433, #4453), and the Codex App autonomous goal guide (#4442).
+  The published wheel, source distribution, checksum, and PyPI artifacts were
+  verified against the exact release source before `stable` fast-forwarded.
+- `v1.1.0` on 2026-09-20 01:04 +08:00: organization migration and governed
+  collaboration release at the matching `v1.1.0` tag (`607c11d75`). LoopX
+  moved its repository, Pages, installer, and update surfaces to
+  `loopx-project`; team plans gained an explicit confirmation-to-canonical-work
+  path, local delegation gained durable operation recovery and checked returns,
+  and Goal acceptance plus replan obligations retained their existing authority
+  owners. The published package, desktop artifacts, signed update feed, and
+  website were verified before `stable` fast-forwarded.
+
+- `v1.2.0` on 2026-09-25 10:19 +08:00: recoverable authority, typed Todo
+  transitions, and inspectable host activation at commit `eb11130e1`.
+  The release separates package acquisition, delivered host material, runtime
+  activation, and enabled-extension readiness.
+
+- `v1.2.1` on 2026-09-27 16:22 +08:00: recoverable work, clearer Chat usage,
+  and lifecycle compatibility at commit `fce1a4bac`.
+  The published package, desktop artifacts, signed update feed, and website
+  were verified against the release source before `stable` fast-forwarded.
+
+- `v1.2.2` on 2026-09-28 07:17 +08:00: recoverable App conversations,
+  delegation continuity and local authority replay at commit
+  `ee9dad81b`. Settings identify device, Goal and Agent
+  targets; usage statistics preserve visible disclosure and persistent opt-out.
+  The published package, four Mac/Windows desktop artifacts, signed update
+  feed, PyPI installation and public Pages were verified against the tagged
+  source before `stable` fast-forwarded. The first full-public attempt hit a
+  disposable native-profile cleanup race; the complete same-source rerun passed
+  under unchanged budgets. Its remaining fixture-quiescence limit is retained
+  on the [existing profile lifecycle owner](https://github.com/loopx-project/loopx/pull/5226#issuecomment-5860681814).
+
+- `v1.2.3` on 2026-09-29 22:54 +08:00: App Goal drafts with explicit Apply,
+  exact Goal ownership for Chat and delegation, opt-in Kiro CLI mode, and typed
+  Explore observations at commit `0a401fe75`. The [published release](https://github.com/loopx-project/loopx/releases/tag/v1.2.3)
+  has 11 assets; package and desktop installer checksums, matching PyPI package
+  hashes, and the signed `desktop-stable` update feed were read back after all
+  three release workflows passed. `stable` was fast-forwarded to the tag.
+  This expedited release used focused local version, packaging, and two native
+  canary checks; the full Python/public smoke/model-behavior/PostgreSQL matrix
+  and a separate Pages check were not run.
 
 When a new public release is promoted, add it here only after the matching tag,
 release note, stable ref, update path, and focused release canary agree.

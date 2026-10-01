@@ -824,3 +824,54 @@ def test_admission_requires_scope_for_unknown_child_action() -> None:
             "reason_codes": ["write_scope_missing"],
         }
     ]
+
+
+def test_peer_inventory_does_not_confuse_first_display_row_with_binding() -> None:
+    old = {**_todo("todo_old"), "claimed_by": "worker"}
+    current = {**_todo("todo_current"), "claimed_by": "worker"}
+    kwargs = dict(
+        fallback_work_lane_contract={"lane": "advancement_task"},
+        goal_boundary={"peer_task_coordination": {"enabled": True, "coordinator_agent_id": AGENT_ID}},
+        agent_identity={"agent_id": AGENT_ID, "registered_agents": [AGENT_ID, "worker"]},
+        agent_todo_summary={"items": [old]},
+        raw_agent_todo_summary={"items": [old]},
+        available_capabilities=[],
+        agent_management_projection=_peer_management("worker"),
+    )
+    # The canonical source replaces the stale display, not merely its ordering.
+    contract, lane = apply_task_orchestration_contract(**kwargs, agent_todo_source_items=[current])
+    assert [r["todo_id"] for r in contract["blocked_peer_lanes"]] == ["todo_current"]
+    assert contract["execution_scope"] == "peer_agent_activation"
+    assert contract["task_selection"] == "canonical_claimed_candidates"
+    assert lane == {"lane": "advancement_task"}
+    assert apply_task_orchestration_contract(**kwargs, agent_todo_source_items=[])[0] is None
+    # Multiple genuinely open tasks are retained; neither becomes an implicit binding.
+    a, _ = apply_task_orchestration_contract(**kwargs, agent_todo_source_items=[old, current])
+    b, _ = apply_task_orchestration_contract(**kwargs, agent_todo_source_items=[current, old])
+    assert a == b
+    assert len(a["blocked_peer_lanes"]) == 2
+
+
+def test_blocked_peer_activation_does_not_hide_admitted_native_children() -> None:
+    items = [{**_todo("todo_one"), "claimed_by": AGENT_ID},
+             {**_todo("todo_two"), "claimed_by": AGENT_ID},
+             {**_todo("todo_peer", resume_ready=False), "claimed_by": "worker"}]
+    summary = {"items": items}
+    contract, lane = apply_task_orchestration_contract(
+        fallback_work_lane_contract={"lane": "advancement_task"},
+        goal_boundary={
+            "write_scope": ["loopx/**"],
+            "peer_task_coordination": {"enabled": True, "coordinator_agent_id": AGENT_ID},
+            "orchestration": {"mode": "multi_subagent", "spawn_allowed": True, "max_children": 2},
+        },
+        agent_identity={"agent_id": AGENT_ID, "registered_agents": [AGENT_ID, "worker"]},
+        agent_todo_summary=summary, raw_agent_todo_summary=summary,
+        agent_todo_source_items=items, available_capabilities=["subagent_spawn"],
+        agent_management_projection=_peer_management("worker"),
+    )
+    assert contract["mode"] == "adaptive"
+    assert lane["must_attempt_work"] is True
+    peer = contract["peer_activation_diagnostic"]
+    assert peer["execution_state"] == "blocked"
+    assert peer["activation_allowed"] is False
+    assert peer["blocked_peer_lanes"][0]["reason_codes"] == ["peer_agent_activation_unavailable", "peer_lane_not_resume_ready"]

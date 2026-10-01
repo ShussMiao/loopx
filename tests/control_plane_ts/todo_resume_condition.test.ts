@@ -36,6 +36,59 @@ test("resume syntax is normalized by the typed Todo boundary", () => {
     schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
     resume_when: "note_contains:approved",
   }), null);
+  assert.equal(normalizeTodoResumeWhen({
+    schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+    resume_when: "resume_at:2026-09-14T09:30:00+08:00",
+  }), "resume_at:2026-09-14T01:30:00Z");
+  for (const resume_when of [
+    "resume_at:2026-09-14T09:30:00",
+    "resume_at:2026-02-30T09:30:00+08:00",
+    "resume_at:2026-09-14T09:30:00+08:60",
+    "resume_at:2026-09-14T09:30:00+15:00",
+    "resume_at:1000-01-01T00:00:00+14:00",
+    "resume_at:9999-12-31T23:59:59-14:00",
+  ]) assert.equal(normalizeTodoResumeWhen({
+    schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+    resume_when,
+  }), null, resume_when);
+});
+
+test("resume_at emits one stable due receipt across repeated ticks and restart", () => {
+  const item = todo("todo_scheduled", "deferred", "advancement_task", {
+    resume_when: "resume_at:2026-09-14T09:30:00+08:00",
+  });
+  const evaluate = (evaluated_at: string) => {
+    const result = evaluateTodoResumeConditions({
+      schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+      items: [item],
+      source_items: [],
+      rollout_events: [],
+      evaluated_at,
+    });
+    return (result.conditions as Array<{ condition: Record<string, unknown> }>)[0].condition;
+  };
+
+  const pending = evaluate("2026-09-14T01:29:59Z");
+  assert.equal(pending.satisfied, false);
+  assert.equal(pending.material_change_generation, 0);
+  assert.equal(pending.resume_receipt, null);
+
+  const firstDue = evaluate("2026-09-14T01:30:00Z");
+  const replayed = evaluate("2026-09-15T00:00:00Z");
+  assert.equal(firstDue.satisfied, true);
+  assert.equal(firstDue.material_change_generation, 1);
+  assert.equal(firstDue.availability_reason, "resume_condition_satisfied");
+  assert.deepEqual(firstDue.resume_receipt, replayed.resume_receipt);
+  assert.match(
+    String((firstDue.resume_receipt as Record<string, unknown>).receipt_id),
+    /^resume_at_[a-f0-9]{24}$/,
+  );
+  assert.throws(() => evaluateTodoResumeConditions({
+    schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: [item],
+    source_items: [],
+    rollout_events: [],
+  }), /evaluated_at must be a timezone-aware RFC3339 timestamp/);
 });
 
 test("live monitor completion is invalid, but historical completion remains satisfied", () => {
@@ -88,7 +141,7 @@ test("legacy compact diagnosis infers only typed resume syntax, not prose or ano
   }
 });
 
-test("one reducer evaluates Todo, PR, capacity, and monitor resume conditions", () => {
+test("one reducer evaluates Todo, PR, capacity, monitor, and date resume conditions", () => {
   const result = evaluateTodoResumeConditions({
     schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
     items: [
@@ -106,6 +159,9 @@ test("one reducer evaluates Todo, PR, capacity, and monitor resume conditions", 
         resume_when: "monitor_changed:todo_watch001",
         resume_monitor_generation: 3,
       }),
+      todo("todo_wait_date", "deferred", "advancement_task", {
+        resume_when: "resume_at:2026-09-14T09:30:00+08:00",
+      }),
     ],
     source_items: [
       todo("todo_dependency", "done"),
@@ -120,6 +176,7 @@ test("one reducer evaluates Todo, PR, capacity, and monitor resume conditions", 
       recorded_at: "2026-08-25T00:00:00Z",
     }],
     available_capabilities: ["shell"],
+    evaluated_at: "2026-09-14T01:30:00Z",
   });
   const conditions = Object.fromEntries(
     (result.conditions as Array<Record<string, unknown>>).map((row) => [
@@ -142,6 +199,50 @@ test("one reducer evaluates Todo, PR, capacity, and monitor resume conditions", 
     conditions.todo_wait_monitor.availability_reason,
     "resume_condition_satisfied",
   );
+  assert.equal(conditions.todo_wait_date.satisfied, true);
+  assert.equal(conditions.todo_wait_date.material_change_generation, 1);
+});
+
+test("PR merge source aliases bridge a repository redirect without weakening repository binding", () => {
+  const request = {
+    schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: [
+      todo("todo_old_repo", "deferred", "advancement_task", {
+        resume_when: "pr_merged:#4344",
+        task_repository: "git:github.com/huangruiteng/loopx",
+      }),
+      todo("todo_unrelated_repo", "deferred", "advancement_task", {
+        resume_when: "pr_merged:#4344",
+        task_repository: "git:github.com/example/loopx",
+      }),
+    ],
+    source_items: [],
+    rollout_events: [{
+      event_id: "event-redirected-merge-4344",
+      event_kind: "pr_merge",
+      pr_ref: "loopx-project/loopx#4344",
+      source_refs: [
+        {kind: "pull_request", ref: "huangruiteng/loopx#4344"},
+        {kind: "pull_request", ref: "example/loopx#9999"},
+      ],
+      recorded_at: "2026-09-13T13:45:34Z",
+    }],
+    available_capabilities: [],
+    evaluated_at: "2026-09-20T00:00:00Z",
+  };
+  const result = evaluateTodoResumeConditions(request);
+  const conditions = Object.fromEntries(
+    (result.conditions as Array<Record<string, unknown>>).map((row) => [
+      row.todo_id,
+      row.condition,
+    ]),
+  ) as Record<string, Record<string, unknown>>;
+  assert.equal(conditions.todo_old_repo.satisfied, true);
+  assert.equal(
+    conditions.todo_old_repo.matched_pr_ref,
+    "huangruiteng/loopx#4344",
+  );
+  assert.equal(conditions.todo_unrelated_repo.satisfied, false);
 });
 
 test("monitor resume is generation-fenced and fail-closed without a baseline", () => {

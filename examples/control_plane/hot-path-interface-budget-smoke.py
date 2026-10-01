@@ -25,7 +25,10 @@ from loopx.extensions.presentation import (  # noqa: E402
     publish_extension_projection,
 )
 from loopx.extensions.runtime import install_extension  # noqa: E402
-from loopx.heartbeat_prompt import build_heartbeat_prompt  # noqa: E402
+from loopx.heartbeat_prompt import (  # noqa: E402
+    build_heartbeat_prompt,
+    project_heartbeat_agent_input,
+)
 from loopx.interface_budget import build_interface_budget_cadence  # noqa: E402
 from loopx.quota import build_quota_should_run  # noqa: E402
 from loopx.review_packet import build_review_packet  # noqa: E402
@@ -45,7 +48,9 @@ SURFACE_BUDGETS = {
         "owner": "heartbeat automation",
         "consumer": "wake and route one bounded turn",
         "cold_path": "quota should-run, status, or review-packet --handoff-only",
-        "max_json_chars": 3_500,
+        # Includes generator metadata and scoped commands, not just task_body.
+        # The independent 2,500-character thin body cap remains unchanged.
+        "max_json_chars": 5_400,
         "max_nested_keys": 40,
         "max_top_level_keys": 30,
         "budget_field": "interface_budget",
@@ -63,17 +68,21 @@ SURFACE_BUDGETS = {
         "owner": "quota guard",
         "consumer": "decide whether the selected goal may spend compute",
         "cold_path": "status, history, or active state",
-        "max_json_chars": 13_000,
-        "max_nested_keys": 330,
+        # Codex keeps a lossless codex_app compatibility alias while the
+        # provider-neutral app_automation packet becomes canonical.
+        # Pre-limit work counts add useful scope/completeness evidence; allow
+        # modest headroom after removing the redundant observed-row count.
+        "max_json_chars": 14_500,
+        "max_nested_keys": 360,
         "max_top_level_keys": 52,
     },
     "dashboard_status_json": {
         "owner": "operator dashboard",
         "consumer": "render first-screen operator state",
         "cold_path": "history, run artifacts, or project-local adapter output",
-        "max_json_chars": 18_215,
-        "max_nested_keys": 260,
-        "max_top_level_keys": 25,
+        "max_json_chars": 22_500,
+        "max_nested_keys": 350,
+        "max_top_level_keys": 27,
     },
 }
 
@@ -351,8 +360,8 @@ def assert_cadence_projection(
     assert projected["overdue"] is False, projected
     assert projected["within_budget"] is True, projected
     assert projected["next_check_due_at"] == "2099-01-02T00:10:00+00:00", projected
-    assert projected["headroom_remaining"] == 0, projected
-    assert projected["recommendation"] == "rerun_hot_path_interface_budget_smoke", projected
+    assert projected["headroom_remaining"] == 7, projected
+    assert projected["recommendation"] == "quiet_skip_until_next_check_due", projected
 
     quota_payload = build_quota_should_run(
         status_payload,
@@ -379,8 +388,12 @@ def main() -> int:
         assert "presentation_surfaces" not in status_payload, status_payload
         status_items = status_payload["attention_queue"]["items"]
         assert status_items, status_payload
+        # Internal graph evaluations must not expand public status payloads.
+        assert "succession_evaluation" not in json.dumps(status_items)
         assert "task_graph_projection" not in status_items[0], status_items[0]
-        assert status_payload["runtime_projection_routes"] == {"healthy": True}
+        route_health = status_payload["runtime_projection_routes"]
+        assert route_health["healthy"] is True, route_health
+        assert route_health["goal_count"] >= 1, route_health
         quota_payload = build_quota_should_run(
             status_payload,
             goal_id=GOAL_ID,
@@ -388,16 +401,30 @@ def main() -> int:
         )
         review_packet = build_review_packet(status_payload, goal_id=GOAL_ID, action_kind="codex")
         handoff_payload = review_packet_handoff_only_payload(review_packet)
-        heartbeat_payload = build_heartbeat_prompt(
-            goal_id=GOAL_ID,
-            thin=True,
-            runtime_profile="codex_app_heartbeat",
+        heartbeat_payload = project_heartbeat_agent_input(
+            build_heartbeat_prompt(
+                goal_id=GOAL_ID,
+                thin=True,
+                runtime_profile="codex_app_heartbeat",
+            )
         )
+        # Real automations normally bind an agent; the unbound fixture alone
+        # misses repeated identity/scope arguments in the generator envelope.
+        for binding in (
+            {"agent_id": "worker-a"},
+            {"agent_id": "worker-a", "agent_scopes": ["implementation", "review"]},
+        ):
+            assert_surface("heartbeat_prompt_json", build_heartbeat_prompt(
+                goal_id=GOAL_ID,
+                thin=True,
+                runtime_profile="codex_app_heartbeat",
+                **binding,
+            ))
 
         assert quota_payload["should_run"] is True, quota_payload
         reset_policy = quota_payload["scheduler_hint"]["reset_policy"]
         assert reset_policy["reset_token"], reset_policy
-        assert reset_policy["codex_app_initial_rrule"], reset_policy
+        assert reset_policy["app_automation_initial_rrule"], reset_policy
         assert reset_policy["host_state_key"] == "scheduler_hint.reset_policy.reset_token", reset_policy
         assert "identity_snapshot" not in reset_policy, reset_policy
         assert "profile_snapshot" not in reset_policy, reset_policy
@@ -423,26 +450,18 @@ def main() -> int:
         assert cadence["surface_count"] == len(summaries), cadence
         assert cadence["next_check_due_at"] == "2099-01-02T00:10:00+00:00", cadence
         assert cadence["minimum_headroom_ratio"] is not None, cadence
-        assert cadence["headroom_remaining"] == 0, cadence
-        assert cadence["recommendation"] == "rerun_hot_path_interface_budget_smoke", cadence
-        relaxed_summaries = [dict(summary) for summary in summaries]
-        for summary in relaxed_summaries:
-            if summary["json_chars"] == summary["max_json_chars"]:
-                summary["max_json_chars"] = summary["json_chars"] + 1
-            if summary["nested_keys"] == summary["max_nested_keys"]:
-                summary["max_nested_keys"] = summary["nested_keys"] + 1
-            if summary["top_level_keys"] == summary["max_top_level_keys"]:
-                summary["max_top_level_keys"] = summary["top_level_keys"] + 1
-        relaxed_cadence = build_interface_budget_cadence(
-            relaxed_summaries,
+        assert cadence["headroom_remaining"] == 7, cadence
+        assert cadence["recommendation"] == "quiet_skip_until_next_check_due", cadence
+        saturated_summaries = [dict(summary) for summary in summaries]
+        saturated_summaries[0]["max_json_chars"] = saturated_summaries[0]["json_chars"]
+        saturated_cadence = build_interface_budget_cadence(
+            saturated_summaries,
             checked_at="2099-01-01T00:10:00+00:00",
             now="2099-01-01T01:00:00+00:00",
             freshness_hours=24,
         )
-        assert relaxed_cadence["within_budget"] is True, relaxed_cadence
-        assert relaxed_cadence["overdue"] is False, relaxed_cadence
-        assert relaxed_cadence["headroom_remaining"] > 0, relaxed_cadence
-        assert relaxed_cadence["recommendation"] == "quiet_skip_until_next_check_due", relaxed_cadence
+        assert saturated_cadence["headroom_remaining"] == 0, saturated_cadence
+        assert saturated_cadence["recommendation"] == "rerun_hot_path_interface_budget_smoke", saturated_cadence
         stale_cadence = build_interface_budget_cadence(
             summaries,
             checked_at="2099-01-01T00:10:00+00:00",

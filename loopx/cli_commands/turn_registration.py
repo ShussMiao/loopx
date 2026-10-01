@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Callable
 
+from ..control_plane.operator_provider import operator_provider_environ
+from ..control_plane.turn_driver.host_binding import (
+    MANAGED_TURN_HOST,
+    resolve_default_turn_host,
+)
+from ..control_plane.turn_driver.execution_profile import REASONING_EFFORTS
 from ..paths import default_public_scan_root
 
+# Explicit host choices stay per-command: planning may name any host the Turn
+# driver routes, while run-once only ships built-in adapters for these three.
+PLANNED_TURN_HOST_CHOICES = ["codex-cli", "claude-code", "dsh", "generic-cli"]
+RUN_ONCE_TURN_HOST_CHOICES = ["codex-cli", "dsh", "generic-cli"]
 
 AddFormat = Callable[[argparse.ArgumentParser], None]
 
@@ -42,7 +53,22 @@ def register_turn_commands(
         help="Build one typed read-only host decision without launching or writing.",
     )
     add_subcommand_format(plan)
-    _add_turn_decision_arguments(plan, default_host="codex-cli")
+    # The default host and the default execution mode are one decision: the
+    # selected managed host runs bounded headless Turns, so pairing it with a
+    # visible interactive mode would produce a default plan that cannot be
+    # scheduled. The mode follows the *selected* host, whatever resolved it.
+    resolved_default_host = resolve_default_turn_host(operator_provider_environ())
+    resolved_default_execution_mode = (
+        "isolated-headless"
+        if resolved_default_host == MANAGED_TURN_HOST
+        else "interactive-visible"
+    )
+    _add_turn_decision_arguments(
+        plan,
+        default_host=resolved_default_host,
+        host_choices=list(PLANNED_TURN_HOST_CHOICES),
+        default_execution_mode=resolved_default_execution_mode,
+    )
     plan.add_argument(
         "--include-transaction-detail",
         action="store_true",
@@ -60,6 +86,66 @@ def register_turn_commands(
         help="Specific public file or directory to scan. Repeatable.",
     )
     plan.add_argument("--limit", type=int, default=5)
+
+    managed_step = command_sub.add_parser(
+        "managed-step",
+        help=(
+            "Decide one bounded same-Turn continuation for a failed Turn "
+            "without executing it."
+        ),
+        description=(
+            "Read one canonical Turn journal, rebuild its validated receipt, "
+            "and ask the pure Turn Loop Controller for a disposition against "
+            "the current decision. Grants no execution authority: it never "
+            "launches a host, writes state, or spends quota. The Turn journal "
+            "remains the authority for the attempt count and retry budget."
+        ),
+    )
+    add_subcommand_format(managed_step)
+    # A managed step decides a bounded headless continuation for a Turn that
+    # already failed, so it selects from the shipped run-once hosts and never
+    # plans a visible interactive mode.
+    _add_turn_decision_arguments(
+        managed_step,
+        default_host=resolved_default_host,
+        host_choices=list(RUN_ONCE_TURN_HOST_CHOICES),
+        execution_mode_choices=["isolated-headless"],
+        default_execution_mode="isolated-headless",
+        allow_todo_selection=False,
+    )
+    managed_step.add_argument(
+        "--turn-key",
+        required=True,
+        help="Exact sha256 Turn key of the failed Turn to decide about.",
+    )
+    managed_step.add_argument(
+        "--observed-attempt",
+        type=int,
+        help=(
+            "Caller's observed attempt count, reconciled against the Turn "
+            "journal. A disagreement is refused rather than adopted."
+        ),
+    )
+    managed_step.add_argument(
+        "--observed-max-attempts",
+        type=int,
+        help=(
+            "Caller's observed retry ceiling, reconciled against the Turn "
+            "journal retry policy."
+        ),
+    )
+    managed_step.add_argument(
+        "--scan-root",
+        default=default_public_scan_root(),
+        help="Public files to scan for obvious private material.",
+    )
+    managed_step.add_argument(
+        "--scan-path",
+        action="append",
+        default=[],
+        help="Specific public file or directory to scan. Repeatable.",
+    )
+    managed_step.add_argument("--limit", type=int, default=5)
 
     run_once = command_sub.add_parser(
         "run-once",
@@ -84,12 +170,20 @@ def register_turn_commands(
     add_subcommand_format(run_once)
     _add_turn_decision_arguments(
         run_once,
-        default_host="generic-cli",
-        host_choices=["codex-cli", "dsh", "generic-cli"],
+        default_host=resolved_default_host,
+        host_choices=list(RUN_ONCE_TURN_HOST_CHOICES),
         execution_mode_choices=["isolated-headless"],
         default_execution_mode="isolated-headless",
     )
     run_once.add_argument("--project", required=True)
+    run_once.add_argument(
+        "--automation-id",
+        help="Stable automation identity for an automation-scoped execution interval.",
+    )
+    run_once.add_argument(
+        "--manual-interval-bypass-reason",
+        help="Explicit manual intent; bypass only the interval and record this start.",
+    )
     run_once.add_argument(
         "--host-command-json",
         "--host-adapter-command-json",
@@ -126,20 +220,76 @@ def register_turn_commands(
     )
     run_once.add_argument("--codex-model")
     run_once.add_argument(
+        "--codex-operation-tools",
+        action="store_true",
+        help="Opt in to the owned app-server operation transport for this admitted codex-cli Turn. Reuses the original Todo/session; does not authenticate an attached Desktop or grant domain effects.",
+    )
+    run_once.add_argument(
+        "--codex-confirmed-operation-id",
+        help="Internal exact-operation resume fence for an operator-granted callback continuation. Requires operation tools; does not authenticate a caller or permit a domain effect.",
+    )
+    run_once.add_argument(
+        "--codex-operation-source-route-json",
+        type=json.loads,
+        help="Registered return audience {host_surface,thread_id} for operation proposals. Required when this Agent has several source routes; not executor authentication or execution permission.",
+    )
+    run_once.add_argument(
+        "--codex-reasoning-effort",
+        choices=list(REASONING_EFFORTS),
+        help=(
+            "Reasoning effort for the independent Codex CLI Turn. This is an "
+            "operator-bound independent Agent profile, not the native child-agent "
+            "model preference."
+        ),
+    )
+    run_once.add_argument(
         "--codex-sandbox",
-        choices=["read-only", "workspace-write"],
+        choices=["read-only", "workspace-write", "danger-full-access"],
         default="read-only",
-        help="Sandbox for a new Codex CLI session; resume preserves its original session policy.",
+        help=(
+            "Codex CLI sandbox (default: read-only). danger-full-access explicitly "
+            "disables the inner sandbox; callers must provide their own isolation. "
+            "The setting is passed explicitly for both new and resumed sessions."
+        ),
+    )
+    run_once.add_argument(
+        "--codex-mcp-server-json",
+        type=json.loads,
+        help=(
+            "Trusted codex_stdio_mcp_server_v0 JSON for one invocation-scoped "
+            "stdio MCP server. The command is passed to fresh and resumed Codex "
+            "sessions without modifying user configuration."
+        ),
     )
     run_once.add_argument(
         "--dsh-provider",
-        help="Provider for the built-in dsh host; defaults to DSH_PROVIDER.",
+        help=(
+            "Provider for the built-in dsh host; defaults to the managed "
+            "execution profile (LOOPX_TURN_PROVIDER)."
+        ),
     )
     run_once.add_argument(
         "--dsh-model",
-        help="Model for the built-in dsh host; defaults to DSH_MODEL.",
+        help=(
+            "Model for the built-in dsh host; defaults to the managed "
+            "execution profile (LOOPX_TURN_MODEL)."
+        ),
     )
-    run_once.add_argument("--dsh-max-tokens", type=int)
+    run_once.add_argument(
+        "--dsh-reasoning-effort",
+        help=(
+            "Reasoning effort for the built-in dsh host; defaults to the "
+            "managed execution profile (LOOPX_TURN_REASONING_EFFORT)."
+        ),
+    )
+    run_once.add_argument(
+        "--dsh-max-tokens",
+        type=int,
+        help=(
+            "Per-model-request output-token cap; defaults to LoopX's bounded "
+            "managed-host value. This is not a whole-Turn or tool-call budget."
+        ),
+    )
     run_once.add_argument(
         "--dsh-home",
         help=(
@@ -196,6 +346,7 @@ def _add_turn_decision_arguments(
     host_choices: list[str] | None = None,
     execution_mode_choices: list[str] | None = None,
     default_execution_mode: str = "interactive-visible",
+    allow_todo_selection: bool = True,
 ) -> None:
     parser.add_argument("--goal-id", required=True)
     parser.add_argument("--agent-id", required=True)
@@ -217,12 +368,27 @@ def _add_turn_decision_arguments(
             "agent_cli_loop otherwise."
         ),
     )
+    if allow_todo_selection:
+        parser.add_argument(
+            "--todo-id",
+            help="Select this currently eligible Todo through the existing quota owner; never fall back to another task.",
+        )
     parser.add_argument(
         "--turn-instance-id",
         help=(
             "Caller-stable public-safe identity for one logical Turn. Reusing the "
             "same id replays idempotently; use a new id for a new Turn with the "
             "same semantic action."
+        ),
+    )
+    parser.add_argument(
+        "--iteration-context",
+        choices=["fresh", "resume-if-available"],
+        default="resume-if-available",
+        help=(
+            "Host context policy for this iteration. fresh starts a clean "
+            "session even when a compatible prior session exists; "
+            "resume-if-available preserves the existing continuation behavior."
         ),
     )
     parser.add_argument(

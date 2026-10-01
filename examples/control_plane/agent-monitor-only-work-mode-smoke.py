@@ -135,7 +135,8 @@ def main() -> None:
     ), due
     assert "autonomous_replan_obligation" not in due, due
     assert due["selected_todo"]["todo_id"] == "todo_due_monitor", due
-    assert "todo_advancement" not in due["protocol_action_packet"]["summary"], due
+    assert "todo_advancement" not in due["interaction_contract"]["agent_channel"]["primary_action"], due
+    assert "protocol_action_packet" not in due, due
 
     peer = decision_for(
         [

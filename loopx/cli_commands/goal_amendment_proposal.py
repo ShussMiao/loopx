@@ -35,6 +35,7 @@ from ..control_plane.goals.goal_amendment_proposal import (
 from ..control_plane.goals.shared_goal_alignment import (
     _registered_goal,
 )
+from ..history import load_registry
 from ..runtime import validate_goal_id_path_segment
 from ..todos import resolve_todo_state_path
 
@@ -243,11 +244,9 @@ def _resolve_goal_routing(
     """
 
     try:
-        registry_payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry_payload = load_registry(registry_path)
     except (OSError, ValueError):
         raise ValueError(f"goal registry is unreadable: {registry_path}") from None
-    if not isinstance(registry_payload, dict):
-        raise TypeError("goal registry must contain a JSON object")
     _registered_goal(registry_payload, goal_id=goal_id)
 
     effective_runtime_root = runtime_root

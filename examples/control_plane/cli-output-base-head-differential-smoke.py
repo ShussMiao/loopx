@@ -58,11 +58,11 @@ def _run_probe(
     fixture_root: Path,
     receipt_path: Path,
     cwd: Path,
+    enforce_budget: bool,
 ) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(source_root)
-    _run(
-        [
+    command = [
             sys.executable,
             str(probe_runner),
             "--test-source",
@@ -73,7 +73,11 @@ def _run_probe(
             str(fixture_root),
             "--receipt",
             str(receipt_path),
-        ],
+        ]
+    if not enforce_budget:
+        command.append("--measurement-only")
+    _run(
+        command,
         cwd=cwd,
         env=env,
     )
@@ -171,6 +175,7 @@ def main() -> int:
                 fixture_root=fixture_root,
                 receipt_path=base_receipt,
                 cwd=temp_root,
+                enforce_budget=False,
             )
             _run_probe(
                 source_root=REPO_ROOT,
@@ -180,6 +185,7 @@ def main() -> int:
                 fixture_root=fixture_root,
                 receipt_path=candidate_receipt,
                 cwd=temp_root,
+                enforce_budget=True,
             )
         finally:
             _run(

@@ -25,6 +25,17 @@ automatically.
 
 ## Slash Command Fallback
 
+When asked to upgrade LoopX on a machine with the desktop App, inspect the App
+bundle and its runtime as well as the CLI. `loopx doctor` exposes
+`desktop_installation` for standard macOS install locations; a paired bundle
+still does not prove which App process is running. Upgrade the App and its
+bundled runtime together, then restart and verify the App, CLI and service
+source revisions. Never claim a desktop upgrade from CLI/HTTP checks alone:
+current App builds ask before replacing a different CLI runtime (update the
+App, or align the CLI to the App's bundled runtime), while an older build can
+still replace a separately upgraded CLI with its bundle.
+Keep SSH host verification separate; a host without an App needs no App install.
+
 When the visible user message is exactly a LoopX slash command or starts with a
 LoopX slash command plus arguments, do not treat it as ordinary chat.
 
@@ -62,8 +73,9 @@ Append `--capability-route issue-fix` only when the caller supplied that exact
 explicit route switch.
 
 Include `--goal-id <STABLE_GOAL_ID>` when known. Codex App automatically reads
-the stable ambient `CODEX_THREAD_ID`; other hosts that expose a stable opaque
-thread id should pass it as `--thread-id <HOST_THREAD_ID>` on every `/loopx`
+the stable ambient `CODEX_THREAD_ID`, while Trae App reads
+`TRAECLI_THREAD_ID`; other hosts that expose a stable opaque thread id should
+pass it as `--thread-id <HOST_THREAD_ID>` on every `/loopx`
 invocation. If that thread is already bound, reuse the returned
 `--agent-id <REGISTERED_AGENT_ID>` on start, heartbeat, quota, refresh-state,
 and Todo commands. Include `--agent-id <REGISTERED_AGENT_ID>` only when the
@@ -451,8 +463,13 @@ any losing high-value candidate that should not be forgotten. Include a product
 bottleneck lens: ask whether the core goal is currently bottlenecked by user
 experience, agent capability, evidence quality, adapter readiness, or
 priority-rule gaps, and promote one concrete bottleneck candidate when it should
-outrank the nearest local TODO. Then choose exactly one bounded, verifiable step
-from that audit.
+outrank the nearest local TODO. Choose scope-bounded work toward a verifiable
+result. Size the work by the task, evidence and risk, not tool calls, file count
+or heartbeat interval. Related implementation, research, validation and writeback
+may form one coherent effort; a focused correction can also be sufficient.
+One operation or writeback alone is not a reason to stop. Budget, scope, explicit
+stop conditions, settlement and replan requirements still apply; this guidance
+does not authorize a new Todo, lease, direction or external action.
 
 When you tell the user a connected LoopX plan, top-todo list, priority
 stack, or route change, treat that as a writeback trigger, not chat memory. If
@@ -499,68 +516,44 @@ limit. It uses an interactive `agent_cli_loop` scheduler context, omits
 heartbeat turn receipts, and must not create/update automations, apply RRULE
 cadence, or invent `LOOPX_TURN`.
 
-When a user or controller wants a recurring Codex App heartbeat for a connected
-goal, prefer the generator instead of hand-copying the quota lifecycle:
+For a recurring Codex App heartbeat, save the stable bootstrap returned by:
 
 ```bash
-loopx heartbeat-prompt --goal-id <STABLE_GOAL_ID>
+loopx --format json --registry <GLOBAL_REGISTRY> heartbeat-prompt \
+  --bootstrap --thin --codex-app --goal-id <STABLE_GOAL_ID> \
+  --agent-id <REGISTERED_AGENT_ID>
 ```
 
-The default generated body is thin when the target Codex agent can inspect
-LoopX state and CLI output itself. Passing `--thin` remains accepted and
-explicit:
+Read the complete JSON and require `ok=true`. Store its `task_body`, headed
+`LoopX managed heartbeat bootstrap v2`, with the App's `automation_update` tool.
+The saved command must load `heartbeat-prompt --thin --codex-app` on each wake;
+it must not include `--bootstrap` recursively. Do not persist the expanded
+thin/compact/brief/full execution body: those are current-turn or audit output,
+not the installed automation contract. `$loopx` startup follows the returned
+host activation command and saves this same bootstrap.
 
-```bash
-loopx heartbeat-prompt --thin --goal-id <STABLE_GOAL_ID>
-```
+Preserve the exact goal, registered agent, current task, schedule and
+notification setting. Never copy the example identity from another task.
+Connected goals resolve active state and agent scope from the registry on each
+wake; pass `--active-state` or `--agent-scope` only for an explicit override.
+An unregistered or missing identity must fail closed before task execution or
+accounting. A successful load is not permission to create another goal or take
+over another scheduler.
 
-Use the compact body after reviewing the full generated contract when the
-installed prompt should carry more lifecycle detail inline:
+For an existing automation, inspect `loopx automation-prompts plan --codex-home
+<ACTIVE_CODEX_HOME>` and apply its reviewed `desired_prompt` through the App
+`automation_update` tool. Read back the same automation, including its preserved
+binding and scheduling fields. Direct SQLite/TOML migration requires the App to
+be closed: a running host can overwrite disk edits from cached state. Do not
+claim completion from a changed file or a replaced CLI alone. Never copy
+sessions or rebind another Codex home's tasks to make its API reachable.
 
-```bash
-loopx heartbeat-prompt --compact --goal-id <STABLE_GOAL_ID>
-```
-
-If the installed automation body still needs to be smaller, use the brief body:
-
-```bash
-loopx heartbeat-prompt --brief --goal-id <STABLE_GOAL_ID>
-```
-
-For a shared-control-plane goal with `coordination.registered_agents`, always
-include the registered identity and scope in the installed automation prompt:
-
-```bash
-loopx heartbeat-prompt --thin --goal-id <STABLE_GOAL_ID> \
-  --agent-id <REGISTERED_AGENT_ID> \
-  --agent-scope "<THIS_AGENT_SCOPE>"
-```
-
-Once agents are registered, an unscoped `heartbeat-prompt` call fails closed so
-stale automations surface an upgrade error instead of running without identity.
-
-For connected goals, omit `--active-state`; the CLI resolves the active state
-from the registry goal `state_file`, which keeps installed automations from
-pinning a stale path. Pass `--active-state <ACTIVE_GOAL_STATE_PATH>` only for
-detached state files, migration checks, or compatibility tests.
-
-Copy the generated task body into the Codex App heartbeat automation. The thin
-body is the installed default for trusted local workers: it keeps the automation
-prompt project-agnostic and tells Codex to re-read registry/global quota truth,
-active state, status/run history, repo state, and project signals on each
-wakeup. Use `--full` for the expanded audit source. The compact body is useful
-when context pressure matters but the installed prompt should still carry the
-quota, gate, blocker-push, recommendation, steering-audit, writeback, refresh,
-and spend lifecycle inline. The brief body keeps only preflight/guard, core
-invariants, and spend accounting in the installed prompt while delegating
-detailed branches back to the generated compact/full contracts.
-The generated guard and spend commands explicitly use the shared global
-registry so project heartbeats read the same operator gates and user todos as
-the dashboard, regardless of their current repo. Completed heartbeat delivery
-spends through `quota spend-slot --source heartbeat --execute`, not through a
-natural-language report. Quota slots are minute-granularity by default: minute
-heartbeats spend `--slots 1`, while coarser fixed-interval automations should
-spend the scheduler minutes consumed by that completed turn.
+Each wake reads the full fresh result and follows only its current `task_body`
+when `ok=true`. Separate notification from execution, follow the current waiting
+contract, and attempt recovery within existing authority when loading fails.
+If the contract remains unavailable, do not execute or account for work; report
+the blocker. The loaded contract owns quota settlement and runtime turn identity;
+never freeze a turn id in the saved bootstrap.
 
 Keep project-specific behavior out of the automation prompt. Encode local
 differences in the project registry, `.codex/goals/<goal-id>/ACTIVE_GOAL_STATE.md`,
@@ -584,22 +577,22 @@ the next wakeup cadence and external-loop unchanged-poll self-stop; this is
 scheduling policy, not delivery permission. Codex CLI TUI and Claude Code loops
 should run the final quota/replan check from `scheduler_hint` before applying
 their `after_limit`; if the guard changes or returns `run_now`, follow the new
-quota contract instead of stopping. Codex App heartbeat workers should
+quota contract instead of stopping. App-hosted heartbeat workers should
 search/use `automation_update` when available. If
 `scheduler_hint.action=stop_until_explicit_resume` and
-`scheduler_hint.codex_app.host_action=pause_or_delete_current_heartbeat`, call
+`scheduler_hint.app_automation.host_action=pause_or_delete_current_heartbeat`, call
 `automation_update` once to pause the current heartbeat (delete only when the
 host cannot pause), verify the host result, spend no quota, and end the turn.
 This terminal host action takes precedence over RRULE handling and requires no
 scheduler ACK. Otherwise use `automation_update` only when
-`scheduler_hint.codex_app.stateful_backoff.apply_needed=true` and
-`scheduler_hint.codex_app.recommended_rrule` is present. After a successful
+`scheduler_hint.app_automation.stateful_backoff.apply_needed=true` and
+`scheduler_hint.app_automation.recommended_rrule` is present. After a successful
 RRULE update, run `loopx` with
-`scheduler_hint.codex_app.ack_hint.cli_args` (normally `quota scheduler-ack-current`,
+`scheduler_hint.app_automation.ack_hint.cli_args` (normally `quota scheduler-ack-current`,
 which re-reads the latest scheduler hint instead of hand-copying short-lived
 reset tokens). Attempt the host update at most once per hint and turn. If it
 fails or times out, do not retry or ACK; run
-`scheduler_hint.codex_app.failure_hint.cli_args` once. That no-spend writeback
+`scheduler_hint.app_automation.failure_hint.cli_args` once. That no-spend writeback
 records the failed target/observed-host pair so later heartbeats suppress the
 exact repeat until either value changes. Continue allowed delivery under the
 observed host cadence. If
@@ -609,7 +602,7 @@ ack hint directly. LoopX owns reset/progression state
 and omits `recommended_rrule` when the desired RRULE is already applied.
 Cadence changes, reset-to-initial updates, final checks, and self-stop changes
 do not spend quota.
-For a uniquely matched active Codex App heartbeat, `quota should-run`
+For a uniquely matched active App heartbeat, `quota should-run`
 automatically reconciles the installed RRULE with LoopX's ACK ledger. Treat
 `stateful_backoff.host_observation.status=drift_detected` as authoritative for
 cadence repair; a stale or premature ACK must not suppress `apply_needed`.
@@ -695,21 +688,48 @@ subcommand:
 loopx --format json review-packet --goal-id <STABLE_GOAL_ID>
 ```
 
-When the human/controller decision is already approved and the only remaining
-step is to relay the target-agent instruction, use the minimal handoff form:
+To relay current target-agent context within existing authorization, use the
+handoff form. Ordinary handoffs add no new approval; actual operator gates
+still apply:
 
 ```bash
 loopx review-packet --goal-id <STABLE_GOAL_ID> --handoff-only
 ```
 
-This command is read-only. It packages the current status into the same Review
-Packet shape as the dashboard; it does not append human reward, append an
-operator gate, refresh state, grant write-control, or authorize production
-actions. `--handoff-only` only strips the human decision wrapper from markdown
-output; JSON output returns a minimized handoff payload with `handoff_text`
-instead of the full operator packet. If the selected queue item is legacy/raw
+This read-only command assembles agent context directly from current status.
+The full Review Packet consumes the same context and adds human presentation.
+Neither path grants authority or changes work state. JSON `handoff_text` and
+`project_agent_handoff` always contain complete prepared text. On overflow,
+`project_agent_handoff_fragments` contains all ordered shards including index 0;
+Markdown prints the shard set. The complete text may exceed 16 lines / 1800
+characters; each shard fits that budget. In-budget output keeps its old shape. If the selected queue item is legacy/raw
 fallback rather than project-asset-backed, do not treat raw queue fields as
 owner, gate, or stop-condition authority.
+
+Collect and restore the entire producer output before using a sharded handoff:
+
+```bash
+loopx --format json review-packet --goal-id <STABLE_GOAL_ID> --handoff-only > handoff.json
+loopx handoff restore --input handoff.json --format json
+```
+
+For raw sharded Markdown use `--input-format markdown`; `--input -` reads stdin.
+JSON avoids relying on a renderer preserving HTML comment envelopes. A fragment
+title without its envelope, or an indented envelope, is rejected rather than
+returned as plain text. If both title and envelope disappear, only the original
+JSON output can establish completeness. Complete unfragmented handoff-only
+Markdown is accepted as plain text without an integrity claim; use JSON for
+unfragmented full Review Packets. Missing,
+reordered, duplicate, mixed or changed parts fail with a nonzero exit and
+`error_code`, without partial text. Obtain the original complete output and
+retry. There is no collector or business-request deduplication by content hash.
+
+A successful restore is content recovery only: it does not execute a command,
+adopt work, change Todo/claim/lease or start a session. Check current goal,
+source freshness, write scope and real gates using existing status/quota and
+ownership workflows. `handoff prepare/inspect/adopt` retains its separate
+ownership contract; restore is not a replacement for it. Do not infer sender
+identity or permission from a checksum.
 
 Read the packet in order:
 
@@ -975,11 +995,15 @@ loopx reward \
   --dry-run
 ```
 
-Only after the user has explicitly approved recording the reward, rerun without
-`--dry-run`. The durable source of truth is still the run-bound
-`human_reward` overlay. The active-state writeback is a `Progress Ledger`
-summary for future agents; project agents should read the reward through the
-returned `project_agent_visibility.history_command`.
+The preview may stay anonymous. Only after the user has explicitly approved
+recording the reward, rerun without `--dry-run` and add exactly one reviewed
+actor classification: `--actor-kind owner` for the owner's judgment or
+`--actor-kind controller` for an authorized controller's judgment. Never infer
+that classification from the process, Agent id, or command defaults. The
+durable source of truth is still the run-bound `human_reward` overlay. The
+active-state writeback is a `Progress Ledger` summary for future agents;
+project agents should read the reward through the returned
+`project_agent_visibility.history_command`.
 
 ## Multi-Project Status
 
@@ -1046,3 +1070,45 @@ Report in Chinese when the user is reviewing:
 
 Never include credentials, private docs, raw internal links, production task
 ids, or raw local evidence in public repo docs or examples.
+
+## Capability Context And Child Models
+
+Read `interaction_contract.agent_context` at planning time (or
+`turn_envelope.agent_context` in LoopX Turn, resolving its detail reference when
+compacted). If the host supplies neither, use the read-only
+`loopx agent-context --goal-id <goal> --agent-id <agent> --phase before_plan`.
+If context is absent, disabled, or the read fails, preserve the existing single
+agent workflow: do not seek delegation splits or invoke child tools because of
+this capability. Tool availability and installed skills do not activate it.
+Only apply delegation guidance from a non-null, current-scope enabled context;
+the capability provider owns that policy. Context never grants spawn authority.
+
+When enabled context and separate authorization allow native child tools
+outside LoopX Turn, read the same capability
+context at each boundary, using the current registry, Goal and Agent:
+
+```bash
+loopx agent-context --goal-id <goal> --agent-id <agent> --phase before_delegate
+# Launch the bounded child work; continue useful coordinator work; collect results.
+loopx agent-context --goal-id <goal> --agent-id <agent> --phase after_delegate_result
+```
+
+These are read-only calls, not new turns or quota spends. Read `before_plan`
+through this command too if the host did not supply an interaction contract.
+LoopX Turn already carries `delegation_context` in its host request and
+`agent_context` in its reconciled result. Apply the relevant guidance once per
+boundary, not on every poll. Validate returned evidence, explain acceptance or
+rejection and link accepted work to the plan/deliverable. A context packet's
+`delivery: projected` proves generation only, not model reading, execution or
+adoption. Native CLI reads cannot certify host receipts.
+
+For an authorized child-worker task, read
+`goal_boundary.orchestration.model_config` when present and explicitly pass
+its `model` and optional `reasoning_effort` through the native host's supported
+launch arguments. Check host support before launch; report unavailable settings
+instead of silently inheriting or substituting the coordinator model. Persist
+preferences through `configure-goal --subagent-model <id>
+--subagent-reasoning-effort <effort> --execute`, and remove them together with
+`--clear-subagent-model-config`. These preferences do not enable spawning or
+widen authority. See `docs/integrations/codex-subagent-orchestration.md` for
+read-heavy briefs, configuration readback, and the host enforcement boundary.

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .assembler import DecisionEvidenceRecords
 from .architecture import build_decision_context_architecture_packet
+from .freshness import render_source_freshness_markdown
 from .profile import resolve_decision_context_activation
 from .private_state import (
     load_private_pending_decision_settlement,
@@ -52,6 +53,10 @@ def _render(payload: dict[str, object]) -> str:
         if isinstance(capability, dict)
         else "decision_context"
     )
+    assembly = payload.get("assembly")
+    freshness = payload.get("source_freshness") or (
+        assembly.get("source_freshness") if isinstance(assembly, dict) else None
+    )
     return "\n".join(
         [
             "# Decision Context",
@@ -62,6 +67,11 @@ def _render(payload: dict[str, object]) -> str:
             f"- source_schemas: `{_collection_size(payload.get('source_schemas'))}`",
             f"- source_count: `{payload.get('source_count', 0)}`",
             "",
+            *(
+                render_source_freshness_markdown(freshness)
+                if isinstance(freshness, dict)
+                else []
+            ),
         ]
     )
 
@@ -75,6 +85,35 @@ def register_decision_context_commands(
         help="Inspect the provider-neutral decision evidence and outcome contract.",
     )
     commands = parser.add_subparsers(dest="decision_context_command", required=True)
+    for name in ("capture-diagnose", "capture-recovery"):
+        recovery = commands.add_parser(
+            name, help="Diagnose or explicitly recover one private capture source."
+        )
+        add_subcommand_format(recovery)
+        for field in (
+            "goal-id",
+            "agent-id",
+            "profile",
+            "spool",
+            "cursor-state",
+            "source-id",
+        ):
+            recovery.add_argument("--" + field, required=True)
+        if name == "capture-diagnose":
+            recovery.add_argument(
+                "--probe",
+                action="store_true",
+                help="Exact-read transiently to check replay; never settle.",
+            )
+        else:
+            recovery.add_argument(
+                "--action", choices=("hold", "restart", "rollback"), required=True
+            )
+            recovery.add_argument("--expected-token")
+            recovery.add_argument(
+                "--recovery-id", help="Applied receipt id to roll back."
+            )
+            recovery.add_argument("--execute", action="store_true")
     for name in ("capture", "capture-status", "prepare-captured"):
         capture = commands.add_parser(
             name, help="Operate the opt-in private source-reference spool."
@@ -236,7 +275,28 @@ def handle_decision_context_command(
 ) -> int | None:
     if args.command != "decision-context":
         return None
-    if args.decision_context_command in {
+    if args.decision_context_command in {"capture-diagnose", "capture-recovery"}:
+        from .capture_recovery import diagnose_capture_source, recover_capture_source
+
+        recovery_args = dict(
+            goal_id=args.goal_id,
+            agent_id=args.agent_id,
+            profile_path=Path(args.profile),
+            spool_path=Path(args.spool),
+            cursor_path=Path(args.cursor_state),
+            source_id=args.source_id,
+        )
+        if args.decision_context_command == "capture-diagnose":
+            payload = diagnose_capture_source(**recovery_args, probe=args.probe)
+        else:
+            payload = recover_capture_source(
+                **recovery_args,
+                action=args.action,
+                execute=args.execute,
+                expected_token=args.expected_token,
+                recovery_id=args.recovery_id,
+            )
+    elif args.decision_context_command in {
         "capture",
         "capture-status",
         "prepare-captured",
@@ -274,7 +334,9 @@ def handle_decision_context_command(
             }
         else:
             payload = capture_profile_sources(
-                **capture_args, execute=bool(getattr(args, "execute", False))
+                **capture_args,
+                execute=bool(getattr(args, "execute", False)),
+                health_runtime_root=runtime_root,
             )
     elif args.decision_context_command == "architecture":
         payload = build_decision_context_architecture_packet()

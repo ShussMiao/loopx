@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
+from loopx.control_plane.todos.user_gate import apply_scoped_user_gate_fallback_projection
 from loopx.control_plane.quota.scheduler_ack import (
     record_quota_scheduler_ack_for_decision,
 )
@@ -32,7 +35,31 @@ APP_CONTEXT = scheduler_execution_context_for_runtime_profile(
 )
 
 
-def _status_payload(*, gate_action_kind: str) -> dict:
+@pytest.mark.parametrize("action", ["quota_skip", "monitor_quiet_skip", None])
+def test_runnable_user_gate_fallback_replaces_a_canonical_skip_action(action):
+    original = {"decision": "skip", "should_run": False, "effective_action": action}
+    result = apply_scoped_user_gate_fallback_projection(
+        original, fallback={"recommended_action": "advance non-gated work"},
+        replan_decision_allowed=False,
+    )
+    assert result["effective_action"] == "scoped_user_gate_fallback"
+    assert result["should_run"] is True
+    assert original["should_run"] is False
+
+
+def test_user_gate_fallback_preserves_repair_and_replan_precedence():
+    original = {"decision": "run", "should_run": True, "effective_action": "capability_bridge_repair"}
+    fallback = {"recommended_action": "advance non-gated work"}
+    result = apply_scoped_user_gate_fallback_projection(
+        original, fallback=fallback, replan_decision_allowed=False,
+    )
+    assert result["effective_action"] == "capability_bridge_repair"
+    assert apply_scoped_user_gate_fallback_projection(
+        original, fallback=fallback, replan_decision_allowed=True,
+    ) is original
+
+
+def _status_payload(*, gate_action_kind: str, blocks_deferred: bool = False) -> dict:
     completed = quota_todo_item(
         todo_id="todo_prerequisite",
         status="done",
@@ -61,6 +88,7 @@ def _status_payload(*, gate_action_kind: str) -> dict:
         text="[P2-user] Review the product first screen.",
         action_kind=gate_action_kind,
         blocks_agent=AGENT_ID,
+        unblocks_todo_id="todo_ready_deferred" if blocks_deferred else "todo_first_screen",
     )
     return quota_status_payload(
         goal_id=GOAL_ID,
@@ -203,7 +231,7 @@ def test_consumed_review_gate_exposes_quality_vision_replan() -> None:
 
 def test_blocking_user_gate_backs_off_instead_of_polling_as_active_work() -> None:
     payload = build_quota_should_run(
-        _status_payload(gate_action_kind="refine_benchmark_treatment"),
+        _status_payload(gate_action_kind="refine_benchmark_treatment", blocks_deferred=True),
         goal_id=GOAL_ID,
         agent_id=AGENT_ID,
         scheduler_execution_context=APP_CONTEXT,
@@ -403,7 +431,7 @@ def test_acked_human_gate_advances_despite_unrelated_historical_host_failure(
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(scheduler_hint_module, "now_utc", lambda: now)
     payload = build_quota_should_run(
-        _status_payload(gate_action_kind="refine_benchmark_treatment"),
+        _status_payload(gate_action_kind="refine_benchmark_treatment", blocks_deferred=True),
         goal_id=GOAL_ID,
         agent_id=AGENT_ID,
         scheduler_execution_context=APP_CONTEXT,

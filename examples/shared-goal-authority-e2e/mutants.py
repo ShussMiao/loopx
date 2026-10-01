@@ -47,6 +47,44 @@ class Case:
 
 
 CASES = [
+    Case("decision_scope_role_guard_removed", (("loopx/control_plane/todos/decision_metadata.ts", replacement(
+        '    if (intent.decision_scope !== null && (role !== "user" || taskClass !== "user_gate")) {',
+        '    if (false) {')),),
+         "tests/control_plane_ts/decision_metadata.test.ts",
+         "user gates own decision_scope and agent work owns required_decision_scopes"),
+    Case("decision_scope_dedup_removed", (("loopx/control_plane/todos/decision_metadata.ts", replacement(
+        "    if (!seen.has(key)) {", "    if (true) {")),),
+         "tests/control_plane_ts/decision_metadata.test.ts",
+         "decision metadata normalizes compact and object forms without duplicate scopes"),
+    Case('todo_global_gate_inferred', (('loopx/control_plane/todos/authoring_scope.ts', replacement(
+        '      : todo.global_gate as boolean | null ?? null;',
+        '      : (todo.global_gate || intent.goal_bound) as boolean | null ?? null;')),),
+         'tests/control_plane_ts/todo_authoring_scope.test.ts', 'global blocking is never inferred'),
+    Case('todo_explicit_scope_overwritten', (('loopx/control_plane/todos/authoring_scope.ts', replacement(
+        'if (requestedBound) fail(', 'if (false) fail(')),),
+         'tests/control_plane_ts/todo_authoring_scope.test.ts', 'explicit continuation and gate'),
+    Case('todo_successor_scope_unbound', (('loopx/control_plane/todos/authoring_scope.ts', replacement(
+        'if (blocks && (goal || !bound || bound !== blocks)) return "agent_binding_conflict";', '')),),
+         'tests/control_plane_ts/todo_authoring_scope.test.ts', 'resolved successor scope'),
+    Case('monitor_route_drops_invalid_capability', (('loopx/control_plane/todos/work_requirements.ts', replacement(
+        '      throw new EffectRuntimeRequestError(`${label} must contain public-safe capability tokens; invalid entries cannot be dropped`);',
+        '      continue;')),),
+         'tests/control_plane_ts/monitor_successor.test.ts', 'invalid successor intent is rejected'),
+    Case('monitor_route_material_guard_removed', (('loopx/control_plane/scheduler/monitor_successor.ts', replacement(
+        'if ((agentTodo || userTodo) && !material)', 'if (false)')),),
+         'tests/control_plane_ts/monitor_successor.test.ts', 'invalid successor intent is rejected'),
+    Case('monitor_route_rewrites_fingerprint', (('loopx/control_plane/quota/monitor_poll_commit.ts', replacement(
+        '  monitorSuccessorIntent(result);', '  Object.assign(result, monitorSuccessorIntent(result));')),),
+         'tests/control_plane_ts/quota_monitor_poll_commit.test.ts', 'preserves the legacy pending observation fingerprint'),
+    Case('governance_exclusion_ignored', (('loopx/control_plane/goals/shared_goal_work.ts', replacement(
+        'else if (!excluded)', 'else if (true)')),),
+         'tests/control_plane_ts/shared_goal_work.test.ts', 'alignment selection respects exclusions'),
+    Case('canonical_zero_basis_stale_admitted', (('loopx/control_plane/goals/goal_amendment_proposal.ts', replacement(
+        'if (proposal.base_source_basis_digest !== derived.source_basis_digest) facts.push("base_source_basis_digest_mismatch");',
+        'if (false) facts.push("base_source_basis_digest_mismatch");')),),
+         'tests/control_plane_ts/goal_amendment_proposal.test.ts', 'canonical Todo bases cannot'),
+    Case('governance_reads_legacy_after_promotion', (('loopx/control_plane/goals/shared_goal_work_source.py', replacement(
+        'if canonical is None:', 'if True:')),), 'tests/control_plane/test_canonical_goal_governance.py::test_empty_canonical_is_authoritative_and_missing_display_is_not_repaired'),
     Case('delivery_wait_target_unbound', (('loopx/control_plane/todos/resume_condition.ts', replacement(
         'condition.target_todo_id !== spec.target || ', '')),),
          'tests/control_plane_ts/delivery_response.test.ts', 'exact dependency identity'),
@@ -58,23 +96,21 @@ CASES = [
         'resolve_runtime_root(registry, runtime_root_arg, registry_path=registry_path)',
         'resolve_runtime_root(registry, runtime_root_arg)')),),
          'tests/control_plane/test_shadow_observable_e2e.py::test_registry_relative_root_does_not_depend_on_callers_cwd[disabled]'),
-    Case('native_note_dropped', ((COORDINATION + 'todo_update.ts', replacement(
+    Case('native_note_dropped', ((COORDINATION + 'todo_update_intent.ts', replacement(
         '  const next: JsonObject = {...todo, ...input.patch};',
         '  const next: JsonObject = {...todo, ...input.patch};\n  if ("note" in input.patch) next.note = todo.note;')),),
          'tests/control_plane/test_shadow_observable_native_e2e.py::test_native_unclaimed_edit_and_explicit_note_clear[disabled]'),
-    Case('native_unclaimed_edit_rejected', ((COORDINATION + 'todo_update.ts', replacement(
-        '  if (todo.claimed_by && todo.claimed_by !== input.actor_agent_id) {',
-        '  if (!todo.claimed_by || todo.claimed_by !== input.actor_agent_id) {')),),
+    Case('native_unclaimed_edit_rejected', ((COORDINATION + 'todo_lifecycle_decision.ts', replacement(
+        '  if (todo.claimed_by !== null && todo.claimed_by !== actor) return "claim_owner_mismatch";',
+        '  if (todo.claimed_by === null || todo.claimed_by !== actor) return "claim_owner_mismatch";')),),
          'tests/control_plane/test_shadow_observable_native_e2e.py::test_native_unclaimed_edit_and_explicit_note_clear[disabled]'),
-    Case('native_diagnostic_truncated', ((COORDINATION + 'todo_update.ts', replacement(
-        'return failure("update_owner_mismatch", "Todo update cannot edit another claim owner\'s work");',
-        'return failure("update_owner_mismatch", "Update rejected");')),),
+    Case('native_diagnostic_truncated', ((COORDINATION + 'todo_update_admission.ts', replacement(
+        '? "Todo update cannot edit another claim owner\'s work"',
+        '? "Update rejected"')),),
          'tests/control_plane/test_shadow_observable_native_e2e.py::test_canonical_argument_intent_and_atomic_claim[disabled]'),
-    Case('cursor_baseline_digest', ((COORDINATION + 'local_authority_shadow_adapter.py', replacement(
-        '        return None if marker is None else marker["partition_digest"]',
-        '''        head = transaction["projection"]
-        return partition_digest({"handoff_mode": head["handoff_mode"], "todos": head["todos"]}
-            if self._partition == TODO_PARTITION else {"leases": head["leases"]})''')),),
+    Case('cursor_baseline_digest', ((COORDINATION + 'shadow_drain_plan.ts', replacement(
+        'last_partition_digest: partitionDigest(last, r.partition)',
+        'last_partition_digest: view.head_digest')),),
          'tests/control_plane/test_shadow_cursor_recovery_e2e.py::test_abandoned_cursor_survives_all_consumers[2-0-todos]'),
     Case('qualification_baseline_digest', ((COORDINATION + 'runtime_shadow.ts', replacement(
         'const digest = marker === null ? null : (marker as JsonObject).partition_digest;',
@@ -84,8 +120,10 @@ CASES = [
         (COORDINATION + 'runtime_shadow.ts', replacement(
             'if (digest !== cursor.last_partition_digest) throw new ShadowLineageError("outbox_cursor_unproved");',
             '// DELIBERATE MUTANT: accept any syntactically valid cursor digest.')),
-        (COORDINATION + 'local_authority_shadow_adapter.py', replacement(
-            '                or self._cursor_digest(anchor) != cursor["last_partition_digest"]\n', ''))),
+        (COORDINATION + 'shadow_drain_plan.ts', replacement(
+            '      anchor.provider_revision === r.cursor.last_provider_revision &&\n'
+            '      partitionDigest(anchor, r.partition) === r.cursor.last_partition_digest,\n',
+            '      anchor.provider_revision === r.cursor.last_provider_revision,\n'))),
          'tests/control_plane/test_shadow_cursor_recovery_e2e.py::test_forged_applied_digest_holds_every_consumer_without_rewriting_bytes[True-todos]'),
     Case('lineage', ((COORDINATION + 'local_authority_shadow.ts', replacement('  requireLineage(entry.capture_lineage_id === binding.capture_lineage_id, "stale_generation");', '  // DELIBERATE MUTANT: omit active lineage validation.')),),
          'tests/control_plane_ts/local_authority_shadow_outbox.test.ts', 'self-consistent foreign'),
@@ -95,11 +133,11 @@ CASES = [
          'tests/control_plane_ts/coordination_runtime_shadow.test.ts', 'observation transaction mixed'),
     Case('management_request_digest', ((COORDINATION + "shadow_management.ts", replacement('if (state.operation.request_digest !== digest) throw new ShadowManagementError("management_operation_identity_mismatch");', 'if (false) throw new ShadowManagementError("management_operation_identity_mismatch");')),),
          "tests/control_plane_ts/shadow_management.test.ts", 'management request digest'),
-    Case('management_manifest_hash', ((COORDINATION + "shadow_management.ts", replacement('managementDigest(manifest) !== state.operation.manifest_digest\n      || manifest.schema_version !== SHADOW_MANAGEMENT_MANIFEST_SCHEMA\n', 'false\n      || manifest.schema_version !== SHADOW_MANAGEMENT_MANIFEST_SCHEMA\n')),),
+    Case('management_manifest_hash', ((COORDINATION + "shadow_management.ts", replacement('managementDigest(manifest) !== state.operation.manifest_digest\n      || !supportedSchema\n', 'false\n      || !supportedSchema\n')),),
          "tests/control_plane_ts/shadow_management.test.ts", 'management manifest hash'),
     Case('management_phase', ((COORDINATION + "shadow_management.ts", replacement('operation.kind !== kind || !phases.includes(String(operation.phase))', 'operation.kind !== kind')),),
          "tests/control_plane_ts/shadow_management.test.ts", 'management phase validation'),
-    Case('management_goal_binding', ((COORDINATION + "shadow_management.ts", replacement('value.goal_id !== goal || ', '')),),
+    Case('management_goal_binding', ((COORDINATION + "shadow_management.ts", replacement(' || value.goal_id !== goal\n      || ', '\n      || ')),),
          "tests/control_plane_ts/shadow_management.test.ts", 'management goal binding'),
     Case('management_candidate_lineage', ((COORDINATION + "shadow_management.ts", replacement('candidate.capture_lineage_id !== expectedLineage', 'false')),),
          "tests/control_plane_ts/shadow_management.test.ts", 'rollback refuses a different valid candidate lineage'),
@@ -110,12 +148,13 @@ PREPARED_WRITE = '''            durable_write_json(
                 record,
             )'''
 CASES.extend([
-    Case("receipt_bytes", ((COORDINATION + "local_authority_shadow_adapter.py", replacement(
-        "            expected = receipt.get(key)",
-        "            expected = outbox.raw_bytes_digest(path.read_bytes())")),),
+    Case("receipt_bytes", ((COORDINATION + "shadow_drain_plan.ts", replacement(
+        "entry[key] === null || entry[key] === rc[key]",
+        "entry[key] === null || entry[key] === entry[key]")),),
         "tests/control_plane/test_shadow_drain_adversarial.py::test_raw_residue_mismatch_preserves_every_file_before_any_cleanup"),
-    Case("cursor_regression", ((COORDINATION + "local_authority_shadow_adapter.py", replacement(
-        "last_seq=len(history),", "last_seq=1,")),),
+    Case("cursor_regression", ((COORDINATION + "shadow_drain_plan.ts", replacement(
+        "{last_seq: history.size, last_entry_id: last.operation_id",
+        "{last_seq: 1, last_entry_id: last.operation_id")),),
         "tests/control_plane/test_shadow_drain_e2e.py::test_public_primary_maps_one_to_one_to_receipts_and_replays_idempotently"),
     Case("early_committed", ((COORDINATION + "local_authority_shadow_outbox.py", replacement(
         PREPARED_WRITE, PREPARED_WRITE + '''
@@ -125,6 +164,27 @@ CASES.extend([
                  "capture_lineage_id": self._lineage_id, "committed_at": utc_now_text()},
             )''')),),
         "tests/control_plane/test_shadow_drain_e2e.py::test_primary_sigkill_preserves_complete_bytes_and_proves_before_marker[before_replace]"),
+])
+
+# Ladder parity-half rows (s2c2.*) drive the same lifecycle through the public
+# CLI; these mutants remove one operator-visible truth each and must turn the
+# corresponding row red.
+LADDER_ROW = "tests/control_plane/test_shared_goal_authority_e2e.py::test_ladder_row_passes_or_is_declared_unverified"
+CASES.extend([
+    Case("status_hides_prepared_only", ((COORDINATION + "local_authority_shadow_outbox.py", replacement(
+        '            "committed_pending": sum(1 for entry in entries if entry.is_committed),\n'
+        '            "prepared_only": sum(1 for entry in entries if not entry.is_committed),',
+        '            "committed_pending": len(entries),\n'
+        '            "prepared_only": 0,')),),
+        LADDER_ROW + "[s2c2.sigkill_between_primary_write_and_drain]"),
+    Case("qualification_ignores_drift", ((COORDINATION + "runtime_shadow.ts", replacement(
+        "const matched = localAuthorityShadowHeadDigest(request.projection) === localAuthorityShadowHeadDigest(lineage.head.head);",
+        "const matched = true;")),),
+        LADDER_ROW + "[s2c2.parity_divergent_detects_foreign_edit]"),
+    Case("replay_counted_as_delivery", ((COORDINATION + "shadow_drain.ts", replacement(
+        "result.no_op += Number(noOp === true); result.entries.push(summary); result.replayed++; consumed++;",
+        "result.no_op += Number(noOp === true); result.entries.push(summary); result.delivered++; consumed++;")),),
+        LADDER_ROW + "[s2c2.sigkill_mid_drain]"),
 ])
 
 
@@ -192,9 +252,9 @@ CASES.extend([
         "    resolved_source = state_file.resolve(strict=False)",
         "    return  # DELIBERATE MUTANT: allow another goal to bypass source authority.\n    resolved_source = state_file.resolve(strict=False)")),),
          "tests/control_plane/test_shadow_writer_variant_e2e.py::test_other_goal_cannot_write_a_protected_goal_source_via_state_override[active_capture]"),
-    Case("cleanup_hides_verified_commit", ((COORDINATION + "local_authority_shadow_adapter.py", replacement(
-        "                self._record_view(view)\n                self._reconcile(transactions, delivered_entry_id=entry.entry_id)",
-        "                self._reconcile(transactions, delivered_entry_id=entry.entry_id)\n                self._record_view(view)")),),
+    Case("cleanup_hides_verified_commit", ((COORDINATION + "shadow_drain.ts", replacement(
+        "      if (plan.view !== null && typeof plan.view === \"object\") observe(plan.view as JsonObject);\n",
+        "")),),
          "tests/control_plane/test_shadow_drain_adversarial.py::test_cleanup_permission_failure_reports_verified_commit_and_recovers[before_commit]"),
     Case("native_update_maintenance", ((COORDINATION + "local_authority_runtime.ts",
          remove_native_update_maintenance),),
@@ -216,7 +276,8 @@ CASES.extend([
     Case("fence_unshared_state_lock", ((COORDINATION + "legacy_writer_fence.ts", replacement(
         "withFileMutationLock(statePath, () =>",
         'withFileMutationLock(statePath + ".mutant-unshared", () =>')),),
-         WRITER_TEST + "test_real_writer_commits_before_a_later_fence_is_published[True]"),
+         "tests/control_plane_ts/shadow_native_writer_boundary.test.ts",
+         "^fence engagement waits for an existing state writer before publication$"),
     Case("remove_bound_state_path", ((COORDINATION + "legacy_writer_fence.py", replacement(
         "if bound_source.resolve(strict=False) != state_file.resolve(strict=False):",
         "if False:")),),
@@ -269,21 +330,23 @@ CASES.append(Case("duplicate_mirror", (
 ), "tests/control_plane/test_shadow_drain_e2e.py::test_public_mutation_has_no_second_snapshot_mirror"))
 
 # Fenced sibling-caller parity: each mutant is caught by exactly one parity row.
+# Promoted CLI acquisition now succeeds through canonical authority. Probe the
+# retained native legacy entrypoint for its fence diagnostic/envelope contract.
 CASES.append(Case("native_fence_remediation_truncated", (
     (COORDINATION + "legacy_writer_fence.ts", replacement(
         'export const LEGACY_WRITER_FENCED_REMEDIATION =\n  "legacy coordination writer is fenced; use the promoted canonical authority ({authority_mode}) for goal {goal_id}; fence {fence_id}; the primary record was not changed";',
         'export const LEGACY_WRITER_FENCED_REMEDIATION =\n  "legacy coordination writer is fenced";')),
-), "tests/control_plane/test_shadow_fence_caller_parity_e2e.py::test_fence_caller_parity[cli-task_lease_acquire-engaged]"))
+), "tests/control_plane_ts/legacy_writer_fence_caller_parity.test.ts", pattern="^fence parity: ts-acquire-engaged$"))
 CASES.append(Case("python_fence_remediation_truncated", (
     (COORDINATION + "legacy_writer_fence.py", replacement(
         'LEGACY_WRITER_FENCED_REMEDIATION = (\n    "legacy coordination writer is fenced; use the promoted canonical authority "\n    "({authority_mode}) for goal {goal_id}; fence {fence_id}; "\n    "the primary record was not changed"\n)',
         'LEGACY_WRITER_FENCED_REMEDIATION = "legacy coordination writer is fenced"')),
-), "tests/control_plane/test_shadow_fence_caller_parity_e2e.py::test_fence_caller_parity[cli-todo_update_status-engaged]"))
+), "tests/control_plane/test_legacy_coordination_writer_fence.py::test_present_fence_delegates_to_typescript_and_blocks"))
 CASES.append(Case("fence_envelope_schema_leak", (
     (COORDINATION + "legacy_writer_fence.ts", replacement(
         "    this.payload = { write_check: writeCheck };",
         "    this.payload = writeCheck;")),
-), "tests/control_plane/test_shadow_fence_caller_parity_e2e.py::test_fence_caller_parity[cli-task_lease_acquire-engaged]"))
+), "tests/control_plane_ts/legacy_writer_fence_caller_parity.test.ts", pattern="^fence parity: ts-acquire-engaged$"))
 CASES.append(Case("fence_acquire_receipt_fabricated", (
     ("loopx/control_plane/work_items/task_lease_acquire.ts", replacement(
         '  return { code: error.code, message: error.message, payload: error.payload, stage: "validation", kind: "permission_denied" };',
@@ -321,12 +384,21 @@ def main() -> int:
         for folder in ("loopx", "tests"):
             shutil.copytree(source / folder, frozen / folder,
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"))
-        for name in ("package.json", "pyproject.toml"):
+        # TS oracles import the repository's supported-Python discovery helper.
+        # Freeze that dependency too; a missing import is not a killed mutant.
+        support_files = (
+            "package.json", "pyproject.toml", "scripts/test-python.mjs",
+            "scripts/loopx-python.sh",
+        )
+        for name in support_files:
+            (frozen / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source / name, frozen / name)
         if (source / "node_modules").is_dir():
             (frozen / "node_modules").symlink_to(source / "node_modules", target_is_directory=True)
         manifest = {str(path.relative_to(frozen)): hashlib.sha256(path.read_bytes()).hexdigest()
                     for folder in ("loopx", "tests") for path in (frozen / folder).rglob("*") if path.is_file()}
+        manifest.update({name: hashlib.sha256((frozen / name).read_bytes()).hexdigest()
+                         for name in support_files})
         (output / "source-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         for case in cases:
             originals = {path: (frozen / path).read_text() for path, _ in case.edits}

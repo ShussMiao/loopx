@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest'
 import { runFile } from '../src/cli.ts'
 import type { FileRunner } from '../src/cli.ts'
 import { LoopXContinuationDriver } from '../src/driver.ts'
+import { pluginPythonCandidates } from '../src/managed-runtime.ts'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
 const sessionId = 'dsh-closeout-session'
@@ -19,14 +20,7 @@ const agentId = 'dsh-closeout-agent'
 const todoId = 'todo_dsh_closeout'
 const turnInstanceId = 'dsh-closeout-turn-1'
 const pythonVersionProbe = 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'
-const pythonCandidates = [...new Set([
-  process.env.PYTHON_BIN,
-  'python3',
-  'python3.14',
-  'python3.13',
-  'python3.12',
-  'python3.11',
-].filter((value): value is string => value !== undefined && value.length > 0))]
+const pythonCandidates = pluginPythonCandidates({ env: process.env })
 
 interface Fixture {
   readonly project: string
@@ -165,6 +159,15 @@ async function fixture(): Promise<Fixture> {
   ], { cwd: project })).exitCode).toBe(0)
 
   const queued: UserMessage[] = []
+  const sessionEvents = [{
+    type: 'user/message',
+    data: {
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text: 'Use LoopX.' }],
+      source: { kind: 'skill-invocation', name: 'loopx', form: 'instructions' },
+    },
+  }] as unknown as SessionEvent[]
   const session = {
     id: sessionId,
     header: {
@@ -174,21 +177,12 @@ async function fixture(): Promise<Fixture> {
       cwd: project,
       seedLength: 0,
     },
-    events: [{
-      type: 'user/message',
-      data: {
-        id: randomUUID(),
-        role: 'user',
-        content: [{ type: 'text', text: 'Use LoopX.' }],
-        source: { kind: 'skill-invocation', name: 'loopx', form: 'instructions' },
-      },
-    }] as SessionEvent[],
+    snapshotEvents: () => sessionEvents,
     surface: { nodes: [] },
   }
   const inbox = {
     nextTurn: queued,
     nextStep: [] as UserMessage[],
-    get hasPending() { return queued.length > 0 || this.nextStep.length > 0 },
     remove(id: UserMessage['id']) {
       const index = queued.findIndex(message => message.id === id)
       if (index < 0) return false

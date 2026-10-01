@@ -2,38 +2,36 @@
 
 <h1 align="center">LoopX</h1>
 
-<img src="docs/assets/loopx-social-preview.png" alt="LoopX loop engineering social preview banner" width="420">
+**Give your agents a goal. Keep the work moving.**
 
-**The open, provider-neutral, stateful control plane for long-horizon agents.**
+The open, local-first control plane for long-horizon agents and personal agent teams.<br>
+<sub>Keep goals, decisions and evidence across sessions. Work with Codex, Claude Code, DeepSeek Harness and other supported runtimes.</sub>
 
-<sub>Runs on top of Codex, Claude Code, Cursor, and other agent harnesses. LoopX preserves objectives, gates, todos, evidence, quota, and handoffs across turns; the harness executes bounded work.</sub>
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/loopx-project/loopx?filter=v*&display_name=tag)](https://github.com/loopx-project/loopx/releases/latest) [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/XmGgQyCFZd)
 
-<a href="https://trendshift.io/repositories/102379?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-102379"><img src="https://trendshift.io/api/badge/repositories/102379" alt="huangruiteng/loopx on Trendshift" width="220" height="48"></a>
+<a href="https://trendshift.io/repositories/102379"><img src="https://trendshift.io/api/badge/repositories/102379" alt="loopx-project/loopx on Trendshift" width="220" height="48"></a>
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/huangruiteng/loopx?filter=v*&display_name=tag)](https://github.com/huangruiteng/loopx/releases/latest) [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/XmGgQyCFZd) [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml) [![Local first](https://img.shields.io/badge/control--plane-local--first-brightgreen.svg)](docs/public-private-boundary.md) [![Loop Agents](https://img.shields.io/badge/status-loop%20agents%20active-brightgreen.svg)](docs/product/release-readiness.md)
+[Get started](#try-loopx) · [Workspace](#meet-the-personal-agent-workspace) · [LHTB results](#lhtb-results) · [Docs](https://loopx-project.github.io/loopx/docs/) · [简体中文](README.zh-CN.md)
 
-[Public website](https://huangruiteng.github.io/loopx/) · [Blog](https://huangruiteng.github.io/loopx/blog/) · [Docs](https://huangruiteng.github.io/loopx/docs/) · [Developer Book](https://huangruiteng.github.io/loopx/docs/book/en/) · [Try LoopX](#try-loopx) · [See real loops](#evidence) · [How it works](#why-loopx) · [简体中文](README.zh-CN.md)
+**[LHTB](https://zli12321.github.io/LHTB/index.html) · 46 tasks · GPT-5.6 Sol:** LoopX 1.0.3 Heartbeat reaches **0.4948 mean reward** — **+17.3% vs Plain Codex**, **+10.6% vs native Codex Goal**.<br>
+<sub><a href="#lhtb-results">Results and pass rates ↓</a></sub>
 
 </div>
 
 ---
 
-Open and provider-neutral, LoopX is a lightweight state kernel and local-first
-control plane for loop engineering. It runs on top of different agent harnesses
-rather than replacing them, providing the long-horizon state, semantic
-decisions about what happens next, governance, recovery, and human-agent
-collaboration that keep long-running work reviewable, restartable, and easier
-to hand off across turns, tools, and agents.
+**More verified work. Less human attention.** LoopX gives agents durable goals,
+bounded continuation, peer ownership and recoverable handoffs. Your runtime
+provides the model and tools; LoopX keeps track of what to do next, what is
+accepted, and when to ask you.
 
-**Loop engineering for long-horizon AI agents and peer agent teams.**
+<a id="learn-loopx"></a>
 
-> Keep the loop moving. Keep the judgment human.
-
-## Learn LoopX
-
-- **Developer Book** - the curated bilingual path from control-plane foundations to project onboarding and developer contributions. [中文版](https://huangruiteng.github.io/loopx/docs/book/) · [English](https://huangruiteng.github.io/loopx/docs/book/en/)
-- **Getting started** - install, connect a project, and run your first governed loop. [Guide](docs/guides/getting-started.md)
-- **Docs** - the full reference and operations site. [LoopX Docs](https://huangruiteng.github.io/loopx/docs/)
+| What you want to do | Start here |
+| --- | --- |
+| Keep a coding or research agent working across sessions | [Install and connect](#try-loopx) |
+| Manage personal projects, schedules and decisions in one place | [Personal Agent Workspace](#meet-the-personal-agent-workspace) |
+| Let agents collaborate and deliver verifiable results | [Agent collaboration guide](docs/product/use-cases/cross-runtime/README.md) |
 
 ## Meet the Personal Agent Workspace
 
@@ -60,17 +58,24 @@ LoopX 1.0 brings these long-horizon control states into the Personal Workspace. 
 - review protected changes through typed preview, explicit confirmation, and
   receipts while LoopX state—not the browser—remains authoritative.
 
+For Manager group conversations, LoopX keeps message visibility separate from
+Turn authority; see the bilingual [Lark Manager context and authority
+contract](docs/reference/protocols/lark-manager-context-authority-v0.md).
+
 ```bash
 loopx dashboard
 ```
 
 `loopx dashboard` is the supported browser/PWA launch path. You can also download
-native desktop previews from the [1.0 release](https://github.com/huangruiteng/loopx/releases/tag/v1.0.0);
+native desktop previews from the [1.0 release](https://github.com/loopx-project/loopx/releases/tag/v1.0.0);
 they reuse the same loopback services and Goal state. Apple Silicon macOS supports
 signed App updates that pair the shell with its bundled runtime, plus repair and
 recovery. Python 3.11+ is required; the App is ad-hoc signed, not notarized.
 Windows preview installers currently use manual updates and a separately installed CLI.
 [Desktop installation, updates, and source development](apps/desktop/loopx-control-plane/README.md).
+
+<details>
+<summary>Capability settings and reproducible workspace scenarios</summary>
 
 <img src="docs/assets/personal-workspace/capability-1.0.webp" alt="Real Workspace recording: configure child-task capacity and allowed responsibility domains" width="960">
 
@@ -78,6 +83,8 @@ From a source checkout, run `python -m demo.workspace serve` to explore a commun
 event, a home-energy comparison, and a neighborhood website release. Each has four
 work roles, 18 tasks, two decisions, and two watches. The screenshot above comes
 from this reproducible workspace. [Scenarios and replay instructions](demo/workspace/README.md).
+
+</details>
 
 [Watch the full 32-second walkthrough](docs/assets/personal-workspace/loopx-dashboard-launch.mp4)
 · [Read the workspace guide](docs/guides/personal-workspace-user-guide.md)
@@ -94,28 +101,19 @@ Chat memory and a timer are not enough to govern that.
 
 LoopX keeps the durable control state in one compact layer:
 
-```text
-objective / issue / project
-   │
-   ▼
-LoopX state: objective + gates + todos + scope + evidence + quota
-   │
-   ├─ human judgment needed? ── yes ─▶ ask a concrete question and wait
-   │
-   ├─ safe fallback available? ──────▶ run one bounded agent slice
-   │
-   ▼
-Codex / Claude Code / Cursor / shell agent executes one turn
-   │
-   ▼
-write evidence + handoff + next todo ─▶ quota decides the next tick
-```
+<picture>
+  <source media="(max-width: 640px)" srcset="docs/assets/harness-neutral.en.mobile.svg">
+  <img src="docs/assets/harness-neutral.en.svg" alt="Your harness runs the turn. LoopX carries the work." width="1200">
+</picture>
 
 Agent runtimes execute the work. LoopX governs the state that lets engineering,
 research, discovery, and operations loops continue across runs. It is not
 another agent framework or a provider-specific orchestration runtime.
 
-![LoopX control-plane board](docs/assets/control-plane-board.svg)
+<picture>
+  <source media="(max-width: 640px)" srcset="docs/assets/control-plane-board.en.mobile.svg">
+  <img src="docs/assets/control-plane-board.en.svg" alt="One turn is a governed state transition—not just a timer." width="1200">
+</picture>
 
 A useful mental model is an
 **[agent-native Kanban for long-running work](docs/development/control-plane-course/00-concept-primer.md)**.
@@ -140,16 +138,84 @@ LoopX is useful when you run:
 LoopX is not an autonomous production controller. Dangerous permissions,
 publishing, production writes, and final ownership stay with the human.
 
+### Personal Agents, Teams, and Self-Improving Workflows
+
+[Meta Muse](https://about.fb.com/news/2026/09/introducing-muse-personal-ai-agent/)
+and [Grok Bot](https://x.ai/news/introducing-grok-bot) make persistent personal
+agents and delegated work a familiar product idea. LoopX approaches that space
+as an open, provider-neutral control plane for agents you already run—not as a
+hosted replacement for either product.
+
+- **Personal agent:** use the shipped Workspace and connected Lark surfaces to
+  inspect goals, steer work and resolve decisions. The
+  [persistent steward and semantic handoff RFC](docs/architecture/rfcs/capable-manager-semantic-handoff-v0.md)
+  extends this toward one capable front door for a team; the complete journey
+  remains under qualification.
+- **Agent team:** share goals without erasing worker ownership. Claims, evidence
+  and explicit returns keep implementation and review connected. See the
+  [three-agent collaboration demo](examples/collaboration-delivery/README.md)
+  for a bounded example, including corrections and two review rounds.
+- **Self-improving workflows:** connect feedback to the next attempt through
+  [Reward Memory](loopx/capabilities/reward_memory/README.md), and evaluate
+  candidate changes through [Explore](loopx/capabilities/explore/README.md).
+  Both are optional. The link to **recursive self-improvement (RSI)** is the
+  engineering loop—propose, test, review, retain—not a claim that LoopX has
+  demonstrated autonomous model improvement or compounding capability gains.
+
+A personal steward is an interaction role, not a second source of authority.
+Background execution still needs an available host and configured runtime.
+The [overall roadmap](docs/architecture/rfcs/loopx-overall-roadmap-v0.md)
+separates shipped foundations from the next end-to-end acceptance milestones.
+
 <a id="see-it-in-action"></a>
 
 ## Evidence
 
+<a id="lhtb-results"></a>
+
+### LHTB: Higher Mean Reward With the Same Model
+
+**LoopX 1.0.3 Heartbeat reaches 0.4948 mean reward across 46 matched tasks:**
+**+17.3% over Plain Codex** and **+10.6% over native Codex Goal**.
+All three use GPT-5.6 Sol, max reasoning effort, and disabled Web Search.
+[Long-Horizon Terminal-Bench](https://zli12321.github.io/LHTB/index.html) goes beyond coding: these tasks span research
+reproduction, scientific simulation, multimodal analysis, professional
+workflows, games, and systems work.
+
+| Execution mode | Mean reward ↑ | Strict pass rate (≥0.95) | Pass rate (≥0.80) |
+| --- | ---: | ---: | ---: |
+| Plain Codex | 0.4218 | 7/46 (15.2%) | 12/46 (26.1%) |
+| Native Codex Goal | 0.4475 | 4/46 (8.7%) | 14/46 (30.4%) |
+| **LoopX 1.0.3 Heartbeat** | **0.4948** | **7/46 (15.2%)** | **15/46 (32.6%)** |
+
+The ≥0.80 threshold is a supplementary, post-hoc view; ≥0.95 remains the
+benchmark's strict solved threshold. No score in this study equals 0.80, so
+these counts also match the study brief's >0.80 view.
+
+Against native Goal, task-level rewards improve on **23**, tie on **13**, and
+regress on **10** tasks. Strict solves match Plain Codex, so the mean gain is
+not a claim that every task improves or that more tasks are fully solved than
+Plain. Mean reward also credits partial progress.
+
+One effective trial per task and mode; designated replacement trials and
+unequal runtime/budgets, including longer budgets for some Heartbeat replacements.
+These are observed system results, not an equal-budget efficiency result or
+an isolated causal estimate of LoopX's effect.
+
+[Interactive results, task comparisons and methodology](https://loopx-project.github.io/loopx/benchmarks/lhtb/)
+· [Five-arm study and limits](benchmark/LHTB/studies/five-arm-gpt56sol-max/README.md)
+· [Public task-level scores](benchmark/LHTB/studies/five-arm-gpt56sol-max/data.json)
+
+Beyond benchmarks, LoopX also has inspectable long-running project evidence.
 The public OpenViking contribution sequence and the redacted, owner-run
 Auto ML showcase each span **200+ hours of elapsed loop lifetime**, preserving
 bounded turns, decisions, and evidence updates. This measures wall-clock project
 time, not continuous model execution or unattended production autonomy. Open
 each visual to inspect the public-safe task graph, evidence branches, and
 cross-turn decisions; each case states its source and reproducibility boundary.
+
+<details>
+<summary>Earlier 200+ hour project trajectories: OpenViking and ML experiments</summary>
 
 ### Open-Source Issue Fix
 
@@ -181,26 +247,9 @@ visible in one graph.**
 
 The redacted public-safe graph preserves decision lineage across that 200+ hour
 elapsed window. It is an owner-run showcase, not a claim of continuous compute,
-independent reproduction, a production result, or company or employer
-endorsement. The redacted image is not sufficient to reproduce the underlying
-experiment independently.
+independent reproduction, or a production result.
 
-### Auto Research
-
-**Reproducible public KNN demo: proposer, executor, and evaluator/promoter agents
-iterate in parallel while todo, quota, evidence, and targeted wake remain
-visible.**
-
-<a href="docs/assets/auto-research-multi-agent-showcase.png">
-  <img src="docs/assets/auto-research-multi-agent-showcase.png" alt="Auto Research multi-agent workspace with proposer, executor, evaluator/promoter, todo, quota, evidence, and targeted wake activity">
-</a>
-
-This screenshot comes from LoopX's built-in exact-KNN demo. The public task,
-editable and protected files, deterministic CPU evaluator, and dev/held-out
-commands all live in this repository. Follow the
-[showcase walkthrough](docs/product/use-cases/auto-research/decentralized-auto-research-showcase.md)
-or the [demo command path](demo/auto_research/README.md) to reproduce the
-workflow; it is a demo result, not a production research claim.
+</details>
 
 ### Used In Real Projects
 
@@ -222,34 +271,37 @@ creator dogfooding, reproducible demos, and explicit evidence-strength labels.
 
 ### Exploratory Benchmark Studies
 
-- **[SWE-Marathon](https://huangruiteng.github.io/loopx/benchmarks/swe-marathon/):**
+- **[SWE-Marathon](https://loopx-project.github.io/loopx/benchmarks/swe-marathon/):**
   Five execution modes on 15 matched tasks compare self-verification, scores,
   and cost. More self-verification did not consistently yield higher scores.
-- **[DeepSWE behavior analysis](https://huangruiteng.github.io/loopx/benchmarks/deepswe/behavior-discovery/)** (Chinese):
+- **[LHTB × LoopX](https://loopx-project.github.io/loopx/benchmarks/lhtb/):**
+  The [results above](#lhtb-results) lead into five execution mechanisms,
+  task-level comparisons, regressions, and exploratory task-type analysis.
+- **[DeepSWE behavior analysis](https://loopx-project.github.io/loopx/benchmarks/deepswe/behavior-discovery/)** (Chinese):
   Selected cases examine how domain hints relate to requirement retention and
   verification choices, offering mechanism hypotheses for further testing.
 
-SWE-Marathon has one trial per task and mode; DeepSWE uses selected cases and
-post-hoc analysis. Neither establishes a general performance gain.
+SWE-Marathon and LHTB have one effective trial per task and mode; DeepSWE uses
+selected cases and post-hoc analysis.
 
 More inspectable surfaces:
 
-- the [public homepage](https://huangruiteng.github.io/loopx/) for the product
+- the [public homepage](https://loopx-project.github.io/loopx/) for the product
   narrative, quick start, and long-running evidence;
 - the [complete Showcase catalog](docs/showcases/README.md) and its
   [bilingual hosted index](docs/showcases/index.html);
-- the [cross-runtime implementation review demo](docs/product/use-cases/cross-runtime/cross-runtime-impl-review-demo.md);
+- the [Agent collaboration guide](docs/product/use-cases/cross-runtime/README.md) for dependent artifacts, independent review and returned results;
 - the public [user manual](https://my.feishu.cn/wiki/CaL5wMk9ui17ngkWzeUcMlAYnZg).
 
 <a id="quick-start"></a>
 
 ## Try LoopX
 
-Requirements: Python 3.11+ and Node.js 22.6+. Use an active Python environment
-whose console scripts are on `PATH`; macOS and Linux use a POSIX shell, while
-native Windows uses PowerShell 7. Node.js runs the managed, idle-exiting
-TypeScript Effect core; LoopX starts it automatically. Git is only needed for
-contributor clone/canary workflows.
+Requirements: Python 3.11+ and Node.js 22.22.3+; Node.js 24 LTS is recommended.
+Use an active Python environment whose console scripts are on `PATH`; macOS and
+Linux use a POSIX shell, while native Windows uses PowerShell 7. Node.js runs
+the managed, idle-exiting TypeScript Effect core; LoopX starts it automatically.
+Git is only needed for contributor clone/canary workflows.
 
 Install from PyPI without cloning:
 
@@ -307,6 +359,7 @@ LoopX should reuse existing state rather than overwrite it. Keep `.loopx/`,
 | Pi | Install the opt-in goal extension with `loopx slash-commands --install --surface pi`, then use `/loopx <task>` from a trusted Pi session. | Visible Pi goal extension gated by LoopX quota (`loopx_goal_activate` + `agent_settled` continuation) |
 | ZCode | Install the skill facade with `loopx slash-commands --install --surface zcode`, then invoke the `$loopx` skill (or `/loopx <complex task>`) from a ZCode session in the project. | The ZCode session's own turn loop; every continuation enters through `quota should-run` |
 | Antigravity CLI (agy) | Install the skill facade with `loopx slash-commands --install --surface agy`, then invoke the `loopx` skill (or `/loopx <complex task>`) from an `agy` session in the project. | The session's native `/goal` loop (audited until `<!-- GOAL_COMPLETE -->`) with `schedule` self-wakes while the session lives; the facade instructs every turn/wake to re-enter through `quota should-run` — advisory pacing, not a host-enforced gate |
+| Kiro CLI | Install the skill facade with `loopx slash-commands --install --surface kiro-cli`, then run `/loopx <complex task>` from a `kiro-cli` session in the project. | The session's native `/goal --max <N> <task_body> Done when: <criteria>` loop, with the acceptance criteria stated inside the goal statement because the host derives them from it, bounded by the host's own iteration budget (default 5) and settled through the built-in `goal` completion contract; the facade instructs every turn and iteration to re-enter through `quota should-run` — advisory pacing, not a host-enforced gate |
 | DeepSeek Harness (dsh) | Install the [native DSH plugin](packages/dsh-loopx-plugin/README.md), select the `loopx` skill, and describe the task. The [dsh goal-mode adapter](loopx/dsh_goal_mode/README.md) remains available for headless turns. | Native same-session continuation and GoalBar, or headless dsh segments; both remain gated by LoopX authority |
 | Cursor, shell, or custom runner | Use the installer and `loopx doctor`; connect manually or call LoopX from your runner. | Your shell, scheduler, or runner |
 
@@ -315,7 +368,8 @@ The exact, copy-ready setup messages and host recovery paths live in
 the [Codex App host command registry contract](docs/reference/protocols/codex-app-host-command-registry-v0.md),
 the [Codex CLI packaged install path](docs/product/runtimes/codex-cli/codex-cli-packaged-install.md),
 the [Claude Code adapter](loopx/claude_goal_mode/README.md), the
-[KunlunCode native Goal adapter](loopx/kunluncode_goal_mode/README.md), or the
+[KunlunCode native Goal adapter](loopx/kunluncode_goal_mode/README.md), the
+[Kiro CLI goal-mode adapter](loopx/kiro_cli_goal_mode/README.md), or the
 [DeepSeek Harness turn adapter](loopx/dsh_goal_mode/README.md).
 
 See the [60-second DSH × LoopX Replan recording and reproducible
@@ -344,11 +398,17 @@ If LoopX works for you, a one-minute public issue helps us learn what a real
 first run looks like. It is optional, contains no telemetry, and should not
 include logs, paths, credentials, internal project names, or goal contents:
 
-- [First-run feedback](https://github.com/huangruiteng/loopx/issues/new?template=first_run.yml)
-- [Usage story for longer runs](https://github.com/huangruiteng/loopx/issues/new?template=usage_story.yml)
+- [First-run feedback](https://github.com/loopx-project/loopx/issues/new?template=first_run.yml)
+- [Usage story for longer runs](https://github.com/loopx-project/loopx/issues/new?template=usage_story.yml)
 
 `loopx first-run-report` prints the same prefilled link locally without
 sending anything.
+
+Basic usage statistics default on after first-use disclosure: a daily random-ID
+heartbeat for platform support and continued use, plus separate ID-free CLI
+counts. No content is collected. Disable both in Settings → Capability Center
+or with `loopx usage-ping disable` / `LOOPX_USAGE_PING=0`; inspect payloads with
+`loopx usage-ping status`. See [Basic usage statistics](docs/reference/usage-ping.md).
 
 A successful connection has:
 
@@ -362,7 +422,7 @@ A successful connection has:
 Clone-based install is only for contributors who want the live canary wrapper:
 
 ```bash
-git clone https://github.com/huangruiteng/loopx ~/loopx
+git clone https://github.com/loopx-project/loopx ~/loopx
 ~/loopx/scripts/install-local.sh
 loopx doctor
 ```
@@ -431,6 +491,7 @@ write boundary:
 | --- | --- | --- |
 | Turn a public issue into a reviewable, evidence-backed change | [Issue Fix](loopx/capabilities/issue_fix/README.md) | `loopx capability show issue-fix --format json` |
 | Qualify the exact final diff before delivery | [Change Quality](loopx/capabilities/change_quality/README.md) | `loopx capability show change-quality-qualification --format json` |
+| Notice busy-but-off-goal work rounds before the periodic review | [Progress-Review Sentinel](loopx/capabilities/progress_review/README.md) | `loopx capability show progress-review-sentinel --format json` |
 | Preserve a changing stack of already reviewed branches | [Integration Branch](loopx/capabilities/integration_branch/README.md) | `loopx capability show integration-branch-reconcile --format json` |
 | Explore uncertain research without losing hypotheses and findings | [Explore](loopx/capabilities/explore/README.md) | `loopx capability show explore --format json` |
 | Rebase decisions on current evidence and verified outcomes | [Decision Context](loopx/capabilities/decision_context/README.md) | `loopx capability show decision-context --format json` |
@@ -473,13 +534,10 @@ loopx configure-goal --goal-id <goal-id>
 Without `--execute`, this reports current/default state, fit, boundaries, and
 copyable commands without changing project state.
 
-### Presets and Auto Research
+### Recurring Work Presets
 
-Safe presets cover daily triage, changelog drafts, and PR watching. The
-one-command research path coordinates proposer, executor, and
-evaluator/promoter roles while keeping quota and evidence visible. See the
-[beginner preset guide](docs/product/foundations/beginner-loop-presets.md) and
-[Auto Research demo path](demo/auto_research/README.md).
+Safe presets cover daily triage, changelog drafts, and PR watching. Start with
+the [beginner preset guide](docs/product/foundations/beginner-loop-presets.md).
 
 ```bash
 loopx preset list
@@ -515,16 +573,17 @@ describes the operator model; the
 describes conservative value signals across output quantity, quality, token
 cost, and user attention cost.
 
-For one concrete peer workflow, see the
-[cross-runtime implementation review demo](docs/product/use-cases/cross-runtime/cross-runtime-impl-review-demo.md):
-Claude implements and Codex reviews while LoopX keeps ownership, evidence,
-quota, and handoff explicit.
+For a concrete peer workflow, start with the
+[Agent collaboration guide](docs/product/use-cases/cross-runtime/README.md):
+a builder consumes an analyst's artifact, obtains independent review, handles
+an owner correction and returns the checked result. The guide distinguishes
+the runnable same-host example from the earlier cross-runtime design sketch.
 
 ### App and Projection Paths
 
 - Local read-first UI: [dashboard guide](apps/presentation/dashboard/README.md)
-- Public product overview: [public homepage](https://huangruiteng.github.io/loopx/)
-- Documentation portal: [hosted docs](https://huangruiteng.github.io/loopx/docs/)
+- Public product overview: [public homepage](https://loopx-project.github.io/loopx/)
+- Documentation portal: [hosted docs](https://loopx-project.github.io/loopx/docs/)
 - Feishu/Lark projection: [Lark Kanban adapter](docs/integrations/lark-kanban-control-plane-adapter.md)
 - Generic host integration: [integration guide](docs/integration.md)
 - Custom multi-agent runner:
@@ -577,32 +636,35 @@ artifacts, and stable reference contracts remain the source of shipped truth.
 
 - **Long-Horizon Benchmarks and Evidence:** reproducible capability evidence
   and controlled mechanism research across complementary benchmark
-  environments. [Direction tracker](https://github.com/huangruiteng/loopx/issues/3243)
+  environments. [Direction tracker](https://github.com/loopx-project/loopx/issues/3243)
 - **Operator Surface and IM Integration:** an operator workspace, session
-  records, and bounded collaboration surfaces, currently incubating on a
-  dedicated integration branch with `@maxliux5` as implementation lead.
-  [Direction tracker](https://github.com/huangruiteng/loopx/issues/3244)
+  records, and bounded collaboration surfaces. The Personal Workspace is
+  shipped; unified steward, execution, and recovery journeys remain under
+  qualification, with `@maxliux5` as implementation lead.
+  [Direction tracker](https://github.com/loopx-project/loopx/issues/3244)
 - **Shared Goal Authority and Cross-host Coordination:** provider-neutral
   coordination for explicitly shared goals, with NoKV as an unpromoted
   provider candidate rather than a new control-plane authority.
-  [Direction tracker](https://github.com/huangruiteng/loopx/issues/3245)
+  [Direction tracker](https://github.com/loopx-project/loopx/issues/3245)
 - **Architecture and Research Incubator:** Effect Program hardening,
   TypeScript parity migration, hierarchical stride, research exploration,
   human attention, artifact lifecycle, and memory utility work at explicitly
   different maturity levels.
-  [Direction tracker](https://github.com/huangruiteng/loopx/issues/3246)
+  [Direction tracker](https://github.com/loopx-project/loopx/issues/3246)
 
 Read the canonical
 [Technical Directions map](docs/project/technical-directions.md) for stages,
 promotion gates, contributor-safe cuts, and ownership boundaries. Use the
-pinned [GitHub Discussion](https://github.com/huangruiteng/loopx/discussions/2851)
+pinned [GitHub Discussion](https://github.com/loopx-project/loopx/discussions/2851)
 for community discussion. Core control-plane reliability continues as the
 shared foundation beneath these programs.
 
 ## Advanced Documentation
 
+[Product website](https://loopx-project.github.io/loopx/) · [Blog](https://loopx-project.github.io/loopx/blog/) · [Developer Book](https://loopx-project.github.io/loopx/docs/book/en/)
+
 Start with the path that matches your current task. Use the hosted
-[documentation portal](https://huangruiteng.github.io/loopx/docs/) for the
+[documentation portal](https://loopx-project.github.io/loopx/docs/) for the
 published docs site; the [documentation index](docs/README.md) remains the
 complete source map. This list stays selective; each category index owns its
 deeper documents and versioned protocols.
@@ -697,7 +759,7 @@ development. The most useful feedback comes from real long-running agent
 projects: where the control plane helped, where it felt heavy, and which gates
 or handoffs disappeared from view.
 
-- Use [GitHub Issues](https://github.com/huangruiteng/loopx/issues) for
+- Use [GitHub Issues](https://github.com/loopx-project/loopx/issues) for
   reproducible bugs, install problems, and feature requests.
 - Open PRs for docs fixes, showcase writeups, and small public-safe examples.
 - Join the [Discord community](https://discord.gg/XmGgQyCFZd), or use Lark or
@@ -755,7 +817,7 @@ coordination, and an explicitly staged architecture and research incubator.
 ## Star History
 
 <p align="center">
-  <a href="https://github.com/huangruiteng/loopx/stargazers"><img src="https://huangruiteng.github.io/loopx/site-assets/star-history.svg" alt="LoopX GitHub star history from verified snapshots" width="800"></a><br>
+  <a href="https://github.com/loopx-project/loopx/stargazers"><img src="https://loopx-project.github.io/loopx/site-assets/star-history.svg" alt="LoopX GitHub star history from verified snapshots" width="800"></a><br>
   <sub>Generated every six hours from GitHub's official stargazer timestamps using a repository-authorized workflow. A snapshot is published only when the fetched rows match GitHub's current star count; GitHub's image cache may delay refreshes.</sub>
 </p>
 

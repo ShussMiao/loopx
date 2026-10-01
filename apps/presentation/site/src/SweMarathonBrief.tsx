@@ -6,7 +6,7 @@ import {
   ShieldCheck,
   TimerReset,
 } from "lucide-react";
-import { useEffect, useMemo } from "react";
+import { useMemo } from "react";
 import type { CSSProperties } from "react";
 import { usePublicPageNavigation } from "./usePublicPageNavigation";
 import benchmarkData from "../../../../benchmark/swe-marathon/data.json";
@@ -14,21 +14,16 @@ import caseInsights from "../../../../benchmark/swe-marathon/case_insights.json"
 import copy from "./swe-marathon-copy.json";
 
 type Language = "en" | "zh";
-type Arm = (typeof benchmarkData.arms)[number];
 
-const armOrder = ["plain", "goal", "ssh-goal", "codex-cli", "heartbeat"] as const;
-const publicAnalysisUrl =
-  "https://github.com/huangruiteng/loopx/pull/3887#issuecomment-5535839229";
+const armOrder = ["plain", "goal", "heartbeat"] as const;
 const repositoryStudyUrl =
-  "https://github.com/huangruiteng/loopx/tree/main/benchmark/swe-marathon";
+  "https://github.com/loopx-project/loopx/tree/main/benchmark/swe-marathon";
 const researchContributors = [
   { handle: "BouwenZhou", href: "https://bouwenzhou.github.io/" },
   { handle: "piaji-68", href: "https://github.com/piaji-68" },
   { handle: "Wanli-Lee", href: "https://wanli-lee.github.io/" },
 ] as const;
 
-const studyObservation = caseInsights.study_observations[0];
-const behaviorMetrics = studyObservation.metrics;
 const zstdHeartbeat = caseInsights.records.find(
   (record) => record.case_id === "zstd-decoder" && record.run_id.includes("heartbeat"),
 );
@@ -37,15 +32,11 @@ const armLabels: Record<Language, Record<string, string>> = {
   en: {
     plain: "Plain Codex",
     goal: "Native Goal",
-    "ssh-goal": "Codex App SSH Goal + LoopX",
-    "codex-cli": "Codex CLI Goal profile + LoopX*",
     heartbeat: "LoopX Turn (external-scheduler automation)",
   },
   zh: {
     plain: "裸 Codex",
     goal: "原生 Goal",
-    "ssh-goal": "Codex App SSH Goal + LoopX",
-    "codex-cli": "Codex CLI Goal profile + LoopX*",
     heartbeat: "LoopX Turn（外部调度 Automation）",
   },
 };
@@ -75,47 +66,10 @@ function HorizonDiagram({ language }: Readonly<{ language: Language }>) {
   );
 }
 
-function BarChart({
-  title,
-  values,
-  format,
-}: Readonly<{
-  title: string;
-  values: Array<[string, number, boolean?]>;
-  format: (value: number) => string;
-}>) {
-  const max = Math.max(...values.map(([, value]) => value));
-  return (
-    <figure className="bm-bar-chart" aria-label={title}>
-      <figcaption>{title}</figcaption>
-      <div className="bm-bars">
-        {values.map(([label, value, accent]) => (
-          <div className="bm-bar-row" key={label}>
-            <span>{label}</span>
-            <div className="bm-bar-track">
-              <i
-                className={accent ? "is-accent" : undefined}
-                style={{ width: `${Math.max(2, (value / max) * 100)}%` }}
-              />
-            </div>
-            <b>{format(value)}</b>
-          </div>
-        ))}
-      </div>
-    </figure>
-  );
-}
-
 export function SweMarathonBrief() {
-  const [language, setLanguage] = usePublicPageNavigation();
+  const [language, setLanguage] = usePublicPageNavigation("sweMarathon");
   const c = copy[language];
   const basePath = import.meta.env.BASE_URL;
-
-  useEffect(() => {
-    document.title = language === "zh"
-      ? "LoopX × SWE-Marathon：持续自我验证"
-      : "LoopX × SWE-Marathon: Continued self-verification";
-  }, [language]);
 
   const summaries = useMemo(
     () =>
@@ -138,7 +92,7 @@ export function SweMarathonBrief() {
             <button aria-pressed={language === "en"} className={language === "en" ? "is-active" : ""} onClick={() => setLanguage("en")} type="button">EN</button>
             <button aria-pressed={language === "zh"} className={language === "zh" ? "is-active" : ""} onClick={() => setLanguage("zh")} type="button">中文</button>
           </div>
-          <a href={repositoryStudyUrl} target="_blank" rel="noreferrer">
+          <a href={repositoryStudyUrl} target="_blank" rel="noopener" referrerPolicy="strict-origin-when-cross-origin">
             {c.source} <ExternalLink size={13} />
           </a>
         </div>
@@ -162,7 +116,7 @@ export function SweMarathonBrief() {
               <p className="bm-contributors">
                 <span>{c.contributorsLabel}</span>
                 {researchContributors.map((contributor) => (
-                  <a href={contributor.href} key={contributor.handle} rel="noreferrer" target="_blank">
+                  <a href={contributor.href} key={contributor.handle} rel="noopener" referrerPolicy="strict-origin-when-cross-origin" target="_blank">
                     @{contributor.handle}<ExternalLink aria-hidden="true" size={11} />
                   </a>
                 ))}
@@ -185,7 +139,6 @@ export function SweMarathonBrief() {
                   const owner = c.armRows.find(([arm]) => arm === row.arm)?.[1];
                   let rowClassName: string | undefined;
                   if (row.arm === "heartbeat") rowClassName = "is-highlight";
-                  else if (row.arm === "codex-cli") rowClassName = "is-caution";
                   return (
                     <tr key={row.arm} className={rowClassName}>
                       <th scope="row"><code>{row.arm}</code><span>{armLabels[language][row.arm]}</span></th>
@@ -228,28 +181,6 @@ export function SweMarathonBrief() {
             <h2>{c.mechanismTitle}</h2>
             <p>{c.mechanismBody}</p>
           </div>
-          <div className="bm-chart-grid">
-            <BarChart
-              title={c.stepsChart}
-              values={[
-                [armLabels[language].goal, behaviorMetrics.agent_step_ratio_vs_plain_median.goal_native],
-                [armLabels[language]["codex-cli"], behaviorMetrics.agent_step_ratio_vs_plain_median["codex-cli"]],
-                [armLabels[language].heartbeat, behaviorMetrics.agent_step_ratio_vs_plain_median.heartbeat],
-                [armLabels[language]["ssh-goal"], behaviorMetrics.agent_step_ratio_vs_plain_median["ssh-goal"], true],
-              ]}
-              format={(value) => `${value.toFixed(2)}×`}
-            />
-            <BarChart
-              title={c.densityChart}
-              values={[
-                [armLabels[language].plain, behaviorMetrics.self_verification_density_per_step_median.plain],
-                [armLabels[language].goal, behaviorMetrics.self_verification_density_per_step_median.goal_native],
-                [armLabels[language].heartbeat, behaviorMetrics.self_verification_density_per_step_median.heartbeat],
-                [armLabels[language]["ssh-goal"], behaviorMetrics.self_verification_density_per_step_median["ssh-goal"], true],
-              ]}
-              format={(value) => value.toFixed(3)}
-            />
-          </div>
           <div className="bm-chain" aria-label="Mechanism chain">
             {c.mechanismChain.map(([number, title, body]) => (
               <article key={number}><span>{number}</span><h3>{title}</h3><p>{body}</p></article>
@@ -260,10 +191,6 @@ export function SweMarathonBrief() {
               <article key={title}><span>0{index + 1}</span><h3>{title}</h3><p>{body}</p></article>
             ))}
           </div>
-          <blockquote>
-            <p>“{c.quote}”</p>
-            <cite><a href={publicAnalysisUrl} target="_blank" rel="noreferrer">{c.quoteBy} <ExternalLink size={12} /></a></cite>
-          </blockquote>
         </section>
 
         <section className="bm-section bm-shell" id="zstd">
@@ -327,7 +254,7 @@ export function SweMarathonBrief() {
           </div>
           <div className="bm-source-list">
             {c.sourceItems.map(([title, body, href], index) => (
-              <a href={href} target="_blank" rel="noreferrer" key={title}>
+              <a href={href} target="_blank" rel="noopener" referrerPolicy="strict-origin-when-cross-origin" key={title}>
                 <span>0{index + 1}</span><div><strong>{title}</strong><p>{body}</p></div><ExternalLink size={15} />
               </a>
             ))}

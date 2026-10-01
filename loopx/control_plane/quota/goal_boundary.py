@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shlex
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -9,6 +8,7 @@ from typing import Any
 from ...boundary_authority import checkpointed_boundary_authority_summary
 from ...execution_profile import execution_profile_outcome_floor
 from ...explore_graph import compact_explore_graph_policy
+from ..projects.registry_codec import load_registry
 from ...orchestration import (
     compact_orchestration_policy,
     compact_peer_task_coordination_policy,
@@ -78,10 +78,10 @@ def registry_goal_by_id(
         return {}
     registry_path = Path(str(registry_value)).expanduser()
     try:
-        payload = json.loads(registry_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = load_registry(registry_path)
+    except (OSError, ValueError):
         return {}
-    goals = payload.get("goals") if isinstance(payload, dict) else None
+    goals = payload.get("goals")
     if not isinstance(goals, list):
         return {}
     return {
@@ -192,6 +192,34 @@ def _registry_boundary_projection(goal: Mapping[str, Any]) -> dict[str, Any]:
     if guards:
         boundary["guards"] = [str(value) for value in guards if str(value).strip()]
     return boundary
+
+
+def _reward_memory_enablement_projection(
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    fields = (
+        "reason_code",
+        "repair",
+        "isolation_mode",
+        "enablement_receipt_status",
+        "actor_binding_verified",
+        "writability_verified",
+        "exact_readback_verified",
+    )
+    return {field: status[field] for field in fields if field in status}
+
+
+def _reward_memory_automation_projection(
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    automation_intent = status.get("automation_intent")
+    host_coverage = status.get("host_coverage")
+    return {
+        "automation_intent": (
+            dict(automation_intent) if isinstance(automation_intent, Mapping) else {}
+        ),
+        "host_coverage": list(host_coverage) if isinstance(host_coverage, list) else [],
+    }
 
 
 def goal_boundary(
@@ -342,7 +370,13 @@ def goal_boundary(
                     "automation_projection_source": (
                         "reward_memory_experiment_status_v1"
                     ),
+                    **_reward_memory_automation_projection(
+                        reward_memory_experiment_status
+                    ),
                 }
+            )
+            reward_capability.update(
+                _reward_memory_enablement_projection(reward_memory_experiment_status)
             )
             if reward_memory_experiment_status.get("config_schema_version"):
                 reward_capability["config_schema_version"] = str(
@@ -429,6 +463,13 @@ def goal_boundary(
                 boundary["orchestration"] = compact_orchestration_policy(
                     project_asset["orchestration"]
                 )
+    # Model preferences belong to the current registry, not a stale asset snapshot.
+    if spawn_policy is not None and "orchestration" in boundary:
+        model_config = compact_orchestration_policy(spawn_policy).get("model_config")
+        if model_config is not None:
+            boundary["orchestration"]["model_config"] = model_config
+        else:
+            boundary["orchestration"].pop("model_config", None)
     if boundary:
         boundary["rule"] = "stay_in_scope_or_stop"
         return boundary
@@ -458,22 +499,4 @@ def declared_available_capabilities(source: Any) -> list[str]:
         else {}
     )
     append(project_asset.get("available_capabilities"))
-    return capabilities
-
-
-def effective_available_capabilities(
-    runtime_available_capabilities: Any,
-    *,
-    item: dict[str, Any],
-    project_asset: dict[str, Any],
-) -> list[str]:
-    capabilities: list[str] = []
-    for raw in (
-        declared_available_capabilities(item),
-        declared_available_capabilities(project_asset),
-        runtime_available_capabilities,
-    ):
-        for capability in normalize_required_capabilities(raw):
-            if capability not in capabilities:
-                capabilities.append(capability)
     return capabilities

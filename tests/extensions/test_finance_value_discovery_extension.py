@@ -3,9 +3,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
+import venv
 from copy import deepcopy
 from pathlib import Path
 
@@ -14,9 +16,14 @@ import pytest
 from loopx.capabilities.catalog import build_capability_catalog_packet
 from loopx.cli import main
 from loopx.extensions.manifest import load_extension_manifest
-from loopx.extensions.presentation import publish_extension_projection
+from loopx.extensions.presentation import (
+    default_extension_projection_root,
+    publish_extension_projection,
+)
 from loopx.extensions.runtime import (
     default_extension_state_file,
+    doctor_installed_extension,
+    extension_catalog_entries,
     install_extension,
 )
 
@@ -404,6 +411,67 @@ def test_manifest_and_paypal_example_preserve_extension_boundary() -> None:
     assert packet["boundary"]["continuous_watch_allowed"] is False
 
 
+def _research_source_period_metric() -> dict[str, object]:
+    return {
+        "metric_id": "synthetic-value-capture",
+        "label": "Synthetic value capture",
+        "event_namespace": "synthetic.period.metric",
+        "event_id": "value-capture-2026w02",
+        "event_at": "2026-01-14T23:00:00Z",
+        "instrument_id": "SYNTH-USD",
+        "scope_id": "synthetic-scope",
+        "period_start": "2026-01-08",
+        "period_end": "2026-01-14",
+        "source_state": "ok",
+        "value": 0.0,
+        "unit": "USD",
+        "metric_basis": "realized_cash",
+        "metric_semantics": "cash_delta",
+        "value_origin": "source_reported",
+        "value_precision": "exact",
+        "observation_authority": "source_reported_exact",
+        "sign_basis": "account_cash_change",
+        "fee_inclusion": "not_applicable",
+        "account_scope": "not_applicable",
+        "account_value_role": "not_applicable",
+        "includes_isolated_margin": False,
+        "expected_components": ["primary", "overlap"],
+        "observed_components": ["primary", "overlap"],
+        "double_counted_components": ["overlap"],
+        "numerator_scope": ["primary"],
+        "denominator_scope": [],
+        "lineage_id": "synthetic-upstream-week",
+        "source_ref": "source:synthetic-value-capture",
+        "methodology_state": "verified",
+        "anomaly_state": "clear",
+    }
+
+
+def _research_spot_market_identity() -> dict[str, object]:
+    return {
+        "pairs": [
+            {
+                "name": "SYNTH-PAIR",
+                "asset_indexes": [4, 0],
+                "is_canonical": False,
+                "source_ref": "source:synthetic-pair",
+            }
+        ],
+        "tokens": [
+            {"index": 0, "symbol": "USDC", "source_ref": "source:synthetic-usdc"},
+            {"index": 4, "symbol": "SYN", "source_ref": "source:synthetic-syn"},
+        ],
+        "contexts": [
+            {
+                "coin": "SYNTH-PAIR",
+                "observed_at": "2026-01-15T12:00:00Z",
+                "mark_price": 4.25,
+                "source_ref": "source:synthetic-context",
+            }
+        ],
+    }
+
+
 def test_finance_research_dashboard_mapping_preserves_research_truth() -> None:
     packet = build_finance_research_dashboard_packet(_research_dashboard_input())
     assert packet == build_finance_research_dashboard_packet(
@@ -447,6 +515,37 @@ def test_finance_research_dashboard_mapping_preserves_research_truth() -> None:
     serialized = json.dumps(packet, sort_keys=True)
     assert "supporting_evidence" not in serialized
     assert "frozen_at" not in serialized
+
+
+def test_dashboard_cli_and_lark_card_share_period_metric_projection(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    payload = _research_dashboard_input()
+    payload["source_period_metrics"] = [_research_source_period_metric()]
+    payload["spot_market_identity"] = _research_spot_market_identity()
+    packet = build_finance_research_dashboard_packet(payload)
+    metric = packet["presentation_projection"]["view"]["source_period_metrics"][0]
+    assert metric["coverage_state"] == "complete"
+    assert metric["value"] == 0.0
+    assert metric["double_counted_components"] == ["overlap"]
+    assert metric["ready_eligible"] is False
+    market = packet["presentation_projection"]["view"]["spot_market_identity"][
+        "markets"
+    ][0]
+    assert market["context_coin"] == "SYNTH-PAIR"
+    assert market["base_asset"] == {"index": 4, "symbol": "SYN"}
+
+    input_path = tmp_path / "research-dashboard.json"
+    input_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert run(["render-lark-card", "--input-json", str(input_path)]) == 0
+    card = json.loads(capsys.readouterr().out)
+    markdown = card["elements"][0]["text"]["content"]
+    assert "0 USD" in markdown
+    assert "Excluded double-counted components: overlap" in markdown
+    assert "Spot identity joins" in markdown
+    assert "SYN / USDC" in markdown
+    assert "evidence-only" in markdown
 
 
 @pytest.mark.parametrize(
@@ -653,9 +752,27 @@ def test_projection_publisher_loads_finance_validator_from_manifest(
     invalid_packet["presentation_projection"]["view"]["unsupported"] = (
         "must fail in the publisher process"
     )
-    provider = tmp_path / "finance-provider"
+    runtime_root = tmp_path / "finance-runtime"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime_root)
+    runtime_python = runtime_root / "bin" / "python"
+    purelib = subprocess.run(
+        [
+            str(runtime_python),
+            "-I",
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (Path(purelib) / "finance-value-discovery-source.pth").write_text(
+        str(EXTENSION_SRC) + "\n",
+        encoding="utf-8",
+    )
+    provider = runtime_root / "bin" / "finance-provider"
     provider.write_text(
-        f"""#!{sys.executable}
+        f"""#!{runtime_python}
 import json
 import sys
 
@@ -676,13 +793,7 @@ json.dump({invalid_packet!r}, sys.stdout)
         ),
         encoding="utf-8",
     )
-    existing = os.environ.get("PYTHONPATH")
-    monkeypatch.setenv(
-        "PYTHONPATH",
-        os.pathsep.join(
-            part for part in [str(EXTENSION_SRC), str(ROOT), existing] if part
-        ),
-    )
+    monkeypatch.delenv("PYTHONPATH", raising=False)
     monkeypatch.syspath_prepend(str(EXTENSION_SRC))
     sys.modules.pop("loopx_finance_value_discovery.presentation_view", None)
     state_file = default_extension_state_file(tmp_path / "runtime")
@@ -696,6 +807,120 @@ json.dump({invalid_packet!r}, sys.stdout)
             request=_research_dashboard_input(),
             execute=True,
         )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX console-script shebang fixture")
+def test_doctor_identity_binds_declared_validator_implementation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replaced validator implementation cannot reuse the earlier doctor proof."""
+
+    runtime_source = tmp_path / "finance-source"
+    shutil.copytree(EXTENSION_SRC, runtime_source)
+    runtime_root = tmp_path / "finance-runtime"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime_root)
+    runtime_python = runtime_root / "bin" / "python"
+    purelib = subprocess.run(
+        [
+            str(runtime_python),
+            "-I",
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (Path(purelib) / "finance-value-discovery-source.pth").write_text(
+        str(runtime_source) + "\n",
+        encoding="utf-8",
+    )
+    unacceptable_view = "must be accepted only by the replaced decision code"
+    packet = build_finance_research_dashboard_packet(_research_dashboard_input())
+    packet["presentation_projection"]["view"]["unsupported"] = unacceptable_view
+    invocation_marker = tmp_path / "provider-called"
+    provider = runtime_root / "bin" / "finance-provider"
+    provider.write_text(
+        f"""#!{runtime_python}
+import json
+import sys
+from pathlib import Path
+
+if "--doctor" in sys.argv:
+    raise SystemExit(0)
+
+Path({str(invocation_marker)!r}).write_text("called", encoding="utf-8")
+json.load(sys.stdin)
+json.dump({packet!r}, sys.stdout)
+""",
+        encoding="utf-8",
+    )
+    provider.chmod(0o755)
+    manifest = tmp_path / "extension.toml"
+    manifest.write_text(
+        MANIFEST.read_text(encoding="utf-8").replace(
+            'entrypoint = "loopx-finance-value-discovery"',
+            f"entrypoint = {json.dumps(str(provider))}",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    state_file = default_extension_state_file(tmp_path / "runtime")
+    install_extension(manifest, state_file=state_file, execute=True)
+
+    def publish() -> dict[str, object]:
+        return publish_extension_projection(
+            "loopx-finance-value-discovery",
+            "investment-research",
+            state_file=state_file,
+            request=_research_dashboard_input(),
+            execute=True,
+        )
+
+    def ready() -> bool:
+        entries = extension_catalog_entries([manifest], state_file=state_file)
+        return bool(entries[0]["provider"]["ready"])
+
+    assert ready() is True
+    with pytest.raises(ValueError, match="unsupported keys"):
+        publish()
+    invocation_marker.unlink()
+
+    validator_module = (
+        runtime_source / "loopx_finance_value_discovery" / "presentation_view.py"
+    )
+    validator_module.write_text(
+        validator_module.read_text(encoding="utf-8")
+        + "\n\ndef validate_decision_research_view(view):\n"
+        '    """Replacement implementation that accepts any view structure."""\n'
+        "    return view\n",
+        encoding="utf-8",
+    )
+
+    assert ready() is False
+    with pytest.raises(ValueError, match="doctor readiness is stale"):
+        publish()
+    assert not invocation_marker.exists()
+
+    doctor = doctor_installed_extension(
+        "loopx-finance-value-discovery",
+        state_file=state_file,
+        execute=True,
+    )
+    assert doctor["verified"] is True
+    assert ready() is True
+
+    # Re-verifying the replaced implementation makes it runnable again, and the
+    # published view proves the replaced decision code is what executed.
+    assert publish()["status"] == "published"
+    projection_file = (
+        default_extension_projection_root(state_file)
+        / "loopx-finance-value-discovery"
+        / "investment-research.json"
+    )
+    persisted = json.loads(projection_file.read_text(encoding="utf-8"))
+    assert persisted["view"]["unsupported"] == unacceptable_view
 
 
 @pytest.mark.parametrize("legacy_command", ["source-map", "install-check"])
@@ -863,9 +1088,10 @@ def test_declared_minimum_core_without_presentation_api_can_import_and_doctor(
         check=False,
     )
     assert doctor.returncode == 1
-    assert "does not provide the extension presentation API" in json.loads(
-        doctor.stdout
-    )["error"]
+    assert (
+        "does not provide the extension presentation API"
+        in json.loads(doctor.stdout)["error"]
+    )
 
 
 def test_dashboard_requires_only_public_presentation_validator_api(
@@ -936,7 +1162,12 @@ def test_standalone_extension_runs_through_verified_runtime(
     assert packet["projection"]["next_targets"] == ["PYPL"]
 
 
+@pytest.mark.parametrize(
+    "case_example",
+    [CASE_EXAMPLE, EXTENSION_ROOT / "examples" / "finance-source-coverage-v1.json"],
+)
 def test_unified_gate_contract_runs_through_verified_runtime(
+    case_example: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -953,7 +1184,7 @@ def test_unified_gate_contract_runs_through_verified_runtime(
                 "run",
                 "loopx-finance-value-discovery",
                 "--input-json",
-                str(CASE_EXAMPLE),
+                str(case_example),
                 "--execute",
             ]
         )
@@ -965,6 +1196,9 @@ def test_unified_gate_contract_runs_through_verified_runtime(
     assert evaluation["schema_version"] == "finance_case_gate_evaluation_v1"
     assert evaluation["disposition"] == "insufficient_evidence"
     assert evaluation["replay"]["evaluation_sha256"]
+    if case_example.name == "finance-source-coverage-v1.json":
+        assert evaluation["gate_results"][0]["source_coverage"]["state"] == "complete"
+        assert evaluation["first_blocking_gate"]["gate_id"] == "economic_evidence"
 
 
 @pytest.mark.parametrize(

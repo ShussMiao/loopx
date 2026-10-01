@@ -4,6 +4,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+_MIN_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
+
+
 def parse_timestamp(value: Any) -> datetime | None:
     if not value:
         return None
@@ -17,6 +20,20 @@ def parse_timestamp(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def chronology_key(value: Any) -> tuple[int, datetime, str]:
+    """Order timestamps by UTC instant with deterministic legacy fallbacks."""
+
+    raw = str(value or "")
+    try:
+        parsed = parse_timestamp(value)
+    except OverflowError:
+        # UTC conversion can overflow at datetime's representable boundaries.
+        parsed = None
+    if parsed is None:
+        return (0, _MIN_TIMESTAMP, raw)
+    return (1, parsed, raw)
 
 
 def now_utc() -> datetime:

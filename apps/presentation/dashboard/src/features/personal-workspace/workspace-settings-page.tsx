@@ -1,127 +1,193 @@
-import { useState } from "react";
-import { ArrowLeft, Check, Languages, Palette, ServerCog, Settings2, SlidersHorizontal } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowLeft, Bot, Check, Clock3, KeyRound, Languages, Palette, ServerCog, Settings2 } from "lucide-react";
 
 import type { WorkspaceLocale } from "./i18n";
 import { useWorkspaceI18n } from "./i18n";
 import { LarkSettingsPage } from "./lark-settings-page";
 import { GoalCapabilitySettings } from "./goal-capability-settings";
+import { AutomationCadenceSettings } from "./automation-cadence-settings";
 import { MachineConfigurationSettings } from "./machine-configuration-settings";
-import type { WorkspaceGoal } from "./personal-workspace-model";
+import { OperatorCredentialSettings } from "./operator-credential-settings";
+import type { PersonalWorkspaceCallbacks, WorkspaceGoal, WorkspaceGoalNotification } from "./personal-workspace-model";
 import type { WorkspaceTheme } from "./workspace-theme";
 
-type WorkspaceSettingsTab = "machine" | "capabilities" | "lark" | "appearance" | "language";
+type WorkspaceSettingsTab = "steward" | "provider" | "machine" | "capabilities" | "cadence" | "lark" | "appearance" | "language";
 
-const tabIcons: Record<WorkspaceSettingsTab, typeof Settings2> = {
+type SettingsPage = Exclude<WorkspaceSettingsTab, "machine">;
+
+const tabIcons: Record<SettingsPage, typeof Settings2> = {
   appearance: Palette,
-  capabilities: SlidersHorizontal,
+  capabilities: ServerCog,
+  cadence: Clock3,
   language: Languages,
   lark: Settings2,
-  machine: ServerCog,
+  provider: KeyRound,
+  steward: Bot,
 };
 
 export function WorkspaceSettingsPage({
+  callbacks,
   focusGoalConnection = false,
   goals,
   initialGoalId,
   initialTab = "lark",
+  goalNotifications,
   onChanged,
   onClose,
   onThemeChange,
   theme,
 }: {
+  callbacks: PersonalWorkspaceCallbacks;
   focusGoalConnection?: boolean;
   goals: WorkspaceGoal[];
   initialGoalId?: string | null;
   initialTab?: WorkspaceSettingsTab;
+  goalNotifications: WorkspaceGoalNotification[];
   onChanged: () => void;
   onClose: () => void;
   onThemeChange: (theme: WorkspaceTheme) => void;
   theme: WorkspaceTheme;
 }) {
   const { locale, setLocale, t } = useWorkspaceI18n();
-  const [tab, setTab] = useState<WorkspaceSettingsTab>(initialTab);
-  const tabs: Array<{ description: string; key: WorkspaceSettingsTab; label: string }> = [
-    ...(initialGoalId ? [{ description: t("settings.capabilitiesTabDescription"), key: "capabilities" as const, label: t("capabilities.title") }] : []),
-    { description: t("settings.machineTabDescription"), key: "machine", label: t("machine.title") },
-    { description: t("settings.larkTabDescription"), key: "lark", label: "Lark" },
-    { description: t("settings.appearanceTabDescription"), key: "appearance", label: t("settings.appearance") },
-    { description: t("settings.languageTabDescription"), key: "language", label: t("settings.language") },
-  ];
-  const localeOptions: Array<{ description: string; label: string; value: WorkspaceLocale }> = [
+  // Preserve existing Goal-settings links while presenting one capability entry.
+  const [tab, setTab] = useState<SettingsPage>(initialTab === "machine" ? "capabilities" : initialTab);
+  const [capabilityScope, setCapabilityScope] = useState<"machine" | "goal">(initialTab === "capabilities" ? "goal" : "machine");
+  const [capabilityGoalId, setCapabilityGoalId] = useState(initialGoalId ?? "");
+  const tabsRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const navigation = tabsRef.current;
+    if (!navigation) return;
+    const revealSelectedTab = () => {
+      if (navigation.scrollWidth <= navigation.clientWidth) return;
+      const selected = navigation.querySelector('[aria-current="page"]');
+      if (!selected) return;
+      const parent = navigation.getBoundingClientRect();
+      const child = selected.getBoundingClientRect();
+      const delta = child.left < parent.left ? child.left - parent.left
+        : child.right > parent.right ? child.right - parent.right : 0;
+      if (delta) navigation.scrollLeft += delta;
+    };
+    revealSelectedTab();
+    const observer = new ResizeObserver(revealSelectedTab);
+    observer.observe(navigation);
+    return () => observer.disconnect();
+  }, [tab]);
+  const tabGroups: Array<{ label: string; tabs: Array<{ key: SettingsPage; label: string }> }> = [
     {
-      description: t("settings.languageEnglishDescription"),
+      label: t("settings.agentGroup"),
+      tabs: [
+        { key: "steward", label: t("settings.steward") },
+        // The model provider is one machine decision (which endpoint and key the
+        // operator credential holds); the capability catalog is another (which
+        // machine defaults every Goal inherits). They answer different questions
+        // and are edited on different surfaces, so they are separate categories.
+        { key: "provider", label: t("settings.modelProvider") },
+        { key: "capabilities", label: t("settings.globalCapabilities") },
+        ...(initialGoalId ? [{ key: "cadence" as const, label: t("cadence.title") }] : []),
+      ],
+    },
+    {
+      label: t("settings.workspaceGroup"),
+      tabs: [
+        { key: "lark", label: "Lark" },
+        { key: "appearance", label: t("settings.appearance") },
+        { key: "language", label: t("settings.language") },
+      ],
+    },
+  ];
+  const localeOptions: Array<{ label: string; value: WorkspaceLocale }> = [
+    {
       label: t("settings.languageEnglish"),
       value: "en",
     },
     {
-      description: t("settings.languageSimplifiedChineseDescription"),
       label: t("settings.languageSimplifiedChinese"),
       value: "zh-CN",
     },
   ];
-  const headings: Record<WorkspaceSettingsTab, { description: string; eyebrow: string; title: string }> = {
+  const headings: Record<SettingsPage, { title: string }> = {
     appearance: {
-      description: t("settings.appearanceDescription"),
-      eyebrow: t("settings.workspaceDisplay"),
       title: t("settings.appearance"),
     },
     capabilities: {
-      description: t("capabilities.description"),
-      eyebrow: t("capabilities.goalPolicy"),
-      title: t("capabilities.title"),
+      title: t("settings.globalCapabilities"),
+    },
+    cadence: {
+      title: t("cadence.title"),
     },
     language: {
-      description: t("settings.languageDescription"),
-      eyebrow: t("settings.workspaceDisplay"),
       title: t("settings.language"),
     },
     lark: {
-      description: t("lark.description"),
-      eyebrow: t("settings.goalConnections"),
       title: "Lark",
     },
-    machine: {
-      description: t("machine.description"),
-      eyebrow: t("machine.machinePolicy"),
-      title: t("machine.title"),
+    provider: {
+      title: t("settings.modelProvider"),
+    },
+    steward: {
+      title: t("settings.steward"),
     },
   };
   const heading = headings[tab];
+  const selectedGoal = goals.find((item) => item.goalId === initialGoalId);
+  const goalSettingsTarget = tab === "cadence" && initialGoalId
+    ? selectedGoal?.title || initialGoalId
+    : null;
 
   return (
     <section aria-label={t("settings.title")} className="personal-settings-page" data-pw-theme={theme}>
       <aside className="personal-settings-sidebar">
-        <button className="personal-settings-back" onClick={onClose} type="button">
+        <button autoFocus className="personal-settings-back" onClick={onClose} type="button">
           <ArrowLeft size={17} />
           <span>{t("settings.back")}</span>
         </button>
         <div className="personal-settings-title">
-          <small>{t("settings.eyebrow")}</small>
           <strong>{t("settings.title")}</strong>
         </div>
-        <nav aria-label={t("settings.categories")} className="personal-settings-tabs">
-          {tabs.map((item) => {
-            const Icon = tabIcons[item.key];
-            return (
-              <button aria-current={tab === item.key ? "page" : undefined} key={item.key} onClick={() => setTab(item.key)} type="button">
-                <Icon size={17} />
-                <span>
-                  <strong>{item.label}</strong>
-                  <small>{item.description}</small>
-                </span>
-              </button>
-            );
-          })}
+        <nav aria-label={t("settings.categories")} className="personal-settings-tabs" ref={tabsRef}>
+          {tabGroups.map((group) => <div className="personal-settings-tab-group" key={group.label}>
+            <span className="personal-settings-tab-group-label">{group.label}</span>
+            {group.tabs.map((item) => {
+              const Icon = tabIcons[item.key];
+              return (
+                <button aria-current={tab === item.key ? "page" : undefined} key={item.key} onClick={() => setTab(item.key)} type="button">
+                  <Icon size={17} />
+                  <span><strong>{item.label}</strong></span>
+                </button>
+              );
+            })}
+          </div>)}
         </nav>
       </aside>
 
       <main className="personal-settings-body">
-        <header className="personal-settings-header">
-          <div>
-            <small>{heading.eyebrow}</small>
+        <header className={`personal-settings-header${tab === "capabilities" ? " has-capability-target" : ""}`}>
+          <div className="personal-settings-heading">
             <h1>{heading.title}</h1>
-            <p>{heading.description}</p>
+            {goalSettingsTarget ? (
+              <span className="personal-settings-goal-target" title={`${goalSettingsTarget} · ${initialGoalId}`}>
+                <span>Goal</span>
+                <strong>{goalSettingsTarget}</strong>
+              </span>
+            ) : null}
           </div>
+          {tab === "capabilities" ? <div className="personal-capability-target">
+            <fieldset className="personal-capability-scope-options">
+              <legend>{t("settings.capabilityScope")}</legend>
+              {(["machine", "goal"] as const).map((scope) => <label key={scope}>
+                <input type="radio" name="capability-scope" checked={capabilityScope === scope} onChange={() => setCapabilityScope(scope)} />
+                {t(`settings.capabilityScope.${scope}`)}
+              </label>)}
+            </fieldset>
+            {capabilityScope === "goal" ? <label className="personal-capability-goal-choice">
+              <span>{t("settings.targetGoal")}</span>
+              <select aria-label={t("settings.targetGoal")} value={capabilityGoalId} onChange={(event) => setCapabilityGoalId(event.target.value)}>
+                <option value="">{t("capabilities.chooseGoal")}</option>
+                {goals.map((goal) => <option key={goal.goalId} value={goal.goalId}>{goal.title} · {goal.goalId}</option>)}
+              </select>
+            </label> : null}
+            <p>{t(`settings.capabilityScope.${capabilityScope}Description`)}</p>
+          </div> : null}
         </header>
         {tab === "lark" ? (
           <LarkSettingsPage
@@ -134,29 +200,39 @@ export function WorkspaceSettingsPage({
           />
         ) : null}
 
-        {tab === "machine" ? <MachineConfigurationSettings /> : null}
-        {tab === "capabilities" ? <GoalCapabilitySettings goalId={initialGoalId} /> : null}
+        {tab === "provider" ? (
+          <div className="personal-provider-settings">
+            <OperatorCredentialSettings />
+          </div>
+        ) : null}
+
+        {tab === "steward" ? <MachineConfigurationSettings onChanged={onChanged} section="steward" /> : null}
+        {tab === "capabilities" && capabilityScope === "machine" ? <MachineConfigurationSettings onChanged={onChanged} section="other" /> : null}
+        {tab === "capabilities" && capabilityScope === "goal" ? (
+          <GoalCapabilitySettings
+            key={capabilityGoalId}
+            callbacks={callbacks}
+            goalId={capabilityGoalId}
+            notification={goalNotifications.find((row) => row.goalId === capabilityGoalId)}
+            onChanged={onChanged}
+          />
+        ) : null}
+        {tab === "cadence" && selectedGoal ? <AutomationCadenceSettings key={selectedGoal.goalId} goal={selectedGoal} /> : null}
 
         {tab === "appearance" ? (
           <section className="personal-detail-card personal-appearance-settings">
-            <small>{t("settings.workspaceDisplay")}</small>
-            <h3>{t("settings.appearance")}</h3>
-            <p>{t("settings.themeDescription")}</p>
             <div className="personal-settings-choice-group" role="radiogroup" aria-label={t("settings.workspaceTheme")}>
               <button aria-checked={theme === "loopx"} onClick={() => onThemeChange("loopx")} role="radio" type="button">
                 <span className="personal-settings-theme-swatch is-loopx" />
                 <strong>{t("settings.themeLoopx")}</strong>
-                <small>{t("settings.themeLoopxDescription")}</small>
               </button>
               <button aria-checked={theme === "paper"} onClick={() => onThemeChange("paper")} role="radio" type="button">
                 <span className="personal-settings-theme-swatch is-paper" />
                 <strong>{t("settings.themeDefault")}</strong>
-                <small>{t("settings.themeDefaultDescription")}</small>
               </button>
               <button aria-checked={theme === "brutal"} onClick={() => onThemeChange("brutal")} role="radio" type="button">
                 <span className="personal-settings-theme-swatch is-brutal" />
                 <strong>{t("settings.themeHighContrast")}</strong>
-                <small>{t("settings.themeHighContrastDescription")}</small>
               </button>
             </div>
           </section>
@@ -164,13 +240,6 @@ export function WorkspaceSettingsPage({
 
         {tab === "language" ? (
           <section className="personal-settings-card">
-            <header>
-              <span className="personal-settings-icon"><Languages size={18} /></span>
-              <div>
-                <h2>{t("settings.language")}</h2>
-                <p>{t("settings.languageDescription")}</p>
-              </div>
-            </header>
             <div aria-label={t("settings.language")} className="personal-language-options" role="radiogroup">
               {localeOptions.map((option) => (
                 <button
@@ -183,13 +252,11 @@ export function WorkspaceSettingsPage({
                 >
                   <span>
                     <strong>{option.label}</strong>
-                    <small>{option.description}</small>
                   </span>
                   {locale === option.value ? <Check aria-hidden size={17} /> : null}
                 </button>
               ))}
             </div>
-            <footer>{t("settings.languageStoredLocally")}</footer>
           </section>
         ) : null}
       </main>

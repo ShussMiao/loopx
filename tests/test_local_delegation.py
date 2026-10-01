@@ -1,0 +1,411 @@
+"""Production delegation/Turn/TS completion with an explicit fixture model host."""
+import json
+import asyncio
+from pathlib import Path
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextlib import contextmanager
+from threading import Event, get_ident
+
+import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "managed-research-team"))
+import research_team as demo  # noqa: E402
+from test_managed_research_scenario import fixture  # noqa: E402
+from loopx.collaboration_mcp import Delegations  # noqa: E402
+from loopx.control_plane.collaboration.peers import returns  # noqa: E402
+from loopx.control_plane.collaboration.inbox import _read  # noqa: E402
+from loopx.file_lock import exclusive_file_lock  # noqa: E402
+
+
+HOST = '''import json, sys, time
+from pathlib import Path
+from loopx.control_plane.turn_driver.host_candidate import build_result
+from loopx.control_plane.collaboration.inbox import acknowledge
+from loopx.control_plane.collaboration.peers import return_result
+request = json.load(sys.stdin)
+workspace = Path.cwd()
+root = Path(sys.argv[1])
+envelope = request['turn_envelope']
+actor = envelope['agent_id']
+counter = workspace / 'host-invocations'
+counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))
+if (root / 'hold').exists():
+    (root / 'host-started').touch()
+    while not (root / 'release').exists(): time.sleep(0.1)
+delegation = json.loads((workspace / 'DELEGATION.json').read_text())
+if not (root / 'skip-adoption').exists():
+    acknowledge(root / 'runtime', envelope['goal_id'], actor, delegation['request_id'], 'adopt', 'Independently checked the requested scope.')
+    return_result(root / 'runtime', envelope['goal_id'], actor, delegation['request_id'], 'Independent member conclusion; host acceptance is separate.')
+print(json.dumps(build_result(request, {'result_kind':'validated_progress', 'classification':'artifact_written', 'summary':'Fixture host supplied output for independent verification.', 'next_action':'Return verified evidence.'}, host_name='Fixture')))
+'''
+
+
+@pytest.fixture(params=["file", "sqlite"])
+def service(tmp_path, request, monkeypatch):
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(tmp_path))
+    root = tmp_path / "team"
+    demo.prepare(root, provider=request.param)
+    fixture(root)
+    host = root / "fixture-host.py"
+    host.write_text(HOST)
+    config = root / "delegations.json"
+    config.write_text(json.dumps({"schema_version": "loopx_local_delegation_v0", "bindings": [{
+        "id": "analysis", "agent_id": "analyst", "todo_id": "todo_analyst-initial", "requesters": ["lead"],
+        "workspace": str(root / "analyst" / "initial"), "timeout_seconds": 60, "output_refs": ["output.json"],
+        "host_args": ["--host", "generic-cli", "--iteration-context", "fresh", "--host-command-json",
+                      json.dumps([sys.executable, str(host), str(root)])],
+    }]}))
+    return root, Delegations(root / "runtime", root / "registry.json", demo.GOAL, "lead", config)
+
+
+def brief():
+    return {"schema_version": "collaboration_brief_v0", "purpose": "Review synthetic cash flow",
+            "context": "Use the initial filing and preserve the period distinction.",
+            "constraints": ["No external actions"], "inputs": [], "acceptance": ["Pinned task validation"],
+            "return_requirement": "Return the independently checked artifact"}
+
+
+@pytest.mark.parametrize("operation", ["--help", "x y", "x\ny", "x;echo", "x/../y"])
+def test_worker_rejects_unbounded_operation_arguments(tmp_path, monkeypatch, operation):
+    from loopx import collaboration_mcp as delegation
+
+    runner = Delegations(tmp_path, tmp_path / "registry.json", "goal", "lead", tmp_path / "config.json")
+    calls = []
+    monkeypatch.setattr(delegation.subprocess, "Popen", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError, match="stable peer operation id"):
+        runner._spawn(operation)
+    assert calls == []
+
+
+def test_delegation_captures_goal_ref_after_registry_becomes_available(tmp_path, monkeypatch):
+    from loopx import collaboration_mcp as delegation
+
+    runner = Delegations(
+        tmp_path,
+        tmp_path / "registry.json",
+        "goal",
+        "lead",
+        tmp_path / "config.json",
+    )
+    captured = {"goal_id": "goal", "goal_instance_id": "instance-a"}
+    calls = []
+    monkeypatch.setattr(
+        delegation,
+        "capture_collaboration_goal_ref",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or captured,
+    )
+
+    assert runner._caller_goal_ref() == captured
+    assert runner._caller_goal_ref() == captured
+    assert len(calls) == 1
+
+
+def test_worker_waits_for_a_transient_status_probe(service, monkeypatch):
+    """A reader temporarily holding the lock must not discard admitted work."""
+    from loopx import collaboration_mcp as delegation
+
+    _, runner = service
+    monkeypatch.setattr(runner, "_spawn", lambda _: None)
+    runner.start("analysis", "analysis-1", brief())
+    path = runner.path("analysis-1")
+    attempted = Event()
+    main_thread = get_ident()
+    executed = []
+
+    @contextmanager
+    def observed_lock(target, **kwargs):
+        if target == path and get_ident() != main_thread:
+            attempted.set()
+        with exclusive_file_lock(target, **kwargs) as held:
+            yield held
+
+    monkeypatch.setattr(delegation, "exclusive_file_lock", observed_lock)
+    monkeypatch.setattr(runner, "_execute", lambda *args: executed.append("ran"))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with exclusive_file_lock(path):
+            future = pool.submit(runner.execute, "analysis-1")
+            assert attempted.wait(5)
+            with pytest.raises(FutureTimeout):
+                future.result(timeout=0.2)
+        future.result(timeout=10)
+    assert executed == ["ran"]
+
+
+def wait(service, operation="analysis-1"):
+    deadline = time.monotonic() + 100
+    while time.monotonic() < deadline:
+        result = service.read(operation)
+        if result["status"] in {"accepted", "rejected"}:
+            return result
+        if result.get("error"):
+            pytest.fail(str(result))
+        time.sleep(0.25)
+    pytest.fail(str(service.read(operation)))
+
+
+@pytest.mark.parametrize("mcp_profile", ["delegation-default", "explicit-null", "unmatched-null"])
+def test_confirmed_wake_reaches_native_acceptance_through_real_delegation_and_turn(service, mcp_profile):
+    """Real detached worker/CLI/Turn; synthetic native transport, no model/effect."""
+    from examples import operation_action_fixtures as fixtures
+    from loopx.chat_action_store import ChatActionStore
+    from loopx.cli import build_parser
+    from loopx.control_plane.collaboration.operation_wake import dispatch_confirmed_operation_wake
+    from loopx.control_plane.turn_driver.codex_cli import load_codex_cli_session
+    from loopx.control_plane.turn_driver.codex_operation_host import run_codex_operation_host, operation_tool_handler
+    from test_codex_operation_host import FAKE_SERVER
+    from test_loopx_turn_codex_cli import _request
+
+    root, runner = service
+    executable = root / "fixture-codex"
+    native_starts = root / "native-starts"
+    startup_probe = (
+        "from pathlib import Path\n"
+        f"counter = Path({str(native_starts)!r})\n"
+        "counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))\n"
+    )
+    executable.write_text(FAKE_SERVER.replace('thread = "owned-app-server-thread"',
+        startup_probe + 'thread = "owned-app-server-thread"'))
+    executable.chmod(0o700)
+    config = json.loads(runner.config.read_text())
+    binding = config["bindings"][0]
+    binding["host_args"] = ["--host", "codex-cli", "--codex-bin", str(executable),
+        "--codex-operation-tools", "--codex-model", "test-model", "--codex-reasoning-effort", "xhigh"]
+    if mcp_profile == "explicit-null":
+        # Existing operator option, not a new profile or a worker-selected grant.
+        binding["host_args"] += ["--codex-mcp-server-json", "null"]
+    runner.config.write_text(json.dumps(config))
+    argv = runner._execution_arguments(binding, "preparation")
+    parsed = build_parser().parse_args(["turn", "run-once", "--goal-id", runner.goal_id,
+        "--agent-id", binding["agent_id"], "--todo-id", binding["todo_id"], *argv])
+    if mcp_profile == "explicit-null":
+        assert argv.count("--codex-mcp-server-json") == 2
+        assert parsed.codex_mcp_server_json is None
+    else:
+        assert parsed.codex_mcp_server_json["name"] == "loopx_delegation"
+    # Reproduce an original standalone operation Session: do NOT prepare it
+    # with the injected delegation MCP just to make the later resume match.
+    mcp_server = parsed.codex_mcp_server_json if mcp_profile == "delegation-default" else None
+    lineage = {"goal_id": runner.goal_id, "agent_id": binding["agent_id"], "todo_id": binding["todo_id"]}
+    request = _request()
+    request["turn_envelope"].update(goal_id=runner.goal_id, agent_id=binding["agent_id"])
+    request["turn_envelope"]["action"]["selected_todo"]["todo_id"] = binding["todo_id"]
+    run_codex_operation_host(request, runtime_root=runner.root, registry_path=runner.registry,
+        project=Path(binding["workspace"]), codex_bin=str(executable), model="test-model",
+        reasoning_effort="xhigh", mcp_server=mcp_server, timeout_seconds=5)
+    assert native_starts.read_text() == "1"
+    session = load_codex_cli_session(runner.root, lineage=lineage)
+    handler = operation_tool_handler(runtime_root=runner.root, registry_path=runner.registry,
+        lineage=lineage, session_id=session["session_id"], profile_digest=session["operation_profile_digest"],
+        model="test-model", reasoning_effort="xhigh")
+    intent = fixtures.request(goal_id=runner.goal_id,
+        payload={"schema_version": "qualification_v0", "marker": "synthetic"})
+    terms = intent["normalized_parameters"]
+    terms.pop("executor")
+    terms.update(agent_id=binding["agent_id"], domain="qualification",
+        operation_kind="qualification.observe", operation_schema="qualification_v0")
+    terms["projection"].update(simulated=False, title="Synthetic native wake qualification")
+    prepared = handler("loopx_operation", {"action": "prepare", "request": intent},
+        {"thread_id": session["session_id"], "host_turn_id": "preparing-turn"})
+    assert prepared["ok"], prepared
+    store = ChatActionStore(runner.root / "chat" / "actions")
+    proposal = prepared["proposal"]
+    delivered = store.record_operation_delivery(proposal["proposal_id"], delivery=fixtures.delivery(proposal))
+    confirmed = store.decide_operation(proposal["proposal_id"], decision="confirm",
+                                     confirmation=fixtures.confirmation(delivered))
+    wake_config = {"registry_path": str(runner.registry), "goal_id": runner.goal_id,
+        "requester_agent_id": runner.agent_id, "project": str(root),
+        "execution_config": "delegations.json", "binding_id": binding["id"]}
+    receipt = dispatch_confirmed_operation_wake(confirmed, runtime_root=runner.root, configuration=wake_config)
+    assert receipt["state"] == "delegation_requested", receipt
+    result = wait(runner, receipt["operation_id"])
+    stored = store.load(proposal["proposal_id"])
+    resumed = load_codex_cli_session(runner.root, lineage=lineage)
+    assert resumed["session_id"] == session["session_id"]
+    assert resumed["operation_profile_digest"] == session["operation_profile_digest"]
+    assert stored["operation"].get("agent_handoff") is None
+    assert stored["operation"]["outcome"] is None
+    # Omitting the original null override must still fail closed, rather than
+    # changing/replacing the original Session to bypass the profile fence.
+    if mcp_profile == "unmatched-null":
+        assert result["status"] == "rejected", result
+        assert stored["operation"].get("host_start") is None, result
+        assert native_starts.read_text() == "1"  # refused before native process start
+        assert stored["status"] == confirmed["status"]
+        assert stored["operation"]["confirmation"] == confirmed["operation"]["confirmation"]
+        return
+    assert native_starts.read_text() == "2"
+    assert stored["operation"]["host_start"] is not None, result
+    assert stored["operation"]["host_start"]["route"]["thread_id"] == session["session_id"]
+    # Fixture deliberately waits: startup is not validated domain completion.
+    assert result["status"] == "rejected"
+    journal = json.loads(runner.path(receipt["operation_id"]).read_text())
+    assert stored["operation"]["host_start"]["turn_key"] == journal["turn_key"]
+    assert dispatch_confirmed_operation_wake(stored, runtime_root=runner.root,
+        configuration=wake_config)["state"] == "existing_delegation"
+    assert native_starts.read_text() == "2"
+
+
+def test_detached_result_reconnects_without_duplicate_execution(service):
+    root, original = service
+    (root / "hold").touch()
+    async def disconnect_requester():
+        params = StdioServerParameters(command=sys.executable, args=[
+            "-m", "loopx.collaboration_mcp", "--registry", str(original.registry),
+            "--runtime-root", str(original.root), "--goal-id", original.goal_id,
+            "--agent-id", original.agent_id, "--workspace", str(root / "lead"),
+            "--execution-config", str(original.config)])
+        async with stdio_client(params) as (reader, writer):
+            async with ClientSession(reader, writer) as session:
+                await session.initialize()
+                inspection = await session.call_tool("inspect_execution_binding", {"binding_id": "analysis"})
+                assert not inspection.isError
+                preflight = json.loads(inspection.content[0].text)
+                assert preflight["state"] == "runtime_unverified"
+                assert not any(preflight["effects"].values())
+                assert not (root / "host-started").exists()
+                inventory = await session.call_tool("list_delegations", {})
+                assert not inventory.isError and json.loads(inventory.content[0].text)["items"] == []
+                result = await session.call_tool("start_delegation", {
+                    "binding_id": "analysis", "operation_id": "analysis-1", "brief": brief()})
+                assert not result.isError
+                inventory = await session.call_tool("list_delegations", {})
+                assert not inventory.isError
+                assert json.loads(inventory.content[0].text)["items"][0]["operation_id"] == "analysis-1"
+                return json.loads(result.content[0].text)
+        # Exiting the real stdio session closes the requesting MCP process.
+    first = asyncio.run(disconnect_requester())
+    deadline = time.monotonic() + 45
+    while not (root / "host-started").exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert (root / "host-started").exists(), _read(original.path("analysis-1"))
+    # Replace the requesting context. The original worker remains independent;
+    # retry/resume cannot start another model call while its lock is held.
+    reconnected = Delegations(original.root, original.registry, original.goal_id, original.agent_id, original.config)
+    assert reconnected.start("analysis", "analysis-1", brief())["request_id"] == first["request_id"]
+    reconnected.resume("analysis-1")
+    (root / "release").touch()
+    result = wait(reconnected)
+    assert result["status"] == "accepted", result
+    assert (root / "analyst" / "initial" / "host-invocations").read_text() == "1"
+    assert not (root / "analyst" / "initial" / "DELEGATION.json").exists()
+    assert demo.canonical_tasks(root)["todo_analyst-initial"]["done"]
+    returned = returns(original.root, original.goal_id, "lead")["items"]
+    assert len(returned) == 1
+    assert returned[0]["decision"] == "adopt"
+    assert wait(reconnected)["artifacts"] == result["artifacts"]
+    changed_brief = {**brief(), "purpose": "Changed instruction"}
+    with pytest.raises(ValueError, match="identity conflict"):
+        reconnected.start("analysis", "analysis-1", changed_brief)
+    ungranted = Delegations(original.root, original.registry, original.goal_id, "reviewer", original.config)
+    original_brief = brief()
+    with pytest.raises(Exception, match="no delegation grant"):
+        ungranted.start("analysis", "other", original_brief)
+    registry = json.loads(original.registry.read_text())
+    registry["goals"][0]["status"] = "stopped"
+    original.registry.write_text(json.dumps(registry))
+    assert reconnected.read("analysis-1")["status"] == "accepted"
+    with pytest.raises(ValueError, match="stopped"):
+        reconnected.start("analysis", "new-operation", original_brief)
+    registry["goals"][0]["status"] = "active"
+    original.registry.write_text(json.dumps(registry))
+    output = root / "analyst" / "initial" / "output.json"
+    output.write_text("{}")
+    with pytest.raises(ValueError, match="acceptance rejected"):
+        reconnected.read("analysis-1")
+
+
+def test_host_timeout_removes_private_delegation_bootstrap(service, monkeypatch):
+    root, runner = service
+    monkeypatch.setattr(runner, "_spawn", lambda _operation_id: None)
+    runner.start("analysis", "analysis-timeout", brief())
+
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("loopx turn", 1)
+
+    monkeypatch.setattr(runner, "_cli", timeout)
+    runner.execute("analysis-timeout")
+
+    workspace = root / "analyst" / "initial"
+    assert not (workspace / "DELEGATION.json").exists()
+    assert runner.read("analysis-timeout")["error"] == "TimeoutExpired"
+
+
+def test_the_starting_conversation_is_pinned_beside_the_operation(service, monkeypatch):
+    """The wake can only return to the conversation whose Turn started the work.
+
+    A second start under the same operation id (another conversation, or a
+    requester recovering its context) replays the original request; it never
+    rebinds the pin, which is part of the operation's own identity.
+    """
+    root, runner = service
+    monkeypatch.setattr(runner, "_spawn", lambda _operation_id: None)
+    start = {"session_id": "chat-session-1", "turn_id": "turn-1"}
+    runner.start("analysis", "analysis-1", brief(), conversation=start)
+    assert _read(runner.path("analysis-1"))["conversation"] == start
+
+    elsewhere = {"session_id": "chat-session-2", "turn_id": "turn-9"}
+    runner.start("analysis", "analysis-1", brief(), conversation=elsewhere)
+    assert _read(runner.path("analysis-1"))["conversation"] == start
+    # Starting without a conversation neither adds nor clears one.
+    runner.start("analysis", "analysis-1", brief())
+    assert _read(runner.path("analysis-1"))["conversation"] == start
+    # An operation started outside a conversation carries no wake target.
+    monkeypatch.setattr(runner, "_spawn", lambda _operation_id: None)
+    runner.start("analysis", "analysis-2", brief())
+    assert "conversation" not in _read(runner.path("analysis-2"))
+
+
+def test_model_success_without_receiver_adoption_cannot_complete(service):
+    root, runner = service
+    (root / "skip-adoption").touch()
+    runner.start("analysis", "analysis-1", brief())
+    result = wait(runner)
+    assert result["status"] == "rejected"
+    assert "did not adopt" in result["error"]
+    assert not demo.canonical_tasks(root)["todo_analyst-initial"]["done"]
+
+
+def test_rejected_operation_publishes_reason_with_terminal_state(service, monkeypatch):
+    """A reader may stop polling as soon as it sees a terminal observation."""
+    root, runner = service
+    (root / "skip-adoption").touch()
+    monkeypatch.setattr(runner, "_spawn", lambda _: None)
+    runner.start("analysis", "analysis-1", brief())
+    observe = runner._observe
+    terminal_reads = []
+
+    def read_on_publish(path, row, status, **facts):
+        observe(path, row, status, **facts)
+        if status == "rejected":
+            result = runner.read("analysis-1")
+            terminal_reads.append(result)
+            assert "did not adopt" in result.get("error", "")
+
+    monkeypatch.setattr(runner, "_observe", read_on_publish)
+    runner.execute("analysis-1")
+    assert len(terminal_reads) == 1
+    assert not demo.canonical_tasks(root)["todo_analyst-initial"]["done"]
+    assert returns(runner.root, runner.goal_id, "lead")["items"] == []
+
+
+def test_an_ordinary_delegation_gains_no_wake_state(service):
+    """A delegation started outside a conversation is never a wake candidate.
+
+    The wake capability is opt-in and belongs to a Chat conversation. An
+    ordinary CLI/MCP delegation must keep the acceptance shape it always had: no
+    intent, no persisted wake, and no change to what a plain read returns.
+    """
+    root, runner = service
+    runner.start("analysis", "analysis-1", brief())
+    acceptance = wait(runner)
+    assert acceptance["status"] == "accepted"
+    recorded = _read(runner.path("analysis-1"))
+    assert "wake" not in recorded, "an ordinary delegation must not carry wake state"
+    # Nor does it gain a wake target it could be routed to later.
+    assert "conversation" not in recorded

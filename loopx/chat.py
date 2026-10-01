@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .todos import add_goal_todo
+from .control_plane.work_items.governed_transition_proposal import (
+    STEWARD_TEAM_PLAN_PREVIEW_KIND,
+)
 
 
 CHAT_AGENT_RESPONSE_SCHEMA_VERSION = "loopx_chat_agent_response_v0"
@@ -29,6 +32,46 @@ class TodoReviewPreviewConflict(ValueError):
     def __init__(self, message: str, *, receipt: dict[str, Any]) -> None:
         super().__init__(message)
         self.receipt = receipt
+
+
+def require_matching_replay(
+    existing: Mapping[str, Any], *, identity: str, request: Mapping[str, Any]
+) -> None:
+    if any(existing.get(field) != value for field, value in request.items()):
+        raise ValueError(f"{identity} already belongs to a different request")
+
+
+def resolve_attached_completion_replay(
+    messages: Iterable[Mapping[str, Any]],
+    *,
+    turn_id: str,
+    completion_id: str,
+    response_message: str,
+) -> str | None:
+    """Return the canonical message id to append, or None for a valid replay."""
+
+    rows = list(messages)
+    turn_rows = [
+        row
+        for row in rows
+        if row.get("role") == "agent" and row.get("turn_id") == turn_id
+    ]
+    if len(turn_rows) > 1:
+        raise ValueError("attached completion transcript identity is ambiguous")
+    current_id = f"attached.{turn_id}.completed"
+    if not turn_rows:
+        if any(row.get("message_id") == current_id for row in rows):
+            raise ValueError("attached completion transcript identity conflicts")
+        return current_id
+    row = turn_rows[0]
+    if row.get("origin") != "attached_host" or row.get("message_id") not in {
+        current_id,
+        f"attached.{completion_id}",
+    }:
+        raise ValueError("attached completion transcript identity conflicts")
+    if row.get("text") != response_message:
+        raise ValueError("attached completion transcript conflicts with response")
+    return None
 
 
 def _stable_digest(payload: dict[str, Any], *, length: int = 24) -> str:
@@ -63,6 +106,10 @@ class VisibleResponseStreamFilter:
     """Stream safe operator text while withholding the structured review envelope."""
 
     _FLUSH_BOUNDARIES = {"\n", "。", "！", "？"}
+    # Latin sentence punctuation ends a sentence only before whitespace, so
+    # decimals, versions, file names and URLs never split. The split lands on
+    # whitespace, which the length fallback below already treats as safe.
+    _SPACED_SENTENCE_ENDINGS = {".", "!", "?"}
     _MAX_PENDING_CHARS = 160
 
     def __init__(self, *, protected_paths: Iterable[Path | str] = ()) -> None:
@@ -71,19 +118,19 @@ class VisibleResponseStreamFilter:
         self.visible_pending = ""
         self.envelope_started = False
 
-    def _accept_visible(self, text: str, *, final: bool) -> str:
-        self.visible_pending += text
-        if final:
-            ready = self.visible_pending
-            self.visible_pending = ""
-            return redact_local_paths(ready, protected_paths=self.protected_paths)
+    def _next_boundary(self, pending: str) -> int:
         boundary = -1
-        search_limit = min(len(self.visible_pending), self._MAX_PENDING_CHARS)
-        for index, character in enumerate(self.visible_pending[:search_limit]):
+        search_limit = min(len(pending), self._MAX_PENDING_CHARS)
+        for index, character in enumerate(pending[:search_limit]):
             if character in self._FLUSH_BOUNDARIES:
                 boundary = index + 1
-        if boundary < 0 and len(self.visible_pending) >= self._MAX_PENDING_CHARS:
-            prefix = self.visible_pending[: self._MAX_PENDING_CHARS + 1]
+            elif (
+                character in self._SPACED_SENTENCE_ENDINGS
+                and pending[index + 1 : index + 2] in {" ", "\t"}
+            ):
+                boundary = index + 2
+        if boundary < 0 and len(pending) >= self._MAX_PENDING_CHARS:
+            prefix = pending[: self._MAX_PENDING_CHARS + 1]
             whitespace = max(prefix.rfind(" "), prefix.rfind("\t"))
             if whitespace >= 0:
                 boundary = whitespace + 1
@@ -91,16 +138,30 @@ class VisibleResponseStreamFilter:
                 boundary = self._MAX_PENDING_CHARS
             else:
                 for index, character in enumerate(
-                    self.visible_pending[self._MAX_PENDING_CHARS :],
+                    pending[self._MAX_PENDING_CHARS :],
                     start=self._MAX_PENDING_CHARS,
                 ):
                     if character in " \t\r\n`'\"<>":
                         boundary = index + 1
                         break
-        if boundary < 0:
+        return boundary
+
+    def _accept_visible(self, text: str, *, final: bool) -> str:
+        self.visible_pending += text
+        if final:
+            ready = self.visible_pending
+            self.visible_pending = ""
+            return redact_local_paths(ready, protected_paths=self.protected_paths)
+        # One chunk can hold several safe boundaries. Keep cutting until none
+        # is left, so an early sentence never holds back a long tail that the
+        # length fallback would otherwise release.
+        ready_length = 0
+        while (boundary := self._next_boundary(self.visible_pending[ready_length:])) > 0:
+            ready_length += boundary
+        if not ready_length:
             return ""
-        ready = self.visible_pending[:boundary]
-        self.visible_pending = self.visible_pending[boundary:]
+        ready = self.visible_pending[:ready_length]
+        self.visible_pending = self.visible_pending[ready_length:]
         return redact_local_paths(ready, protected_paths=self.protected_paths)
 
     def feed(self, chunk: str) -> str:
@@ -138,12 +199,29 @@ def _compact_line(value: Any, *, limit: int) -> str:
     return text[:limit].strip()
 
 
-def _normalize_proposals(value: Any, *, protected_paths: Iterable[Path | str]) -> list[dict[str, str]]:
-    proposals: list[dict[str, str]] = []
+def _normalize_proposals(
+    value: Any,
+    *,
+    protected_paths: Iterable[Path | str],
+    team_plan_context: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    proposals: list[dict[str, Any]] = []
     if not isinstance(value, list):
         return proposals
     for raw in value[:5]:
-        if not isinstance(raw, dict) or raw.get("kind") != "todo":
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("kind") == STEWARD_TEAM_PLAN_PREVIEW_KIND:
+            # A team plan is admitted here or not at all: without the host facts
+            # that say which Agents and action kinds exist, a preview cannot be
+            # validated, so it is never surfaced half-checked.
+            preview = _validated_team_plan_preview(raw, team_plan_context)
+            if preview is not None:
+                proposals.append(
+                    {"kind": STEWARD_TEAM_PLAN_PREVIEW_KIND, "preview": preview}
+                )
+            continue
+        if raw.get("kind") != "todo":
             continue
         text = _compact_line(redact_local_paths(str(raw.get("text") or ""), protected_paths=protected_paths), limit=400)
         if not text:
@@ -164,6 +242,55 @@ def _normalize_proposals(value: Any, *, protected_paths: Iterable[Path | str]) -
             }
         )
     return proposals
+
+
+def _validated_team_plan_preview(
+    raw: Mapping[str, Any], context: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    """Return the validated preview, or ``None`` when it may not be surfaced.
+
+    A preview names its Goal, so the host facts are per Goal rather than for
+    "the" Goal: the manager channel is not bound to one, and a plan for a Goal
+    the host was not given facts for is dropped instead of being validated
+    against another Goal's Agents.
+    """
+
+    if not isinstance(context, Mapping):
+        return None
+    from .control_plane.work_items.governed_transition_proposal import (
+        validate_steward_team_plan_preview,
+    )
+
+    goal_id = str(raw.get("goal_id") or "")
+    agents: list[str] | None = None
+    by_goal = context.get("registered_agents_by_goal")
+    if isinstance(by_goal, Mapping):
+        declared = by_goal.get(goal_id)
+        if isinstance(declared, (list, tuple)):
+            agents = [str(value) for value in declared]
+    if agents is None:
+        # A host with a large Goal set resolves on demand, and only for the
+        # Goal the plan named, so admission stays bounded by one lookup.
+        resolve = context.get("resolve_registered_agents")
+        if callable(resolve):
+            try:
+                resolved = resolve(goal_id)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                resolved = None
+            if isinstance(resolved, (list, tuple)):
+                agents = [str(value) for value in resolved]
+    if agents is None:
+        return None
+    try:
+        return validate_steward_team_plan_preview(
+            raw,
+            registered_agent_ids=agents,
+            supported_action_kinds=list(context.get("supported_action_kinds") or []),
+        )
+    except ValueError:
+        # A malformed preview is dropped exactly like any other proposal this
+        # normalizer cannot accept; the answer text still reaches the owner.
+        return None
 
 
 def _normalize_protected_action(
@@ -228,24 +355,47 @@ def _normalize_gate(value: Any, *, protected_paths: Iterable[Path | str]) -> dic
     }
 
 
+def _normalize_goal_draft(payload: Mapping[str, Any], *, protected_paths: Iterable[Path | str]) -> dict[str, Any] | None:
+    if payload.get("goal_draft") is None:
+        return None
+    from .control_plane.effect_runtime import effect_runtime_result
+
+    draft = effect_runtime_result("collaboration.goal_draft", dict(payload)).get("draft")
+    if not draft:
+        return None
+    # Python owns transport redaction; the shared TypeScript owner admits structure.
+    return {
+        key: [redact_local_paths(option, protected_paths=protected_paths) for option in field]
+        if isinstance(field, list) else redact_local_paths(field, protected_paths=protected_paths)
+        for key, field in draft.items()
+    }
+
+
 def normalize_agent_response(
     payload: Mapping[str, Any],
     *,
     protected_paths: Iterable[Path | str] = (),
+    team_plan_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalize one structured provider response to the public Chat contract."""
 
+    from .capabilities.manager_context import normalize_request
+    handoff = normalize_request(payload.get("context_handoff"))
     protected = tuple(protected_paths)
     message = redact_local_paths(
         str(payload.get("message") or ""),
         protected_paths=protected,
     ).strip()
+    goal_draft = _normalize_goal_draft(payload, protected_paths=protected)
     return {
         "schema_version": CHAT_AGENT_RESPONSE_SCHEMA_VERSION,
         "message": message,
+        **({"goal_draft": goal_draft} if goal_draft else {}),
+        **({"context_handoff": handoff} if handoff else {}),
         "proposals": _normalize_proposals(
             payload.get("proposals"),
             protected_paths=protected,
+            team_plan_context=team_plan_context,
         ),
         "protected_action": _normalize_protected_action(
             payload.get("protected_action"),
@@ -259,6 +409,7 @@ def parse_agent_response(
     raw_text: str,
     *,
     protected_paths: Iterable[Path | str] = (),
+    team_plan_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     protected = tuple(protected_paths)
     start = raw_text.rfind(CHAT_REVIEW_OPEN_TAG)
@@ -270,7 +421,11 @@ def parse_agent_response(
         except json.JSONDecodeError:
             payload = None
         if isinstance(payload, dict):
-            return normalize_agent_response(payload, protected_paths=protected)
+            return normalize_agent_response(
+                payload,
+                protected_paths=protected,
+                team_plan_context=team_plan_context,
+            )
         key = re.search(r'"message"\s*:\s*', body)
         if key:
             try:
@@ -286,6 +441,31 @@ def parse_agent_response(
                     "gate": None,
                 }
         raw_text = raw_text[:start]
+    elif start >= 0:
+        # The review envelope is an authority boundary, not display text.  A
+        # provider can finish after emitting a complete JSON object but before
+        # emitting the closing tag.  In that case retain only a human-readable
+        # answer and fail closed for proposals, gates, and protected actions.
+        # Never leak the raw protocol fragment into downstream transports.
+        visible = raw_text[:start].strip()
+        body = raw_text[start + len(CHAT_REVIEW_OPEN_TAG) :].strip()
+        salvaged_message = ""
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            salvaged_message = str(payload.get("message") or "").strip()
+        else:
+            key = re.search(r'"message"\s*:\s*', body)
+            if key:
+                try:
+                    salvaged, _ = json.JSONDecoder().raw_decode(body[key.end() :])
+                except json.JSONDecodeError:
+                    salvaged = None
+                if isinstance(salvaged, str):
+                    salvaged_message = salvaged.strip()
+        raw_text = visible or salvaged_message
     return {
         "schema_version": CHAT_AGENT_RESPONSE_SCHEMA_VERSION,
         "message": redact_local_paths(raw_text, protected_paths=protected).strip(),
@@ -397,6 +577,7 @@ def _add_review_todo(
     registry_path: Path,
     goal_id: str,
     text: str,
+    priority: str | None = None,
     dry_run: bool,
 ) -> dict[str, Any]:
     return add_goal_todo(
@@ -404,6 +585,7 @@ def _add_review_todo(
         goal_id=goal_id,
         role="agent",
         text=_normalize_todo_text(text),
+        priority=priority,
         task_class="advancement_task",
         action_kind=CHAT_TODO_ACTION_KIND,
         dry_run=dry_run,
@@ -415,11 +597,13 @@ def build_todo_review_preview(
     registry_path: Path,
     goal_id: str,
     text: str,
+    priority: str | None = None,
 ) -> dict[str, Any]:
     payload = _add_review_todo(
         registry_path=registry_path,
         goal_id=goal_id,
         text=text,
+        priority=priority,
         dry_run=True,
     )
     compact = _compact_todo_payload(payload, applied=False)
@@ -432,12 +616,14 @@ def apply_todo_review_preview(
     registry_path: Path,
     goal_id: str,
     text: str,
+    priority: str | None = None,
     preview_id: str,
 ) -> dict[str, Any]:
     current_preview = _add_review_todo(
         registry_path=registry_path,
         goal_id=goal_id,
         text=text,
+        priority=priority,
         dry_run=True,
     )
     if not preview_id or preview_id != _todo_preview_fingerprint(current_preview):
@@ -452,6 +638,7 @@ def apply_todo_review_preview(
         registry_path=registry_path,
         goal_id=goal_id,
         text=text,
+        priority=priority,
         dry_run=False,
     )
     compact = _compact_todo_payload(applied, applied=True)

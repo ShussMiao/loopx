@@ -564,11 +564,10 @@ def read_only_project_map_run(
         **record,
     }
     if not dry_run:
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        json_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        markdown_path.write_text(render_read_only_project_map_markdown(payload) + "\n", encoding="utf-8")
-        with index_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(index_record, ensure_ascii=False) + "\n")
+        from .history import write_reserved_run_artifacts
+        write_reserved_run_artifacts(runs_dir=runs_dir, generated_at=generated_at,
+            record=record, index_record=index_record, payload=payload,
+            render_markdown=render_read_only_project_map_markdown)
     projection_result = finalize_material_projection(
         registry_path=registry_path,
         source_runtime_root=runtime_root,

@@ -1,9 +1,10 @@
 # RFC：共享 Goal 对齐与受治理 Amendment 协议（v0）
 
-- 状态：草案；维护者评审中
+- 状态：已接受
+- 替代 / 关闭：无
 - 跟踪 Issue：[#3836](https://github.com/huangruiteng/loopx/issues/3836)
 - 日期：2026-09-02
-- 最后更新：2026-09-05
+- 最后更新：2026-09-16
 - 范围：多个对等 Agent 围绕同一个共享 Goal 协作，同时保留 canonical
   intent、每个 Agent 的执行 frontier、claim/lease 所有权，以及可审计的
   replan/amendment 决策
@@ -18,6 +19,17 @@
 ---
 
 ## 1. 摘要与决策
+
+实现检查点（仅 Stage 1/2）：alignment 与 amendment admission 共用一份完整 Todo/lease
+来源快照。Promotion 前仍为 legacy 读取；之后 canonical 空状态和 provider 失败都不
+回退 Markdown 或逐 Todo lease 文件。TS 筛选排除非 open、归档和恢复条件未满足的
+工作；Agent eligibility 还遵守 exclusion，但 amendment 影响范围可包含其他 Agent
+持有或当前 executor 被排除的开放工作。Source digest 通过 `source_basis.todo_basis`
+绑定 canonical provider revision。有 state event log 时，`revision_basis=state_event_log`
+仍只表示事件轴；没有时，promoted 读取使用 `canonical_todo_snapshot`、事件序号 0 和
+unbound Agent frontier。即使事件序号为 0，canonical digest 变化也要求 `needs_rebase`。
+这不等于完整 Goal intent envelope 已版本化，不推断 Agent 已确认，也不把 admission
+变成审批或 CAS commit；Stage 3 仍须重新验证自己的精确提交时 basis。
 
 LoopX 将区分四类不能坍缩为一份可变计划的状态：
 
@@ -67,6 +79,9 @@ bounded evidence       bounded evidence
                  |
           每个 frontier rebase 或被 gate
 ```
+
+- 检查点已移至执行账本：[已核验交付与管家衔接检查点（2026-09-13）](ledger/shared-goal-alignment-and-governed-amendment-v0/2026-09-13-verified-delivery-and-manager-integration.zh-CN.md)。
+- 检查点已移至执行账本：[所有者授权验收检查点](ledger/shared-goal-alignment-and-governed-amendment-v0/2026-09-17-owner-authorized-acceptance.zh-CN.md)。
 
 ## 2. 问题与当前边界
 
@@ -188,6 +203,46 @@ Core 只解析一次 host-specific 深链语法，并只向 provider 暴露 norm
 live task 发消息。其他 harness 可以实现相同的 Decision Context provider 协议，无需
 把 host 语法或 transcript 存储引入 Goal authority。
 
+### 3.6 Peer agent directory 与有界观察
+
+per-Agent frontier 告诉一个 Agent 自己的路线。peer 之间也需要彼此具备同样的三种
+能力，而管家需要对它被问到的每个 Agent 都具备这些能力：发现有哪些 Agent 存在、哪些
+正在运行，在有界范围内观察其中一个，以及把一条有界请求交给其中一个。这条可复用契约
+就是
+[`peer_agent_directory_v0`](../../reference/protocols/peer-agent-directory-and-observation-v0.md)。
+
+它不新增第六种共享状态。身份、工作、claim、lease 与规范修订仍然留在本文已经安排的
+位置；该契约贡献的是一个**面向 Agent 的视图**，以及读取与投递的规则。其中三条规则在
+这里最关键：
+
+- **presence 是 advisory 且按 provider 划定范围的。** live session 从不创造身份，
+  没有 live session 的 Agent 仍然已注册、仍然拥有它的 claim、仍然是投递目标。provider
+  用自己的 session-scoped handle 报告自己的位置，用自己的 liveness 词表；无法分类某个
+  目标的读取方报告 `unknown` 并点名覆盖缺口，而不是推断"已完成"或"没有进展"。
+- **观察与投递不授予任何东西。** 读取一个 peer、或把上下文交给它，都不是 claim、lease、
+  优先级、计划变更或修订。投递仍然是 `context_handoff`；Goal 要什么仍然只经
+  `GoalAmendmentAuthority` 改变，工作状态仍然只经 canonical Todo、quota 与 lane owner
+  改变。
+- **terminal-space provider 是 provider，不是契约本身。** 拥有终端的宿主面可以提供
+  presence 与有界的实时输出，且必须声明：调用方如何证明自己在空间之内、detach 或重启
+  之后什么会保留、以及它无法恢复什么。没有这类 provider 时，directory 退化为"已注册
+  身份 + 持久工作状态"——这正是 prompt-only transport 的常态。
+
+有三条规则把同一契约从单一 provider、单一管家场景推广为可复用契约：
+
+- **一个空间、三个层次、两类调用方。** 空间是这个 Goal 的执行空间，宿主面只是空间内
+  的 transport。同一契约可以在三个层次抵达：typed state 与受治理命令、运行中的 Agent
+  加载的 in-space skill、以及只提供 presence 的 provider 面；层次只能收窄权限，不能
+  放大权限。管家（manager channel）与 peer Agent（`peer_v1`）是同一契约的两类调用方，
+  前者由 channel 的 Goal 绑定划定范围、后者由该 Goal 已注册的 Agent 划定范围；调用方
+  只从自己抵达时所用的绑定解析自身，目标则来自 directory。
+- **有界等待要 pin 身份，并要求状态向前推进。** 一次等待、或"投递是否真的产生了 turn"
+  的读回，都要 pin 已解析的 Agent、工作身份（`todo_id`）与 provider 位置，使同一位置的
+  替代者无法满足它；同时要求观察到的状态在请求开始之后确实变过，否则一次陈旧重读什么
+  也证明不了。这与本文对受治理写入结算所要求的绑定形状一致。
+- **attention rollup 是 typed 的，且不分配任何东西。** "现在谁需要决策"的视图可以按
+  typed state 排序和标注行；它不创造 claim、lease 或优先级，也不是自动分配的输入。
+
 ## 4. Authority matrix
 
 ### 4.1 `GoalAmendmentAuthority` 到底是什么
@@ -249,8 +304,9 @@ committing --CAS success--> committed + receipt -> frontier reconciliation
 1. **Propose。** 任一有 proposal 权限的 actor 提交
    `goal_amendment_proposal_v0`，其中包含 base revision/digest、amendment
    class、retained/changed/stopped intent、evidence references、affected Todos
-   与关联的 replan obligation。可选的 host-session rendezvous 可以帮助发现或审阅
-   gap，但只有经过提升的 durable evidence 才能进入 proposal。
+   与关联的 replan obligation。由请求派生的 proposal 还必须绑定不可变的来源
+   request id 与 revision。可选的 host-session rendezvous 可以帮助发现或审阅 gap，
+   但只有经过提升的 durable evidence 才能进入 proposal。
 2. **Admit。** LoopX 校验 schema、actor identity、有界 evidence pointer、
    amendment class 与影响范围。Host locator 不能证明 actor identity，也不能充当
    evidence。Admission 不等于 approve 或 apply。
@@ -263,8 +319,10 @@ committing --CAS success--> committed + receipt -> frontier reconciliation
    policy 阻塞。Semantic amendment 不能静默使 lease 已授权的工作失效。
 5. **Commit。** `GoalAmendmentAuthority` transaction 带 `operation_id`、期望的
    `base_goal_revision` 与 `base_intent_digest` 提交 policy-authorized digest，
-   再次校验 policy 并执行一次 CAS。Base 过期时 fail closed。日常 in-envelope
-   amendment 不等待人。
+   再次校验 policy 并执行一次 CAS。对于 request-derived proposal，必须使用第 5.1 节
+   的精确来源 reservation 与 operation 终局协议；远端读一次有效性再做 Goal CAS 不够。
+   Goal 基线过期，或来源 revision 已被替代且没有 reservation，均 fail closed。
+   日常 in-envelope amendment 不等待人。
 6. **Receipt。** 同一事务记录 proposal digest、actor、authority source、旧/新
    revision、retained/changed/stopped delta、evidence references、affected Todos、
    lease disposition 与精确 replan obligation settlement。
@@ -274,6 +332,64 @@ committing --CAS success--> committed + receipt -> frontier reconciliation
 
 只有第 5 步会让 amendment 成为 canonical。第 6 步保证响应丢失时仍能恢复这一事实；
 第 7 步让它对所有 peer 真正产生运行时影响。
+
+### 5.1 来源请求预留与取消顺序
+
+这是 request-derived Stage 3 commit 的拟议验收要求，不是已交付 API，也不是新分布式事务。
+复用[协作请求 fence](capable-manager-semantic-handoff-v0.zh-CN.md#510-最小契约与合法-observation)
+和已验收 amendment owner 的 operation/receipt 事务；请求与 Goal 仍由各自 owner 管理。
+
+1. **在请求 owner 预留。** 同一请求事务校验来源 revision 当前有效及其权限，取得独占
+   effectful attempt fence，并持久化 reservation，绑定 request/revision、attempt/fence epoch、
+   目标 Goal 与 authority source、proposal digest、预期 Goal 基线、actor 和 `operation_id`。
+   Amendment owner 必须认证该 reservation；调用方自填 token 不构成权限。
+   预留重放返回同一绑定，任何绑定输入改变均冲突。预留与生效的取消/替代使用同一
+   请求 owner 的 CAS，检查来源 revision、lifecycle 和 fence epoch，先胜出者决定资格。
+   记录后来的纠正不会撤销已预留 operation，也不会使其不可变来源绑定失效。
+2. **排序后来的控制请求。** 预留后仍立即记录取消或纠正，但不能只改请求 store 就撤销
+   该在途 operation。将其标为待结算，阻止后续效果/改派，并要求 amendment owner 中止
+   这一次精确 operation。Reservation 只覆盖该不可变 operation，不覆盖被替代请求的其他
+   工作或新 proposal。实际 effect owner 的权限与 policy 校验仍必须满足。Abort 需要
+   请求 owner 出具的取消/恢复回执，绑定 reservation、原因与 operation；只知道 operation ID 没有此权限。
+3. **在 Goal owner 结算。** 已认证的 commit 与 abort 在 `GoalAmendmentAuthority` 竞争
+   同一个持久终局 operation record。Commit 校验 reservation、当前 policy 和预期 Goal
+   基线，原子写入 Goal delta 与 `committed` 回执。Abort 仅在尚未提交时原子写入
+   `aborted` 无效果回执。两者使用相同 operation identity 和串行化边界；abort 是终局
+   tombstone，不是另起重试身份。已提交不可被 abort 撤销，已中止永远不能再 commit。
+   重放读回原结果，digest/绑定漂移冲突。确定的 policy 或基线拒绝也以无 Goal 修改关闭 operation。
+   在此串行化边界内校验已认证绑定；新 operation ID 必须重新取得 reservation，不能绕过旧
+   tombstone。终局回执区分 `committed`、`aborted`、`rejected`，携带 reservation/attempt 引用，
+   明确本 operation 是否修改 Goal。无效果回执没有产生的新 Goal revision，也不代表整个请求
+   的其他外部效果不存在。
+4. **恢复后才释放。** 将 Goal owner 的精确终局回执关联到不可变请求 attempt 后，才能
+   释放 fence 或确认取消结果。该关联/结算是请求 owner 的独立幂等事务：结算精确 attempt，
+   对剩余工作应用待处理控制变化，再释放；绝不回滚已提交的 Goal delta。
+   回执缺失、超时或 worker lease 过期均不能证明无效果：
+   在相同 operation identity 下读回，或让条件 abort 与 commit 竞争。Owner 不可用时
+   保持 pending/unknown，允许无关工作，但不改派该效果。终局记录必须保留到可证明旧
+   attempt 不可能再提交，包括重启或来源迁移之后。晚到 worker 必须命中此持久边界，
+   不能仅靠 token TTL。Reservation 不独立于结算自行过期；deadline 触发恢复，不授权遗忘
+   未决 operation。未支持该协议的 profile 不能提交 request-derived amendment；
+   仍可准入 proposal 并继续独立工作。
+
+Reservation CAS 决定来源资格先后；Goal owner 的终局事务决定已预留 commit 与 abort
+的胜负。这是两个明确的本地决定，不声称来源读取和 Goal 写入原子。首个 Stage 3 class
+仍限于 `shared_work_graph`；该协议不扩大 amendment 权限。
+
+管家 A7/A16 联合 fixture 必须经过两个 owner 验证以下交错，不能用两套独立单测替代：
+
+| 交错 | 必须结果 |
+| --- | --- |
+| 取消/纠正在预留前胜出 | 没有 reservation，旧 proposal 不修改 Goal |
+| 已预留；取消的 abort 在 Goal owner 胜出 | 只有一份 `aborted` 回执；晚到原 commit 被拒绝；取消可以结算 |
+| 已预留 commit 先于 abort 胜出 | 只有一份 `committed` 回执；取消报告已提交效果并停止剩余工作，不声称回滚 |
+| 预留/校验后崩溃，尚不知 Goal 结果 | 保留 fence；同 operation 恢复/条件 abort 产生唯一终局，即使旧 worker 恢复也如此 |
+| Goal CAS 成功，但响应或请求侧关联丢失 | 读回原 committed 回执，关联旧 attempt，绝不重复应用 delta |
+| 结果未知时 lease 过期或宿主重启 | 不因超时启动替代效果；终局 abort 拦住晚到 commit，或对账既有 commit |
+
+前端、飞书、CLI 共用投影，区分已请求取消、待结算、已结算且有/无既有提交效果。
+超时不能显示“已取消、没有修改”。实现 PR 必须先在选定 authority profile 验收该路径，
+再启用它。
 
 ## 6. 提议的 schema
 
@@ -293,7 +409,8 @@ committing --CAS success--> committed + receipt -> frontier reconciliation
   "stopped": [],
   "evidence_refs": ["evidence:..."],
   "affected_todo_ids": ["todo-a", "todo-b"],
-  "replan_obligation_id": "replan:..."
+  "replan_obligation_id": "replan:...",
+  "source_request_ref": {"request_id": "req_...", "revision": 1}
 }
 ```
 
@@ -372,6 +489,36 @@ projection 与 proposal contract 交付；把 commit 映射进 provider-neutral 
 `Next Action` 继续是 compatibility prose 与 read projection。它永远不是 claim、
 lease、Goal amendment、replan settlement 或 authority decision。
 
+### 9.1 语义交接与执行路线衔接
+
+用既有 alignment 投影给接收方提供真实工作基线。意图内的路线重规划仍走接收方
+Vision/Replan；共享改变走本文分类与准入。Stage 2 可以保留来自请求的 proposal、
+来源/context 引用与明确未结义务，但不能报告共享 Goal 已改变。缺完整 intent
+authority，不能靠从 Todo provider head 或事件序号合成 revision 来补。
+
+下一步 amendment 实现仍是**一个有界 Stage 3 work-graph commit class**，
+不是广泛改验收/权限。先建立真实 canonical intent/policy 基线和经审阅事务映射，
+再证明精确基线准入、lease 影响、CAS 回执恢复、peer frontier rebase。复用
+[shared authority](shared-goal-authority-state-provider-v0.zh-CN.md) 的存储保证与
+[TS 事务迁移](typescript-control-plane-migration-v0.zh-CN.md) owner；两者存在不等于
+已经提供 amendment 语义。
+
+管家 M1 和普通 M2 handoff 可以先于此 commit class 交付。此前明确呈现
+proposal/admission 与提交不可用边界，无关工作继续。验收后，管家按已有 policy
+调用未来 Stage 3 `GoalAmendmentAuthority` commit owner，不添加永久管家超级用户、强制 peer 投票或重复主人确认。管家结果
+关联已提交 amendment 回执与 peer/在途处置。跨 Goal handoff 不合并不同 Goal
+意图，也不授权修改任一 Goal。
+
+管家 RFC 的 A16 复用既有 alignment/amendment fixture 验路线/提案/过期基线负例，
+随后验证已支持 commit 路径。本文保留 Stage 3–5 的实现与晋级责任；管家就绪不能
+悄悄把这些阶段标为完成。
+
+### 管家执行衔接（2026-09-16）
+
+[统一路线](loopx-overall-roadmap-v0.zh-CN.md) R1 修复团队计划的源基线约束，R4 拥有本 RFC Stage 3–5 的产品接续。当前 team-plan receipt 的 `intent_basis` 仅复用 `source_basis_digest`；后者是来源事实摘要，不覆盖完整 objective/non-goals/acceptance/permissions/stop envelope。该字段可缺失且不是 CAS precondition；不得声称计划已绑定完整 canonical intent revision。
+
+先把现有承诺/工作基线与 commit-time 校验接好，再在本 owner 版本化 intent 和一个保持 intent 的 work-graph amendment class，验证 policy/verifier、lease impact、冲突与 receipt recovery。普通 Todo 编辑继续走自己的 writer，不被强行升级为 amendment。管家可组织和综合 peer 工作，但不因此拥有 leader 写权威。Stage 1/2 以及本地 24 行 directory 已有实现；Stage 3 未交付、无 presence/lease epoch 和分页的部分继续显式列缺口。
+
 ## 10. 分阶段交付
 
 1. **Stage 0 — characterization 与 RFC。** 记录 own-lane、unclaimed、
@@ -433,3 +580,10 @@ durable evidence store。
 最小有用结果是一份清晰的只读 alignment projection，以及一份显式不具 authority
 的 proposal。只有这条边界在真实多 Agent 工作中证明有价值后，runtime commit 才
 继续推进。
+
+## 附录 A：执行账本
+
+本 RFC 带日期的检查点记录存于
+[逐条 ledger](ledger/shared-goal-alignment-and-governed-amendment-v0/)，每个已实测
+切片一个文件。上文第 1–12 节仍是规范合同；ledger 条目只记录交付了什么、没有确立
+什么，不改变该合同。

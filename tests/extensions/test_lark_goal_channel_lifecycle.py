@@ -207,10 +207,16 @@ def test_refresh_lifecycle_no_gate_checks_extension_without_delivery(
 ) -> None:
     registry_path = _registry(tmp_path)
     _binding(registry_path, enabled=True)
+    status_reads: list[dict[str, Any]] = []
+
+    def operational_status(**kwargs: Any) -> dict[str, Any]:
+        status_reads.append(kwargs)
+        return {"status": "fixture"}
+
     monkeypatch.setattr(
         goal_channel_lifecycle,
         "collect_status",
-        lambda **kwargs: {"status": "fixture"},
+        operational_status,
     )
     monkeypatch.setattr(
         goal_channel_lifecycle,
@@ -236,6 +242,9 @@ def test_refresh_lifecycle_no_gate_checks_extension_without_delivery(
     assert result["enabled"] is True
     assert result["status"] == "not_selected"
     assert result["extension_activation"] == {"status": "active"}
+    assert len(status_reads) == 1
+    assert status_reads[0]["goal_id"] == GOAL_ID
+    assert status_reads[0]["include_public_boundary_scan"] is False
 
 
 def test_refresh_lifecycle_extension_failure_prevents_private_binding_read(

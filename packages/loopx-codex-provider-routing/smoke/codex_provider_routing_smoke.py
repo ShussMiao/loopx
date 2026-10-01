@@ -273,6 +273,14 @@ def main() -> int:
         }
     )
     assert recovered_instruction["qualified"] is True
+    # Scheduled inputs and sent host instructions share the same recovery owner.
+    heartbeat_observation = json.loads(
+        (PACKAGE_ROOT / "examples/host-control-recovery.json").read_text()
+    )["host_control_recovery"]
+    heartbeat_observation["tool_name"] = "automation_update"
+    heartbeat = qualify_host_control_recovery(heartbeat_observation)
+    assert heartbeat["qualified"] is True
+    assert heartbeat["expected_action"] == "project_as_user"
     assert recovered_instruction["expected_action"] == "project_as_user"
     assert (
         recovered_instruction["required_contract"][

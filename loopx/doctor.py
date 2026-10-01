@@ -1,23 +1,22 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from enum import Enum
 from importlib.metadata import PackageNotFoundError, distribution
 import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, doctor_git
 from .command_invocation import resolve_command_path
 from .control_plane.runtime.promotion_readiness import (
     PROMOTION_READINESS_CLASSIFICATION,
     PROMOTION_READINESS_RUNTIME_INDEX,
 )
+from .control_plane.runtime.time import chronology_key
 from .install_contract import NO_CLONE_INSTALL_URL
 from .paths import DEFAULT_RUNTIME_ROOT, global_registry_path
 from .python_install_owner import PythonInstallOwner, python_distribution_upgrade_command, resolve_python_install_owner
@@ -28,6 +27,7 @@ from .skill_install_readback import (
     ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
     configured_host_skills_dir,
     inspect_skill_install_readback,
+    skill_install_doctor_checks,
 )
 
 
@@ -44,10 +44,11 @@ REQUIRED_INSTALLED_SKILL_PHRASES = {
         "--delivery-outcome <ACTUAL_DELIVERY_OUTCOME>",
     ),
     "loopx-pr-review": (
-        "loopx --format json pr-review --state all",
+        "keeps ordinary queue discovery open-only",
+        "explicit `--state merged|all`",
         "thin host adapter",
         "agent_response_contract.review_execution_contract",
-        "pull_requests[].review_plan",
+        "pull_requests[review_action_kind!=null].review_plan",
         "completion_gate",
         "loopx-pr-merge",
     ),
@@ -70,22 +71,13 @@ REQUIRED_INSTALLED_SKILL_PHRASES = {
         "For a generic library microbenchmark",
     ),
     "loopx-self-repair": (
-        "Build a compact evidence packet",
-        "loopx --format json diagnose --goal-id <goal-id>",
-        "loopx --format json status --goal-id <goal-id> --limit 20",
-        "registry-declared active state file",
-        "references/repair-patterns.md",
+        "Reuse evidence before collecting more",
+        "scripts/find_pattern.py",
+        "references/targeted-diagnostics.md",
+        "references/pattern-lookup.md",
         "Repair at the lowest durable layer",
     ),
 }
-
-
-class GitRevisionRelation(str, Enum):
-    SAME = "same"
-    INSTALLED_AHEAD = "installed_ahead"
-    INSTALLED_BEHIND = "installed_behind"
-    DIVERGED = "diverged"
-    UNKNOWN = "unknown"
 
 
 def _powershell_literal(value: str | Path) -> str:
@@ -255,187 +247,6 @@ def short_revision(value: Any, *, length: int = 12) -> str | None:
     return text[:length] if len(text) > length else text
 
 
-def git_metadata_for_root(root: Path | None) -> dict[str, Any]:
-    if root is None:
-        return {
-            "root": None,
-            "git_commit": None,
-            "git_ref": None,
-            "git_dirty": None,
-        }
-    try:
-        source_root = root.expanduser().resolve()
-    except OSError:
-        source_root = root.expanduser()
-    if not source_root.exists():
-        return {
-            "root": str(source_root),
-            "git_commit": None,
-            "git_ref": None,
-            "git_dirty": None,
-        }
-
-    def _run(args: list[str]) -> str | None:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(source_root), *args],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            return None
-        if result.returncode != 0:
-            return None
-        return result.stdout.strip() or None
-
-    commit = _run(["rev-parse", "HEAD"])
-    branch = _run(["symbolic-ref", "--quiet", "--short", "HEAD"])
-    tag = _run(["describe", "--tags", "--exact-match"])
-    status = _run(["status", "--porcelain"])
-    dirty = None if commit is None and branch is None and tag is None and status is None else bool(status)
-    return {
-        "root": str(source_root),
-        "git_commit": commit,
-        "git_ref": branch or tag,
-        "git_dirty": dirty,
-    }
-
-
-def git_revision_relation(
-    root: Path | None,
-    *,
-    installed_commit: Any,
-    comparison_commit: Any,
-) -> GitRevisionRelation:
-    """Classify installed vs comparison revisions in one Git object graph."""
-    if not isinstance(installed_commit, str) or not installed_commit.strip():
-        return GitRevisionRelation.UNKNOWN
-    if not isinstance(comparison_commit, str) or not comparison_commit.strip():
-        return GitRevisionRelation.UNKNOWN
-    installed_commit = installed_commit.strip()
-    comparison_commit = comparison_commit.strip()
-    if installed_commit == comparison_commit:
-        return GitRevisionRelation.SAME
-    if root is None:
-        return GitRevisionRelation.UNKNOWN
-
-    try:
-        source_root = root.expanduser().resolve()
-    except OSError:
-        source_root = root.expanduser()
-    if not source_root.exists():
-        return GitRevisionRelation.UNKNOWN
-
-    def _is_ancestor(ancestor: str, descendant: str) -> bool | None:
-        try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(source_root),
-                    "merge-base",
-                    "--is-ancestor",
-                    ancestor,
-                    descendant,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            return None
-        if result.returncode == 0:
-            return True
-        if result.returncode == 1:
-            return False
-        return None
-
-    comparison_is_ancestor = _is_ancestor(comparison_commit, installed_commit)
-    installed_is_ancestor = _is_ancestor(installed_commit, comparison_commit)
-    if comparison_is_ancestor is None or installed_is_ancestor is None:
-        return GitRevisionRelation.UNKNOWN
-    if comparison_is_ancestor:
-        return GitRevisionRelation.INSTALLED_AHEAD
-    if installed_is_ancestor:
-        return GitRevisionRelation.INSTALLED_BEHIND
-    return GitRevisionRelation.DIVERGED
-
-
-def _github_repository_from_remote_url(value: Any) -> str | None:
-    text = str(value or "").strip().removesuffix(".git")
-    match = re.search(r"github\.com(?::|/)([^/\s]+/[^/\s]+)$", text, flags=re.IGNORECASE)
-    return match.group(1).lower() if match else None
-
-
-def trusted_release_ref_for_root(
-    root: Path | None,
-    *,
-    repository: Any,
-    ref: Any,
-) -> dict[str, Any] | None:
-    """Resolve the manifest repository's fetched ref without trusting canary HEAD."""
-    expected_repository = _github_repository_from_remote_url(repository) or (
-        str(repository or "").strip().removesuffix(".git").lower()
-    )
-    expected_ref = str(ref or "").strip().removeprefix("refs/heads/")
-    if root is None or not expected_repository or not expected_ref:
-        return None
-    try:
-        source_root = root.expanduser().resolve()
-    except OSError:
-        source_root = root.expanduser()
-    if not source_root.exists():
-        return None
-
-    try:
-        remotes = subprocess.run(
-            ["git", "-C", str(source_root), "remote"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None
-    if remotes.returncode != 0:
-        return None
-
-    for remote in remotes.stdout.splitlines():
-        remote = remote.strip()
-        if not remote:
-            continue
-        try:
-            remote_url = subprocess.run(
-                ["git", "-C", str(source_root), "remote", "get-url", remote],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            continue
-        if (
-            remote_url.returncode != 0
-            or _github_repository_from_remote_url(remote_url.stdout) != expected_repository
-        ):
-            continue
-        trusted_ref = f"refs/remotes/{remote}/{expected_ref}"
-        resolved = subprocess.run(
-            ["git", "-C", str(source_root), "rev-parse", "--verify", f"{trusted_ref}^{{commit}}"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        commit = resolved.stdout.strip() if resolved.returncode == 0 else ""
-        if commit:
-            return {
-                "label": f"{expected_repository}@{expected_ref}",
-                "root": str(source_root),
-                "git_commit": commit,
-                "git_ref": f"{remote}/{expected_ref}",
-            }
-    return None
-
-
 def build_install_freshness(
     *,
     command_path: Path | None,
@@ -570,7 +381,7 @@ def build_install_freshness(
     )
     source_commit_is_behind = (
         manifest_source_matches_freshness_source is False
-        and freshness_revision_relation == GitRevisionRelation.INSTALLED_BEHIND
+        and freshness_revision_relation == doctor_git.GitRevisionRelation.INSTALLED_BEHIND
     )
 
     if (
@@ -649,7 +460,7 @@ def build_install_freshness(
         "manifest_source_matches_comparison": manifest_source_matches_comparison,
         "manifest_source_comparison_relation": (
             comparison_revision_relation.value
-            if isinstance(comparison_revision_relation, GitRevisionRelation)
+            if isinstance(comparison_revision_relation, doctor_git.GitRevisionRelation)
             else comparison_revision_relation
         ),
         "freshness_source_label": freshness_source_label if trusted else None,
@@ -660,7 +471,7 @@ def build_install_freshness(
         "manifest_source_matches_freshness_source": manifest_source_matches_freshness_source,
         "manifest_source_freshness_relation": (
             freshness_revision_relation.value
-            if isinstance(freshness_revision_relation, GitRevisionRelation)
+            if isinstance(freshness_revision_relation, doctor_git.GitRevisionRelation)
             else freshness_revision_relation
         ),
         "manifest_archive_sha256": manifest_source.get("archive_sha256"),
@@ -814,7 +625,7 @@ def latest_promotion_readiness_event(runtime_root: Path, goal_id: str | None = N
         )
     for index_path, current_goal_id, source in indexes:
         try:
-            lines = index_path.read_text(encoding="utf-8").splitlines()
+            lines = index_path.read_text(encoding="utf-8").split("\n")
         except OSError:
             continue
         for line in lines:
@@ -852,6 +663,8 @@ def latest_promotion_readiness_event(runtime_root: Path, goal_id: str | None = N
                     "markdown_exists": markdown_path.exists() if str(markdown_path) else False,
                 }
             )
+        if runtime_matches:
+            break
 
     matches = runtime_matches or legacy_matches
     if not matches:
@@ -865,7 +678,10 @@ def latest_promotion_readiness_event(runtime_root: Path, goal_id: str | None = N
                 else "no canary promotion readiness run found"
             ),
         }
-    matches.sort(key=lambda item: str(item.get("generated_at") or ""), reverse=True)
+    matches.sort(
+        key=lambda item: chronology_key(item.get("generated_at")),
+        reverse=True,
+    )
     latest = matches[0]
     latest["runtime_root"] = str(runtime_root)
     return latest
@@ -935,7 +751,9 @@ def collect_doctor(
     release_manifest = load_release_manifest(release_root)
     comparison_source = None
     if canary_realpath and command_realpath and canary_realpath != command_realpath:
-        comparison_source = git_metadata_for_root(command_release_root(canary_realpath))
+        comparison_source = doctor_git.git_metadata_for_root(
+            command_release_root(canary_realpath)
+        )
         comparison_source["label"] = "loopx-canary"
     path_entries = os.environ.get("PATH", "").split(os.pathsep)
     local_bin = user_local_bin()
@@ -970,12 +788,12 @@ def collect_doctor(
     )
     if comparison_source:
         comparison_root = comparison_source.get("root")
-        comparison_source["revision_relation"] = git_revision_relation(
+        comparison_source["revision_relation"] = doctor_git.git_revision_relation(
             Path(str(comparison_root)) if comparison_root else None,
             installed_commit=release_manifest_source.get("git_commit"),
             comparison_commit=comparison_source.get("git_commit"),
         )
-    freshness_source = trusted_release_ref_for_root(
+    freshness_source = doctor_git.trusted_release_ref_for_root(
         Path(str(comparison_source.get("root")))
         if comparison_source and comparison_source.get("root")
         else None,
@@ -983,7 +801,7 @@ def collect_doctor(
         ref=release_manifest_source.get("ref"),
     )
     if freshness_source:
-        freshness_source["revision_relation"] = git_revision_relation(
+        freshness_source["revision_relation"] = doctor_git.git_revision_relation(
             Path(str(freshness_source.get("root"))),
             installed_commit=release_manifest_source.get("git_commit"),
             comparison_commit=freshness_source.get("git_commit"),
@@ -1079,6 +897,10 @@ def collect_doctor(
         if default_global_registry.exists()
         else {
             "schema_version": "runtime_projection_route_diagnostics_v0",
+            "registry": str(default_global_registry.resolve()),
+            "runtime_root": str(DEFAULT_RUNTIME_ROOT.resolve()),
+            "goal_filter": None,
+            "activation_state_filter": None,
             "available": False,
             "goal_count": 0,
             "healthy": True,
@@ -1086,6 +908,12 @@ def collect_doctor(
             "items": [],
         }
     )
+    from .capabilities.decision_context.freshness import (
+        capture_host_diagnostics_detail,
+        collect_capture_host_diagnostics,
+    )
+
+    decision_context_capture = collect_capture_host_diagnostics(DEFAULT_RUNTIME_ROOT)
     typescript_control_plane = collect_effect_runtime_readiness(deep=deep)
     typescript_runtime_required = True
     deep_validation = None
@@ -1213,19 +1041,7 @@ def collect_doctor(
                 else ",".join(globally_visible_project_skills)
             ),
         },
-        *(
-            [
-                {
-                    "id": "host_skill_installation_readback",
-                    "required": False,
-                    "ok": bool(host_skill_install_readback.get("ready")),
-                    "applicable": True,
-                    "detail": str(host_skill_install_readback.get("reason")),
-                }
-            ]
-            if host_skill_install_readback
-            else []
-        ),
+        *skill_install_doctor_checks(host_skill_install_readback),
         {
             "id": "global_registry_writable",
             "required": True,
@@ -1245,12 +1061,28 @@ def collect_doctor(
             ),
         },
         {
+            "id": "decision_context_capture_hosts_healthy",
+            "required": False,
+            "ok": bool(decision_context_capture["healthy"]),
+            "detail": capture_host_diagnostics_detail(decision_context_capture),
+        },
+        {
             "id": "typescript_effect_runtime_ready",
             "required": typescript_runtime_required,
             "ok": bool(typescript_control_plane.get("ready")),
             "detail": str(typescript_control_plane.get("status")),
         },
     ]
+    from .desktop_installation import desktop_installation_status
+
+    desktop_installation = desktop_installation_status(release_manifest_source.get("git_commit"))
+    if desktop_installation["apps"]:
+        checks.append({
+            "id": "desktop_app_runtime_pairing",
+            "required": False,
+            "ok": desktop_installation["status"] == "paired",
+            "detail": desktop_installation["recommended_action"] or "App bundle and CLI source revisions match; running App not verified",
+        })
     if deep_validation:
         checks.extend(deep_validation["checks"])
     payload = {
@@ -1289,9 +1121,11 @@ def collect_doctor(
             "python_distribution": python_distribution,
         },
         "release_manifest": release_manifest,
+        "desktop_installation": desktop_installation,
         "release_provenance": release_provenance,
         "global_registry_writability": global_registry_writability,
         "runtime_projection_routes": runtime_projection_routes,
+        "decision_context_capture": decision_context_capture,
         "typescript_control_plane": typescript_control_plane,
         "install_freshness": install_freshness,
         "upgrade_hint": install_freshness,
@@ -1375,7 +1209,13 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
         f"- skill_delivery_mode: `{(payload.get('skill_delivery') or {}).get('mode')}`",
         f"- skill_delivery_status: `{(payload.get('skill_delivery') or {}).get('status')}`",
         f"- global_registry_writable: `{(payload.get('global_registry_writability') or {}).get('ok')}`",
-        f"- runtime_projection_routes_healthy: `{(payload.get('runtime_projection_routes') or {}).get('healthy')}`",
+        f"- runtime_projection_routes_healthy: `{(payload.get('runtime_projection_routes') or {}).get('healthy')}`"
+        f" (registry=`{(payload.get('runtime_projection_routes') or {}).get('registry')}`,"
+        f" goals=`{(payload.get('runtime_projection_routes') or {}).get('goal_count')}`,"
+        f" counts=`{json.dumps((payload.get('runtime_projection_routes') or {}).get('counts') or {}, sort_keys=True)}`)",
+        f"- decision_context_capture_hosts_healthy: `{(payload.get('decision_context_capture') or {}).get('healthy')}`"
+        f" (hosts=`{(payload.get('decision_context_capture') or {}).get('host_count')}`,"
+        f" unhealthy=`{(payload.get('decision_context_capture') or {}).get('unhealthy_count')}`)",
         f"- user_local_bin_on_path: `{(payload.get('path') or {}).get('user_local_bin_on_path')}`",
         f"- python: `{(payload.get('python') or {}).get('executable')}`",
         f"- typescript_control_plane: `{typescript_control_plane.get('status')}`",
@@ -1489,9 +1329,35 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
                 f"- semantic_probe: `{typescript_control_plane.get('semantic_probe')}`",
             ]
         )
+        runtime_identity = typescript_control_plane.get("runtime_identity")
+        if isinstance(runtime_identity, dict):
+            lines.append(
+                "- runtime_identity: "
+                f"node=`{runtime_identity.get('node_version')}`, "
+                f"sqlite=`{runtime_identity.get('sqlite_version')}`, "
+                "sqlite_authority_qualified="
+                f"`{runtime_identity.get('sqlite_authority_qualified')}`"
+            )
         recommended_action = typescript_control_plane.get("recommended_action")
         if recommended_action:
             lines.append(f"- recommended_action: {recommended_action}")
+    restart = payload.get("effect_runtime_restart")
+    if isinstance(restart, dict):
+        previous = restart.get("previous_runtime_identity")
+        previous_text = (
+            f"Node {previous.get('node_version')} / SQLite "
+            f"{previous.get('sqlite_version')}"
+            if isinstance(previous, dict)
+            else "no runtime was serving"
+        )
+        lines.extend(
+            [
+                "",
+                "## Effect Runtime Restart",
+                f"- status: `{restart.get('status')}`",
+                f"- stopped_runtime: {previous_text}",
+            ]
+        )
     if not payload.get("ok"):
         lines.extend(["", "## Fix", str(payload.get("fix"))])
         writable = payload.get("global_registry_writability")

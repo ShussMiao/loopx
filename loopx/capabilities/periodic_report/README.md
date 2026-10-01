@@ -95,6 +95,45 @@ delivery-Todo pipeline. It acknowledges the provider source only after
 `delivery_ready` durability; failed ACKs become settlement-only retries and do
 not duplicate delivery work.
 
+## Todo authority and report retries
+
+Stage-boundary frontier evaluation and project-progress selection share one
+complete evaluated Todo snapshot. After Goal promotion, File/SQLite authority
+owns those facts even when the Markdown display is stale, absent or malformed.
+An empty canonical graph is empty; a failed canonical read remains a failed
+observation and never falls back to Markdown. Reading does not repair the display.
+Before promotion, the existing Markdown source remains in use.
+
+The TS report selector consumes bounded decision fields, not report prose. It
+keeps the reporter's outcomes before peer outcomes, excludes unowned work, and
+uses the existing resume/acceptance evaluation for the next action. Report
+consumption and all report-repair actions are excluded from next-action facts.
+Publication-history filtering still runs before the six-outcome cap so already
+published facts do not hide an unseen seventh outcome.
+
+Completion and retry ordering compares offset-aware instants at microsecond
+precision, rather than timestamp strings. Invalid/naive completion timestamps
+are not reportable; an invalid stage timestamp is an error. A retained canonical
+User rejection/cancellation can supersede an approval-pending receipt after
+archival. It must match the exact decision scope and addressed Agent; this is
+permission to reconsider that pending attempt, not approval to publish. Existing
+retry-key bytes remain unchanged for the same selected decision.
+
+Use the existing local command to consume pending work:
+
+```bash
+loopx periodic-report consume-pending --goal-id <goal-id> --agent-id <agent-id> --execute --format json
+```
+
+An explicit global `--runtime-root` routes both intent state and Todo reads.
+When the result is `editorial_required`, inspect its local editorial-request
+artifact: facts identify their source Todos. An identical retry reuses the
+frozen editorial input; it does not rebuild it from newer Todo state. Provider
+outages leave the intent for retry after authority recovery. Keep existing
+editorial artifacts and receipts when rolling back; do not delete them to force
+re-generation. No provider default, subscription, scheduler, external-delivery
+permission or publication cursor is changed by this read-path refactor.
+
 ## Customize or schedule
 
 The capability remains **inactive for background work and external writes by
@@ -266,6 +305,10 @@ fails closed without a user/default-Bot fallback. Retries first scan the complet
 Goal Channel history from the frozen generation time and reuse only an exact card,
 chat, and Bot-sender match. Incomplete history fails closed instead of risking a
 duplicate; the stable provider idempotency key closes the concurrent-send race.
+When the normalized report contains a primary typed `next_action`, the hosted
+report announcement also carries its public-safe summary as a compact `下一步`
+prompt. The hosted artifact remains authoritative, while the Channel card gives
+an immediate direction and the same exact-card readback verifies that prompt.
 
 This is a built-in capability, not an extension: callers need the trigger,
 idempotency, retry, and receipt contract even when no provider is installed.

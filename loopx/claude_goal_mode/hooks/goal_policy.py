@@ -126,14 +126,14 @@ def should_run(registry, goal_id, agent_id=None) -> bool | None:
         out = subprocess.run(
             [*cmd, *CLAUDE_RUNTIME_PROFILE_ARGS],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
         )
         if _runtime_profile_flag_is_unsupported(out):
             out = subprocess.run(
                 [*cmd, *CLAUDE_LEGACY_SCHEDULER_ARGS],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
     except Exception:

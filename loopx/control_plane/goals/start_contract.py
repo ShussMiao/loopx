@@ -5,6 +5,50 @@ from typing import Any
 GOAL_START_SCHEMA_VERSION = "loopx_goal_start_command_v0"
 
 
+def goal_planner_contract(*, fine_grained: bool = False) -> dict[str, Any]:
+    planner = {
+        "required_before_todo_write": True,
+        "default_profile": "open_ended_product_direction",
+        "profile_selection": (
+            "Use open_ended_product_direction when the user's goal is a broad, "
+            "fuzzy product direction or new initiative. Use clear_bounded_problem "
+            "when the target is a concrete task with a clear success condition. "
+            "In both cases, let the model produce a real ordered plan before writes."
+        ),
+        "profiles": {
+            "open_ended_product_direction": {
+                "suggested_items_min": 2,
+                "suggested_items_max": 5,
+                "intent": (
+                    "turn an ambiguous product direction into public-safe, ranked "
+                    "todo options before execution"
+                ),
+            },
+            "clear_bounded_problem": {
+                "item_count_policy": "planner_sized",
+                "may_reuse_current_todo_when_it_already_represents_the_plan": True,
+                "intent": (
+                    "make the approach explicit with enough concise ordered todos, "
+                    "without arbitrary caps or management-only filler"
+                ),
+            },
+        },
+        "allowed_priorities": ["P0", "P1", "P2"],
+        "default_role": "agent",
+        "default_task_class": "advancement_task",
+        "required_fields": ["priority", "text", "task_class", "action_kind"],
+        "public_safe_only": True,
+        "budget_policy": "minimum sufficient plan; no fixed-count filler",
+    }
+    if fine_grained:
+        planner["fine_grained_plan_horizon"] = (
+            "write one current runnable checkpoint; keep later options as evidence-linked "
+            "planning notes until the existing replan path qualifies the successor"
+        )
+        planner["maximum_runnable_todos_written_ahead"] = 1
+    return planner
+
+
 def build_goal_start_contract(
     *,
     goal_text: str | None,
@@ -26,40 +70,7 @@ def build_goal_start_contract(
         "explicit_invocation_confirms_project_local_state_writes": True,
         "connect_if_needed": True,
         "bootstrap_policy": "create project-local LoopX state only when no matching registry goal exists",
-        "planner": {
-            "required_before_todo_write": True,
-            "default_profile": "open_ended_product_direction",
-            "profile_selection": (
-                "Use open_ended_product_direction when the user's goal is a broad, "
-                "fuzzy product direction or new initiative. Use clear_bounded_problem "
-                "when the target is a concrete task with a clear success condition. "
-                "In both cases, let the model produce a real ordered plan before writes."
-            ),
-            "profiles": {
-                "open_ended_product_direction": {
-                    "suggested_items_min": 2,
-                    "suggested_items_max": 5,
-                    "intent": (
-                        "turn an ambiguous product direction into public-safe, ranked "
-                        "todo options before execution"
-                    ),
-                },
-                "clear_bounded_problem": {
-                    "item_count_policy": "planner_sized",
-                    "may_reuse_current_todo_when_it_already_represents_the_plan": True,
-                    "intent": (
-                        "make the approach explicit with enough concise ordered todos, "
-                        "without arbitrary caps or management-only filler"
-                    ),
-                },
-            },
-            "allowed_priorities": ["P0", "P1", "P2"],
-            "default_role": "agent",
-            "default_task_class": "advancement_task",
-            "required_fields": ["priority", "text", "task_class", "action_kind"],
-            "public_safe_only": True,
-            "budget_policy": "minimum sufficient plan; no fixed-count filler",
-        },
+        "planner": goal_planner_contract(fine_grained=fine_grained),
         "priority_ordering": {
             "bucket_order": ["P0", "P1", "P2"],
             "same_priority_tie_breaker": "planner_order_then_todo_write_order",
@@ -83,6 +94,7 @@ def build_goal_start_contract(
             "agent_type_discovery": "loopx agent-onboard --list-agent-types",
             "host_surfaces": {
                 "codex-app": "Codex App heartbeat automation",
+                "trae_app": "Trae App heartbeat automation",
                 "codex-cli": "visible Codex CLI `/goal <task_body>`",
                 "claude-code": "Claude Code native `/loop` after `/loopx <task>` arms LoopX",
                 "opencode": "OpenCode `loopx_goal_activate`",
@@ -91,6 +103,7 @@ def build_goal_start_contract(
                 "cursor-agent": "agent-driven cursor-agent loop; every turn enters through quota should-run",
                 "zcode": "agent-driven ZCode loop; turns enter through quota should-run",
                 "agy": "agy native /goal loop with schedule wakes; quota entry advisory",
+                "kiro-cli": "Kiro CLI native /goal loop; quota entry advisory",
                 "deepseek-harness-native": "DeepSeek Harness same-session plugin driver; every turn enters through quota should-run",
                 "ark-managed-agent": "one-shot Goal",
                 "manual": "external scheduler or manual quota/status loop",
@@ -147,12 +160,6 @@ def build_goal_start_contract(
             "replan": "direction_change_or_bounded_chain",
             "checkpoint_accounting": "advancement_only",
         }
-        planner = contract["planner"]
-        planner["fine_grained_plan_horizon"] = (
-            "write one current runnable checkpoint; keep later options as evidence-linked "
-            "planning notes until the existing replan path qualifies the successor"
-        )
-        planner["maximum_runnable_todos_written_ahead"] = 1
     return contract
 
 
@@ -171,7 +178,7 @@ def build_goal_start_prompt(
     agent_clause = f" Use agent id `{agent_id}` for quota/claim commands." if agent_id else ""
     todo_rule = (
         "plan the broader direction as evidence-linked notes, but write exactly one "
-        "current small, verifiable Agent advancement_task Todo; do not write a runnable "
+        "current independently verifiable Agent advancement_task Todo; do not write a runnable "
         "successor ahead. Use `[P0]`/`[P1]`/`[P2]`, no `--priority`; User Todo only "
         "for owner/private gates"
         if fine_grained
@@ -181,11 +188,11 @@ def build_goal_start_prompt(
         "Todo before work"
     )
     fine_rule = (
-        "\n8. Fine-grained mode: the current Todo must be one small verifiable checkpoint. "
-        "If it is too broad, split it before work. A coherent decision slice may complete "
+        "\n8. Fine-grained mode: the current Todo must be an independently verifiable checkpoint. "
+        "Split independent decisions before work. Scope-bounded work may complete "
         "one or more causally related Agent advancement Todos in the same turn: after each "
         "completion inspect its fresh evidence before creating or claiming the next Todo, "
-        "and settle only once after the slice. Use the existing replan obligation/ACK path "
+        "and settle only once after the work. Use the existing replan obligation/ACK path "
         "when evidence changes direction or the bounded-chain review becomes due; never "
         "prewrite a long runnable chain. Protocol/setup and capability re-entry steps stay "
         "inline in the guided transaction, are not Todos, and do not count as advancement "

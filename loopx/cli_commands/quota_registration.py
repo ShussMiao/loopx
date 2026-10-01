@@ -40,7 +40,7 @@ def register_quota_command(
     )
     quota_parser.add_argument(
         "--goal-id",
-        help="Goal id to check. Required for one-goal quota commands, including should-run, scheduler ACK/failure, spend, and void.",
+        help="Goal id to check. Optional for status/plan (omit for all goals); required for should-run, scheduler ACK/failure, spend, and void. A scoped status/plan ranks only the selected goal, not the global next turn.",
     )
     quota_parser.add_argument(
         "--agent-id",
@@ -57,8 +57,9 @@ def register_quota_command(
         help=(
             "For `quota should-run`, `quota monitor-poll`, `quota scheduler-ack`, "
             "`quota scheduler-ack-current`, and `quota spend-slot`, declare a "
-            "capability available in this current agent environment. Repeat the "
-            "same declarations for commands that recompute should-run; basic local "
+            "capability observed in this current agent environment. Live should-run "
+            "remembers supported runtime observations for this registered Agent on "
+            "this host; inspect or correct them with agent-capabilities. Basic local "
             "shell/filesystem capabilities are assumed."
         ),
     )
@@ -68,7 +69,8 @@ def register_quota_command(
         action="append",
         choices=[*QUOTA_DETAIL_SECTIONS, "all"],
         help=(
-            "Include one command-specific cold-path detail section. For `quota "
+            "Include one command-specific cold-path detail section. Status/plan default "
+            "to bounded Todo summaries; use agent-todos or user-todos for full lists. For `quota "
             "should-run`: scheduler, agent-todos, user-todos, goal-boundary, or "
             "vision. For `quota monitor-poll`: decisions. Repeat for multiple "
             "sections or use `all`."
@@ -90,11 +92,20 @@ def register_quota_command(
         help=argparse.SUPPRESS,
     )
     quota_parser.add_argument(
+        "--app-automation-current-rrule",
+        help=(
+            "Current RRULE observed from the selected hosted App heartbeat. "
+            "This provider-neutral input reconciles host reality with LoopX's "
+            "last scheduler ACK."
+        ),
+    )
+    quota_parser.add_argument(
         "--codex-app-current-rrule",
         help=(
             "Current RRULE observed from the active Codex App heartbeat. For "
             "`quota should-run`, this reconciles host reality with LoopX's last "
-            "scheduler ACK so a stale ACK cannot suppress a required update."
+            "scheduler ACK so a stale ACK cannot suppress a required update. "
+            "Deprecated compatibility alias for --app-automation-current-rrule."
         ),
     )
     quota_parser.add_argument(
@@ -117,6 +128,15 @@ def register_quota_command(
         ),
     )
     quota_parser.add_argument(
+        "--trae_app",
+        action="store_true",
+        help=(
+            "Compact explicit alias for --runtime-profile "
+            "trae_app. Cannot be combined with another scheduler "
+            "runtime or execution context."
+        ),
+    )
+    quota_parser.add_argument(
         "-H",
         "--host-surface",
         choices=[
@@ -124,8 +144,10 @@ def register_quota_command(
             "codex_app",
             "codex_app_ssh",
             "codex_cli",
+            "trae_app",
             "generic_cli",
             "claude_code",
+            "kiro_cli",
             "local_scheduler",
         ],
         help="Host surface that will consume this scheduler projection.",
@@ -210,13 +232,17 @@ def register_quota_command(
     register_quota_monitor_poll_request_arguments(quota_parser)
     quota_parser.add_argument(
         "--surface",
-        default="codex_app",
-        help="Scheduler surface for scheduler ACK/failure commands; defaults to codex_app.",
+        help=(
+            "Scheduler surface for scheduler ACK/failure commands; derived from "
+            "the selected App runtime, or codex_app for a legacy unscoped call."
+        ),
     )
     quota_parser.add_argument(
         "--state-key",
-        default="scheduler_hint.codex_app.stateful_backoff",
-        help="Scheduler state key for scheduler ACK/failure commands.",
+        help=(
+            "Scheduler state key for scheduler ACK/failure commands; derived from "
+            "the selected App runtime when omitted."
+        ),
     )
     quota_parser.add_argument(
         "--applied-rrule",

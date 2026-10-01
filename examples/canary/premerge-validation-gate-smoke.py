@@ -18,6 +18,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from loopx.canary.premerge import (  # noqa: E402
     _gate_status,
     _public_boundary_changed_files_run,
+    apply_change_quality_verification,
     build_premerge_validation_gate,
     downgrade_inherited_baseline_failures,
 )
@@ -34,7 +35,7 @@ def commands_from(run: dict | None) -> list[str]:
     return commands
 
 
-def assert_control_plane_change_selects_state_machine_validation() -> None:
+def assert_control_plane_change_retains_state_machine_and_vocabulary_validation() -> None:
     payload = build_premerge_validation_gate(
         changed_files=[
             "loopx/control_plane/work_items/interaction_contract.py",
@@ -59,6 +60,7 @@ def assert_control_plane_change_selects_state_machine_validation() -> None:
     assert any("interaction-contract-state-machine-smoke.py" in item for item in catalog_commands), payload
     assert not any("control-plane-integrated-canary-smoke.py" in item for item in catalog_commands), payload
     assert any("heartbeat-quota-flow-smoke.py" in item for item in catalog_commands), payload
+    assert any("semantic-vocabulary-drift-smoke.py" in item for item in catalog_commands), payload
     assert any("bounded-context-namespace-smoke.py" in item for item in catalog_commands), payload
     assert risk_commands, payload
     assert payload["gate"]["status"] == "preview_only", payload
@@ -308,6 +310,45 @@ def assert_no_changes_does_not_mask_direct_failures() -> None:
     assert status["merge_gate_passed"] is False, status
 
 
+def assert_passed_validation_does_not_grant_self_merge_authority() -> None:
+    status = _gate_status(
+        execute=True,
+        changed_files=["docs/example.md"],
+        direct_checks=[{"ok": True, "status": "passed", "id": "diff_check"}],
+        catalog_run={"ok": True},
+        risk_profile_run=None,
+        boundary_run=None,
+        manual_holds=[],
+    )
+    assert status["status"] == "passed", status
+    assert status["merge_gate_passed"] is True, status
+    assert status["self_merge_validation_passed"] is True, status
+    assert status["self_merge_allowed"] is False, status
+    assert status["self_merge_authority"] == {
+        "granted": False,
+        "reason": "repository_policy_required",
+        "next_gate": "apply repository policy and exact-head merge readiness",
+    }, status
+
+    payload = {
+        "ok": True,
+        "gate": status,
+        "validation_summary": {"failure_count": 0},
+        "recommended_pr_comment_fields": [],
+    }
+    apply_change_quality_verification(
+        payload,
+        {
+            "enforcement_applied": True,
+            "ok": False,
+            "status": "receipt_invalid",
+        },
+    )
+    assert payload["gate"]["merge_gate_passed"] is False, payload
+    assert payload["gate"]["self_merge_validation_passed"] is False, payload
+    assert payload["gate"]["self_merge_allowed"] is False, payload
+
+
 def assert_installed_wrapper_uses_bound_python_and_redirects_to_checkout() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         release_root = Path(temp_dir) / "release"
@@ -513,7 +554,7 @@ def assert_inherited_maintainability_red_is_advisory_only() -> None:
 
 
 def main() -> None:
-    assert_control_plane_change_selects_state_machine_validation()
+    assert_control_plane_change_retains_state_machine_and_vocabulary_validation()
     assert_public_docs_change_adds_boundary_scan()
     assert_quick_public_docs_change_skips_risk_profile_smokes()
     assert_public_boundary_scan_executes_in_process()
@@ -526,6 +567,7 @@ def main() -> None:
     assert_cli_json_preview()
     assert_cli_premerge_reports_progress_by_default()
     assert_no_changes_does_not_mask_direct_failures()
+    assert_passed_validation_does_not_grant_self_merge_authority()
     assert_installed_wrapper_uses_bound_python_and_redirects_to_checkout()
     assert_external_dirty_worktree_uses_caller_repo()
     assert_inherited_maintainability_red_is_advisory_only()

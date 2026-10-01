@@ -14,14 +14,24 @@ from .host_loop_activation import (
     render_agent_type_catalog_markdown,
     scheduler_command_binding_for_agent_type,
 )
+from .history import load_registry
 from .install_contract import NO_CLONE_INSTALL_URL
+from .kiro_cli_goal_mode import (
+    KIRO_CLI_GOAL_CLEAR_COMMAND,
+    KIRO_CLI_GOAL_COMPLETION_TOOL,
+    KIRO_CLI_GOAL_DEFAULT_MAX_ITERATIONS,
+    kiro_cli_goal_invocation,
+)
+from .kiro_cli_goal_mode import (
+    SKILLS_ROOT_LABEL as KIRO_CLI_SKILLS_ROOT_LABEL,
+)
 from .project_prompt import (
     render_available_capability_args,
     render_codex_cli_install_preflight,
     render_quota_guard_command,
     shell_arg,
 )
-from .registry import read_json, registry_goals
+from .registry import registry_goals
 from .skill_install_readback import (
     ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
     configured_host_skills_dir,
@@ -52,6 +62,8 @@ def _surface_install_command(agent_type: str, cli_bin: str, project: str) -> str
         return f"{shell_arg(cli_bin)} slash-commands --install --surface zcode"
     if agent_type == "agy":
         return f"{shell_arg(cli_bin)} slash-commands --install --surface agy"
+    if agent_type == "kiro-cli":
+        return f"{shell_arg(cli_bin)} slash-commands --install --surface kiro-cli"
     if agent_type == "pi":
         # The slash-commands installer resolves the Pi extension target through
         # --pi-project; pass the resolved project so the command stays correct
@@ -231,7 +243,7 @@ def _skill_delivery_contract(
                 else {}
             )
         ),
-        "source_repository": "https://github.com/huangruiteng/loopx",
+        "source_repository": "https://github.com/loopx-project/loopx",
         "source_directories": [
             f"skills/{skill_id}"
             for skill_id in required_skill_ids
@@ -271,6 +283,7 @@ def _bootstrap_pack_command(
 ) -> str:
     surface_by_type = {
         "codex-app": "codex-app",
+        "trae_app": "trae_app",
         "codex-app-ssh": "codex-app-ssh",
         "codex-ide-plugin": "codex-ide-plugin",
         "codex-cli": "codex-cli-tui",
@@ -282,6 +295,7 @@ def _bootstrap_pack_command(
         "cursor-agent": "cursor-agent",
         "zcode": "zcode",
         "agy": "agy",
+        "kiro-cli": "kiro-cli",
         "deepseek-harness": "deepseek-harness",
         "deepseek-harness-native": "deepseek-harness-native",
         "ark-managed-agent": "ark-managed-agent",
@@ -310,6 +324,8 @@ def _bootstrap_pack_command(
 def _start_instruction(agent_type: str) -> str:
     if agent_type == "codex-app":
         return "Use `$loopx <task>` or select the LoopX skill from `/skills`; Codex App should then create/update the heartbeat automation."
+    if agent_type == "trae_app":
+        return "Use `$loopx <task>` or select the LoopX skill from `/skills`; Trae App should then create/update the heartbeat automation."
     if agent_type == "codex-app-ssh":
         return "Use `$loopx <task>` or select the LoopX skill from `/skills`; after todos are written, set `/goal <task_body>` in the visible Codex App task."
     if agent_type == "codex-ide-plugin":
@@ -355,6 +371,21 @@ def _start_instruction(agent_type: str) -> str:
             "wake Prompt; recurring via MaxIterations) when quota allows more "
             "work."
         )
+    if agent_type == "kiro-cli":
+        return (
+            f"Run `/loopx <task>` (the LoopX skill installed in "
+            f"`{KIRO_CLI_SKILLS_ROOT_LABEL}`); after todo writeback, bind the "
+            f"objective with the native `{kiro_cli_goal_invocation()}` command, "
+            f"stating the todo's acceptance criteria inside the goal statement "
+            f"because the host derives them from it, and taking N from the "
+            f"remaining quota slots (host default is "
+            f"{KIRO_CLI_GOAL_DEFAULT_MAX_ITERATIONS}; "
+            f"`{KIRO_CLI_GOAL_CLEAR_COMMAND}` cancels). "
+            f"Start every turn and native goal iteration with `quota "
+            f"should-run`, and settle through the built-in "
+            f"`{KIRO_CLI_GOAL_COMPLETION_TOOL}` tool only after LoopX writeback "
+            f"so its completion contract cites the same evidence."
+        )
     if agent_type == "deepseek-harness":
         return (
             "Install `loopx[deepseek-harness]`, prepare a dsh cordis.yml, and run "
@@ -398,7 +429,7 @@ def build_agent_onboarding_packet(
     resolved_project = str(inspection["project"])
     resolved_goal_id = str(inspection["goal_id"])
     registry_path = Path(str(inspection["registry"]))
-    registry = read_json(registry_path) if registry_path.exists() else {}
+    registry = load_registry(registry_path) if registry_path.exists() else {}
     goal = next(
         (
             item
@@ -406,6 +437,24 @@ def build_agent_onboarding_packet(
             if str(item.get("id") or "") == resolved_goal_id
         ),
         {},
+    )
+    from .capabilities.machine_configuration.builtins import (
+        build_builtin_machine_configuration_registry,
+        project_goal_with_builtin_machine_configuration,
+    )
+    from .capabilities.machine_configuration.store import read_machine_configuration
+    from .paths import resolve_runtime_root
+
+    runtime_root = resolve_runtime_root(
+        registry,
+        registry_path=registry_path,
+    )
+    goal = project_goal_with_builtin_machine_configuration(
+        goal,
+        read_machine_configuration(
+            runtime_root,
+            registry=build_builtin_machine_configuration_registry(),
+        ),
     )
     active_project_skill_ids = (
         [CHANGE_QUALITY_SKILL_ID]

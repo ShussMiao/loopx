@@ -117,7 +117,7 @@ def handle_opencode2_goal_worker_command(
             node_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
     except FileNotFoundError:
         payload = {

@@ -9,6 +9,11 @@ on:
       - "package.json"
       - "package-lock.json"
       - "pyproject.toml"
+      - "setup.py"
+      - "MANIFEST.in"
+      - "apps/presentation/dashboard/**"
+      - "scripts/chat_bundle.py"
+      - "scripts/verify_installed_chat.py"
       - "README.md"
       - "scripts/release_artifacts.py"
       - "tsconfig.control-plane.json"
@@ -30,7 +35,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.repository == 'huangruiteng/loopx'
+    if: github.repository == 'loopx-project/loopx'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -55,7 +60,7 @@ jobs:
       - name: Set up the packaged TypeScript control-plane runtime
         uses: actions/setup-node@v6
         with:
-          node-version: "22.6"
+          node-version: "24"
 
       - name: Resolve and validate release identity
         id: identity
@@ -74,6 +79,11 @@ jobs:
           echo "RELEASE_TAG=${release_tag}" >> "${GITHUB_ENV}"
           echo "SOURCE_DATE_EPOCH=${source_date_epoch}" >> "${GITHUB_ENV}"
           echo "PYTHONHASHSEED=0" >> "${GITHUB_ENV}"
+
+      - name: Build exact release frontend with previous delivery assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/chat_bundle.py release-build --tag "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
 
       - name: Install release build tools
         run: python -m pip install --disable-pip-version-check build==1.4.4 twine==6.2.0
@@ -195,6 +205,21 @@ jobs:
               assert committed["appended"] is True, committed
               assert committed["replayed"] is False, committed
           PY
+
+      - name: Verify installed frontend and sdist rebuild
+        run: |
+          python scripts/verify_installed_chat.py --python "${RUNNER_TEMP}/loopx-wheel/bin/python"
+          python -m pip wheel --no-deps dist/packages/*.tar.gz --wheel-dir "${RUNNER_TEMP}/sdist-wheel"
+          "${RUNNER_TEMP}/loopx-wheel/bin/python" -m pip install --force-reinstall --no-deps "${RUNNER_TEMP}"/sdist-wheel/*.whl
+          python scripts/verify_installed_chat.py --python "${RUNNER_TEMP}/loopx-wheel/bin/python"
+
+      - name: Exercise the installed page in a real browser
+        working-directory: apps/presentation/dashboard
+        env:
+          LOOPX_PYTHON_BIN: ${{ runner.temp }}/loopx-wheel/bin/python
+        run: |
+          ./node_modules/.bin/playwright install --with-deps chromium
+          npm run smoke:personal-workspace-packaged
 
       - name: Verify wheel through the DSH managed-runtime install shape
         run: |

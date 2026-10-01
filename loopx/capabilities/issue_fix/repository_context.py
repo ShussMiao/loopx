@@ -9,7 +9,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ...control_plane.runtime.public_safety import public_safe_compact_text
-from .repository_memory import build_issue_fix_repository_memory_hook
+from .repository_memory import (
+    SUPPORT_ASPECTS,
+    build_issue_fix_repository_memory_hook,
+)
 
 ISSUE_FIX_REPOSITORY_CONTEXT_INPUT_SCHEMA_VERSION = (
     "issue_fix_repository_context_input_v0"
@@ -30,13 +33,6 @@ SOURCE_KINDS = {
 TRUST_LEVELS = {"authoritative", "verified", "advisory"}
 FRESHNESS_STATES = {"current", "stale", "unknown"}
 CONSULTATION_STATES = {"not_applicable", "available", "queried", "unavailable"}
-SUPPORT_ASPECTS = {
-    "architecture",
-    "ownership",
-    "change_scope",
-    "reproduction",
-    "validation",
-}
 REQUIRED_FIX_ASPECTS = ("change_scope", "reproduction", "validation")
 MAX_SOURCES = 16
 

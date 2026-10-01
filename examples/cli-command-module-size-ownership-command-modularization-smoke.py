@@ -12,6 +12,7 @@ DEFAULT_MAX_LINES = 1000
 STARTER_MODULE_LIMITS = {
     # Legacy command owners are frozen at their current baseline while each
     # cohesive extraction lands; the default budget still catches new growth.
+    "turn.py": 1114,
     "todo.py": 1098,
     "starter.py": 180,
     "starter_bootstrap.py": 220,
@@ -25,6 +26,8 @@ STARTER_MODULE_LIMITS = {
 }
 STARTER_COMMAND_OWNERS = {
     "start-goal": "start_goal.py",
+    "prepare-operation": "goal_channel_operation.py",
+    "deliver-operation": "goal_channel_operation.py",
     "new-project-prompt": "starter_bootstrap_registration.py",
     "codex-cli-bootstrap-message": "starter_bootstrap_registration.py",
     "codex-cli-tui-bootstrap-smoke-bundle": "starter_bootstrap_registration.py",
@@ -74,7 +77,9 @@ def module_limit(module_name: str) -> int:
 def assert_module_size_budgets() -> None:
     module_names = {path.name for path in python_modules()}
     stale_budgets = sorted(set(STARTER_MODULE_LIMITS) - module_names)
-    require(not stale_budgets, f"size budgets reference missing modules: {stale_budgets}")
+    require(
+        not stale_budgets, f"size budgets reference missing modules: {stale_budgets}"
+    )
 
     for path in python_modules():
         count = line_count(path)

@@ -6,6 +6,37 @@ from ..runtime.time import parse_timestamp
 from .progress_observation import FRESH_VISION_PATH_DISPOSITIONS
 
 AUTONOMOUS_REPLAN_ACK_MATERIAL_RUN_WINDOW = 20
+# A normal delivery appends both a durable run record and a neutral quota-spend
+# record. Keep enough internal history to observe the full material-run
+# threshold even when those records are interleaved, with headroom for other
+# neutral events. The budget is per agent lane: a Goal-wide window that peer
+# lanes also fill cannot decide one lane's material-run count.
+AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK = AUTONOMOUS_REPLAN_ACK_MATERIAL_RUN_WINDOW * 3
+
+
+def ack_binds_trigger_checkpoints(ack: dict[str, Any] | None) -> bool:
+    """Return whether an ACK binds exact typed trigger revisions.
+
+    A checkpoint-bearing ACK is revision-gated: the typed frontier evaluator
+    suppresses a trigger only when the ACK names that trigger's exact revision,
+    and the obligation-clearing path additionally requires the exact obligation
+    id. Such an ACK therefore cannot hide a materially changed frontier, which
+    is why it stays visible for the whole scanned history instead of expiring
+    with the material-run window.
+    """
+
+    semantic_delta = ack.get("semantic_delta") if isinstance(ack, dict) else None
+    if not isinstance(semantic_delta, dict):
+        return False
+    checkpoints = semantic_delta.get("trigger_checkpoints")
+    if not isinstance(checkpoints, list):
+        return False
+    return any(
+        isinstance(checkpoint, dict)
+        and str(checkpoint.get("kind") or "").strip()
+        and str(checkpoint.get("frontier_revision") or "").strip()
+        for checkpoint in checkpoints
+    )
 
 
 def normalize_projected_autonomous_replan_ack(
@@ -77,6 +108,9 @@ def compact_autonomous_replan_ack(run: dict[str, Any] | None) -> dict[str, Any] 
                 "trigger_kinds",
                 "trigger_checkpoints",
                 "obligation_id",
+                "successor_todo_id",
+                "successor_origin_obligation_id",
+                "successor_binding",
                 "observation_fingerprint",
                 "reason",
             )
@@ -88,16 +122,10 @@ def compact_autonomous_replan_ack(run: dict[str, Any] | None) -> dict[str, Any] 
         isinstance(outcomes, list)
         and "fresh_vision_path_outcome" in outcomes
     ):
-        agent_vision = (
-            run.get("agent_vision")
-            if isinstance(run.get("agent_vision"), dict)
-            else {}
-        )
-        path_delta = (
-            agent_vision.get("path_delta")
-            if isinstance(agent_vision.get("path_delta"), dict)
-            else {}
-        )
+        raw_vision = run.get("agent_vision")
+        agent_vision = raw_vision if isinstance(raw_vision, dict) else {}
+        raw_path = agent_vision.get("path_delta")
+        path_delta = raw_path if isinstance(raw_path, dict) else {}
         path_disposition = str(path_delta.get("outcome") or "").strip()
         if path_disposition in FRESH_VISION_PATH_DISPOSITIONS:
             result["path_disposition"] = path_disposition
@@ -177,11 +205,8 @@ def _latest_monitor_replan_frontier_identity(
     for run in latest_runs or []:
         if not isinstance(run, dict):
             continue
-        target = (
-            run.get("monitor_target")
-            if isinstance(run.get("monitor_target"), dict)
-            else {}
-        )
+        raw_target = run.get("monitor_target")
+        target = raw_target if isinstance(raw_target, dict) else {}
         if normalized_agent_id:
             run_agent_id = str(run.get("agent_id") or "").strip()
             target_agent_id = str(target.get("agent_id") or "").strip()
@@ -275,15 +300,25 @@ def latest_autonomous_replan_ack_for_projection(
     *,
     neutral_classifications: set[str],
 ) -> dict[str, Any] | None:
-    """Return a recent durable replan ACK within the material review window."""
+    """Return the newest durable replan ACK this lane may still use.
+
+    A legacy ACK (one without typed trigger checkpoints) keeps the material-run
+    review window that produced it. A checkpoint-bearing ACK stays visible while
+    the scanned history still carries it: expiring it on run count alone re-armed
+    the long Todo-chain rule for an unchanged frontier, which is exactly the
+    level trigger the checkpoint contract exists to prevent.
+    """
 
     material_run_count = 0
+    window_expired = False
     for run in latest_runs or []:
         if not isinstance(run, dict):
             continue
         replan_ack = compact_autonomous_replan_ack(run)
         if replan_ack:
-            return replan_ack
+            if not window_expired or ack_binds_trigger_checkpoints(replan_ack):
+                return replan_ack
+            return None
         classification = str(run.get("classification") or "").strip()
         if not classification:
             continue
@@ -293,5 +328,6 @@ def latest_autonomous_replan_ack_for_projection(
             continue
         material_run_count += 1
         if material_run_count >= AUTONOMOUS_REPLAN_ACK_MATERIAL_RUN_WINDOW:
-            return None
+            window_expired = True
+    return None
     return None

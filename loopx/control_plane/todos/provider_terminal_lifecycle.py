@@ -14,15 +14,18 @@ from inspect import signature
 from pathlib import Path
 from typing import Any
 
-from ...agent_registry import load_goal_from_registry, registered_agent_ids_for_goal
 from ...state_refresh import now_local
 from ..coordination.local_authority import (
+    LOCAL_AUTHORITY_SOURCES,
     LocalCoordinationAuthorityRejection,
     LocalCoordinationAuthorityUnavailable,
     read_canonical_todos_if_promoted,
 )
 from ..coordination.local_authority_shadow_adapter import effective_runtime_root
-from ..effect_runtime import effect_runtime_result
+from ..effect_runtime import (
+    CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+    effect_runtime_result,
+)
 from .completion_policy import (
     build_completion_policy_request,
     linked_successor_from_todo,
@@ -30,16 +33,20 @@ from .completion_policy import (
 from .completion_transaction import require_completion_successor_todo_ids
 from .completion_validation import (
     resolve_private_completion_validation_declaration,
-    run_declared_completion_validation_effect,
+    execute_completion_validation_effects,
+    completion_validation_failure,
 )
 from .contract import resolve_next_user_task_class
-from .mutation_authority import normalize_todo_lifecycle_authority
+from .mutation_authority import todo_lifecycle_facts
+from ..coordination.authority_source_capture import authority_registry_source
 from .path_resolution import resolve_todo_state_path
-from .provider_projection import settle_canonical_todo_projection
+from .provider_projection import projection_delivery_requires_ack, settle_canonical_todo_projection
 from .successor_derivation import build_successor_intents
+from .completion_result import read_completion_result, store_completion_result
 
-_TERMINAL_REQUEST_SCHEMA = "loopx_local_coordination_todo_terminal_lifecycle_request_v0"
+_TERMINAL_REQUEST_SCHEMA = "loopx_local_coordination_todo_terminal_lifecycle_request_v3"
 _ARCHIVE_REQUEST_SCHEMA = "loopx_local_coordination_todo_archive_request_v0"
+_ARCHIVE_ACK_REQUEST_SCHEMA = "loopx_local_coordination_todo_archive_ack_request_v0"
 _ACCEPTED = {"applied", "recovered", "replayed", "no_change", "planned"}
 
 
@@ -73,6 +80,9 @@ def _route_terminal_call(command: str, call: Mapping[str, Any]) -> dict[str, Any
             goal_id=goal_id,
             project=call.get("project"),
             state_file=call.get("state_file"),
+            # Canonical archive can recover its display after committing or
+            # replaying. The legacy fallback still requires an existing file.
+            require_existing=False,
         )
         return archive_canonical_todos_if_promoted(
             registry_path=registry_path,
@@ -95,6 +105,9 @@ def _route_terminal_call(command: str, call: Mapping[str, Any]) -> dict[str, Any
         goal_id=goal_id,
         project=call.get("project"),
         state_file=call.get("state_file"),
+        # Completion consumes canonical state and can rebuild its display just
+        # like archive. The legacy caller below still requires its source file.
+        require_existing=False,
     )
     complete = command == "complete"
     return terminal_canonical_todo_if_promoted(
@@ -108,11 +121,19 @@ def _route_terminal_call(command: str, call: Mapping[str, Any]) -> dict[str, Any
         authority_reason=call.get("authority_reason"),
         decision_outcome=call.get("decision_outcome") if complete else None,
         evidence=call.get("evidence") if complete else None,
+        completion_result_file=call.get("completion_result_file") if complete else None,
         note=call.get("note") if complete else "superseded",
         reason=None if complete else call.get("reason"),
         completion_turn_key=call.get("completion_turn_key") if complete else None,
         completion_identity_source=(
             call.get("completion_identity_source") if complete else None
+        ),
+        review_basis=call.get("terminal_review_basis"),
+        completion_delivery_workspace=(
+            call.get("completion_delivery_workspace") if complete else None
+        ),
+        completion_validation_workspace_path=(
+            call.get("completion_validation_workspace_path") if complete else None
         ),
         task_lease_idempotency_key=call.get("task_lease_idempotency_key"),
         task_lease_expected_version=_non_negative_integer(
@@ -160,26 +181,15 @@ def provider_first_terminal_lifecycle(command: str) -> Callable[[TodoMutation], 
             bound = call_signature.bind(*args, **kwargs)
             bound.apply_defaults()
             result = _route_terminal_call(command, bound.arguments)
+            if result is None and bound.arguments.get("terminal_review_basis") is not None:
+                raise ValueError("Reviewed canonical completion cannot fall back to legacy authority; regenerate preview")
+            if result is None and bound.arguments.get("completion_result_file") is not None:
+                raise ValueError("Completion results require promoted canonical Todo authority")
             return result if result is not None else legacy(*args, **kwargs)
 
         return routed
 
     return decorate
-
-
-def _goal_facts(
-    registry_path: Path, goal_id: str
-) -> tuple[list[str], list[dict[str, Any]]]:
-    goal = load_goal_from_registry(registry_path, goal_id)
-    registered = registered_agent_ids_for_goal(goal)
-    coordination = goal.get("coordination") if isinstance(goal, Mapping) else None
-    grants = normalize_todo_lifecycle_authority(
-        coordination.get("todo_lifecycle_authority")
-        if isinstance(coordination, Mapping)
-        else None,
-        registered_agents=registered,
-    )
-    return registered, grants
 
 
 def _todo_by_id(
@@ -189,30 +199,6 @@ def _todo_by_id(
         (dict(todo) for todo in todos if str(todo.get("todo_id") or "") == todo_id),
         None,
     )
-
-
-def _terminal_failure_payload(
-    result: Mapping[str, Any], *, goal_id: str, todo_id: str, dry_run: bool
-) -> dict[str, Any] | None:
-    if result.get("status") != "failed":
-        return None
-    if result.get("reason_code") not in {
-        "validation_declaration_invalid",
-        "validation_failed",
-    }:
-        return None
-    return {
-        "ok": False,
-        "dry_run": dry_run,
-        "completed": False,
-        "changed": False,
-        "goal_id": goal_id,
-        "todo_id": todo_id,
-        "validation_blocked_completion": True,
-        "reason": result.get("reason"),
-        "validation_failure": result.get("validation_failure"),
-        **dict(result),
-    }
 
 
 def _projection_payload(value: Any) -> dict[str, Any]:
@@ -259,6 +245,27 @@ def _archive_operation_id(
     return f"todo-archive:{digest[:32]}"
 
 
+def _persist_validated_completion_result(
+    *,
+    request: Mapping[str, Any],
+    source: Path,
+    runtime_root: Path,
+    goal_id: str,
+    expected_descriptor: Mapping[str, Any] | None,
+) -> None:
+    """Persist host-local bytes only after the owner's validation effects pass."""
+    receipts = request.get("goal_acceptance_validation_receipts")
+    passed = (isinstance(receipts, list) and bool(receipts) and
+              all(isinstance(row, Mapping) and isinstance(row.get("receipt"), Mapping) and
+                  row["receipt"].get("passed") is True for row in receipts))
+    caller_receipt = request.get("validation_receipt")
+    if passed and (caller_receipt is None or
+                   isinstance(caller_receipt, Mapping) and caller_receipt.get("passed") is True):
+        staged = store_completion_result(source=source, runtime_root=runtime_root, goal_id=goal_id)
+        if staged != expected_descriptor:
+            raise ValueError("completion result changed during acceptance validation")
+
+
 def terminal_canonical_todo_if_promoted(
     *,
     registry_path: Path,
@@ -271,10 +278,13 @@ def terminal_canonical_todo_if_promoted(
     authority_reason: str | None,
     decision_outcome: str | None,
     evidence: str | None,
+    completion_result_file: Path | None,
     note: str | None,
     reason: str | None,
     completion_turn_key: str | None,
     completion_identity_source: str | None,
+    completion_delivery_workspace: Mapping[str, Any] | None,
+    completion_validation_workspace_path: Path | None,
     task_lease_idempotency_key: str | None,
     task_lease_expected_version: int | None,
     no_followup: bool,
@@ -293,6 +303,7 @@ def terminal_canonical_todo_if_promoted(
     next_excluded_agents: list[str] | None,
     self_merged: bool,
     dry_run: bool,
+    review_basis: Mapping[str, Any] | None = None,
     project: Path | None = None,
     state_file: Path | None = None,
 ) -> dict[str, Any] | None:
@@ -321,108 +332,147 @@ def terminal_canonical_todo_if_promoted(
     # The canonical transaction owns missing/role/archive lifecycle decisions.
     # Keep only the optional local validation facts needed by the host adapter.
     target = _todo_by_id(todos, todo_id) or {}
-    registered, grants = _goal_facts(registry_path, goal_id)
-    successor_intents = build_successor_intents(
-        next_agent_todo=next_agent_todo,
-        next_user_todo=next_user_todo,
-        next_user_task_class=next_user_task_class,
-        next_claimed_by=next_claimed_by,
-        next_task_class=next_task_class,
-        next_action_kind=next_action_kind,
-        next_task_repository=next_task_repository,
-        next_required_capabilities=next_required_capabilities,
-        next_continuation_policy=next_continuation_policy,
-        next_excluded_agents=next_excluded_agents,
-    )
-    linked = [
-        linked_successor_from_todo(todo)
-        for linked_id in successor_todo_ids
-        if (todo := _todo_by_id(todos, linked_id)) is not None
-    ]
-    completion_policy_request = (
-        build_completion_policy_request(
-            registry_path=registry_path,
-            goal_id=goal_id,
-            claimed_by=claimed_by,
-            next_claimed_by=next_claimed_by,
-            next_agent_todo=next_agent_todo,
-            next_action_kind=next_action_kind,
-            next_continuation_policy=next_continuation_policy,
-            next_excluded_agents=next_excluded_agents or [],
-            self_merged=self_merged,
-            evidence=evidence,
-            linked_successors=linked,
-        )
-        if command == "complete"
-        else None
-    )
-    validation_declaration = None
-    if command == "complete" and target.get("completion_validation_required") is True:
-        if state_file is None:
-            raise ValueError(
-                "canonical Todo completion validation requires its private state projection"
+    result_descriptor = None
+    if completion_result_file is not None:
+        try:
+            result_descriptor = store_completion_result(
+                source=completion_result_file, runtime_root=runtime_root,
+                goal_id=goal_id, persist=False,
             )
-        validation_declaration = resolve_private_completion_validation_declaration(
-            canonical_todo=target,
-            state_file=state_file,
-            runtime_root=runtime_root,
-            registry_path=registry_path,
-            goal_id=goal_id,
-            todo_id=todo_id,
-            role=role,
+        except FileNotFoundError:
+            if target.get("status") != "done":
+                raise
+            bound = read_completion_result(
+                registry_path=registry_path, runtime_root=runtime_root,
+                goal_id=goal_id, todo_id=todo_id,
+            )["result"]
+            result_descriptor = {key: bound[key] for key in
+                                 ("provider", "sha256", "size_bytes", "content_type")}
+    with authority_registry_source(registry_path) as registry_source:
+        registered, grants = todo_lifecycle_facts(registry_path, goal_id)
+        successor_intents = build_successor_intents(
+            next_agent_todo=next_agent_todo,
+            next_user_todo=next_user_todo,
+            next_user_task_class=next_user_task_class,
+            next_claimed_by=next_claimed_by,
+            next_task_class=next_task_class,
+            next_action_kind=next_action_kind,
+            next_task_repository=next_task_repository,
+            next_required_capabilities=next_required_capabilities,
+            next_continuation_policy=next_continuation_policy,
+            next_excluded_agents=next_excluded_agents,
+        )
+        linked = [
+            linked_successor_from_todo(todo)
+            for linked_id in successor_todo_ids
+            if (todo := _todo_by_id(todos, linked_id)) is not None
+        ]
+        completion_policy_request = (
+            build_completion_policy_request(
+                registry_path=registry_path,
+                goal_id=goal_id,
+                claimed_by=claimed_by,
+                next_claimed_by=next_claimed_by,
+                next_agent_todo=next_agent_todo,
+                next_action_kind=next_action_kind,
+                next_continuation_policy=next_continuation_policy,
+                next_excluded_agents=next_excluded_agents or [],
+                self_merged=self_merged,
+                evidence=evidence,
+                linked_successors=linked,
+            )
+            if command == "complete"
+            else None
+        )
+        implicit_monitor_cycle = (
+            command == "complete"
+            and completion_turn_key is None
+            and target.get("task_class") == "continuous_monitor"
+        )
+        request = {
+            "schema_version": _TERMINAL_REQUEST_SCHEMA,
+            **({"review_basis": dict(review_basis)} if review_basis is not None else {}),
+            "validation_source_provider_revision": None,
+            "runtime_root": str(runtime_root.expanduser().resolve(strict=False)),
+            "goal_id": goal_id,
+            "todo_id": todo_id,
+            "role": role,
+            "command": command,
+            "actor_agent_id": actor_agent_id,
+            "registered_agents": registered,
+            "lifecycle_grants": grants,
+            "registry_source": registry_source,
+            "authority_reason": authority_reason,
+            "decision_outcome": decision_outcome,
+            "operation_identity": (
+                {"kind": "current_monitor_cycle"}
+                if implicit_monitor_cycle
+                else {"kind": "completion_turn"}
+                if command == "complete" and completion_turn_key is not None
+                and completion_identity_source == "turn_settlement"
+                else {"kind": "explicit", "operation_id": _terminal_operation_id(
+                    command=command, goal_id=goal_id, todo_id=todo_id,
+                    completion_turn_key=completion_turn_key,
+                )}
+            ),
+            "lease_idempotency_key": task_lease_idempotency_key,
+            "lease_expected_version": task_lease_expected_version,
+            "allow_user_gate_auto_acquire": command == "complete",
+            "requested_no_followup": no_followup,
+            "requested_completion_turn_key": completion_turn_key,
+            "requested_completion_identity_source": completion_identity_source,
+            "linked_successor_todo_ids": successor_todo_ids,
+            "successor_intents": successor_intents,
+            "note": note,
+            "evidence": evidence,
+            "completion_result": result_descriptor,
+            "reason": reason,
+            "clear_claim": clear_claim,
+            "validation_declaration": None,
+            "validation_declaration_sha256": target.get("completion_validation_sha256") if command == "complete" else None,
+            "validation_receipt": None,
+            "completion_policy_request": completion_policy_request,
+            "dry_run": dry_run,
+            "observed_at": now_local(),
+        }
+    result = effect_runtime_result(
+        "coordination.local_authority.todo_terminal", request,
+        timeout=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+    )
+    if isinstance(result, Mapping) and result.get("status") == "resolve_validation":
+        # Admission and receipt recovery precede host-local declaration IO.
+        # Resolving private argv grants no authority to run it; re-enter the
+        # same transaction and original source witness before executing effects.
+        if state_file is None:
+            raise ValueError("canonical Todo completion validation requires its private state projection")
+        request["validation_source_provider_revision"] = result["provider_revision"]
+        request["validation_declaration"] = resolve_private_completion_validation_declaration(
+            canonical_todo=target, state_file=state_file, runtime_root=runtime_root,
+            registry_path=registry_path, goal_id=goal_id, todo_id=todo_id, role=role,
             persist_if_resolved=not dry_run,
         )
-    request = {
-        "schema_version": _TERMINAL_REQUEST_SCHEMA,
-        "runtime_root": str(runtime_root.expanduser().resolve(strict=False)),
-        "goal_id": goal_id,
-        "todo_id": todo_id,
-        "role": role,
-        "command": command,
-        "actor_agent_id": actor_agent_id,
-        "registered_agents": registered,
-        "lifecycle_grants": grants,
-        "authority_reason": authority_reason,
-        "decision_outcome": decision_outcome,
-        "operation_id": None,
-        "lease_idempotency_key": task_lease_idempotency_key,
-        "lease_expected_version": task_lease_expected_version,
-        "allow_user_gate_auto_acquire": command == "complete",
-        "requested_no_followup": no_followup,
-        "requested_completion_turn_key": completion_turn_key,
-        "requested_completion_identity_source": completion_identity_source,
-        "linked_successor_todo_ids": successor_todo_ids,
-        "successor_intents": successor_intents,
-        "note": note,
-        "evidence": evidence,
-        "reason": reason,
-        "clear_claim": clear_claim,
-        "validation_declaration": validation_declaration,
-        "validation_receipt": None,
-        "completion_policy_request": completion_policy_request,
-        "dry_run": dry_run,
-        "observed_at": now_local(),
-    }
-    request["operation_id"] = _terminal_operation_id(
-        command=command,
-        goal_id=goal_id,
-        todo_id=todo_id,
-        completion_turn_key=completion_turn_key,
-    )
-    result = effect_runtime_result(
-        "coordination.local_authority.todo_terminal", request
-    )
-    if isinstance(result, Mapping) and result.get("status") == "execute_validation":
-        effect = result.get("validation_effect")
-        if not isinstance(effect, Mapping):
-            raise RuntimeError("Todo terminal validation effect shape mismatch")
-        request["validation_receipt"] = run_declared_completion_validation_effect(
-            effect=effect,
-            registry_path=registry_path,
-            goal_id=goal_id,
-        )
         result = effect_runtime_result(
-            "coordination.local_authority.todo_terminal", request
+            "coordination.local_authority.todo_terminal", request,
+            timeout=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+        )
+    completion_validation_executed = False
+    if isinstance(result, Mapping) and result.get("status") == "execute_validation":
+        request["validation_source_provider_revision"] = result["provider_revision"]
+        request.update(execute_completion_validation_effects(
+            result, registry_path=registry_path, goal_id=goal_id,
+            delivery_workspace=completion_delivery_workspace,
+            validation_workspace_path=completion_validation_workspace_path,
+        ))
+        if completion_result_file is not None and not dry_run:
+            _persist_validated_completion_result(
+                request=request, source=completion_result_file, runtime_root=runtime_root,
+                goal_id=goal_id, expected_descriptor=result_descriptor,
+            )
+        completion_validation_executed = True
+        request["observed_at"] = now_local()
+        result = effect_runtime_result(
+            "coordination.local_authority.todo_terminal", request,
+            timeout=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
         )
     if not isinstance(result, Mapping):
         raise LocalCoordinationAuthorityUnavailable(
@@ -430,12 +480,14 @@ def terminal_canonical_todo_if_promoted(
             code="local_authority_todo_terminal_invalid_result",
             payload={"source_authority": "file_v0"},
         )
-    validation_failure = _terminal_failure_payload(
+    validation_failure = completion_validation_failure(
         result, goal_id=goal_id, todo_id=todo_id, dry_run=dry_run
     )
     if validation_failure is not None:
         return validation_failure
     payload = dict(result)
+    if completion_validation_executed:
+        payload["completion_validation_executed"] = True
     if (
         payload.get("status") == "failed"
         and payload.get("failure_kind") == "decision_rejection"
@@ -447,7 +499,7 @@ def terminal_canonical_todo_if_promoted(
         )
     if (
         payload.get("status") not in _ACCEPTED
-        or payload.get("source_authority") != "file_v0"
+        or payload.get("source_authority") not in LOCAL_AUTHORITY_SOURCES
         or payload.get("decision_read_from_provider") is not True
         or payload.get("legacy_fallback_used") is not False
     ):
@@ -463,6 +515,7 @@ def terminal_canonical_todo_if_promoted(
     idempotent_replay = provider_status in {"replayed", "no_change"} or (
         isinstance(terminal_decision, Mapping)
         and terminal_decision.get("idempotent") is True
+        and payload.get("changed") is not True
     )
     response = {
         **payload,
@@ -532,9 +585,11 @@ def archive_canonical_todos_if_promoted(
                 max_active_done=max_active_done,
                 provider_revision=provider_revision,
             ),
+            "expected_provider_revision": provider_revision,
             "dry_run": dry_run,
             "observed_at": now_local(),
         },
+        timeout=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
     )
     if not isinstance(result, Mapping) or result.get("status") not in _ACCEPTED:
         payload = dict(result) if isinstance(result, Mapping) else {}
@@ -545,7 +600,7 @@ def archive_canonical_todos_if_promoted(
             ),
             payload=payload,
         )
-    return _projection_payload(
+    response = _projection_payload(
         settle_canonical_todo_projection(
             {"ok": True, "dry_run": dry_run, "goal_id": goal_id, **dict(result)},
             registry_path=registry_path,
@@ -555,6 +610,37 @@ def archive_canonical_todos_if_promoted(
             state_file=state_file,
         )
     )
+    if (
+        not dry_run
+        and response.get("moved_count", 0) > 0
+        and projection_delivery_requires_ack(response.get("projection_delivery"))
+    ):
+        # The native owner retains the attempt until its external projection
+        # provider succeeds. An ACK failure must preserve the committed result
+        # and leave the same attempt available for the next retry.
+        try:
+            acknowledgement = effect_runtime_result(
+                "coordination.local_authority.todo_archive_ack",
+                {
+                    "schema_version": _ARCHIVE_ACK_REQUEST_SCHEMA,
+                    "runtime_root": str(runtime_root.expanduser().resolve(strict=False)),
+                    "goal_id": goal_id,
+                    "role": role,
+                    "operation_id": response.get("operation_id"),
+                },
+                timeout=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+            )
+            response["archive_delivery_ack"] = (
+                dict(acknowledgement)
+                if isinstance(acknowledgement, Mapping)
+                else {"status": "pending", "reason_code": "invalid_archive_ack_result"}
+            )
+        except Exception as error:  # noqa: BLE001 - the canonical commit already landed
+            response["archive_delivery_ack"] = {
+                "status": "pending", "reason_code": "archive_ack_unavailable",
+                "error_class": error.__class__.__name__, "retryable": True,
+            }
+    return response
 
 
 __all__ = [

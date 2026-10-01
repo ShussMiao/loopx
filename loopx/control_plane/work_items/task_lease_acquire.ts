@@ -1,4 +1,10 @@
+import {observeLeaseWorktree, type LeaseWorkspace} from "./task_lease_workspace.ts";
+import {executeCanonicalTaskLeaseAcquire} from "../coordination/task_lease_acquire.ts";
+import {withCanonicalTaskLeaseAuthority} from "./canonical_task_lease_lifecycle.ts";
+import {evaluateTaskLeaseWriteScopesOverlap, evaluateTaskLeaseAcquireDecision, materializeTaskLeaseAcquire, type AcquireDecisionOtherLease} from "./task_lease_acquire_decision.ts";
+import {leaseOwnerRejection as ownerRejection} from "./task_lease_eligibility.ts";
 import { ShadowManagementError, requireShadowPrimaryWriteAllowed } from "../coordination/shadow_management.ts";
+import { parseIsoTimestamp } from "../runtime_timestamp.ts";
 import { LegacyCoordinationWriteError, requireLegacyCoordinationPrimaryWriteAllowed } from "../coordination/legacy_writer_fence.ts";
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
@@ -23,7 +29,8 @@ import {
   decodeLocalAuthorityShadowBinding,
   type LocalAuthorityShadowBinding,
 } from "../coordination/local_authority_shadow_outbox.ts";
-import { TASK_LEASE_ACQUIRE_REQUEST_SCHEMA } from "../coordination/coordination_state_contract.generated.ts";
+import { TASK_LEASE_ACQUIRE_REQUEST_SCHEMA, TASK_LEASE_CANONICAL_ACQUIRE_REQUEST_SCHEMA } from "../coordination/coordination_state_contract.generated.ts";
+import { BARE_SHA256_PATTERN } from "../content_digest.ts";
 
 export const TASK_LEASE_ACQUIRE_REQUEST_SCHEMA_VERSION =
   TASK_LEASE_ACQUIRE_REQUEST_SCHEMA;
@@ -59,6 +66,7 @@ export interface TodoFact {
   task_class?: string | null;
   bound_agent?: string | null;
   blocks_agent?: string | null;
+  task_repository?: string | null;
   /** Fields explicitly supplied by a legacy caller snapshot, if known. */
   provided_fields?: readonly TodoFactField[];
 }
@@ -72,6 +80,9 @@ export interface AuthorityFacts {
 }
 
 interface AcquireRequest {
+  canonical: boolean;
+  write_worktree: string | null;
+  write_workspace?: LeaseWorkspace | null;
   runtime_root: string;
   goal_id: string;
   owner: string;
@@ -91,6 +102,7 @@ export interface LeaseRecord extends JsonObject {
   owner?: unknown;
   idempotency_key?: unknown;
   write_scopes?: unknown;
+  write_repository?: unknown;
   acquire_ttl_seconds?: unknown;
   version?: unknown;
   lease_epoch?: unknown;
@@ -98,49 +110,6 @@ export interface LeaseRecord extends JsonObject {
   acquired_at?: unknown;
   updated_at?: unknown;
   expires_at?: unknown;
-}
-
-interface AcquireDecisionLease {
-  present: boolean;
-  active: boolean;
-  effective: boolean;
-  status: string | null;
-  owner: string | null;
-  idempotency_key: string | null;
-  version: number;
-  lease_epoch: number;
-  write_scopes: readonly string[];
-  acquire_ttl_seconds: number | null;
-}
-
-interface AcquireDecisionOtherLease {
-  todo_id: string;
-  active: boolean;
-  effective: boolean;
-  write_scopes: readonly string[];
-}
-
-interface AcquireDecisionInput {
-  handoff_mode: string;
-  registered_agents: readonly string[];
-  todo: TodoFact | null;
-  lease: AcquireDecisionLease | null;
-  other_leases: readonly AcquireDecisionOtherLease[];
-  command: {
-    owner: string;
-    idempotency_key: string;
-    ttl_seconds: number;
-    write_scopes: readonly string[];
-    expected_version: number | null;
-  };
-}
-
-interface AcquireDecision extends JsonObject {
-  outcome: "apply" | "no_change" | "conflict" | "rejected";
-  code: string;
-  idempotent: boolean;
-  next_lease: JsonObject | null;
-  conflict_indexes: number[];
 }
 
 interface TaskLeaseFailure {
@@ -157,6 +126,7 @@ interface ExecutionContext {
 }
 
 export interface TaskLeaseAcquireDependencies {
+  authorityProvider?: import("../coordination/local_authority_provider.ts").LocalAuthorityProviderDependencies;
   now?: () => Date;
   beforeWrite?: (lease: JsonObject) => void | Promise<void>;
 }
@@ -316,7 +286,7 @@ function decodeSourceReceipt(value: unknown, index: number): SourceReceipt {
   const sha256 = receipt.sha256;
   if (
     (state === "file" &&
-      (typeof sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(sha256))) ||
+      (typeof sha256 !== "string" || !BARE_SHA256_PATTERN.test(sha256))) ||
     (state === "missing" && sha256 !== null)
   ) {
     throw new EffectRuntimeRequestError("authority source receipt digest is invalid");
@@ -420,7 +390,7 @@ export function decodeTaskLeaseAuthority(value: unknown): AuthorityFacts {
   };
 }
 
-function normalizeHandoffMode(value: unknown): string {
+export function normalizeHandoffMode(value: unknown): string {
   const mode = compact(value) || "legacy";
   if (!new Set(["legacy", "soft_claim", "hard_lease"]).has(mode)) {
     throw new TaskLeaseAcquireError(
@@ -434,14 +404,24 @@ function normalizeHandoffMode(value: unknown): string {
 
 function decodeRequest(value: unknown): AcquireRequest {
   const request = requireJsonObject(value, "task lease acquire request");
-  if (request.schema_version !== TASK_LEASE_ACQUIRE_REQUEST_SCHEMA_VERSION) {
+  const canonical = request.schema_version === TASK_LEASE_CANONICAL_ACQUIRE_REQUEST_SCHEMA;
+  if (request.schema_version !== TASK_LEASE_ACQUIRE_REQUEST_SCHEMA_VERSION && !canonical) {
     throw new EffectRuntimeRequestError("Task-lease acquire request schema mismatch");
   }
   // Decode the authority envelope first.  Besides keeping the boundary
   // fail-closed, this preserves the public error ordering used by the native
   // CLI: a missing authority projection is reported before unrelated fields.
-  const authority = decodeTaskLeaseAuthority(request.authority);
+  if (canonical) {
+    const allowed = new Set(["schema_version", "runtime_root", "goal_id", "todo_id", "owner", "idempotency_key",
+      "ttl_seconds", "write_scopes", "write_worktree", "expected_version", "authority"]);
+    const unsupported = Object.keys(request).find(key => !allowed.has(key));
+    if (unsupported) throw new TaskLeaseAcquireError(`canonical acquire does not accept ${unsupported}`, "invalid_canonical_acquire_request");
+  }
+  const rawAuthority = requireJsonObject(request.authority, "acquire authority");
+  const authority = decodeTaskLeaseAuthority(canonical ? {...rawAuthority, handoff_mode: "legacy", todos: [], todo_projection_error: null} : rawAuthority);
   return {
+    canonical,
+    write_worktree: request.write_worktree == null ? null : stringValue(request.write_worktree, "write_worktree"),
     runtime_root: stringValue(request.runtime_root, "runtime_root"),
     goal_id: normalizeGoalId(request.goal_id),
     owner: normalizeOwner(request.owner),
@@ -547,13 +527,11 @@ export function leaseInteger(
   } else if (typeof raw === "string" && /^-?\d+$/u.test(raw)) {
     number = Number(raw);
   }
-  const positive = field === "lease_epoch";
-  const nonNegative = field === "version";
+  const minimum = field === "version" ? 0 : 1;
   if (
-    typeof raw === "boolean" || !Number.isSafeInteger(number) ||
-    (positive && number <= 0) || (nonNegative && number < 0)
+    typeof raw === "boolean" || !Number.isSafeInteger(number) || number < minimum
   ) {
-    let message = "lease acquire_ttl_seconds must be an integer";
+    let message = "lease acquire_ttl_seconds must be a positive integer";
     if (field === "lease_epoch") {
       message = "lease epoch must be a positive integer";
     } else if (field === "version") {
@@ -573,44 +551,6 @@ export function leaseEpoch(lease: LeaseRecord | null): number {
   return leaseInteger(lease, "lease_epoch") ?? 1;
 }
 
-export function parseLeaseTimestamp(value: string): Date | null {
-  const match = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|z|[+-]\d{2}(?::?\d{2})?)?)?$/u.exec(
-    value.trim(),
-  );
-  if (match === null) return null;
-  const [, yearText, monthText, dayText, hourText, minuteText, secondText, fraction, timezone] = match;
-  const [year, month, day, hour, minute, second, millisecond] = [
-    yearText,
-    monthText,
-    dayText,
-    hourText ?? "0",
-    minuteText ?? "0",
-    secondText ?? "0",
-    (fraction ?? "").slice(0, 3).padEnd(3, "0") || "0",
-  ].map(Number);
-  const endOfDay = hour === 24;
-  if (
-    endOfDay &&
-    (minute !== 0 || second !== 0 || (fraction !== undefined && /[1-9]/u.test(fraction)))
-  ) return null;
-  const calendarHour = endOfDay ? 0 : hour;
-  const calendar = new Date(0);
-  calendar.setUTCHours(calendarHour, minute, second, millisecond);
-  calendar.setUTCFullYear(year, month - 1, day);
-  if (
-    calendar.getUTCFullYear() !== year || calendar.getUTCMonth() !== month - 1 ||
-    calendar.getUTCDate() !== day || calendar.getUTCHours() !== calendarHour ||
-    calendar.getUTCMinutes() !== minute || calendar.getUTCSeconds() !== second ||
-    calendar.getUTCMilliseconds() !== millisecond
-  ) return null;
-  if (hourText === undefined) return calendar;
-  let text = value.trim().replace(" ", "T").replace(/z$/u, "Z");
-  if (fraction !== undefined) text = text.replace(`.${fraction}`, `.${fraction.slice(0, 3)}`);
-  if (timezone === undefined) text += "Z";
-  else text = text.replace(/([+-]\d{2})$/u, "$1:00");
-  const parsed = new Date(text);
-  return Number.isNaN(parsed.valueOf()) ? null : parsed;
-}
 
 export function leaseIsActive(lease: LeaseRecord | null, at: Date): boolean {
   if (
@@ -626,7 +566,7 @@ export function leaseIsActive(lease: LeaseRecord | null, at: Date): boolean {
       { expires_at: lease.expires_at ?? null },
     );
   }
-  const expiresAt = parseLeaseTimestamp(lease.expires_at);
+  const expiresAt = parseIsoTimestamp(lease.expires_at);
   if (expiresAt === null) {
     throw new TaskLeaseAcquireError(
       "active lease expires_at must be a valid timestamp",
@@ -639,22 +579,6 @@ export function leaseIsActive(lease: LeaseRecord | null, at: Date): boolean {
 
 export function utcIsoformat(value: Date): string {
   return value.toISOString().replace(/\.\d{3}Z$/u, "Z");
-}
-
-export function ownerRejection(
-  todo: TodoFact | undefined,
-  owner: string | null,
-  registeredAgents: readonly string[],
-): string | null {
-  if (todo === undefined) return "todo_not_found";
-  if (todo.status !== "open") return "todo_not_open";
-  if (owner === null) return "invalid_owner";
-  if (!registeredAgents.includes(owner)) return "owner_not_registered";
-  if (todo.excluded_agents.includes(owner)) return "owner_excluded_from_todo";
-  if (todo.claimed_by && todo.claimed_by !== owner) {
-    return "owner_conflicts_with_claim";
-  }
-  return null;
 }
 
 function ownerFailure(
@@ -683,318 +607,6 @@ function ownerFailure(
     todo_id: request.todo_id,
     owner: request.owner,
     ...detail,
-  });
-}
-
-function classMatch(
-  pattern: string,
-  start: number,
-  value: string,
-): { end: number; matches: boolean } | null {
-  let end = start + 1;
-  if (pattern[end] === "!") end += 1;
-  if (pattern[end] === "]") end += 1;
-  end = pattern.indexOf("]", end);
-  if (end < 0) return null;
-  let body = pattern.slice(start + 1, end);
-  const negated = body.startsWith("!");
-  if (negated) body = body.slice(1);
-  let matches = false;
-  for (let index = 0; index < body.length; index += 1) {
-    if (index + 2 < body.length && body[index + 1] === "-") {
-      if (body[index] <= value && value <= body[index + 2]) matches = true;
-      index += 2;
-    } else if (body[index] === value) {
-      matches = true;
-    }
-  }
-  return { end, matches: negated ? !matches : matches };
-}
-
-function fnmatchcase(value: string, pattern: string): boolean {
-  const memo = new Map<string, boolean>();
-  const match = (valueIndex: number, patternIndex: number): boolean => {
-    const key = `${valueIndex}:${patternIndex}`;
-    const cached = memo.get(key);
-    if (cached !== undefined) return cached;
-    let result: boolean;
-    if (patternIndex === pattern.length) {
-      result = valueIndex === value.length;
-    } else if (pattern[patternIndex] === "*") {
-      result = match(valueIndex, patternIndex + 1) ||
-        (valueIndex < value.length && match(valueIndex + 1, patternIndex));
-    } else if (valueIndex === value.length) {
-      result = false;
-    } else if (pattern[patternIndex] === "?") {
-      result = match(valueIndex + 1, patternIndex + 1);
-    } else if (pattern[patternIndex] === "[") {
-      const characterClass = classMatch(pattern, patternIndex, value[valueIndex]);
-      result = characterClass === null
-        ? value[valueIndex] === "[" && match(valueIndex + 1, patternIndex + 1)
-        : characterClass.matches && match(valueIndex + 1, characterClass.end + 1);
-    } else {
-      result = value[valueIndex] === pattern[patternIndex] &&
-        match(valueIndex + 1, patternIndex + 1);
-    }
-    memo.set(key, result);
-    return result;
-  };
-  return match(0, 0);
-}
-
-function scopeLiteralPrefix(scope: string): string {
-  const indexes = ["*", "?", "["]
-    .map((token) => scope.indexOf(token))
-    .filter((index) => index >= 0);
-  return indexes.length > 0 ? scope.slice(0, Math.min(...indexes)) : scope;
-}
-
-function scopePairOverlaps(left: string, right: string): boolean {
-  if (left === right) return true;
-  if (["*", "**", "./"].includes(left) || ["*", "**", "./"].includes(right)) {
-    return true;
-  }
-  const leftGlob = ["*", "?", "["].some((token) => left.includes(token));
-  const rightGlob = ["*", "?", "["].some((token) => right.includes(token));
-  if (leftGlob && !rightGlob) {
-    const prefix = scopeLiteralPrefix(left);
-    return fnmatchcase(right, left) ||
-      (prefix.endsWith("/") && right.replace(/\/$/u, "") === prefix.replace(/\/$/u, ""));
-  }
-  if (rightGlob && !leftGlob) {
-    const prefix = scopeLiteralPrefix(right);
-    return fnmatchcase(left, right) ||
-      (prefix.endsWith("/") && left.replace(/\/$/u, "") === prefix.replace(/\/$/u, ""));
-  }
-  if (leftGlob && rightGlob) {
-    const leftPrefix = scopeLiteralPrefix(left);
-    const rightPrefix = scopeLiteralPrefix(right);
-    return !leftPrefix || !rightPrefix || leftPrefix.startsWith(rightPrefix) ||
-      rightPrefix.startsWith(leftPrefix);
-  }
-  const leftRoot = left.replace(/\/$/u, "");
-  const rightRoot = right.replace(/\/$/u, "");
-  return (left.endsWith("/") && right.startsWith(`${leftRoot}/`)) ||
-    (right.endsWith("/") && left.startsWith(`${rightRoot}/`));
-}
-
-function writeScopesOverlap(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length === 0 || right.length === 0) return false;
-  return left.some((a) => right.some((b) => scopePairOverlaps(a, b)));
-}
-
-function decisionStringArray(value: unknown, label: string): string[] {
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-    throw new EffectRuntimeRequestError(`${label} must be an array of strings`);
-  }
-  return [...value] as string[];
-}
-
-export function evaluateTaskLeaseWriteScopesOverlap(value: unknown): JsonObject {
-  const input = requireJsonObject(value, "task lease write-scope overlap");
-  return {
-    overlap: writeScopesOverlap(
-      decisionStringArray(input.left, "left"),
-      decisionStringArray(input.right, "right"),
-    ),
-  };
-}
-
-function decisionBoolean(value: unknown, label: string): boolean {
-  if (typeof value !== "boolean") {
-    throw new EffectRuntimeRequestError(`${label} must be a boolean`);
-  }
-  return value;
-}
-
-function decisionInteger(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new EffectRuntimeRequestError(`${label} must be a non-negative safe integer`);
-  }
-  return value;
-}
-
-function decisionNullableString(value: unknown, label: string): string | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== "string") {
-    throw new EffectRuntimeRequestError(`${label} must be a string or null`);
-  }
-  return value;
-}
-
-function decodeDecisionTodo(value: unknown): TodoFact | null {
-  if (value === null || value === undefined) return null;
-  const todo = requireJsonObject(value, "task lease acquire decision todo");
-  return {
-    todo_id: stringValue(todo.todo_id, "todo.todo_id"),
-    status: stringValue(todo.status, "todo.status"),
-    claimed_by: decisionNullableString(todo.claimed_by, "todo.claimed_by"),
-    excluded_agents: decisionStringArray(todo.excluded_agents, "todo.excluded_agents"),
-  };
-}
-
-function decodeDecisionLease(value: unknown): AcquireDecisionLease | null {
-  if (value === null || value === undefined) return null;
-  const lease = requireJsonObject(value, "task lease acquire decision lease");
-  return {
-    present: decisionBoolean(lease.present, "lease.present"),
-    active: decisionBoolean(lease.active, "lease.active"),
-    effective: decisionBoolean(lease.effective, "lease.effective"),
-    status: decisionNullableString(lease.status, "lease.status"),
-    owner: decisionNullableString(lease.owner, "lease.owner"),
-    idempotency_key: decisionNullableString(
-      lease.idempotency_key,
-      "lease.idempotency_key",
-    ),
-    version: decisionInteger(lease.version, "lease.version"),
-    lease_epoch: decisionInteger(lease.lease_epoch, "lease.lease_epoch"),
-    write_scopes: decisionStringArray(lease.write_scopes, "lease.write_scopes"),
-    acquire_ttl_seconds: optionalInteger(
-      lease.acquire_ttl_seconds,
-      "lease.acquire_ttl_seconds",
-    ),
-  };
-}
-
-function decodeAcquireDecisionInput(value: unknown): AcquireDecisionInput {
-  const input = requireJsonObject(value, "task lease acquire decision");
-  const command = requireJsonObject(input.command, "task lease acquire decision command");
-  const rawOtherLeases = input.other_leases;
-  if (!Array.isArray(rawOtherLeases)) {
-    throw new EffectRuntimeRequestError("other_leases must be an array");
-  }
-  const otherLeases = rawOtherLeases.map((raw, index) => {
-    const lease = requireJsonObject(raw, `other_leases[${index}]`);
-    return {
-      todo_id: stringValue(lease.todo_id, `other_leases[${index}].todo_id`),
-      active: decisionBoolean(lease.active, `other_leases[${index}].active`),
-      effective: decisionBoolean(lease.effective, `other_leases[${index}].effective`),
-      write_scopes: decisionStringArray(
-        lease.write_scopes,
-        `other_leases[${index}].write_scopes`,
-      ),
-    };
-  });
-  return {
-    handoff_mode: stringValue(input.handoff_mode, "handoff_mode"),
-    registered_agents: decisionStringArray(
-      input.registered_agents,
-      "registered_agents",
-    ),
-    todo: decodeDecisionTodo(input.todo),
-    lease: decodeDecisionLease(input.lease),
-    other_leases: otherLeases,
-    command: {
-      owner: stringValue(command.owner, "command.owner"),
-      idempotency_key: stringValue(
-        command.idempotency_key,
-        "command.idempotency_key",
-      ),
-      ttl_seconds: decisionInteger(command.ttl_seconds, "command.ttl_seconds"),
-      write_scopes: decisionStringArray(
-        command.write_scopes,
-        "command.write_scopes",
-      ),
-      expected_version: optionalInteger(
-        command.expected_version,
-        "command.expected_version",
-      ),
-    },
-  };
-}
-
-function acquireDecisionResult(
-  outcome: AcquireDecision["outcome"],
-  code: string,
-  options: {
-    idempotent?: boolean;
-    nextLease?: JsonObject | null;
-    conflictIndexes?: number[];
-  } = {},
-): AcquireDecision {
-  return {
-    outcome,
-    code,
-    idempotent: options.idempotent ?? false,
-    next_lease: options.nextLease ?? null,
-    conflict_indexes: options.conflictIndexes ?? [],
-  };
-}
-
-/**
- * Canonical pure decision for both local file acquire and shared coordination.
- * Locking, source revalidation, persistence, provider CAS, and receipts stay in
- * their respective execution layers.
- */
-export function evaluateTaskLeaseAcquireDecision(value: unknown): AcquireDecision {
-  const input = decodeAcquireDecisionInput(value);
-  const { command, lease } = input;
-  if (lease !== null && lease.active && (!lease.present || lease.status === "released")) {
-    return acquireDecisionResult("rejected", "invalid_lease_snapshot");
-  }
-  if (input.handoff_mode === "soft_claim") {
-    return acquireDecisionResult("rejected", "handoff_mode_forbids_lease");
-  }
-  const rejection = ownerRejection(
-    input.todo ?? undefined,
-    command.owner || null,
-    input.registered_agents,
-  );
-  if (rejection !== null) {
-    return acquireDecisionResult("rejected", rejection);
-  }
-  const actualVersion = lease !== null && lease.present ? lease.version : 0;
-  if (
-    command.expected_version !== null && command.expected_version !== actualVersion
-  ) {
-    return acquireDecisionResult("conflict", "version_mismatch");
-  }
-  if (lease !== null && lease.present && lease.active && lease.effective) {
-    if (
-      lease.owner === command.owner &&
-      lease.idempotency_key === command.idempotency_key
-    ) {
-      const scopesMatch = equalScopeSets(lease.write_scopes, command.write_scopes);
-      const ttlMatches = lease.acquire_ttl_seconds === null ||
-        lease.acquire_ttl_seconds === command.ttl_seconds;
-      if (!scopesMatch || !ttlMatches) {
-        return acquireDecisionResult("rejected", "idempotency_key_reuse");
-      }
-      return acquireDecisionResult("no_change", "lease_acquire_replay", {
-        idempotent: true,
-      });
-    }
-    return acquireDecisionResult("conflict", "todo_lease_conflict");
-  }
-  if (
-    lease !== null && lease.present &&
-    lease.idempotency_key === command.idempotency_key
-  ) {
-    return acquireDecisionResult("rejected", "idempotency_key_reuse");
-  }
-  const conflictIndexes = input.other_leases.flatMap((other, index) =>
-    other.active && other.effective &&
-      writeScopesOverlap(command.write_scopes, other.write_scopes)
-      ? [index]
-      : []
-  );
-  if (conflictIndexes.length > 0) {
-    return acquireDecisionResult("conflict", "write_scope_conflict", {
-      conflictIndexes,
-    });
-  }
-  return acquireDecisionResult("apply", "lease_acquire", {
-    nextLease: {
-      present: true,
-      active: true,
-      status: "active",
-      owner: command.owner,
-      idempotency_key: command.idempotency_key,
-      version: actualVersion + 1,
-      lease_epoch: (lease?.lease_epoch ?? 0) + 1,
-      write_scopes: [...command.write_scopes],
-      acquire_ttl_seconds: command.ttl_seconds,
-    },
   });
 }
 
@@ -1160,12 +772,6 @@ function transitionError(
   );
 }
 
-function equalScopeSets(left: readonly string[], right: readonly string[]): boolean {
-  const a = [...new Set(left)].sort((first, second) => first.localeCompare(second));
-  const b = [...new Set(right)].sort((first, second) => first.localeCompare(second));
-  return a.length === b.length && a.every((value, index) => value === b[index]);
-}
-
 function successEnvelope(
   request: AcquireRequest,
   lease: LeaseRecord,
@@ -1215,11 +821,14 @@ const VALIDATION_FAILURE_CODES = new Set([
   ...PERMISSION_DENIED_CODES,
   "todo_lease_conflict",
   "write_scope_conflict",
+  "lease_generation_exhausted",
   "authority_source_changed",
+  "corrupt_lease",
 ]);
 
 function failureKind(code: string): string {
   if (INVALID_IDENTITY_CODES.has(code)) return "invalid_identity";
+  if (code === "corrupt_lease") return "permission_denied";
   if (PERMISSION_DENIED_CODES.has(code)) return "permission_denied";
   return "writeback_rejected";
 }
@@ -1297,11 +906,6 @@ async function commitAcquire(
   const version = leaseVersion(existing);
   const epoch = leaseEpoch(existing);
   const active = leaseIsActive(existing, at);
-  const existingEffective = existing !== null && active && ownerRejection(
-    todo ?? undefined,
-    normalizeAgent(existing.owner),
-    request.authority.registered_agents,
-  ) === null;
   const otherLeases = await otherLeaseFacts(request, at);
   const decision = evaluateTaskLeaseAcquireDecision({
     handoff_mode: request.authority.handoff_mode,
@@ -1312,7 +916,6 @@ async function commitAcquire(
       : {
         present: true,
         active,
-        effective: existingEffective,
         status: typeof existing.status === "string" ? existing.status : null,
         owner: normalizeAgent(existing.owner),
         idempotency_key: typeof existing.idempotency_key === "string"
@@ -1374,27 +977,7 @@ async function commitAcquire(
     );
   }
 
-  const acquiredAt = utcIsoformat(at);
-  const lease: LeaseRecord = {
-    schema_version: TASK_LEASE_SCHEMA_VERSION,
-    goal_id: request.goal_id,
-    todo_id: request.todo_id,
-    owner: request.owner,
-    idempotency_key: request.idempotency_key,
-    write_scopes: [...request.write_scopes],
-    acquire_ttl_seconds: request.ttl_seconds,
-    version: decisionInteger(decision.next_lease.version, "next_lease.version"),
-    lease_epoch: decisionInteger(
-      decision.next_lease.lease_epoch,
-      "next_lease.lease_epoch",
-    ),
-    acquired_at: acquiredAt,
-    updated_at: acquiredAt,
-    expires_at: utcIsoformat(
-      new Date(at.valueOf() + request.ttl_seconds * 1_000),
-    ),
-    status: "active",
-  };
+  const lease = materializeTaskLeaseAcquire(request, request, decision, at);
   await dependencies.beforeWrite?.(lease);
   await revalidateAuthoritySources(request.authority.source_receipts);
   const captureRequired = request.runtime_shadow !== null ||
@@ -1409,6 +992,10 @@ async function commitAcquire(
       operation_id: request.idempotency_key,
       previous_lease: existing,
       planned_lease: lease,
+      active_todo_ids: [...request.authority.todos.keys()],
+      goal_ref: request.runtime_shadow !== null && "goal_ref" in request.runtime_shadow
+        ? request.runtime_shadow.goal_ref
+        : undefined,
     });
   if (shadowCapture?.failure && await requireShadowPrimaryWriteAllowed(request.runtime_root, request.goal_id) !== null) {
     throw new ShadowManagementError("shadow_capture_prepare_failed", "durable shadow preparation failed; the primary lease was not changed");
@@ -1436,6 +1023,13 @@ export async function executeTaskLeaseAcquire(
   const context = executionContext(value);
   try {
     request = decodeRequest(value);
+    if (request.write_worktree !== null) {
+      if (!request.canonical || request.write_scopes.length === 0) throw new TaskLeaseAcquireError(
+        "--write-worktree requires canonical authority and nonempty code-edit scopes", "invalid_worktree_lease_request");
+      try { request.write_workspace = await observeLeaseWorktree(request.write_worktree, path =>
+        evaluateTaskLeaseWriteScopesOverlap({left: request.write_scopes, right: [path]}).overlap === true); }
+      catch { throw new TaskLeaseAcquireError("cannot verify independent Git worktree and origin for --write-worktree", "invalid_worktree_lease_request"); }
+    }
   } catch (error) {
     if (error instanceof TaskLeaseAcquireError || error instanceof ShadowManagementError || error instanceof LegacyCoordinationWriteError) {
       return failureEnvelope(
@@ -1447,6 +1041,28 @@ export async function executeTaskLeaseAcquire(
   }
 
   try {
+    if (request.canonical) {
+      const result = await withCanonicalTaskLeaseAuthority({...request, operation: "acquire"}, {
+        ...dependencies, now: dependencies.now ?? (() => new Date()),
+      }, async (store, guards) => {
+        await guards.revalidate();
+        return await executeCanonicalTaskLeaseAcquire(store, {...request,
+          registered_agents: request.authority.registered_agents, now: (dependencies.now ?? (() => new Date()))()}, guards.beforeCommit);
+      });
+      if (["applied", "no_change", "replayed", "recovered"].includes(String(result.status))) {
+        const idempotent = result.status !== "applied";
+        const envelope = successEnvelope(request, result.lease as LeaseRecord, "", acquireEffectId(request), idempotent);
+        delete envelope.lease_path;
+        return {...result, ...envelope, acquired: !idempotent && result.changed === true};
+      }
+      const envelope = failureEnvelope({code: String(result.reason_code ?? result.conflict_kind ?? "canonical_acquire_failed"),
+        message: String(result.reason ?? "canonical acquisition failed; inspect before retrying"),
+        kind: result.reason_code === "legacy_writer_fence_read_failed" ? "permission_denied" : undefined,
+        payload: result, stage: result.failure_stage === "durable_writeback" ? "durable_writeback" : "validation"}, context);
+      delete envelope.lease_path;
+      // Keep the public acquire schema even when the inner command has diagnostics.
+      return {...envelope, schema_version: TASK_LEASE_SCHEMA_VERSION};
+    }
     return await withFileMutationLock(
       legacyCoordinationLeaseLockPath(request.runtime_root, request.goal_id),
       () => withFileMutationLock(taskLeaseLockPath(request), async () => {

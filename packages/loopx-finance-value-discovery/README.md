@@ -38,6 +38,50 @@ Two P1 overlays reuse that contract without weakening it:
   directions. They do not contain thresholds or evaluate provider-declared
   pass/fail states.
 
+Extension 0.8.0 adds `finance_contract_liquidity_input_v0`, a provider-neutral
+exit-liquidity admission for derivatives. Venue adapters remain responsible for
+contract identity, precision, book collection and evidence timestamps. Finance
+evaluates each frozen position direction and requested notional against one
+freshness window, minimum executable-book coverage and maximum derived exit
+cost. Exit cost is the deterministic sum of spread, price impact and fees; a
+provider cannot submit its own total or pass/fail decision. Long positions must
+use a sell exit and short positions a buy exit.
+
+The result is deliberately independent of investment value and funding. Those
+fields, venue names and account material are rejected rather than folded into
+the liquidity decision. A fresh passing result means only
+`eligible_for_research_successor`; it never creates a ready candidate or grants
+order, signing or transfer authority. Stale measurements are
+`insufficient_evidence`, while fresh amount/cost failures are
+`insufficient_liquidity`.
+
+0.8.0 新增 `finance_contract_liquidity_input_v0`，用于对衍生品退出流动性做
+provider-neutral 准入。私有场所适配器继续负责合约身份、精度、订单簿采集和
+证据时间；Finance 只按持仓方向与申请退出金额，使用冻结的新鲜度、可执行订单簿
+覆盖率和最大退出成本阈值进行确定性判断。退出成本由点差、价格冲击和手续费相加
+得到，不接受 provider 自报总成本或通过/失败；多头必须卖出退出，空头必须买入
+退出。
+
+该判断与投资价值和资金费明确隔离，相关字段、场所名称和账户材料会被拒绝，而
+不是混入流动性结论。通过只表示可以进入下一段研究，不能升级 ready，更不授权
+下单、签名或转账；过期测量是证据不足，新鲜但金额或成本不满足才是流动性不足。
+
+Run the same contract through the direct CLI or managed extension runtime:
+
+```bash
+loopx-finance-value-discovery evaluate-contract-liquidity \
+  --input-json packages/loopx-finance-value-discovery/examples/contract-liquidity-v0.json
+
+loopx extension run loopx-finance-value-discovery \
+  --input-json packages/loopx-finance-value-discovery/examples/contract-liquidity-v0.json \
+  --execute --format json
+```
+
+This slice changes the CLI/managed-Turn contract only. Dashboard and Lark must
+consume the same evaluation in their separately owned projection slice; until
+that lands, this backend delivery is intentionally partial rather than an
+end-to-end visual release.
+
 The packet enforces:
 
 - a cross-sectional screen before a named candidate is selected;
@@ -52,8 +96,62 @@ The packet enforces:
 
 It rejects raw provider bodies, private paths, credentials, account or
 portfolio material, future-dated evidence, unsupported fields, and malformed
-public URLs. It never emits investment advice, a price target, a trade, or an
-automatic watch.
+public URLs. The discovery reducer never emits investment advice, a price
+target, a trade, or an automatic watch.
+
+## Simulation-only transaction confirmation / 仅模拟交易确认
+
+Extension 0.7.0 adds the
+`finance_transaction_approval_input_v0` consumer, deliberately separate from
+the discovery reducer. It turns an explicit, already-bounded candidate action
+into Core's canonical `loopx_operation_request_v0`. The request freezes the
+order action, public evidence links, evidence observation time, expected
+economics, expiry, and no-trade conditions into the same projection shown by
+the Dashboard and the Goal Channel Lark card. It always targets
+`account:simulation` and the `finance.operation.simulate` executor permission.
+It cannot place an order, sign, transfer, infer an approver, or create standing
+trading authority.
+
+0.7.0 新增的 `finance_transaction_approval_input_v0` consumer 与发现 reducer
+明确隔离。它只把一个已经收敛、显式提出的候选动作转换成 Core 的
+`loopx_operation_request_v0`，并把下单动作、公开证据链接、证据观察时间、
+预期经济性、过期时间和禁交易条件冻结进 Dashboard 与 Goal Channel 飞书卡片
+共用的投影。目标固定为 `account:simulation`，权限固定为
+`finance.operation.simulate`；它不能真实下单、签名、转账、推断审批人或产生
+持续交易权限。
+
+The executor revision must come from the enabled `loopx-finance-execution`
+extension readback. Authorized principals must be explicit provider-qualified
+identities from the current Goal Channel operator authority; the Finance builder
+neither discovers nor broadens them. Build the packet once, retain both its
+idempotency key and canonical request, then let Core persist and deliver it
+through the existing two-step entrypoint:
+
+```bash
+loopx-finance-value-discovery build-operation-request \
+  --input-json transaction-approval.json > approval-packet.json
+jq '.operation_request' approval-packet.json > operation-request.json
+loopx goal-channel prepare-operation \
+  --goal-id <goal> --agent-id <agent> \
+  --summary "Review one simulated finance transaction" \
+  --idempotency-key "$(jq -r '.idempotency_key' approval-packet.json)" \
+  --request-json operation-request.json --execute --format json
+loopx goal-channel deliver-operation \
+  --goal-id <goal> --proposal-id <operation-id> --execute --format json
+```
+
+`prepare-operation` only writes Core's canonical proposal; `deliver-operation`
+projects that same proposal to the bound Lark group. The Dashboard reads the
+same safe projection. Confirm/reject callbacks remain Core-owned and produce an
+idempotent receipt. Managed Turn callers may submit the input schema to the
+extension runtime and select `operation_request` from its returned packet.
+
+`executor_revision` 必须来自已启用 `loopx-finance-execution` 的真实 readback；
+审批人必须来自当前 Goal Channel 操作权限，并以 provider-qualified principal
+显式传入，Finance builder 不发现或扩大审批人范围。两者都不会被猜测。
+`prepare-operation` 只写入 Core 的 canonical proposal，`deliver-operation` 再将
+同一 proposal 投影到 Goal 绑定群；Dashboard 也读取同一安全投影。确认/拒绝
+callback 与幂等 receipt 继续由 Core 负责。
 
 ## Public-Safe Research Surface
 
@@ -74,6 +172,37 @@ recommendation.
 fully synthetic public-safe example. It deliberately reports zero validated
 company alpha and an unchanged active method.
 
+Extension 0.6.0 adds the optional `source_period_metrics` section to that same
+view. It records calendar-period completeness, realized-versus-estimated basis,
+value origin and precision, numerator/denominator scope, component coverage,
+double-count exclusions, upstream lineage, methodology verification, and
+anomaly state. The validator recomputes coverage and lineage status. Missing is
+`null`, not zero; repeated wrappers around one upstream period are not
+independent evidence; and every row remains evidence-only with
+`ready_eligible=false`. Deduplication uses the full event namespace/id/time,
+instrument, anonymous scope, period, semantics and unit. Explicit authority
+makes fill-derived VWAP outrank rounded position entry. Signed cash change,
+cumulative funding cost and inclusive fill fees stay distinct; unified-account
+NAV, venue composition, venue withdrawable and external-asset coverage cannot
+be added or relabeled as one another.
+
+0.6.0 版本在同一规范 view 中增加可选的 `source_period_metrics`：显式记录
+日历周期完整性、实际现金/估算口径、数值来源与精度、分子分母范围、子项
+覆盖、double-count 排除、上游 lineage、方法学互证和异常状态。完整性与
+lineage 去重由校验器重算；缺失保持 `null` 而不是 0；同一上游周期的多层
+封装不算独立证据；复合事件 identity 包含 namespace/id/time、instrument、
+匿名 scope、周期、语义和单位，fill-derived VWAP 显式高于 rounded entry。
+现金变化、累计 funding、已含 builder 的 fill fee，以及 unified-account NAV、
+venue 组成/可取金额、外部资产覆盖均保持不同口径；每行固定
+`ready_eligible=false`，不能自动升级 ready。
+
+The same view can carry an optional spot identity join. Contexts are matched by
+pair name and assets by explicit token indexes; input order is irrelevant and
+missing, duplicate or unmatched identities fail closed. Noncanonical naming is
+shown without inferring fraud or backing. 中文：spot context 按 pair name、
+资产按 token index 连接，不做 positional zip；`is_canonical=false` 不被解释
+为欺诈或无 backing。
+
 After separately installing, enabling, and doctor-validating the extension,
 publish a validated local projection with:
 
@@ -91,6 +220,22 @@ doctor-stale, missing, or revision-mismatched extension projection is hidden
 from status and Dashboard surfaces. Publishing does not install or enable the
 extension, activate or replace a Finance method, spend LoopX quota, consume a
 learning queue, create a trade, or place an order.
+
+Render the exact published-view semantics for an authorized Lark delivery
+without sending anything:
+
+```bash
+loopx-finance-value-discovery render-lark-card \
+  --input-json owner-research.json
+```
+
+The command returns a card payload only. Existing Goal Channel routing and
+message authority still own any external send. Dashboard and Lark both consume
+the same validated Finance view; neither reads raw provider material or carries
+a separate readiness rule. 中文：该命令只生成卡片、不发消息；外部发送仍需
+既有 Goal Channel 授权。停用可继续使用
+`loopx extension disable loopx-finance-value-discovery --execute`；若只回退
+期次指标，删除可选字段并重新发布旧 view 即可。
 
 ## Worked Method: How PayPal Surfaced
 
@@ -185,6 +330,25 @@ loopx-finance-value-discovery attribute-beta \
 loopx-finance-value-discovery evaluate-pack \
   --input-json packages/loopx-finance-value-discovery/examples/software-metric-pack-v1.json
 ```
+
+In extension 0.5.0, a frozen gate can require source-query coverage computed from
+normalized page receipts. Matching totals alone cannot pass it: missing pages or
+snapshot assertions remain insufficient evidence. This does not verify source
+truth or historical publication time. See the [coverage contract](CONTRACT.md#source-query-coverage-extension-050).
+
+```bash
+loopx extension run loopx-finance-value-discovery \
+  --input-json packages/loopx-finance-value-discovery/examples/finance-source-coverage-v1.json \
+  --execute --format json
+loopx-finance-value-discovery evaluate \
+  --input-json packages/loopx-finance-value-discovery/examples/finance-source-coverage-v1.json > evaluation.json
+loopx-finance-value-discovery replay \
+  --input-json packages/loopx-finance-value-discovery/examples/finance-source-coverage-v1.json \
+  --expected-json evaluation.json
+```
+
+The synthetic example passes query coverage but still lacks economic evidence.
+Existing inputs without the optional gate retain their result and replay bytes.
 
 The manifest declares no permissions: this workflow is a deterministic reducer
 over caller-supplied frozen public evidence. It performs no collection or other

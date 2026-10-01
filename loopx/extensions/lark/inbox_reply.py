@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -13,21 +14,37 @@ from .event_inbox import (
     load_lark_event_inbox_config,
 )
 from .inbox_reactions import complete_lark_event_inbox_reactions
+from .presentation.markdown_post import (
+    lark_markdown_post_content,
+    lark_markdown_preview_matches,
+    lark_markdown_readback_matches,
+)
+
 from .outbound import (
+    DEFAULT_LARK_TEXT_LIMIT,
+    LARK_POST_REQUEST_MAX_BYTES,
     expected_lark_mention_identities,
     lark_member_identities,
     lark_provider_preview_matches_outbound,
     lark_readback_matches_outbound,
     normalize_lark_outbound_text,
+    validate_lark_text_request_size,
 )
 
 CommandRunner = Callable[[Sequence[str]], Mapping[str, Any]]
+BOT_IDENTITY_VERIFY_ATTEMPTS = 3
+
+
+class BotIdentityVerification(str, Enum):
+    VERIFIED = "verified"
+    RETRYABLE_VERIFY_FAILED = "retryable_verify_failed"
+    REJECTED = "rejected"
 
 
 def _default_runner(args: Sequence[str]) -> Mapping[str, Any]:
     result = subprocess.run(
         list(args),
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         capture_output=True,
         timeout=30,
         check=False,
@@ -91,6 +108,123 @@ def _message(value: Any, message_id: str) -> Mapping[str, Any] | None:
     return None
 
 
+def _intent_digest(profile: str, chat_id: str, receipt: str) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps([profile, chat_id, receipt]).encode("utf-8")
+    ).hexdigest()
+
+
+def _verified_mention_aliases(
+    *,
+    runner: CommandRunner,
+    base: Sequence[str],
+    chat_id: str,
+    reply_text: str,
+) -> tuple[dict[str, str] | None, str | None]:
+    expected_mentions = expected_lark_mention_identities(reply_text)
+    if not expected_mentions:
+        return {}, None
+    member_identity_sets: dict[str, set[str]] = {}
+    bot_alias_candidates: dict[str, set[str]] = {}
+    for identity_kind in sorted(set(expected_mentions.values())):
+        expected_identities = {
+            identity
+            for identity, declared_kind in expected_mentions.items()
+            if declared_kind == identity_kind
+        }
+        members = _call(
+            runner,
+            [
+                *base,
+                "im",
+                "+chat-members-list",
+                "--chat-id",
+                chat_id,
+                "--member-types",
+                "user,bot",
+                "--member-id-type",
+                identity_kind,
+                "--page-all",
+                "--as",
+                "bot",
+                "--format",
+                "json",
+            ],
+        )
+        if members.get("returncode") != 0:
+            return None, "lark_inbox_reply_mention_identity_unresolved"
+        member_payload = _json_object(members.get("stdout"))
+        member_identity_sets[identity_kind] = lark_member_identities(member_payload)
+        member_data = member_payload.get("data", member_payload)
+        bots = member_data.get("bots", []) if isinstance(member_data, Mapping) else []
+        for member in bots if isinstance(bots, list) else []:
+            if not isinstance(member, Mapping):
+                continue
+            app_id, member_id = member.get("app_id"), member.get("member_id")
+            if (
+                isinstance(app_id, str)
+                and app_id
+                and isinstance(member_id, str)
+                and member_id in expected_identities
+            ):
+                bot_alias_candidates.setdefault(app_id, set()).add(member_id)
+    if any(
+        identity not in member_identity_sets.get(identity_kind, set())
+        for identity, identity_kind in expected_mentions.items()
+    ):
+        return None, "lark_inbox_reply_mention_identity_unresolved"
+    return {
+        app_id: next(iter(identities))
+        for app_id, identities in bot_alias_candidates.items()
+        if len(identities) == 1 and next(iter(identities)) in expected_mentions
+    }, None
+
+
+def _bot_identity_verification(
+    *,
+    runner: CommandRunner,
+    base: Sequence[str],
+    expected_name: str,
+) -> BotIdentityVerification:
+    auth = _call(runner, [*base, "auth", "status", "--verify", "--json"])
+    if auth.get("returncode") != 0:
+        return BotIdentityVerification.REJECTED
+    identities = _json_object(auth.get("stdout")).get("identities")
+    identity = identities.get("bot") if isinstance(identities, Mapping) else None
+    if not isinstance(identity, Mapping):
+        return BotIdentityVerification.REJECTED
+    if identity.get("available") is True and identity.get("verified") is True:
+        return (
+            BotIdentityVerification.VERIFIED
+            if str(identity.get("appName") or "") == expected_name
+            else BotIdentityVerification.REJECTED
+        )
+    if str(identity.get("status") or "") == "verify_failed":
+        return BotIdentityVerification.RETRYABLE_VERIFY_FAILED
+    return BotIdentityVerification.REJECTED
+
+
+def _bot_identity_verified(
+    *,
+    runner: CommandRunner,
+    base: Sequence[str],
+    expected_name: str,
+) -> bool:
+    """Retry only the provider's explicit transient verification state."""
+
+    for _attempt in range(BOT_IDENTITY_VERIFY_ATTEMPTS):
+        result = _bot_identity_verification(
+            runner=runner,
+            base=base,
+            expected_name=expected_name,
+        )
+        if result is BotIdentityVerification.VERIFIED:
+            return True
+        if result is BotIdentityVerification.REJECTED:
+            return False
+    return False
+
+
 def _result(
     *,
     status: str,
@@ -144,12 +278,22 @@ def _deliver_lark_inbox_outbound(
     config_path: str | Path,
     message_id: str | None,
     text: str,
+    content_format: str = "text",
     execute: bool = False,
     provider_preflight: bool = False,
     runner: CommandRunner = _default_runner,
     before_send: Callable[[str], Mapping[str, Any]] | None = None,
+    delivery_attempt_recorder: Callable[[Mapping[str, str | None]], None] | None = None,
+    short_message_limit: int | None = DEFAULT_LARK_TEXT_LIMIT,
 ) -> dict[str, Any]:
-    """Deliver through one inbox-configured bot with exact provider readback."""
+    """Deliver through one inbox-configured bot with exact provider readback.
+
+    ``short_message_limit`` owns the compact, self-imposed length a delivery
+    keeps when it has no source message to answer. Only the chat-root
+    notification caller relies on it: 1200 is not a provider bound, so a
+    delivery that answers a captured source message is bounded by the provider's
+    own request limit instead of being cut by our own guess.
+    """
 
     config = load_lark_event_inbox_config(project=project, config_path=config_path)
     if not config["enabled"]:
@@ -176,7 +320,18 @@ def _deliver_lark_inbox_outbound(
         raise ValueError(
             "lark inbox reply source message is not captured by this inbox"
         )
-    reply_text = normalize_lark_outbound_text(text)
+    if content_format not in {"text", "markdown"}:
+        raise ValueError("unsupported Lark reply content format")
+    # Structured mentions retain the existing identity-verified text transport.
+    markdown = content_format == "markdown" and not expected_lark_mention_identities(text)
+    reply_text = normalize_lark_outbound_text(
+        text,
+        limit=None if source_event is not None else short_message_limit,
+        preserve_format=markdown,
+    )
+    # Reject an oversized content lower bound before building a CLI argument.
+    # The full rendered request body is checked again after provider preview.
+    validate_lark_text_request_size({"content": json.dumps({"text": reply_text}, ensure_ascii=False, separators=(",", ":"))})
     if not reply_text:
         raise ValueError("lark inbox reply requires non-empty text")
 
@@ -210,6 +365,7 @@ def _deliver_lark_inbox_outbound(
                 "message_id": source_message_id,
                 "placement": placement,
                 "text": reply_text,
+                **({"content_format": "markdown"} if markdown else {}),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -228,15 +384,10 @@ def _deliver_lark_inbox_outbound(
         )
 
     base = ["lark-cli", "--profile", profile]
-    auth = _call(runner, base + ["auth", "status", "--verify", "--json"])
-    identities = _json_object(auth.get("stdout")).get("identities")
-    identity = identities.get("bot", {}) if isinstance(identities, Mapping) else {}
-    identity_verified = bool(
-        auth.get("returncode") == 0
-        and isinstance(identity, Mapping)
-        and identity.get("available") is True
-        and identity.get("verified") is True
-        and str(identity.get("appName") or "") == reply_config["bot_display_name"]
+    identity_verified = _bot_identity_verified(
+        runner=runner,
+        base=base,
+        expected_name=str(reply_config["bot_display_name"]),
     )
     if not identity_verified:
         return _result(
@@ -274,80 +425,33 @@ def _deliver_lark_inbox_outbound(
             format_preflight_passed=True,
         )
 
-    expected_mentions = expected_lark_mention_identities(reply_text)
-    bot_alias_candidates: dict[str, set[str]] = {}
-    if expected_mentions:
-        member_identity_sets: dict[str, set[str]] = {}
-        membership_failed = False
-        for identity_kind in sorted(set(expected_mentions.values())):
-            expected_identities = {
-                identity
-                for identity, declared_kind in expected_mentions.items()
-                if declared_kind == identity_kind
-            }
-            members = _call(
-                runner,
-                base
-                + [
-                    "im",
-                    "+chat-members-list",
-                    "--chat-id",
-                    chat_id,
-                    "--member-types",
-                    "user,bot",
-                    "--member-id-type",
-                    identity_kind,
-                    "--page-all",
-                    "--as",
-                    "bot",
-                    "--format",
-                    "json",
-                ],
-            )
-            if members.get("returncode") != 0:
-                membership_failed = True
-                break
-            member_payload = _json_object(members.get("stdout"))
-            member_identity_sets[identity_kind] = lark_member_identities(member_payload)
-            member_data = member_payload.get("data", member_payload)
-            bots = (
-                member_data.get("bots", []) if isinstance(member_data, Mapping) else []
-            )
-            for member in bots if isinstance(bots, list) else []:
-                if not isinstance(member, Mapping):
-                    continue
-                app_id, member_id = member.get("app_id"), member.get("member_id")
-                if (
-                    isinstance(app_id, str)
-                    and app_id
-                    and isinstance(member_id, str)
-                    and member_id in expected_identities
-                ):
-                    bot_alias_candidates.setdefault(app_id, set()).add(member_id)
-        if membership_failed or any(
-            identity not in member_identity_sets.get(identity_kind, set())
-            for identity, identity_kind in expected_mentions.items()
-        ):
-            return _result(
-                status="gate_required",
-                ok=False,
-                execute=execute,
-                receipt=receipt,
-                identity_verified=True,
-                membership_verified=True,
-                placement=placement,
-                blocker="lark_inbox_reply_mention_identity_unresolved",
-                format_preflight_passed=True,
-            )
+    bot_aliases, mention_error = _verified_mention_aliases(
+        runner=runner, base=base, chat_id=chat_id, reply_text=reply_text
+    )
+    if mention_error:
+        return _result(
+            status="gate_required",
+            ok=False,
+            execute=execute,
+            receipt=receipt,
+            identity_verified=True,
+            membership_verified=True,
+            placement=placement,
+            blocker=mention_error,
+            format_preflight_passed=True,
+        )
 
+    content_args = (
+        ["--msg-type", "post", "--content", lark_markdown_post_content(reply_text)]
+        if markdown else ["--text", reply_text]
+    )
     destination = (
         [
             "im",
             "+messages-send",
             "--chat-id",
             chat_id,
-            "--text",
-            reply_text,
+            *content_args,
         ]
         if placement == "chat_root"
         else [
@@ -355,8 +459,7 @@ def _deliver_lark_inbox_outbound(
             "+messages-reply",
             "--message-id",
             source_message_id,
-            "--text",
-            reply_text,
+            *content_args,
             "--reply-in-thread",
         ]
     )
@@ -375,9 +478,11 @@ def _deliver_lark_inbox_outbound(
     preview = _call(runner, provider_args + ["--dry-run"])
     provider_preview_verified = bool(
         preview.get("returncode") == 0
-        and lark_provider_preview_matches_outbound(
-            outbound_text=reply_text,
-            payload=_json_object(preview.get("stdout")),
+        and (
+            lark_markdown_preview_matches(text=reply_text, payload=_json_object(preview.get("stdout")))
+            if markdown else lark_provider_preview_matches_outbound(
+                outbound_text=reply_text, payload=_json_object(preview.get("stdout")),
+            )
         )
     )
     if not provider_preview_verified:
@@ -393,16 +498,31 @@ def _deliver_lark_inbox_outbound(
             format_preflight_passed=True,
             provider_preview_performed=True,
         )
+    preview_payload = _json_object(preview.get("stdout"))
+    preview_data = preview_payload.get("data")
+    api_calls = preview_payload.get("api")
+    if not isinstance(api_calls, list) and isinstance(preview_data, Mapping):
+        api_calls = preview_data.get("api")
+    for call in api_calls if isinstance(api_calls, list) else []:
+        if isinstance(call, Mapping) and isinstance(call.get("body"), Mapping):
+            validate_lark_text_request_size(call["body"])
+            body_bytes = len(json.dumps(call["body"], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            if markdown and body_bytes > LARK_POST_REQUEST_MAX_BYTES:
+                # No write has occurred. Preserve the full answer via the existing
+                # larger text transport rather than truncate or retry after send.
+                result = _deliver_lark_inbox_outbound(
+                    project=project, config_path=config_path, message_id=message_id,
+                    text=text, content_format="text", execute=execute,
+                    provider_preflight=provider_preflight, runner=runner, before_send=before_send,
+                    delivery_attempt_recorder=delivery_attempt_recorder,
+                )
+                result.update(content_format="text", format_fallback="post_size_limit")
+                return result
     guidance = None
     if before_send is not None:
         # Bind review to destination/profile as well as content and placement.
         # The optional binder hashes the verified destination before retrieval.
-        intent_digest = (
-            "sha256:"
-            + hashlib.sha256(
-                json.dumps([profile, chat_id, receipt]).encode("utf-8")
-            ).hexdigest()
-        )
+        intent_digest = _intent_digest(profile, chat_id, receipt)
         bind_destination = getattr(before_send, "for_destination", None)
         scoped_hook = bind_destination(chat_id) if bind_destination else before_send
         guidance = scoped_hook(intent_digest)
@@ -454,8 +574,40 @@ def _deliver_lark_inbox_outbound(
             provider_preview_verified=True,
         )
 
+    intent_digest = _intent_digest(profile, chat_id, receipt)
     reply_message_id = _message_id(_json_object(send.get("stdout")))
     if not reply_message_id:
+        # The provider accepted the write and reported no message id, so there is
+        # nothing a later readback could key on. Recording the attempt with an
+        # empty locator is what keeps a retry from posting the same text again:
+        # the durable record proves a write happened even though it cannot be
+        # located, and a locator nothing can verify must not be re-sent blindly.
+        if delivery_attempt_recorder is not None:
+            try:
+                delivery_attempt_recorder(
+                    {
+                        "schema_version": "manager_return_delivery_attempt_v0",
+                        "provider": "lark",
+                        "message_ref": None,
+                        "intent_digest": intent_digest,
+                        "provider_receipt": receipt,
+                    }
+                )
+            except (OSError, TypeError, ValueError):
+                return _result(
+                    status="sent_unverified",
+                    ok=False,
+                    execute=True,
+                    receipt=receipt,
+                    identity_verified=True,
+                    membership_verified=True,
+                    write_performed=True,
+                    placement=placement,
+                    blocker="lark_inbox_reply_delivery_attempt_not_persisted",
+                    format_preflight_passed=True,
+                    provider_preview_performed=True,
+                    provider_preview_verified=True,
+                )
         return _result(
             status="sent_unverified",
             ok=False,
@@ -470,6 +622,32 @@ def _deliver_lark_inbox_outbound(
             provider_preview_performed=True,
             provider_preview_verified=True,
         )
+    if delivery_attempt_recorder is not None:
+        try:
+            delivery_attempt_recorder(
+                {
+                    "schema_version": "manager_return_delivery_attempt_v0",
+                    "provider": "lark",
+                    "message_ref": reply_message_id,
+                    "intent_digest": intent_digest,
+                    "provider_receipt": receipt,
+                }
+            )
+        except (OSError, TypeError, ValueError):
+            return _result(
+                status="sent_unverified",
+                ok=False,
+                execute=True,
+                receipt=receipt,
+                identity_verified=True,
+                membership_verified=True,
+                write_performed=True,
+                placement=placement,
+                blocker="lark_inbox_reply_delivery_attempt_not_persisted",
+                format_preflight_passed=True,
+                provider_preview_performed=True,
+                provider_preview_verified=True,
+            )
     readback = _call(
         runner,
         base
@@ -490,17 +668,14 @@ def _deliver_lark_inbox_outbound(
     verified = bool(
         readback.get("returncode") == 0
         and readback_message is not None
-        and lark_readback_matches_outbound(
+        and (lark_markdown_readback_matches(text=reply_text, message=readback_message)
+             if markdown else lark_readback_matches_outbound(
             outbound_text=reply_text,
             message=readback_message,
             # mget may report a bot's app_id instead of its member_id. Only
             # accept an unambiguous mapping verified for the mention's declared kind.
-            verified_bot_aliases={
-                app_id: next(iter(identities))
-                for app_id, identities in bot_alias_candidates.items()
-                if len(identities) == 1 and next(iter(identities)) in expected_mentions
-            },
-        )
+            verified_bot_aliases=bot_aliases or {},
+        ))
     )
     reaction_cleanup = (
         complete_lark_event_inbox_reactions(
@@ -559,23 +734,205 @@ def reply_lark_event_inbox(
     config_path: str | Path,
     message_id: str,
     text: str,
+    content_format: str = "text",
     execute: bool = False,
     provider_preflight: bool = False,
     runner: CommandRunner = _default_runner,
     before_send: Callable[[str], Mapping[str, Any]] | None = None,
+    delivery_attempt_recorder: Callable[[Mapping[str, str | None]], None] | None = None,
+    short_message_limit: int | None = DEFAULT_LARK_TEXT_LIMIT,
 ) -> dict[str, Any]:
-    """Reply with the explicit inbox-configured bot and placement policy."""
+    """Reply with the explicit inbox-configured bot and placement policy.
 
-    return _deliver_lark_inbox_outbound(
+    An answer delivery passes ``short_message_limit=None`` to declare that it is
+    bounded by the provider's request limit rather than by the compact
+    notification length.
+    """
+
+    result = _deliver_lark_inbox_outbound(
         project=project,
         config_path=config_path,
         message_id=message_id,
         text=text,
+        content_format=content_format,
         execute=execute,
         provider_preflight=provider_preflight,
         runner=runner,
         before_send=before_send,
+        delivery_attempt_recorder=delivery_attempt_recorder,
+        short_message_limit=short_message_limit,
     )
+
+    result.setdefault("content_format", "markdown" if content_format == "markdown"
+                      and not expected_lark_mention_identities(text) else "text")
+    return result
+
+
+def verify_lark_inbox_reply(
+    *,
+    project: str | Path,
+    config_path: str | Path,
+    message_id: str,
+    text: str,
+    attempt: Mapping[str, Any],
+    runner: CommandRunner = _default_runner,
+) -> dict[str, Any]:
+    """Read back one prior Lark reply without sending another message."""
+
+    if (
+        set(attempt) != {
+            "schema_version",
+            "provider",
+            "message_ref",
+            "intent_digest",
+            "provider_receipt",
+        }
+        or attempt.get("schema_version") != "manager_return_delivery_attempt_v0"
+        or attempt.get("provider") != "lark"
+        or not MESSAGE_ID_PATTERN.fullmatch(str(attempt.get("message_ref") or ""))
+    ):
+        return {
+            "ok": False,
+            "verification_performed": True,
+            "reply_verified": False,
+            "blocker": "provider_delivery_intent_conflict",
+        }
+    config = load_lark_event_inbox_config(project=project, config_path=config_path)
+    reply_config = config["reply"]
+    profile = str(reply_config.get("sender_profile") or "")
+    chat_id = str(reply_config.get("chat_id") or "")
+    preview = None
+    for content_format in ("markdown", "text"):
+        candidate = reply_lark_event_inbox(
+            project=project,
+            config_path=config_path,
+            message_id=message_id,
+            text=text,
+            content_format=content_format,
+            execute=False,
+            runner=runner,
+        )
+        receipt = str(candidate.get("idempotency_key") or "")
+        if (
+            attempt.get("provider_receipt") == receipt
+            and attempt.get("intent_digest")
+            == _intent_digest(profile, chat_id, receipt)
+        ):
+            preview = candidate
+            break
+    if preview is None:
+        return {
+            "ok": False,
+            "verification_performed": True,
+            "reply_verified": False,
+            "blocker": "provider_delivery_intent_conflict",
+        }
+    base = ["lark-cli", "--profile", profile]
+    if not _bot_identity_verified(
+        runner=runner,
+        base=base,
+        expected_name=str(reply_config.get("bot_display_name") or ""),
+    ):
+        return {
+            "ok": False,
+            "verification_performed": False,
+            "reply_verified": False,
+            "blocker": "provider_verification_unavailable",
+        }
+    membership = _call(
+        runner,
+        [
+            *base,
+            "im",
+            "chats",
+            "get",
+            "--chat-id",
+            chat_id,
+            "--as",
+            "bot",
+            "--format",
+            "json",
+        ],
+    )
+    if membership.get("returncode") != 0:
+        return {
+            "ok": False,
+            "verification_performed": False,
+            "reply_verified": False,
+            "blocker": "provider_verification_unavailable",
+        }
+    markdown = preview.get("content_format") == "markdown"
+    reply_text = normalize_lark_outbound_text(text, limit=None, preserve_format=markdown)
+    bot_aliases, mention_error = _verified_mention_aliases(
+        runner=runner, base=base, chat_id=chat_id, reply_text=reply_text
+    )
+    if mention_error:
+        return {
+            "ok": False,
+            "verification_performed": False,
+            "reply_verified": False,
+            "blocker": "provider_verification_unavailable",
+        }
+    provider_message_id = str(attempt["message_ref"])
+    readback = _call(
+        runner,
+        [
+            *base,
+            "im",
+            "+messages-mget",
+            "--message-ids",
+            provider_message_id,
+            "--as",
+            "bot",
+            "--no-reactions",
+            "--format",
+            "json",
+        ],
+    )
+    if readback.get("returncode") != 0:
+        return {
+            "ok": False,
+            "verification_performed": False,
+            "reply_verified": False,
+            "blocker": "provider_verification_unavailable",
+        }
+    message = _message(_json_object(readback.get("stdout")), provider_message_id)
+    if message is None:
+        return {
+            "ok": False,
+            "verification_performed": True,
+            "reply_verified": False,
+            "blocker": "provider_message_missing",
+        }
+    verified = (
+        lark_markdown_readback_matches(text=reply_text, message=message)
+        if markdown
+        else lark_readback_matches_outbound(
+            outbound_text=reply_text,
+            message=message,
+            verified_bot_aliases=bot_aliases or {},
+        )
+    )
+    if not verified:
+        return {
+            "ok": False,
+            "verification_performed": True,
+            "reply_verified": False,
+            "blocker": "provider_delivery_mismatch",
+        }
+    cleanup = complete_lark_event_inbox_reactions(
+        project=project,
+        config_path=config_path,
+        message_id=message_id,
+        execute=True,
+        runner=runner,
+    )
+    return {
+        "ok": cleanup.get("ok") is True,
+        "verification_performed": True,
+        "reply_verified": True,
+        "reaction_cleanup_verified": cleanup.get("ok") is True,
+    }
 
 
 def send_lark_inbox_message(
@@ -588,7 +945,12 @@ def send_lark_inbox_message(
     runner: CommandRunner = _default_runner,
     before_send: Callable[[str], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Send one verified chat-root message through the configured inbox bot."""
+    """Send one verified chat-root message through the configured inbox bot.
+
+    A chat-root notification keeps the compact self-imposed length: it is a
+    notice on the channel, not an answer, and the reader expects it to stay
+    short.
+    """
 
     result = _deliver_lark_inbox_outbound(
         project=project,
@@ -599,6 +961,7 @@ def send_lark_inbox_message(
         provider_preflight=provider_preflight,
         runner=runner,
         before_send=before_send,
+        short_message_limit=DEFAULT_LARK_TEXT_LIMIT,
     )
     result["schema_version"] = "lark_outbound_message_v0"
     blocker = result.get("blocker")

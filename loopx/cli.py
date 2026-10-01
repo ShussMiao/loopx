@@ -1,8 +1,30 @@
 from __future__ import annotations
 
+# Source-tree invocations must use the same bounded entrypoint as the console
+# script. Keep the full parser below importable for compatibility callers; the
+# entrypoint can still import this module by name when a full-parser fallback is
+# required, without executing this module-entry branch a second time.
+if __name__ == "__main__":
+    from .entrypoint import main as _entrypoint_main
+
+    raise SystemExit(_entrypoint_main())
+
+from .cli_commands.automation_cadence import (
+    register_automation_cadence_command, handle_automation_cadence_command,
+)
+
 import argparse
 import sys
 
+from .cli_commands.agent_capabilities import register_agent_capabilities, handle_agent_capabilities
+from .cli_commands.agent_directory import register_agent_directory, handle_agent_directory
+from .cli_commands.agent_context import register_agent_context, handle_agent_context
+from .capabilities.multi_subagent.cli import (
+    register_native_child_commands, handle_native_child_command,
+)
+from .cli_commands.todo_continuation import register_todo_continuation, handle_todo_continuation
+from .cli_commands.manager_inbox import register_manager_inbox, handle_manager_inbox
+from .cli_commands.delegation import register_delegation
 from .capabilities.content_ops.cli import (
     handle_content_ops_command,
     register_content_ops_commands,
@@ -66,17 +88,18 @@ from .capabilities.connector_registry.cli import (
     handle_connector_command,
     register_connector_commands,
 )
+from .capabilities.external_research.cli import (
+    handle_external_evidence_command,
+    register_external_evidence_commands,
+)
 from .cli_commands import (
-    handle_turn_command,
     handle_benchmark_command,
     handle_bootstrap_connect_command,
     handle_canary_command,
     handle_coordination_shadow_command,
     handle_capability_command,
-    handle_doctor_command,
     handle_dreaming_command,
     handle_evidence_log_command,
-    handle_extension_command,
     handle_explore_command,
     handle_first_run_report_command,
     handle_goal_channel_command,
@@ -94,7 +117,6 @@ from .cli_commands import (
     handle_ready_score_command,
     handle_review_batch_command,
     handle_registry_admin_command,
-    handle_slash_commands_command,
     handle_starter_command,
     handle_summary_all_command,
     handle_support_control_command,
@@ -102,6 +124,7 @@ from .cli_commands import (
     handle_task_lease_command,
     handle_authority_shadow_command,
     handle_version_command,
+    handle_usage_ping_command,
     handle_host_mode_plan_command,
     handle_worker_bridge_command,
     handle_workflow_skills_command,
@@ -110,6 +133,7 @@ from .cli_commands import (
     register_bootstrap_connect_command,
     register_canary_commands,
     register_coordination_shadow_command,
+    register_authority_archive_command,
     register_capability_commands,
     register_doctor_command,
     register_dreaming_commands,
@@ -144,6 +168,7 @@ from .cli_commands import (
     register_authority_shadow_command,
     register_todo_command,
     register_version_command,
+    register_usage_ping_command,
     register_host_mode_plan_command,
     register_worker_bridge_commands,
     register_workflow_skills_command,
@@ -155,6 +180,10 @@ from .cli_commands.opencode2_goal_worker import (
 from .cli_commands.shared_goal_alignment import (
     handle_shared_goal_alignment_command,
     register_shared_goal_alignment_command,
+)
+from .cli_commands.goal_acceptance import (
+    handle_goal_acceptance_command,
+    register_goal_acceptance_command,
 )
 from .cli_commands.goal_amendment_proposal import (
     handle_goal_amendment_proposal_command,
@@ -174,8 +203,7 @@ from .extensions.lark.periodic_report_cli import (
     register_lark_periodic_report_commands,
 )
 from .help_surface import (
-    build_command_reference_payload,
-    render_command_reference_markdown,
+    register_command_reference,
     render_concise_help,
     top_level_help_requested,
 )
@@ -238,11 +266,7 @@ def build_parser() -> LoopXArgumentParser:
 
     register_version_command(sub, add_subcommand_format)
 
-    commands_parser = sub.add_parser(
-        "commands",
-        help="Show grouped LoopX command reference for operators and contributors.",
-    )
-    add_subcommand_format(commands_parser)
+    register_command_reference(sub)
 
     register_bootstrap_connect_command(sub)
 
@@ -251,6 +275,8 @@ def build_parser() -> LoopXArgumentParser:
     register_doctor_command(sub, add_subcommand_format)
 
     register_first_run_report_command(sub)
+
+    register_usage_ping_command(sub, add_subcommand_format)
 
     register_opencode2_goal_worker_command(sub)
 
@@ -302,6 +328,8 @@ def build_parser() -> LoopXArgumentParser:
 
     register_connector_commands(sub, add_subcommand_format)
 
+    register_external_evidence_commands(sub, add_subcommand_format)
+
     register_ml_experiment_commands(sub, add_subcommand_format)
 
     _register_demo_commands(sub, add_subcommand_format)
@@ -322,6 +350,12 @@ def build_parser() -> LoopXArgumentParser:
 
     register_project_lifecycle_commands(sub, add_subcommand_format)
     register_goal_channel_commands(sub, add_subcommand_format)
+    register_manager_inbox(sub, add_subcommand_format)
+    register_delegation(sub, add_subcommand_format)
+    register_agent_capabilities(sub, add_subcommand_format)
+    register_agent_context(sub, add_subcommand_format)
+    register_native_child_commands(sub, add_subcommand_format)
+    register_agent_directory(sub, add_subcommand_format)
     register_lark_inbox_commands(sub, add_subcommand_format)
     register_lark_kanban_commands(sub, add_subcommand_format)
 
@@ -336,10 +370,14 @@ def build_parser() -> LoopXArgumentParser:
     register_explore_commands(sub, add_subcommand_format)
     register_todo_command(sub, add_subcommand_format)
     register_coordination_shadow_command(sub, add_subcommand_format)
+    register_automation_cadence_command(sub, add_subcommand_format)
+    register_authority_archive_command(sub, add_subcommand_format)
     register_task_lease_command(sub, add_subcommand_format)
     register_authority_shadow_command(sub, add_subcommand_format)
+    register_todo_continuation(sub, add_subcommand_format)
     register_handoff_mode_command(sub, add_subcommand_format)
     register_shared_goal_alignment_command(sub, add_subcommand_format)
+    register_goal_acceptance_command(sub, add_subcommand_format)
     register_goal_amendment_proposal_command(sub, add_subcommand_format)
     register_quota_command(sub)
 
@@ -359,6 +397,8 @@ def main(argv: list[str] | None = None) -> int:
         pass  # demo package absent in installed builds; no question rewrite
     parser = build_parser()
     args = parser.parse_args(raw_argv)
+    from .usage_ping import select_operation
+    select_operation(args)
     args.format = resolve_global_output_format(args)
     guard_result = enforce_native_controller_guard(args)
     if guard_result is not None:
@@ -377,14 +417,6 @@ def main(argv: list[str] | None = None) -> int:
     if version_result is not None:
         return version_result
 
-    if args.command == "commands":
-        print_payload(
-            build_command_reference_payload(),
-            output_format(args),
-            render_command_reference_markdown,
-        )
-        return 0
-
     bootstrap_connect_result = handle_bootstrap_connect_command(
         args,
         registry_path=registry_path,
@@ -397,9 +429,6 @@ def main(argv: list[str] | None = None) -> int:
     if starter_result is not None:
         return starter_result
 
-    if args.command == "doctor":
-        return handle_doctor_command(args, print_payload)
-
     workflow_skills_result = handle_workflow_skills_command(
         args,
         output_format=output_format,
@@ -410,6 +439,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "first-run-report":
         return handle_first_run_report_command(args, print_payload)
+
+    if args.command == "usage-ping":
+        return handle_usage_ping_command(args, print_payload)
 
     if args.command == "opencode2-goal-worker":
         return handle_opencode2_goal_worker_command(args, print_payload)
@@ -463,15 +495,6 @@ def main(argv: list[str] | None = None) -> int:
     if reliability_diagnostics_result is not None:
         return reliability_diagnostics_result
 
-    extension_result = handle_extension_command(
-        args,
-        runtime_root_arg=args.runtime_root,
-        output_format=output_format,
-        print_payload=print_payload,
-    )
-    if extension_result is not None:
-        return extension_result
-
     change_quality_result = handle_change_quality_command(
         args,
         registry_path=registry_path,
@@ -502,16 +525,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "ml-experiment":
         return handle_ml_experiment_command(args, output_format=output_format, print_payload=print_payload)
-
-    turn_result = handle_turn_command(
-        args,
-        registry_path=registry_path,
-        runtime_root_arg=args.runtime_root,
-        output_format=output_format,
-        print_payload=print_payload,
-    )
-    if turn_result is not None:
-        return turn_result
 
     host_mode_plan_result = handle_host_mode_plan_command(
         args,
@@ -608,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
             effective_runtime_root(registry_path, args.runtime_root)
             if args.command == "decision-context"
             and args.decision_context_command
-            in {"recall-context", "prepare-evidence", "prepare-review"}
+            in {"recall-context", "prepare-evidence", "prepare-review", "capture"}
             else None
         ),
         output_format=output_format,
@@ -664,6 +677,7 @@ def main(argv: list[str] | None = None) -> int:
 
     semantic_preference_result = handle_semantic_preference_command(
         args,
+        registry_path=registry_path,
         runtime_root_arg=args.runtime_root,
         output_format=output_format,
         print_payload=print_payload,
@@ -679,6 +693,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     if connector_result is not None:
         return connector_result
+
+    external_evidence_result = handle_external_evidence_command(
+        args, output_format=output_format, print_payload=print_payload,
+    )
+    if external_evidence_result is not None:
+        return external_evidence_result
 
     registry_admin_result = handle_registry_admin_command(
         args,
@@ -751,6 +771,46 @@ def main(argv: list[str] | None = None) -> int:
     if lark_kanban_result is not None:
         return lark_kanban_result
 
+    if args.command == "agent-capabilities":
+        return handle_agent_capabilities(
+            args, registry_path, effective_runtime_root(registry_path, args.runtime_root),
+            print_payload, output_format,
+        )
+
+    if args.command == "agent-context":
+        return handle_agent_context(
+            args,
+            registry_path,
+            effective_runtime_root(registry_path, args.runtime_root),
+            print_payload,
+            output_format,
+        )
+
+    if args.command == "native-child":
+        return handle_native_child_command(
+            args, registry_path, effective_runtime_root(registry_path, args.runtime_root),
+            print_payload, output_format,
+        )
+
+    if args.command == "agent-directory":
+        return handle_agent_directory(
+            args, registry_path, effective_runtime_root(registry_path, args.runtime_root),
+            print_payload, output_format,
+        )
+
+    if args.command == "manager-inbox":
+        from .control_plane.projects.registry_codec import load_project_registry
+        from .paths import resolve_runtime_root
+
+        return handle_manager_inbox(
+            args,
+            registry_path,
+            resolve_runtime_root(
+                load_project_registry(registry_path),
+                args.runtime_root,
+                registry_path=registry_path,
+            ),
+        )
     lark_inbox_result = handle_lark_inbox_command(
         args,
         registry_path=registry_path,
@@ -773,8 +833,14 @@ def main(argv: list[str] | None = None) -> int:
 
     pr_review_result = handle_pr_review_command(
         args,
+        registry_path=registry_path,
         output_format=output_format,
         print_payload=print_payload,
+        runtime_root=(
+            effective_runtime_root(registry_path, args.runtime_root)
+            if args.command == "pr-review" and registry_path.exists()
+            else None
+        ),
     )
     if pr_review_result is not None:
         return pr_review_result
@@ -786,14 +852,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     if deepresearch_result is not None:
         return deepresearch_result
-
-    slash_commands_result = handle_slash_commands_command(
-        args,
-        output_format=output_format,
-        print_payload=print_payload,
-    )
-    if slash_commands_result is not None:
-        return slash_commands_result
 
     if args.command == "dreaming":
         return handle_dreaming_command(
@@ -825,6 +883,12 @@ def main(argv: list[str] | None = None) -> int:
     if explore_result is not None:
         return explore_result
 
+    cadence_result = handle_automation_cadence_command(
+        args, registry_path=registry_path, runtime_root_arg=args.runtime_root,
+        print_payload=print_payload, output_format=output_format,
+    )
+    if cadence_result is not None:
+        return cadence_result
     coordination_shadow_result = handle_coordination_shadow_command(
         args,
         registry_path=registry_path,
@@ -855,6 +919,13 @@ def main(argv: list[str] | None = None) -> int:
     if authority_shadow_result is not None:
         return authority_shadow_result
 
+    continuation_result = handle_todo_continuation(
+        args, registry_path=registry_path, runtime_root_arg=args.runtime_root,
+        output_format=output_format, print_payload=print_payload,
+    )
+    if continuation_result is not None:
+        return continuation_result
+
     handoff_mode_result = handle_handoff_mode_command(
         args,
         registry_path=registry_path,
@@ -864,6 +935,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     if handoff_mode_result is not None:
         return handoff_mode_result
+
+    goal_acceptance_result = handle_goal_acceptance_command(
+        args, registry_path=registry_path, runtime_root_arg=args.runtime_root,
+        output_format=output_format, print_payload=print_payload,
+    )
+    if goal_acceptance_result is not None:
+        return goal_acceptance_result
 
     shared_goal_alignment_result = handle_shared_goal_alignment_command(
         args,
@@ -916,7 +994,3 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

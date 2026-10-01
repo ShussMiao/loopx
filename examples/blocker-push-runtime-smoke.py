@@ -211,13 +211,18 @@ def main() -> int:
         assert "state=operator_gate" not in compact_prompt, prompt
         assert "Normal turns use CLI `interaction_contract`" in compact_prompt, prompt
         assert "`user_channel.notify` controls OUTPUT only" in compact_prompt, prompt
-        assert "NOTIFY=向用户输出动作; DONT_NOTIFY=安静输出" in compact_prompt, prompt
-        assert "Due/peer gate != prompt" in compact_prompt, prompt
-        assert "missing NOTIFY action->具体user todo未投影" in compact_prompt, prompt
-        assert "`LOOPX_TURN=<current_time_iso>`; reuse." in compact_prompt, prompt
-        assert "guard receipt; 2 stalls->replan" in compact_prompt, prompt
-        assert "no-change=`surface_only`/no spend" in compact_prompt, prompt
-        assert "unchanged->`--vision-unchanged-reason`" in compact_prompt, prompt
+        assert "NOTIFY=show; DONT_NOTIFY=no output" in compact_prompt, prompt
+        assert "Due/peer work is not a user prompt" in compact_prompt, prompt
+        assert "Missing NOTIFY action: user Todo unprojected" in compact_prompt, prompt
+        # The bootstrap rule is shared from heartbeat.rules after #4201; assert the
+        # current compact sentence instead of the retired per-shell phrasing.
+        assert "reuse the value on retries" in compact_prompt, prompt
+        assert "guard; 2 stalls->replan" in compact_prompt, prompt
+        assert "no-change=surface_only/no spend" in compact_prompt, prompt
+        # The shipped writeback sentence moved to the mixed-language form in the
+        # same change that updated examples/control_plane/heartbeat-prompt-smoke.py;
+        # this assertion keeps the blocker-runtime path pinned to the same text.
+        assert "unchanged->truthful --vision-unchanged-reason" in compact_prompt, prompt
 
     print("blocker-push-runtime-smoke ok")
     return 0

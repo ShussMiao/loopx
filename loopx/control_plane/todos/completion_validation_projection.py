@@ -86,6 +86,8 @@ def project_completion_validation_authority(item: dict[str, Any]) -> dict[str, A
         projected["completion_validation_sha256"] = (
             completion_validation_declaration_sha256(declaration)
         )
+        projected.setdefault("completion_validation_revision", 0)
+        projected.setdefault("completion_validation_revision_history", [])
     return projected
 
 

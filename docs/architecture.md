@@ -333,8 +333,9 @@ The server path should land in layers:
    CLI fallbacks for every write.
 4. **Heartbeat scheduler**: move recurring heartbeat bookkeeping behind the
    coordinator only after quota/spend idempotency is proven. Scheduler output
-   should be the same `quota should-run` / `interaction_contract` /
-   `protocol_action_packet` shape that current automation prompts already use.
+   should consume the structured `quota should-run` / `interaction_contract`
+   output, with `scheduler_hint` owning cadence; historical
+   `protocol_action_packet` summaries are compatibility observations only.
 5. **Planning and dreaming queues**: let background planning produce ranked
    todo proposals, evidence probes, and refactor warnings as advisory records.
    These queues must not execute protected work, read private material, or

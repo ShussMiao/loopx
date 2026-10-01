@@ -52,6 +52,7 @@
         "qualify_quota_recovery",
         "qualify_snapshot",
         "qualify_tool_transport",
+        "qualify_stream_recovery",
         "reconcile_integration_candidate",
         "upgrade_plan"
       ]

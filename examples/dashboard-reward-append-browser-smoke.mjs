@@ -5,6 +5,7 @@ import { existsSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
 import net from "node:net";
+import { resolveTestPython } from "../scripts/test-python.mjs";
 
 const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 const pwcli = process.env.PWCLI ?? resolve(homedir(), ".codex/skills/playwright/scripts/playwright_cli.sh");
@@ -280,7 +281,7 @@ async function main() {
     const statusBase = `http://127.0.0.1:${statusPort}`;
     const dashboardBase = `http://127.0.0.1:${dashboardPort}`;
 
-    statusServer = startProcess("python3", [
+    statusServer = startProcess(resolveTestPython(), [
       "-m",
       "loopx.cli",
       "--registry",

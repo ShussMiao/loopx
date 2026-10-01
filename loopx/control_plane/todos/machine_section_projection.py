@@ -27,25 +27,32 @@ from ..coordination.coordination_state_contract import (
 from .active_state_editing import (
     COMPLETED_WORK_ARCHIVE_HEADING,
     TODO_SECTION_HEADINGS,
-    archive_section_bounds,
-    todo_blocks,
 )
-from .machine_region import find_todo_regions, todo_region_marker
+from .machine_region import todo_region_marker
+from .projection_document import TodoProjectionDocument
+from .todo_block_codec import decode_todo_blocks
 from .completion_validation_projection import (
     completion_validation_declaration,
     completion_validation_declaration_sha256,
     project_completion_validation_authority,
 )
-from .active_state_todo_parser import parse_active_state_todos
+from .active_state_todo_parser import parse_todo_source
 from .contract import (
+    TODO_DECISION_SCOPE_SCHEMA_VERSION,
     TODO_METADATA_FIELDS,
     TODO_STATUS_OPEN,
     format_todo_metadata_line,
+    normalize_todo_id,
+    normalize_todo_generation,
     normalize_todo_status,
     require_todo_decision_scope,
     todo_marker_for_status,
 )
-from .todo_summary import canonical_todo_read_record
+from .todo_summary import (
+    canonical_todo_read_record, todo_priority_parts, normalize_todo_text,
+    structured_todo_item,
+)
+from ..content_digest import BARE_SHA256_PATTERN
 
 
 TODO_SECTION_PROJECTION_SCHEMA_VERSION = "loopx_todo_section_projection_v0"
@@ -71,13 +78,6 @@ class TodoSectionProjectionResult:
     provider_revision: str
     todo_count: int
     section_record_sha256: dict[str, str]
-
-
-@dataclass(frozen=True)
-class _SectionSpan:
-    role: str
-    start: int
-    end: int
 
 
 def _sha256_text(value: str) -> str:
@@ -118,6 +118,7 @@ def _canonical_records(records: Sequence[Mapping[str, object]]) -> list[dict[str
             raise TodoSectionProjectionError(
                 f"Todo {todo_id!r} has an unsupported archive state"
             )
+        _validate_projection_decision_scope(record, todo_id=todo_id)
         canonical_todo_read_record(
             {
                 **record,
@@ -135,6 +136,63 @@ def _canonical_records(records: Sequence[Mapping[str, object]]) -> list[dict[str
     return canonical
 
 
+def _validate_projection_decision_scope(
+    record: Mapping[str, object],
+    *,
+    todo_id: str,
+) -> None:
+    """Reject explicit scope data that the Markdown projection cannot preserve."""
+
+    if "decision_scope" not in record:
+        return
+    value = record["decision_scope"]
+    if not isinstance(value, Mapping):
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} decision_scope must be an object"
+        )
+    allowed_fields = {
+        "schema_version",
+        "kind",
+        "granularity",
+        "scope_key",
+        "decision_id",
+    }
+    unknown_fields = sorted(str(field) for field in set(value) - allowed_fields)
+    if unknown_fields:
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} decision_scope has unsupported fields: "
+            + ", ".join(unknown_fields)
+        )
+    if (
+        "schema_version" in value
+        and value["schema_version"] != TODO_DECISION_SCOPE_SCHEMA_VERSION
+    ):
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} decision_scope.schema_version must be "
+            f"{TODO_DECISION_SCOPE_SCHEMA_VERSION!r} when present"
+        )
+    if "decision_id" in value:
+        decision_id = value["decision_id"]
+        if (
+            not isinstance(decision_id, str)
+            or normalize_todo_id(decision_id) != decision_id
+        ):
+            raise TodoSectionProjectionError(
+                f"Todo {todo_id!r} decision_scope.decision_id must be a "
+                "public-safe Todo id"
+            )
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} decision_scope.decision_id cannot be represented "
+            "by the current Markdown projection"
+        )
+    try:
+        require_todo_decision_scope(value)
+    except ValueError as exc:
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} has invalid decision_scope: {exc}"
+        ) from exc
+
+
 def _record_sort_key(record: Mapping[str, object]) -> tuple[int, str]:
     raw_index = record.get("index")
     try:
@@ -142,32 +200,6 @@ def _record_sort_key(record: Mapping[str, object]) -> tuple[int, str]:
     except (TypeError, ValueError):
         index = 2**31 - 1
     return index, str(record.get("todo_id") or "")
-
-
-def _section_spans(markdown: str) -> dict[str, _SectionSpan]:
-    lines = markdown.splitlines(keepends=True)
-    offsets = [0]
-    for line in lines:
-        offsets.append(offsets[-1] + len(line))
-    spans: dict[str, _SectionSpan] = {}
-    for region in find_todo_regions(lines):
-        if region.role in spans:
-            raise TodoSectionProjectionError(
-                f"active Markdown contains multiple {region.role} Todo sections"
-            )
-        spans[region.role] = _SectionSpan(region.role, offsets[region.start], offsets[region.end])
-    return spans
-
-
-def _narrative_segments(markdown: str) -> list[str]:
-    spans = sorted(_section_spans(markdown).values(), key=lambda span: span.start)
-    cursor = 0
-    parts: list[str] = []
-    for span in spans:
-        parts.append(markdown[cursor : span.start])
-        cursor = span.end
-    parts.append(markdown[cursor:])
-    return parts
 
 
 def _render_record(
@@ -230,67 +262,38 @@ def _render_section(
     return newline.join(lines), digest
 
 
-def _replace_existing_sections(
-    markdown: str,
-    *,
-    rendered_sections: Mapping[str, str],
-) -> str:
-    spans = sorted(_section_spans(markdown).values(), key=lambda value: value.start)
-    if not spans:
-        raise TodoSectionProjectionError(
-            "active Markdown omits required Todo sections: no projection anchor"
-        )
-    replacements = {span.role: rendered_sections[span.role] for span in spans}
-    source_roles = set(replacements)
-    first_role = spans[0].role
-    last_role = spans[-1].role
-    prefix: list[str] = []
-    if "user" not in source_roles:
-        prefix.append(rendered_sections["user"])
-    if "agent" not in source_roles:
-        if "user" in source_roles:
-            replacements["user"] += rendered_sections["agent"]
-        else:
-            prefix.append(rendered_sections["agent"])
-    if "archive" in rendered_sections and "archive" not in source_roles:
-        replacements[last_role] += rendered_sections["archive"]
-    if prefix:
-        replacements[first_role] = "".join(prefix) + replacements[first_role]
-
-    result = markdown
-    for span in reversed(spans):
-        result = result[: span.start] + replacements[span.role] + result[span.end :]
-    return result
-
-
 def _parsed_active_records(markdown: str) -> list[dict[str, Any]]:
-    fields = parse_active_state_todos(markdown, item_limit=None)
+    items_by_role, _, source_sections = parse_todo_source(markdown)
     records: list[dict[str, Any]] = []
     for role in TODO_SECTION_HEADINGS:
-        summary = fields.get(f"{role}_todos")
-        items = summary.get("items") if isinstance(summary, dict) else []
-        for item in sorted(items or [], key=_record_sort_key):
-            if isinstance(item, dict) and item.get("archive_state") == "active":
-                records.append(canonical_todo_read_record(item, reject_unknown=False))
+        for item in sorted(items_by_role[role], key=_record_sort_key):
+            # Display selection/resume evaluation is not source serialization.
+            # Preserve all text and skip attention-policy RPCs during parity.
+            normalized = structured_todo_item(
+                item, role=role, source_section=source_sections[role], text_limit=None,
+            )
+            records.append(canonical_todo_read_record(normalized, reject_unknown=False))
     return records
 
 
 def _parsed_archive_records(markdown: str) -> list[dict[str, Any]]:
-    lines = markdown.splitlines()
-    bounds = archive_section_bounds(lines)
-    if bounds is None:
-        return []
+    _, archived, _ = parse_todo_source(markdown)
     records: list[dict[str, Any]] = []
-    for item in todo_blocks(
-        lines,
-        bounds[0],
-        bounds[1],
-        source_section=COMPLETED_WORK_ARCHIVE_HEADING,
-    ):
+    for item in archived:
         if item.get("role") not in TODO_SECTION_HEADINGS:
             raise TodoSectionProjectionError(
                 f"archived Todo {item.get('todo_id')!r} omits its source role"
             )
+        # Metadata is textual; canonical capture and active reads normalize this
+        # counter. Archive readback must use the same codec, not compare "12" to 12.
+        if "material_change_generation" in item:
+            generation = normalize_todo_generation(item["material_change_generation"])
+            if generation is None:
+                raise TodoSectionProjectionError("invalid archived Monitor material generation")
+            item["material_change_generation"] = generation
+        priority, title = todo_priority_parts(str(item.get("text") or ""))
+        if priority:
+            item.update(priority=priority, title=normalize_todo_text(title, limit=None))
         records.append(
             canonical_todo_read_record(
                 project_completion_validation_authority({
@@ -319,7 +322,8 @@ def _projection_record(
                 if record.get("archive_state") == "archive"
                 else TODO_SECTION_HEADINGS[str(record["role"])]
             ),
-            "index": record.get("index", display_index),
+            # Stored import ordinals determine ordering; the new display has its own contiguous ordinals.
+            "index": display_index,
         },
         reject_unknown=True,
     ))
@@ -328,6 +332,13 @@ def _projection_record(
         # readback. Normalize that display representation, never the provider
         # record or its digest, before comparing the same semantic scope.
         projected["decision_scope"] = require_todo_decision_scope(projected["decision_scope"])
+    # Native authors may retain only the full text. The permanent Markdown
+    # reader derives its title/priority; compare that same display view without
+    # inventing persisted domain fields or masking an explicit disagreement.
+    priority, title = todo_priority_parts(str(projected.get("text") or ""))
+    if priority:
+        projected.setdefault("priority", priority)
+        projected.setdefault("title", normalize_todo_text(title, limit=None))
     return projected
 
 
@@ -337,22 +348,22 @@ _DERIVED_READ_MODEL_FIELDS = {
     "resume_condition",
     "resume_ready",
     "handoff_note",
+    # Revision receipts are canonical-provider audit state.  The readable
+    # Markdown projection intentionally carries only the private validation
+    # declaration needed to execute the current validator, so these fields
+    # cannot participate in Markdown parse/render parity.
+    "completion_validation_revision",
+    "completion_validation_revision_history",
 }
 
 
 def _private_validation_metadata(
-    markdown: str,
+    document: TodoProjectionDocument,
 ) -> dict[str, tuple[dict[str, Any], dict[str, object]]]:
-    lines = markdown.splitlines()
+    lines = [line.rstrip("\r\n") for line in document.lines]
     private: dict[str, tuple[dict[str, Any], dict[str, object]]] = {}
-    for region in find_todo_regions(lines):
-        for item in todo_blocks(
-            lines,
-            region.start,
-            region.body_end,
-            role=region.role if region.role in TODO_SECTION_HEADINGS else None,
-            source_section=region.heading,
-        ):
+    for region in document.regions:
+        for item in decode_todo_blocks(lines, region.start, region.body_end, visible=document.visible):
             todo_id = str(item.get("todo_id") or "")
             declaration = completion_validation_declaration(item)
             if not todo_id or declaration is None:
@@ -405,17 +416,33 @@ def render_canonical_todo_sections(
     if not re.fullmatch(r"[A-Za-z0-9_.:-]+", provider_revision):
         raise TodoSectionProjectionError("provider_revision must be a public-safe token")
     canonical = _canonical_records(records)
-    private_source = _private_validation_metadata(markdown)
+    try:
+        source_document = TodoProjectionDocument.parse(markdown)
+    except ValueError as error:
+        raise TodoSectionProjectionError(str(error)) from error
+    private_source = _private_validation_metadata(source_document)
+    canonical_validation_digests = {
+        str(record.get("todo_id") or ""): record.get("completion_validation_sha256")
+        for record in canonical
+        if record.get("completion_validation_required") is True
+    }
     for todo_id, declaration in (private_validation_declarations or {}).items():
         external = _private_validation_entry(declaration)
         existing = private_source.get(todo_id)
-        if existing is not None and (
-            completion_validation_declaration_sha256(existing[0])
-            != completion_validation_declaration_sha256(external[0])
-        ):
-            raise TodoSectionProjectionError(
-                f"Todo {todo_id!r} has divergent private validation declarations"
-            )
+        external_digest = completion_validation_declaration_sha256(external[0])
+        if existing is not None:
+            existing_digest = completion_validation_declaration_sha256(existing[0])
+            if existing_digest != external_digest:
+                # A successful CAS revision updates provider authority and the
+                # private declaration sidecar before the readable Markdown can
+                # be regenerated.  In that bounded state the old Markdown is
+                # expected to disagree.  Only the declaration selected by the
+                # canonical record may replace it; every other divergence is
+                # still rejected closed.
+                if canonical_validation_digests.get(todo_id) != external_digest:
+                    raise TodoSectionProjectionError(
+                        f"Todo {todo_id!r} has divergent private validation declarations"
+                    )
         private_source[todo_id] = external
     private_validation: dict[str, Mapping[str, object]] = {}
     for record in canonical:
@@ -428,7 +455,7 @@ def render_canonical_todo_sections(
                     f"Todo {todo_id!r} has a validation digest without authority"
                 )
             continue
-        if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+        if not isinstance(digest, str) or not BARE_SHA256_PATTERN.fullmatch(digest):
             raise TodoSectionProjectionError(
                 f"Todo {todo_id!r} requires validation but omits its declaration digest"
             )
@@ -441,7 +468,6 @@ def render_canonical_todo_sections(
                 f"Todo {todo_id!r} private validation declaration does not match authority"
             )
         private_validation[todo_id] = source[1]
-    source_spans = _section_spans(markdown)
     by_role = {
         role: sorted(
             [
@@ -469,7 +495,7 @@ def render_canonical_todo_sections(
             newline=newline,
             private_validation=private_validation,
         )
-    if archived or "archive" in source_spans:
+    if archived or "archive" in source_document.spans:
         rendered_sections["archive"], section_digests["archive"] = _render_section(
             role="archive",
             records=archived,
@@ -478,12 +504,13 @@ def render_canonical_todo_sections(
             private_validation=private_validation,
         )
 
-    rendered = _replace_existing_sections(
-        markdown,
-        rendered_sections=rendered_sections,
-    )
-    before_narrative = "".join(_narrative_segments(markdown))
-    after_narrative = "".join(_narrative_segments(rendered))
+    try:
+        rendered = source_document.replace(rendered_sections)
+        rendered_document = TodoProjectionDocument.parse(rendered)
+    except ValueError as error:
+        raise TodoSectionProjectionError(str(error)) from error
+    before_narrative = source_document.narrative
+    after_narrative = rendered_document.narrative
     if before_narrative != after_narrative:
         raise TodoSectionProjectionError("render changed Markdown outside Todo sections")
 
@@ -503,7 +530,7 @@ def render_canonical_todo_sections(
     )
     if _canonical_json(actual) != _canonical_json(expected):
         raise TodoSectionProjectionError("Todo section parse/render parity mismatch")
-    second = _replace_existing_sections(rendered, rendered_sections=rendered_sections)
+    second = rendered_document.replace(rendered_sections)
     if second != rendered:
         raise TodoSectionProjectionError("Todo section projection is not idempotent")
 
@@ -522,7 +549,13 @@ def render_canonical_todo_sections(
 def inspect_todo_section_projection(markdown: str) -> dict[str, object]:
     """Return compact marker diagnostics without treating Markdown as truth."""
 
-    markers = [match.groupdict() for match in _MARKER_PATTERN.finditer(markdown)]
+    document = TodoProjectionDocument.parse(markdown)
+    markers = []
+    for region in document.regions:
+        for line in document.lines[region.start:region.body_end]:
+            match = _MARKER_PATTERN.fullmatch(line.rstrip("\r\n"))
+            if match is not None and match["role"] == region.role:
+                markers.append(match.groupdict())
     return {
         "schema_version": TODO_SECTION_PROJECTION_SCHEMA_VERSION,
         "section_count": len(markers),

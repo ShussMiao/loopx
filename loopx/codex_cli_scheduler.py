@@ -110,7 +110,9 @@ def build_codex_cli_local_scheduler_tick(
         else {}
     )
     codex_app_hint = (
-        scheduler_hint.get("codex_app")
+        scheduler_hint.get("app_automation")
+        if isinstance(scheduler_hint.get("app_automation"), dict)
+        else scheduler_hint.get("codex_app")
         if isinstance(scheduler_hint.get("codex_app"), dict)
         else {}
     )
@@ -352,7 +354,7 @@ def _run_scheduler_executor_shell_command(
         completed = subprocess.run(
             argv,
             check=False,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout_seconds,
             stdout=stdout,
             stderr=stderr,

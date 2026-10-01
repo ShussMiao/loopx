@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import ExitStack
 from dataclasses import dataclass
 import errno
 import json
@@ -10,11 +11,11 @@ from typing import Any, Callable
 
 from .authority import compact_authority_registry
 from .control_plane.projects.contract import validate_project_record_bindings
+from .control_plane.projects.registry_codec import load_registry
 from .control_plane.runtime.time import now_local_iso
-from .file_lock import exclusive_file_lock
-from .history import load_registry
+from .file_lock import exclusive_cross_runtime_file_lock
 from .paths import DEFAULT_RUNTIME_ROOT, global_registry_path, resolve_runtime_root
-from .registry import registry_goals
+from .registry import read_json, registry_goals
 from .registry_writability import is_write_denied_error, probe_registry_write_path
 
 
@@ -42,6 +43,10 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
+def _load_global_registry(path: Path) -> dict[str, Any]:
+    return read_json(path) if path.exists() else {}
+
+
 @dataclass(frozen=True, slots=True)
 class GlobalRegistryReduction:
     payload: dict[str, Any]
@@ -54,34 +59,30 @@ def _global_registry_backup_path(global_path: Path, label: str) -> Path:
     return global_path.with_name(f"{global_path.name}.{label}-{timestamp}.bak")
 
 
-def mutate_global_registry(
+def _mutate_global_registry_locked(
     global_path: Path,
-    operation: str,
     reducer: Callable[[dict[str, Any]], GlobalRegistryReduction],
 ) -> dict[str, Any]:
-    """Apply one authoritative global-registry read-modify-write transaction."""
+    current = _load_global_registry(global_path)
+    reduction = reducer(copy.deepcopy(current))
+    if not isinstance(reduction, GlobalRegistryReduction):
+        raise TypeError(
+            "global registry reducer must return GlobalRegistryReduction"
+        )
+    if not isinstance(reduction.payload, dict):
+        raise TypeError("global registry reducer payload must be a JSON object")
 
-    with exclusive_file_lock(global_path, operation=operation):
-        current = load_registry(global_path)
-        reduction = reducer(copy.deepcopy(current))
-        if not isinstance(reduction, GlobalRegistryReduction):
-            raise TypeError(
-                "global registry reducer must return GlobalRegistryReduction"
-            )
-        if not isinstance(reduction.payload, dict):
-            raise TypeError("global registry reducer payload must be a JSON object")
-
-        wrote = reduction.payload != current
-        backup_path = None
-        if wrote and reduction.backup_label and global_path.exists():
-            backup = _global_registry_backup_path(
-                global_path,
-                reduction.backup_label,
-            )
-            write_json(backup, current)
-            backup_path = str(backup)
-        if wrote:
-            write_json(global_path, reduction.payload)
+    wrote = reduction.payload != current
+    backup_path = None
+    if wrote and reduction.backup_label and global_path.exists():
+        backup = _global_registry_backup_path(
+            global_path,
+            reduction.backup_label,
+        )
+        write_json(backup, current)
+        backup_path = str(backup)
+    if wrote:
+        write_json(global_path, reduction.payload)
 
     return {
         "before": current,
@@ -90,6 +91,17 @@ def mutate_global_registry(
         "backup_path": backup_path,
         "wrote": wrote,
     }
+
+
+def mutate_global_registry(
+    global_path: Path,
+    operation: str,
+    reducer: Callable[[dict[str, Any]], GlobalRegistryReduction],
+) -> dict[str, Any]:
+    """Apply one authoritative global-registry read-modify-write transaction."""
+
+    with exclusive_cross_runtime_file_lock(global_path, operation=operation):
+        return _mutate_global_registry_locked(global_path, reducer)
 
 
 def global_write_denied_payload(
@@ -535,7 +547,7 @@ def retire_global_registry_goals(
 
     updated_at = now_local()
     preview = _retire_global_registry_reduction(
-        load_registry(global_path),
+        _load_global_registry(global_path),
         requested_ids=requested_ids,
         global_path=global_path,
         updated_at=updated_at,
@@ -620,13 +632,16 @@ def render_global_goal_retirement_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def sync_project_registry_to_global(
+def _sync_project_registry_to_global_once(
     *,
     registry_path: Path,
     runtime_root_override: str | None,
     goal_id: str | None = None,
     dry_run: bool = False,
     allow_route_replacement: bool = False,
+    _global_registry_lock_held: bool = False,
+    _expected_global_registry: Path | None = None,
+    _lock_write_denied: OSError | None = None,
 ) -> dict[str, Any]:
     registry_path = registry_path.expanduser()
     if not registry_path.exists():
@@ -634,6 +649,13 @@ def sync_project_registry_to_global(
     project_registry = load_registry(registry_path)
     runtime_root = resolve_runtime_root(project_registry, runtime_root_override)
     global_path = global_registry_path(runtime_root)
+    if (
+        _expected_global_registry is not None
+        and global_path.absolute() != _expected_global_registry.absolute()
+    ):
+        raise ValueError(
+            "global registry route changed while waiting for the write lock; retry"
+        )
     if registry_path.resolve() == global_path.resolve():
         return {
             "ok": True,
@@ -687,7 +709,7 @@ def sync_project_registry_to_global(
         "synced_at": synced_at,
     }
     preview = _sync_global_registry_reduction(
-        load_registry(global_path),
+        _load_global_registry(global_path),
         incoming,
         incoming_projects,
         **merge_kwargs,
@@ -702,8 +724,8 @@ def sync_project_registry_to_global(
     writability = None
     if not dry_run:
         writability = probe_registry_write_path(global_path, create_parent=True)
-        if not writability.get("ok"):
-            exc = PermissionError(
+        if _lock_write_denied is not None or not writability.get("ok"):
+            exc = _lock_write_denied or PermissionError(
                 writability.get("errno")
                 if isinstance(writability.get("errno"), int)
                 else errno.EPERM,
@@ -740,15 +762,25 @@ def sync_project_registry_to_global(
                 else None
             )
         else:
-            mutation = mutate_global_registry(
-                global_path,
-                "sync_global_registry",
-                lambda current: _sync_global_registry_reduction(
+            def reduce_current(current: dict[str, Any]) -> GlobalRegistryReduction:
+                return _sync_global_registry_reduction(
                     current,
                     incoming,
                     incoming_projects,
                     **merge_kwargs,
-                ),
+                )
+
+            mutation = (
+                _mutate_global_registry_locked(
+                    global_path,
+                    reduce_current,
+                )
+                if _global_registry_lock_held
+                else mutate_global_registry(
+                    global_path,
+                    "sync_global_registry",
+                    reduce_current,
+                )
             )
             receipt = mutation["receipt"]
             merged_goals = receipt["merged_goals"]
@@ -794,6 +826,74 @@ def sync_project_registry_to_global(
         "wrote": not dry_run,
         "global_registry_writability": writability or {},
     }
+
+
+def sync_project_registry_to_global(
+    *,
+    registry_path: Path,
+    runtime_root_override: str | None,
+    goal_id: str | None = None,
+    dry_run: bool = False,
+    allow_route_replacement: bool = False,
+    _global_registry_lock_held: bool = False,
+) -> dict[str, Any]:
+    """Sync a fresh source snapshot while holding the target registry lock."""
+
+    if dry_run or _global_registry_lock_held:
+        return _sync_project_registry_to_global_once(
+            registry_path=registry_path,
+            runtime_root_override=runtime_root_override,
+            goal_id=goal_id,
+            dry_run=dry_run,
+            allow_route_replacement=allow_route_replacement,
+            _global_registry_lock_held=_global_registry_lock_held,
+        )
+
+    source_registry = registry_path.expanduser()
+    if not source_registry.exists():
+        raise FileNotFoundError(
+            f"registry file does not exist: {source_registry}"
+        )
+    source_payload = load_registry(source_registry)
+    runtime_root = resolve_runtime_root(source_payload, runtime_root_override)
+    target_registry = global_registry_path(runtime_root)
+    if source_registry.resolve() == target_registry.resolve():
+        # This route's global registry is the source registry itself, which a
+        # caller such as configure-goal already owns through the source
+        # transaction lock. Acquiring the cross-runtime lock here would wait
+        # on this process while holding the source lock, so a single-runtime
+        # route would write the source and then fail to report it. The
+        # single-shot reducer already treats this route as an owned no-op.
+        return _sync_project_registry_to_global_once(
+            registry_path=source_registry,
+            runtime_root_override=runtime_root_override,
+            goal_id=goal_id,
+            dry_run=False,
+            allow_route_replacement=allow_route_replacement,
+            _global_registry_lock_held=_global_registry_lock_held,
+        )
+    with ExitStack() as lock:
+        lock_write_denied: OSError | None = None
+        try:
+            lock.enter_context(exclusive_cross_runtime_file_lock(
+                target_registry,
+                operation="sync_global_registry",
+            ))
+        except OSError as exc:
+            if not is_write_denied_error(exc):
+                raise
+            # A later writable probe cannot authorize an unlocked retry.
+            lock_write_denied = exc
+        return _sync_project_registry_to_global_once(
+            registry_path=source_registry,
+            runtime_root_override=runtime_root_override,
+            goal_id=goal_id,
+            dry_run=False,
+            allow_route_replacement=allow_route_replacement,
+            _global_registry_lock_held=lock_write_denied is None,
+            _expected_global_registry=target_registry,
+            _lock_write_denied=lock_write_denied,
+        )
 
 
 def render_global_sync_markdown(payload: dict[str, Any]) -> str:

@@ -107,6 +107,12 @@ export function decodeLegacyCoordinationWriterFence(value: unknown): JsonObject 
     fence.schema_version !== LEGACY_COORDINATION_WRITER_FENCE_SCHEMA ||
     fence.state !== "engaged"
   ) throw new Error("legacy coordination writer fence must be engaged");
+  const promotionPlanSha256 = fence.promotion_plan_sha256 === undefined
+    ? null
+    : requireAuthorityStoreId(
+      fence.promotion_plan_sha256,
+      "writer fence promotion plan sha256",
+    );
   return canonicalAuthorityObject({
     schema_version: LEGACY_COORDINATION_WRITER_FENCE_SCHEMA,
     state: "engaged",
@@ -124,6 +130,9 @@ export function decodeLegacyCoordinationWriterFence(value: unknown): JsonObject 
       fence.expected_shadow_provider_revision,
       "writer fence expected shadow provider revision",
     ),
+    ...(promotionPlanSha256 === null ? {} : {
+      promotion_plan_sha256: promotionPlanSha256,
+    }),
   }, "legacy coordination writer fence");
 }
 
@@ -142,12 +151,60 @@ export async function loadLegacyCoordinationWriterFence(
     return { status: "loaded", fence };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "missing" };
+    const path = (error as NodeJS.ErrnoException).path;
+    const reason = error instanceof Error ? error.message : "legacy writer fence read failed";
     return {
       status: "failed",
       reason_code: "legacy_writer_fence_read_failed",
-      reason: error instanceof Error ? error.message : "legacy writer fence read failed",
+      reason: typeof path === "string" ? reason.replace(` '${path}'`, "") : reason,
     };
   }
+}
+
+/** Persist one exact fence while the caller already owns maintenance/source locks. */
+export async function engageLegacyCoordinationWriterFenceUnderLocks(
+  root: string,
+  goalId: string,
+  statePath: string,
+  fence: JsonObject,
+): Promise<JsonObject> {
+  const binding = await requireShadowPrimaryWriteAllowed(root, goalId);
+  if (
+    binding !== null &&
+    await realpath(await readShadowBootstrapSourcePath(root, goalId, binding)) !== await realpath(statePath)
+  ) throw new ShadowManagementError("shadow_source_state_path_mismatch");
+  const path = legacyCoordinationWriterFencePath(root, goalId);
+  return await withFileMutationLock(path, async () => {
+    const existing = await loadLegacyCoordinationWriterFence(root, goalId);
+    if (existing.status === "loaded") {
+      const matched = canonicalAuthorityBytes(existing.fence).equals(
+        canonicalAuthorityBytes(fence),
+      );
+      return {
+        schema_version: LEGACY_COORDINATION_WRITER_FENCE_RESULT_SCHEMA,
+        status: matched ? "replayed" : "conflict",
+        ...(matched ? { fence } : {
+          reason_code: "legacy_writer_fence_identity_mismatch",
+          reason: "a different legacy writer fence is already engaged",
+        }),
+      };
+    }
+    if (existing.status === "failed") return {
+      schema_version: LEGACY_COORDINATION_WRITER_FENCE_RESULT_SCHEMA,
+      ...existing,
+    };
+    await atomicWriteJson(path, fence);
+    const readback = await loadLegacyCoordinationWriterFence(root, goalId);
+    if (
+      readback.status !== "loaded" ||
+      !canonicalAuthorityBytes(readback.fence).equals(canonicalAuthorityBytes(fence))
+    ) throw new Error("legacy writer fence readback mismatch");
+    return {
+      schema_version: LEGACY_COORDINATION_WRITER_FENCE_RESULT_SCHEMA,
+      status: "applied",
+      fence,
+    };
+  });
 }
 
 /** Persist the fail-closed marker that every legacy writer must inspect. */
@@ -167,47 +224,12 @@ export async function engageLegacyCoordinationWriterFence(value: unknown): Promi
     if (!(await stat(statePath)).isFile()) throw new Error("state_path must identify an existing source state file");
     const fence = decodeLegacyCoordinationWriterFence(input.fence);
     if (fence.goal_id !== goalId) throw new Error("legacy writer fence goal mismatch");
-    const path = legacyCoordinationWriterFencePath(root, goalId);
     return await withFileMutationLock(shadowMaintenanceLockPath(root, goalId), async () => {
-      const binding = await requireShadowPrimaryWriteAllowed(root, goalId);
-      if (binding !== null && await realpath(await readShadowBootstrapSourcePath(root, goalId, binding)) !== statePath) {
-        throw new ShadowManagementError("shadow_source_state_path_mismatch");
-      }
       return withFileMutationLock(legacyCoordinationTodoLockPath(root, goalId), () =>
         withFileMutationLock(statePath, () =>
           withFileMutationLock(legacyCoordinationLeaseLockPath(root, goalId), () =>
             withFileMutationLock(taskLeaseLockPath({runtime_root: root, goal_id: goalId}), () =>
-              withFileMutationLock(path, async () => {
-                const existing = await loadLegacyCoordinationWriterFence(root, goalId);
-                if (existing.status === "loaded") {
-                  const matched = canonicalAuthorityBytes(existing.fence).equals(
-                    canonicalAuthorityBytes(fence),
-                  );
-                  return {
-                    schema_version: LEGACY_COORDINATION_WRITER_FENCE_RESULT_SCHEMA,
-                    status: matched ? "replayed" : "conflict",
-                    ...(matched ? { fence } : {
-                      reason_code: "legacy_writer_fence_identity_mismatch",
-                      reason: "a different legacy writer fence is already engaged",
-                  }),
-                };
-              }
-              if (existing.status === "failed") return {
-                schema_version: LEGACY_COORDINATION_WRITER_FENCE_RESULT_SCHEMA,
-                ...existing,
-              };
-              await atomicWriteJson(path, fence);
-              const readback = await loadLegacyCoordinationWriterFence(root, goalId);
-              if (
-                readback.status !== "loaded" ||
-                !canonicalAuthorityBytes(readback.fence).equals(canonicalAuthorityBytes(fence))
-              ) throw new Error("legacy writer fence readback mismatch");
-              return {
-                schema_version: LEGACY_COORDINATION_WRITER_FENCE_RESULT_SCHEMA,
-                status: "applied",
-                fence,
-              };
-              }),
+              engageLegacyCoordinationWriterFenceUnderLocks(root, goalId, statePath, fence),
             ),
           ),
         ),

@@ -11,24 +11,24 @@ SMOKE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SMOKE_DIR))
 sys.path.insert(0, str(REPO_ROOT))
 
-from loopx.control_plane.scheduler.execution_context import (
+from loopx.control_plane.scheduler.execution_context import (  # noqa: E402 - standalone smoke bootstraps repo imports
     SchedulerRuntimeProfile,
     scheduler_execution_context_for_runtime_profile,
 )
-from loopx.control_plane.todos.contract import (
+from loopx.control_plane.todos.contract import (  # noqa: E402 - standalone smoke bootstraps repo imports
     TODO_TASK_CLASS_ADVANCEMENT,
     TODO_TASK_CLASS_MONITOR,
 )
-from loopx.quota import (
+from loopx.quota import (  # noqa: E402 - standalone smoke bootstraps repo imports
     build_quota_should_run as _build_quota_should_run,
     render_quota_should_run_markdown,
 )
-from loopx.status import (
+from loopx.status import (  # noqa: E402 - standalone smoke bootstraps repo imports
     compact_todo_group,
     compact_post_handoff_run,
     normalize_todo_task_class,
 )
-from work_lane_contract_fixtures import (
+from work_lane_contract_fixtures import (  # noqa: E402 - standalone smoke bootstraps repo imports
     FUTURE_DUE_AT,
     GOAL_ID,
     PAST_DUE_AT,
@@ -283,12 +283,11 @@ def assert_monitor_only_with_user_todo_surfaces_user_action_without_transition()
     assert interaction["user_channel"]["notify"] == "NOTIFY", interaction
     assert interaction["agent_channel"]["must_attempt"] is True, interaction
     assert interaction["agent_channel"]["quiet_noop_allowed"] is False, interaction
-    packet = guard["protocol_action_packet"]
-    assert "actor=agent_with_user_gate" in packet["summary"], packet
-    assert "user_action_required=true" in packet["summary"], packet
-    assert "agent_action_required=true" in packet["summary"], packet
-    assert "quiet_noop_allowed=false" in packet["summary"], packet
-    assert "user_action=[P1] Decide whether to approve a no-submit Terminal-Bench" in packet["summary"], packet
+    assert len(interaction["user_channel"]["actions"]) == 1, interaction
+    assert interaction["user_channel"]["actions"][0].startswith(
+        "[P1] Decide whether to approve a no-submit Terminal-Bench"
+    ), interaction
+    assert "protocol_action_packet" not in guard, guard
     markdown = render_quota_should_run_markdown(guard)
     assert "obligation=repair_monitor_schedule_metadata" in markdown, markdown
     assert "work_lane_monitor_policy: repair_schedule_metadata_before_quiet_wait" in markdown, markdown
@@ -666,7 +665,7 @@ def assert_mixed_monitor_and_advancement_routes_to_advancement() -> None:
     assert lane["must_attempt_work"] is True, lane
     assert guard["recommended_action"] == executable_todo, guard
     assert guard["interaction_contract"]["agent_channel"]["primary_action"] == executable_todo, guard
-    assert f"agent_action={executable_todo}" in guard["protocol_action_packet"]["summary"], guard
+    assert "protocol_action_packet" not in guard, guard
     first_items = guard["agent_todo_summary"]["first_open_items"]
     assert [item["task_class"] for item in first_items] == ["advancement_task", "continuous_monitor"], guard
 
@@ -907,9 +906,8 @@ def assert_external_monitor_context_recommends_executable_backlog() -> None:
     assert guard["interaction_contract"]["agent_channel"]["primary_action"] == (
         "[P1] Behavior regression suite lane"
     ), guard
-    packet = guard["protocol_action_packet"]["summary"]
-    assert "lane=advancement_task" in packet, packet
-    assert "agent_action=[P1] Behavior regression suite lane" in packet, packet
+    assert guard["work_lane_contract"]["lane"] == "advancement_task", guard
+    assert "protocol_action_packet" not in guard, guard
 
 
 def assert_benchmark_readiness_scan_routes_to_advancement() -> None:
@@ -1393,8 +1391,9 @@ def assert_peer_requires_reassignment_when_only_other_peer_has_claimed_work() ->
     assert guard["effective_action"] == "reassignment_required", guard
     assert "agent_lane_next_action" not in guard, guard
     frontier = guard["agent_scope_frontier"]
-    assert frontier["schema_version"] == "agent_scope_frontier_v0", frontier
+    assert frontier["schema_version"] == "agent_scope_frontier_v1", frontier
     assert frontier["action"] == "reassignment_required", frontier
+    assert "effective_action" not in frontier, frontier
     assert frontier["agent_id"] == "codex-side-bypass", frontier
     assert "primary_agent" not in frontier, frontier
     assert frontier["candidate_counts"]["current_agent_claimed_advancement_count"] == 0, frontier

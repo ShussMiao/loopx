@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from ...file_lock import exclusive_file_lock
+from ...file_lock import exclusive_run_index_lock
 from ...history import load_index, reserve_unique_run_paths
 from .time import now_local_iso
 
@@ -44,7 +44,7 @@ def write_compact_runtime_projection(
 
     runs_dir = target_runtime_root / "goals" / goal_id / "runs"
     index_path = runs_dir / "index.jsonl"
-    with exclusive_file_lock(index_path):
+    with exclusive_run_index_lock(index_path, operation="runtime_projection_append"):
         existing, _ = load_index(index_path)
         for item in existing:
             item_marker = item.get(marker_field)

@@ -66,5 +66,5 @@ if ($AddToUserPath) {
     if (-not (($env:Path -split ";") -contains $BinDir)) {
         $env:Path = "$BinDir;$env:Path"
     }
-    Write-Output "LoopX Windows user PATH includes: $BinDir"
+    [Console]::Error.WriteLine("LoopX Windows user PATH includes: $BinDir")
 }

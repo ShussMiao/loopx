@@ -11,8 +11,14 @@ from ...agents.agent_scope import (
 from ...agents.profile import agent_profile_requires_vision
 from ...agents.runtime_model import peer_work_key, select_peer_for_work
 from ...runtime.time import parse_timestamp
-from ...todos.contract import normalize_todo_replan_obligation_id
-from ...todos.projection import (
+# Refs #4447: the todo contract owns this vocabulary; import it instead of
+# restating the literal in every module that classifies a Todo.
+from ...todos.contract import (
+    TODO_TASK_CLASS_ADVANCEMENT,
+    TODO_TASK_CLASS_MONITOR,
+    normalize_todo_replan_obligation_id,
+)
+from ...todos.todo_semantics import (
     todo_advancement_frontier_counts,
     todo_item_is_watch_only_monitor,
 )
@@ -49,6 +55,10 @@ from ..goal_vision_read_model import (
 )
 from ..goal_vision_wait import build_goal_vision_wait_state
 from . import outcome_continuity
+from .acceptance import (
+    GOAL_ACCEPTANCE_HOLD_TRIGGERS,
+    acceptance_gaps_from_held_goal_binding,
+)
 from .ack_policy import (
     autonomous_replan_ack_satisfies_obligation,
     replan_successor_transition_ack,
@@ -62,8 +72,7 @@ from .fallback_disposition import (
 )
 from .long_todo_chain import (
     LONG_TODO_CHAIN_TRIGGER,
-    classify_long_todo_chain_ack,
-    observe_long_todo_chain,
+    evaluate_long_todo_chain,
 )
 from .replan_rules import (
     GoalFrontierReplanFacts,
@@ -100,8 +109,6 @@ FRONTIER_EXHAUSTED_MONITOR_TRIGGER = "frontier_exhausted_monitor_lane"
 MONITOR_NO_CHANGE_STREAK_TRIGGER = "monitor_no_change_streak"
 VISION_PROFILE_MISSING_TRIGGER = "required_agent_vision_missing"
 TODO_SUCCESSION_GAP_TRIGGER = TODO_SUCCESSION_WARNING_REASON_CODE
-TODO_TASK_CLASS_ADVANCEMENT = "advancement_task"
-TODO_TASK_CLASS_MONITOR = "continuous_monitor"
 
 
 def safe_non_negative_int(value: Any) -> int:
@@ -362,6 +369,7 @@ def acceptance_gaps_from_agent_profile_requirement(
     ]
 
 
+
 def build_vision_continuation_audit(
     *,
     goal_id: str | None = None,
@@ -444,6 +452,13 @@ def build_vision_continuation_audit(
     }
     if acceptance_requirements:
         audit["acceptance_requirements"] = acceptance_requirements[:5]
+    diagnostics = [
+        {key: gap[key] for key in ("reason_code", "component_checks", "resolution_hint")}
+        for gap in compact_acceptance_gaps
+        if gap.get("reason_code") and gap.get("component_checks") and gap.get("resolution_hint")
+    ]
+    if diagnostics:
+        audit["outcome_checkpoint_diagnostics"] = diagnostics[:5]
     return audit
 
 
@@ -568,11 +583,21 @@ def _count_advancement_items(items: Any, *, claimed_by: str | None = None) -> in
 def _summary_task_counts(summary: dict[str, Any] | None) -> dict[str, int]:
     open_count = _open_todo_count(summary)
     if not isinstance(summary, dict):
-        return {"open": open_count, "advancement": 0, "monitor": 0, "monitor_due": 0}
+        return {
+            "open": open_count,
+            "advancement": 0,
+            "monitor": 0,
+            "monitor_due": 0,
+            "watch_only_monitor_due": 0,
+        }
     executable = summary.get("executable_backlog_items")
     monitor_open = summary.get("monitor_open_items")
-    watch_only_count = (
-        len(
+    if isinstance(summary.get("watch_only_monitor_count"), int):
+        watch_only_count = safe_non_negative_int(
+            summary.get("watch_only_monitor_count")
+        )
+    elif isinstance(monitor_open, list):
+        watch_only_count = len(
             [
                 item
                 for item in monitor_open
@@ -581,10 +606,14 @@ def _summary_task_counts(summary: dict[str, Any] | None) -> dict[str, int]:
                 and todo_item_is_watch_only_monitor(item)
             ]
         )
-        if isinstance(monitor_open, list)
-        else safe_non_negative_int(summary.get("watch_only_monitor_count"))
-    )
-    open_count = max(0, open_count - watch_only_count)
+    else:
+        watch_only_count = 0
+    if isinstance(summary.get("convergence_open_count"), int):
+        open_count = safe_non_negative_int(summary.get("convergence_open_count"))
+    else:
+        # Compatibility-only fallback for summaries produced before the typed
+        # TypeScript lane owner exposed convergence_open_count.
+        open_count = max(0, open_count - watch_only_count)
     advancement_count = (
         _count_advancement_items(executable)
         if isinstance(executable, list)
@@ -598,8 +627,15 @@ def _summary_task_counts(summary: dict[str, Any] | None) -> dict[str, int]:
             ]
         )
     )
-    monitor_count = (
-        len(
+    work_counts = summary.get("work_counts")
+    if isinstance(work_counts, dict):
+        monitor_count = max(
+            0,
+            safe_non_negative_int(work_counts.get("monitor"))
+            - watch_only_count,
+        )
+    elif isinstance(monitor_open, list):
+        monitor_count = len(
             [
                 item
                 for item in monitor_open
@@ -609,9 +645,10 @@ def _summary_task_counts(summary: dict[str, Any] | None) -> dict[str, int]:
                 and not todo_item_is_watch_only_monitor(item)
             ]
         )
-        if isinstance(monitor_open, list)
-        else safe_non_negative_int(summary.get("claimed_monitor_open_count"))
-    )
+    else:
+        monitor_count = safe_non_negative_int(
+            summary.get("claimed_monitor_open_count")
+        )
     return {
         "open": open_count,
         "advancement": advancement_count,
@@ -620,6 +657,9 @@ def _summary_task_counts(summary: dict[str, Any] | None) -> dict[str, int]:
             0,
             safe_non_negative_int(summary.get("monitor_due_count"))
             - safe_non_negative_int(summary.get("watch_only_monitor_due_count")),
+        ),
+        "watch_only_monitor_due": safe_non_negative_int(
+            summary.get("watch_only_monitor_due_count")
         ),
     }
 
@@ -886,6 +926,52 @@ def _vision_gap_acknowledged(
 
     if not acceptance_gaps or not isinstance(latest_replan_ack, dict):
         return False
+    # The vision-patch shortcut below covers gaps authored by that same Turn.
+    # A persisted Goal Acceptance drift is an independent Todo event: an older
+    # vision patch cannot acknowledge a later semantic edit.
+    held_bindings = [
+        gap for gap in acceptance_gaps
+        if gap.get("kind") in GOAL_ACCEPTANCE_HOLD_TRIGGERS
+    ]
+    if held_bindings:
+        semantic_delta = latest_replan_ack.get("semantic_delta")
+        satisfying_outcomes = (
+            semantic_delta.get("satisfying_outcomes")
+            if isinstance(semantic_delta, dict)
+            and isinstance(semantic_delta.get("satisfying_outcomes"), list)
+            else []
+        )
+        recorded_checkpoints = (
+            semantic_delta.get("trigger_checkpoints")
+            if isinstance(semantic_delta, dict)
+            and isinstance(semantic_delta.get("trigger_checkpoints"), list)
+            else []
+        )
+        exact_hold_checkpoints = all(
+            any(
+                isinstance(checkpoint, dict)
+                and checkpoint.get("kind") == gap.get("kind")
+                and checkpoint.get("frontier_revision") == gap.get("frontier_revision")
+                for checkpoint in recorded_checkpoints
+            )
+            for gap in held_bindings
+        )
+        if (
+            not _replan_evidence_acknowledged(
+                held_bindings, latest_replan_ack, time_key="generated_at",
+            )
+            or not isinstance(semantic_delta, dict)
+            or latest_replan_ack.get("recorded") is not True
+            or semantic_delta.get("accepted") is not True
+            or not all(gap.get("kind") in (semantic_delta.get("trigger_kinds") or [])
+                       for gap in held_bindings)
+            or not exact_hold_checkpoints
+            or not any(
+                outcome in {"new_runnable_successor", "new_concrete_blocker"}
+                for outcome in satisfying_outcomes if isinstance(outcome, str)
+            )
+        ):
+            return False
     delta_contract = latest_replan_ack.get("delta_contract")
     delta_kinds = (
         delta_contract.get("delta_kinds")
@@ -958,9 +1044,12 @@ def derive_goal_frontier_replan_obligation_from_summaries(
         if selectable_frontier_advancement == 0
         else None
     )
-    compact_acceptance_gaps = [
-        item for item in (acceptance_gaps or []) if isinstance(item, dict)
-    ]
+    compact_acceptance_gaps = sorted(
+        (item for item in (acceptance_gaps or []) if isinstance(item, dict)),
+        # An enforced hold must survive the bounded trigger projection. Its
+        # exact checkpoint is required to settle; generic vision gaps follow.
+        key=lambda gap: gap.get("kind") not in GOAL_ACCEPTANCE_HOLD_TRIGGERS,
+    )
     if any(gap.get("vision_todo_ids") for gap in compact_acceptance_gaps):
         # Diagnostic claim counts retain executor-excluded work. A causal
         # acceptance obligation needs an actually selectable Todo identity.
@@ -983,20 +1072,13 @@ def derive_goal_frontier_replan_obligation_from_summaries(
         agent_todo_summary,
         agent_id=agent_id,
     )
-    long_chain_observation = observe_long_todo_chain(
+    long_chain_observation, long_chain_ack_decision = evaluate_long_todo_chain(
         agent_todo_summary=agent_todo_summary,
         agent_counts=agent_counts,
         frontier_counts=frontier_counts,
         agent_id=agent_id,
         agent_todo_source_items=agent_todo_source_items,
-    )
-    long_chain_ack_decision = (
-        classify_long_todo_chain_ack(
-            long_chain_observation,
-            current_transition_replan_ack or latest_replan_ack,
-        )
-        if long_chain_observation is not None
-        else None
+        latest_replan_ack=current_transition_replan_ack or latest_replan_ack,
     )
     replan_rule = select_goal_frontier_replan_rule(
         GoalFrontierReplanFacts(
@@ -1128,6 +1210,9 @@ def derive_goal_frontier_replan_obligation_from_summaries(
             },
         )
     if replan_rule.rule is GoalFrontierReplanRule.VISION_ACCEPTANCE_GAP:
+        acceptance_held = any(
+            gap.get("kind") in GOAL_ACCEPTANCE_HOLD_TRIGGERS for gap in compact_acceptance_gaps
+        )
         rearmed_after_obligation_id = _acknowledged_replan_obligation_id(
             latest_replan_ack
         )
@@ -1154,19 +1239,25 @@ def derive_goal_frontier_replan_obligation_from_summaries(
                             "completed_todo_count",
                             "completed_todo_threshold",
                             "completed_todo_ids",
+                            "vision_todo_ids",
+                            "frontier_revision",
+                            "reason_code",
+                            "component_checks",
+                            "resolution_hint",
                         )
                         if gap.get(key) is not None
                     },
                 }
                 for gap in compact_acceptance_gaps[:3]
             ],
-            guidance_actions=[
-                "create_successor",
-                "update_agent_vision",
-                "record_evidence_gap",
-                "record_no_followup",
-            ],
-            todo_actions=[
+            guidance_actions=(
+                ["inspect_acceptance_binding", "select_eligible_successor", "record_evidence_gap"]
+                if acceptance_held else
+                ["create_successor", "update_agent_vision", "record_evidence_gap", "record_no_followup"]
+            ),
+            # Another unbound advancement Todo cannot repair this admission
+            # hold. Keep authoring suggestions aligned with the typed exits.
+            todo_actions=[] if acceptance_held else [
                 {
                     "action": "add",
                     "role": "agent",
@@ -1182,6 +1273,13 @@ def derive_goal_frontier_replan_obligation_from_summaries(
                 "production actions, or owner-only decisions"
             ),
             recommended_action=(
+                " ".join(
+                    str(gap["resolution_hint"])
+                    for gap in compact_acceptance_gaps
+                    if gap.get("resolution_hint")
+                )
+                if all(gap.get("resolution_hint") for gap in compact_acceptance_gaps)
+                else
                 "run a bounded vision-gap replan before another quiet poll: create "
                 "successor work, update the agent vision, record evidence gap, or "
                 "record no-follow-up"
@@ -1191,7 +1289,7 @@ def derive_goal_frontier_replan_obligation_from_summaries(
     if replan_rule.rule is GoalFrontierReplanRule.LONG_TODO_CHAIN:
         assert long_chain_observation is not None
         assert long_chain_ack_decision is not None
-        long_chain_trigger = long_chain_observation.to_trigger()
+        long_chain_trigger = long_chain_observation.trigger
         return build_autonomous_replan_obligation_payload(
             schema_version=AUTONOMOUS_REPLAN_OBLIGATION_SCHEMA_VERSION,
             agent_id=agent_id,
@@ -1203,7 +1301,7 @@ def derive_goal_frontier_replan_obligation_from_summaries(
                     "kind": LONG_TODO_CHAIN_TRIGGER,
                     "section": "agent_todo_summary",
                     "text": (
-                        "current agent lane has a long selectable todo chain; "
+                        "current agent lane has a long claimed todo chain; "
                         "run a vision checkpoint/replan before continuing linearly"
                     ),
                     **long_chain_trigger,
@@ -1216,18 +1314,7 @@ def derive_goal_frontier_replan_obligation_from_summaries(
                 "update_agent_vision",
                 "create_successor",
             ],
-            todo_actions=[
-                {
-                    "action": "add",
-                    "role": "agent",
-                    "priority": "P1",
-                    "text": (
-                        "run a bounded long-chain vision replan: compare evidence "
-                        "with the active vision, group or prune the todo chain, "
-                        "and select the next high-value runnable slice"
-                    ),
-                }
-            ],
+            todo_actions=[],
             stop_condition=(
                 "stop if pruning or external research requires private material, "
                 "credentials, destructive git, production actions, or owner-only decisions"
@@ -1235,7 +1322,10 @@ def derive_goal_frontier_replan_obligation_from_summaries(
             recommended_action=(
                 "run a bounded long-chain vision replan before continuing a 15+ "
                 "todo lane: read evidence, use public research if local evidence "
-                "is weak, group/prune work, and write a concrete todo or vision delta"
+                "is weak, group/prune work, and record an evidence-linked vision "
+                "path through replan_action_packet.writeback_contract using the "
+                "current Turn settlement binding; retain existing runnable work "
+                "when appropriate instead of adding a Todo whose only action is replan"
             ),
             rearmed_after_obligation_id=(
                 long_chain_ack_decision.rearmed_after_obligation_id
@@ -1492,6 +1582,9 @@ def build_goal_frontier_projection_context_from_status(
                 (project_asset or {}).get("execution_profile")
             ),
         )
+        + acceptance_gaps_from_held_goal_binding(
+            agent_todo_summary, agent_todo_source_items, agent_id=agent_id,
+        )
     )
     if _terminal_no_followup_resolves_vision_checkpoint(
         user_todo_summary=user_todo_summary,
@@ -1528,7 +1621,10 @@ def build_goal_frontier_projection_context_from_status(
             + frontier_counts["unclaimed_advancement_count"]
         ),
     )
-    acceptance_gaps = [] if vision_wait_state else source_acceptance_gaps
+    acceptance_gaps = (
+        [gap for gap in source_acceptance_gaps if gap.get("kind") in GOAL_ACCEPTANCE_HOLD_TRIGGERS]
+        if vision_wait_state else source_acceptance_gaps
+    )
     declared_fallback_gaps = [
         gap
         for gap in (
@@ -1552,6 +1648,11 @@ def build_goal_frontier_projection_context_from_status(
         replan_obligation=replan_obligation,
         agent_todo_items=agent_todo_source_items,
     )
+    # Keep the validated history-obligation transition distinct from any
+    # successor frontier obligation derived below. Exact Turn settlement may
+    # still owe this receipt even when the next decision has another duty.
+    run_replan_transition_ack = replan_transition_ack
+    run_transition_candidate = {"obligation": replan_obligation, "ack": replan_transition_ack}
     obligation_ack = replan_transition_ack or effective_replan_ack
     if (
         autonomous_replan_is_required(replan_obligation)
@@ -1593,6 +1694,7 @@ def build_goal_frontier_projection_context_from_status(
         agent_todo_items=agent_todo_source_items,
     )
     frontier_obligation_ack = frontier_transition_ack or effective_replan_ack
+    frontier_transition_candidate = {"obligation": frontier_replan_obligation, "ack": frontier_transition_ack}
     if (
         frontier_replan_obligation
         and autonomous_replan_ack_satisfies_obligation(
@@ -1670,6 +1772,8 @@ def build_goal_frontier_projection_context_from_status(
         "latest_replan_ack": latest_agent_replan_ack,
         "projected_replan_ack": projected_replan_ack,
         "replan_transition_ack": replan_transition_ack,
+        "run_replan_transition_ack": run_replan_transition_ack,
+        "replan_transition_candidates": [run_transition_candidate, frontier_transition_candidate],
     }
 
 
@@ -1799,6 +1903,9 @@ def build_goal_frontier_projection(
             "agent_advancement_open_count": agent_counts.get("advancement", 0),
             "agent_monitor_open_count": agent_counts.get("monitor", 0),
             "agent_monitor_due_count": agent_counts.get("monitor_due", 0),
+            "agent_watch_only_monitor_due_count": agent_counts.get(
+                "watch_only_monitor_due", 0
+            ),
         },
         "remaining_advancement_frontier": {
             "current_agent_claimed_advancement_count": current_agent_claimed_advancement_count,

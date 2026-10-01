@@ -4,8 +4,8 @@ import argparse
 from collections.abc import Callable
 from pathlib import Path
 
+from ..control_plane.work_items.local_lease_record import TaskLeaseError
 from ..control_plane.work_items.task_lease import (
-    TaskLeaseError,
     inspect_task_lease,
     release_task_lease,
     renew_task_lease,
@@ -48,10 +48,22 @@ def render_task_lease_markdown(payload: dict[str, object]) -> str:
                 f"- status: `{lease.get('status')}`",
                 f"- expires_at: `{lease.get('expires_at')}`",
                 f"- write_scopes: `{', '.join(lease.get('write_scopes') or [])}`",
+                f"- write_repository: `{lease.get('write_repository') or 'unknown (conservative overlap)'}`",
             ]
         )
+    advisories = payload.get("integration_overlap_advisories")
+    if isinstance(advisories, list) and advisories:
+        lines.append("- Independent worktree path overlap: coordinate changes and validate integration before merge.")
+        for row in advisories:
+            if not isinstance(row, dict):
+                continue
+            lines.append(f"  - `{row['todo_id']}`: {', '.join(row['write_scopes'])}")
     if payload.get("lease_path"):
         lines.append(f"- lease_path: `{payload.get('lease_path')}`")
+    if payload.get("transfer_claim") is True:
+        lines.append(f"- committed claim owner: `{payload.get('claimed_by')}`")
+        lines.append(f"- Todo projection delivery: `{payload.get('projection_delivery')}`")
+        lines.append("- A replay reports the original handover; use task-lease inspect for current authority.")
     conflicts = payload.get("conflicts")
     if isinstance(conflicts, list) and conflicts:
         lines.append("- conflicts:")
@@ -61,6 +73,7 @@ def render_task_lease_markdown(payload: dict[str, object]) -> str:
             lines.append(
                 f"  - `{conflict.get('todo_id')}` owner=`{conflict.get('owner')}` "
                 f"expires_at=`{conflict.get('expires_at')}` "
+                f"write_repository=`{conflict.get('write_repository') or 'unknown'}` "
                 f"write_scopes=`{', '.join(conflict.get('write_scopes') or [])}`"
             )
     append_operator_action_markdown(lines, payload)
@@ -68,7 +81,7 @@ def render_task_lease_markdown(payload: dict[str, object]) -> str:
 
 
 def register_task_lease_command(
-    subparsers: argparse._SubParsersAction,
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
     add_subcommand_format: Callable[[argparse.ArgumentParser], None],
 ) -> None:
     parser = subparsers.add_parser(
@@ -87,6 +100,8 @@ def register_task_lease_command(
     parser.add_argument("--idempotency-key", help="Public-safe token used for idempotent retries and CAS.")
     parser.add_argument("--new-owner", help="For transfer, target registered public-safe agent id.")
     parser.add_argument("--new-idempotency-key", help="For transfer, target idempotency key.")
+    parser.add_argument("--transfer-claim", action="store_true",
+        help="For transfer on canonical hard_lease authority, atomically move the source owner's Todo claim with its lease.")
     parser.add_argument(
         "--ttl-seconds",
         type=int,
@@ -98,6 +113,7 @@ def register_task_lease_command(
         action="append",
         help="Relative write scope protected by this lease, such as loopx/**. Repeatable.",
     )
+    parser.add_argument("--write-worktree", help="Independent Git worktree root for code-edit scopes (canonical File/SQLite). Sibling worktree overlaps are advisory; shared-state leases stay exclusive.")
     parser.add_argument(
         "--expected-version",
         type=int,
@@ -123,6 +139,10 @@ def handle_task_lease_command(
     if args.command != "task-lease":
         return None
     try:
+        if args.write_worktree and args.task_lease_command != "acquire":
+            raise ValueError("--write-worktree is valid only for task-lease acquire")
+        if args.transfer_claim and args.task_lease_command != "transfer":
+            raise ValueError("--transfer-claim is valid only for task-lease transfer")
         if _requires_owner(args) and not args.owner:
             raise ValueError("task-lease action requires --owner")
         if _requires_owner(args) and not args.idempotency_key:
@@ -137,6 +157,7 @@ def handle_task_lease_command(
                 todo_id=args.todo_id,
                 idempotency_key=args.idempotency_key,
                 write_scopes=args.write_scopes,
+                **({"write_worktree": args.write_worktree} if args.write_worktree is not None else {}),
                 ttl_seconds=args.ttl_seconds,
                 expected_version=args.expected_version,
             )
@@ -167,6 +188,7 @@ def handle_task_lease_command(
                 idempotency_key=args.idempotency_key,
                 new_owner=args.new_owner,
                 new_idempotency_key=args.new_idempotency_key,
+                transfer_claim=args.transfer_claim,
                 ttl_seconds=args.ttl_seconds,
                 expected_version=args.expected_version,
             )

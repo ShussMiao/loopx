@@ -192,7 +192,7 @@ class ClaudeCodeAdapter:
                 cwd=str(self.work_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 bufsize=1,
             )
         except OSError as exc:
@@ -240,7 +240,18 @@ class ClaudeCodeAdapter:
         finally:
             with self.lock:
                 self.current_process = None
-        raw_response = "".join(parts) or result_text
+        streamed_response = "".join(parts)
+        raw_response = streamed_response if streamed_response.strip() else result_text
+        if not raw_response.strip():
+            summary = "Claude Code completed without returning an answer."
+            raise CodexChatAgentError(
+                summary,
+                error_code="provider_empty_response",
+                gate=_host_tool_gate(
+                    summary,
+                    "Retry this session or select another healthy Agent endpoint.",
+                ),
+            )
         if not parts and result_text:
             visible = display_filter.feed(result_text)
             if visible:
@@ -250,7 +261,11 @@ class ClaudeCodeAdapter:
         if visible_tail:
             visible_delta_count += 1
             event_sink("answer.delta", {"text": visible_tail})
-        response = parse_agent_response(raw_response, protected_paths=[self.work_dir])
+        response = parse_agent_response(
+            raw_response,
+            protected_paths=[self.work_dir],
+            team_plan_context=getattr(self, "team_plan_context", None),
+        )
         self.resumed = True
         event_sink("agent.phase", {"label": "正在整理回答"})
         if visible_delta_count == 0:
@@ -372,7 +387,11 @@ class DirectModelAdapter:
                 raise ValueError(f"unsupported direct model provider: {self.provider}")
         else:
             raise _provider_error(self.provider.title(), "The model exceeded the bounded read-only tool-call limit.")
-        response = parse_agent_response(raw_response, protected_paths=[self.work_dir])
+        response = parse_agent_response(
+            raw_response,
+            protected_paths=[self.work_dir],
+            team_plan_context=getattr(self, "team_plan_context", None),
+        )
         self.history.extend([
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": raw_response},

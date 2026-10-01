@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import argparse
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -10,7 +11,10 @@ from typing import Any
 import pytest
 
 from loopx.cli_commands import goal_channel as goal_channel_cli
+from loopx.cli_commands import goal_channel_operation as goal_channel_operation_cli
 from loopx.extensions.lark import goal_channel_contracts
+from loopx.extensions.lark import goal_channel_lifecycle
+from loopx.extensions.lark import goal_channel_runtime
 from loopx.extensions.lark.goal_channel import (
     GOAL_CHANNEL_BINDING_SCHEMA_VERSION,
     configure_lark_goal_channel_automation,
@@ -19,6 +23,9 @@ from loopx.extensions.lark.goal_channel import (
     read_goal_channel_binding,
     setup_lark_goal_channel,
     sync_lark_goal_channel,
+)
+from loopx.extensions.lark.goal_channel_message_delivery import (
+    GoalChannelDeliveryStageError,
 )
 from loopx.extensions.lark.goal_channel_runtime import (
     auto_notify_lark_goal_channel_gate,
@@ -811,6 +818,197 @@ def test_auto_notify_gate_sends_only_for_quota_selected_gate(
     assert sum("+messages-send" in args for args in calls) == 1
 
 
+def _refresh_gate_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    binding_path = _gate_test_binding(tmp_path)
+    registry_path = binding_path.parent / "registry.json"
+    registry_path.write_text(json.dumps(_registry(tmp_path)), encoding="utf-8")
+    configure_lark_goal_channel_automation(
+        registry=_registry(tmp_path), goal_id=GOAL_ID, binding_path=binding_path,
+        human_gate_auto_notify=True, execute=True,
+    )
+    monkeypatch.setattr(goal_channel_lifecycle, "resolve_extension_activation",
+                        lambda *args, **kwargs: {"status": "active"})
+    monkeypatch.setattr(goal_channel_lifecycle, "collect_status", lambda **kwargs: {})
+    monkeypatch.setattr(goal_channel_lifecycle, "build_quota_should_run",
+                        lambda *args, **kwargs: {
+                            "state": "operator_gate", "notify_user_on_gate": True,
+                            "gate_prompt": "Approve the bounded external write.",
+                        })
+
+    def run(runner, *, authorized=True):
+        return goal_channel_lifecycle.sync_human_gate_after_refresh(
+            registry_path=registry_path, runtime_root_override=None,
+            goal_id=GOAL_ID, agent_id="agent-public-fixture",
+            external_sink_delivery_authorized=authorized, runner=runner,
+        )
+
+    return binding_path, run
+
+
+@pytest.mark.parametrize(
+    ("command", "failure", "stage", "reason", "write_status"),
+    [
+        ("+messages-send", "timeout", "provider_send", "timeout", "unknown"),
+        ("+messages-send", "spawn", "provider_send", "runtime_unavailable", "not_performed"),
+        ("+messages-send", "reject", "provider_send", "provider_send_rejected", "not_performed"),
+        ("+messages-send", "empty", "provider_send", "delivery_outcome_unknown", "unknown"),
+        ("+messages-send", "unexpected", "provider_send", "unexpected_failure", "unknown"),
+        ("+messages-mget", "timeout", "provider_readback", "timeout", "performed"),
+        ("+messages-mget", "spawn", "provider_readback", "runtime_unavailable", "performed"),
+        ("+messages-mget", "reject", "provider_readback", "provider_api_failed", "performed"),
+        ("+messages-mget", "empty", "provider_readback", "readback_mismatch", "performed"),
+    ],
+)
+def test_refresh_gate_preserves_safe_transport_failure_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    command: str, failure: str, stage: str, reason: str, write_status: str,
+) -> None:
+    _, run = _refresh_gate_fixture(tmp_path, monkeypatch)
+    calls: list[list[str]] = []
+    base = _fake_runner(calls)
+
+    def runner(args, cwd, timeout):
+        if command not in args:
+            return base(args, cwd, timeout)
+        calls.append(args)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(args, timeout, output="private provider details")
+        if failure == "spawn":
+            raise FileNotFoundError("private CLI path")
+        if failure == "unexpected":
+            raise RuntimeError("private channel and provider details")
+        return {
+            "returncode": 1 if failure == "reject" else 0,
+            "stdout": "private provider details" if failure == "reject" else "",
+            "stderr": "", "timed_out": False,
+        }
+
+    result = run(runner)
+    assert result["ok"] is False
+    assert result["delivery_postcondition"]["blocks_delivery"] is True
+    assert result["failure"] == {
+        "schema_version": "loopx_goal_channel_gate_failure_v0",
+        "stage": stage, "reason_code": reason,
+        "external_write_status": write_status,
+    }
+    assert result["external_write_performed"] is (write_status == "performed")
+    assert sum("+messages-send" in args for args in calls) == 1
+    for private_detail in (
+        "private provider details", "private CLI path", "private channel and provider details",
+    ):
+        assert private_detail not in json.dumps(result)
+    _assert_public_packet(result)
+
+
+def test_refresh_gate_receipt_failure_keeps_send_identity_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding_path, run = _refresh_gate_fixture(tmp_path, monkeypatch)
+    before = binding_path.read_bytes()
+    calls: list[list[str]] = []
+    runner = _fake_runner(calls)
+    save = goal_channel_runtime.save_goal_binding
+
+    def fail(**kwargs):
+        raise PermissionError("private receipt path")
+
+    monkeypatch.setattr(goal_channel_runtime, "save_goal_binding", fail)
+    result = run(runner)
+    assert result["failure"]["stage"] == "receipt_write"
+    assert result["failure"]["reason_code"] == "permission_denied"
+    assert result["failure"]["external_write_status"] == "performed"
+    assert result["external_write_performed"] is True
+    assert binding_path.read_bytes() == before
+    monkeypatch.setattr(goal_channel_runtime, "save_goal_binding", save)
+    assert run(runner)["status"] == "sent_verified"
+    sends = [args for args in calls if "+messages-send" in args]
+    keys = [args[args.index("--idempotency-key") + 1] for args in sends]
+    assert len(keys) == 2 and keys[0] == keys[1]
+    assert run(runner)["status"] == "already_sent"
+    assert sum("+messages-send" in args for args in calls) == 2
+    _assert_public_packet(result)
+
+
+def test_refresh_gate_selection_failure_is_local_and_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, run = _refresh_gate_fixture(tmp_path, monkeypatch)
+
+    def fail(**kwargs):
+        raise TimeoutError("private coordination address")
+
+    monkeypatch.setattr(goal_channel_lifecycle, "collect_status", fail)
+    calls: list[list[str]] = []
+    result = run(_fake_runner(calls))
+    assert result["failure"]["stage"] == "gate_selection"
+    assert result["failure"]["reason_code"] == "timeout"
+    assert result["failure"]["external_write_status"] == "not_attempted"
+    assert calls == []
+    _assert_public_packet(result)
+
+
+@pytest.mark.parametrize("stage", ["extension_activation", "binding_resolution"])
+def test_refresh_gate_local_configuration_failure_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    _, run = _refresh_gate_fixture(tmp_path, monkeypatch)
+
+    def fail(*args, **kwargs):
+        raise ValueError("private configuration details")
+
+    symbol = "resolve_extension_activation" if stage == "extension_activation" else "read_goal_channel_binding"
+    monkeypatch.setattr(goal_channel_lifecycle, symbol, fail)
+    calls: list[list[str]] = []
+    result = run(_fake_runner(calls))
+    assert result["failure"]["stage"] == stage
+    assert result["failure"]["reason_code"] == "invalid_input_or_config"
+    assert calls == []
+    _assert_public_packet(result)
+
+
+def test_refresh_gate_observer_uses_command_position_and_preserves_runner_inputs() -> None:
+    calls = []
+
+    def runner(args, cwd, timeout):
+        calls.append((args, cwd, timeout))
+        return _result({"message_id": GATE_MESSAGE_ID})
+
+    observation = goal_channel_lifecycle._DeliveryObservation(runner)
+    argv = ["custom-lark-cli", "auth", "status", "--text", "im", "+messages-send"]
+    observation(argv, Path("fixture"), 12)
+    assert observation.stage == "provider_preflight"
+    assert observation.write_status == "not_attempted"
+    profiled = ["custom-lark-cli", "--profile", "fixture", "im", "+messages-send"]
+    observation(profiled, None, 7)
+    assert observation.stage == "provider_send" and observation.write_status == "performed"
+    assert calls == [(argv, Path("fixture"), 12), (profiled, None, 7)]
+
+
+@pytest.mark.parametrize("mode", ["disabled", "suppressed", "not_selected", "cooldown"])
+def test_refresh_gate_noop_has_no_extra_provider_calls_or_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    binding_path, run = _refresh_gate_fixture(tmp_path, monkeypatch)
+    if mode == "disabled":
+        configure_lark_goal_channel_automation(
+            registry=_registry(tmp_path), goal_id=GOAL_ID, binding_path=binding_path,
+            human_gate_auto_notify=False, execute=True,
+        )
+    elif mode in {"not_selected", "cooldown"}:
+        packet = {"state": "eligible"} if mode == "not_selected" else {
+            "state": "operator_gate", "notify_user_on_gate": True,
+            "user_gate_notification_cooldown": {"notification_suppressed": True},
+        }
+        monkeypatch.setattr(goal_channel_lifecycle, "build_quota_should_run",
+                            lambda *args, **kwargs: packet)
+    calls: list[list[str]] = []
+    result = run(_fake_runner(calls), authorized=mode != "suppressed")
+    assert result["ok"] is True
+    assert "failure" not in result and "failure_summary" not in result
+    assert result["status"] == ("external_sink_suppressed" if mode == "suppressed" else mode)
+    assert calls == []
+
+
 def test_setup_inherits_existing_bot_identity_when_flags_are_omitted(
     tmp_path: Path,
 ) -> None:
@@ -1437,7 +1635,7 @@ def test_notify_gate_resends_for_material_transition_or_one_reminder_window(
     assert sum("+messages-send" in args for args in calls) == 3
 
 
-def test_notify_gate_honors_interaction_contract_and_renders_one_clear_action_list(
+def test_notify_gate_honors_admission_and_does_not_present_labels_as_decisions(
     tmp_path: Path,
 ) -> None:
     binding_path = _gate_test_binding(tmp_path)
@@ -1488,8 +1686,10 @@ def test_notify_gate_honors_interaction_contract_and_renders_one_clear_action_li
     assert rejected["blocker"] == "state_transition_rejected"
     assert calls == []
     assert message.startswith("LoopX · Action required\n\nGoal:")
-    assert "\n1. Approve the bounded change." in message
-    assert "\n2. Revoke the test key." in message
+    assert "Request details are unavailable" in message
+    assert "Approve the bounded change" not in message
+    assert "Revoke the test key" not in message
+    assert "Reply with" not in message
     assert "Current recommendation" not in message
     assert "Next safe action" not in message
     assert "\n- " not in message
@@ -2105,6 +2305,92 @@ def test_cli_global_registry_routes_binding_to_source_registry_from_any_cwd(
     assert not (unrelated_two / ".loopx").exists()
 
 
+def test_cli_deliver_operation_uses_source_registry_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "canonical-project"
+    source_registry_path = project / ".loopx" / "registry.json"
+    source_registry_path.parent.mkdir(parents=True)
+    source_registry = _registry(project)
+    source_registry["goals"][0]["repo"] = str(project)
+    source_registry_path.write_text(json.dumps(source_registry), encoding="utf-8")
+    source_runtime = project / "runtime"
+    shared_runtime = tmp_path / "shared-runtime"
+    global_registry_path = shared_runtime / "registry.global.json"
+    global_registry_path.parent.mkdir(parents=True)
+    global_registry = {
+        **source_registry,
+        "registry_role": "global-local",
+        "common_runtime_root": str(shared_runtime),
+    }
+    global_registry["goals"] = [
+        {
+            **source_registry["goals"][0],
+            "source_registry": str(source_registry_path),
+        }
+    ]
+    global_registry_path.write_text(json.dumps(global_registry), encoding="utf-8")
+    captured: dict[str, Any] = {}
+    printed: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        goal_channel_cli,
+        "resolve_extension_activation",
+        lambda *args, **kwargs: {"ok": True},
+    )
+
+    def capture_delivery(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "goal_id": GOAL_ID,
+            "provider": "lark",
+            "operation": "deliver_operation_card",
+            "status": "pending_execution",
+            "execute": False,
+            "external_write_performed": False,
+            "readback_verified": False,
+            "public_summary": "validated",
+        }
+
+    monkeypatch.setattr(
+        goal_channel_operation_cli,
+        "deliver_goal_channel_operation_card",
+        capture_delivery,
+    )
+    result = goal_channel_cli.handle_goal_channel_command(
+        argparse.Namespace(
+            command="goal-channel",
+            goal_channel_command="deliver-operation",
+            goal_id=GOAL_ID,
+            proposal_id="proposal-public-fixture",
+            binding_path=None,
+            target_path=None,
+            execute=False,
+            subcommand_format="json",
+            format=None,
+        ),
+        registry_path=global_registry_path,
+        runtime_root_arg=None,
+        print_payload=lambda payload, fmt, renderer: printed.update(payload),
+        output_format=lambda args: "json",
+    )
+
+    assert result == 0
+    assert printed["ok"] is True
+    assert printed["extension_activation"] == {"ok": True}
+    assert captured["proposal_id"] == "proposal-public-fixture"
+    assert captured["action_store_root"] == source_runtime / "chat" / "actions"
+    assert captured["runtime_root"] == source_runtime
+    assert captured["binding_path"] == project / ".loopx" / "goal-channel.json"
+    assert (
+        captured["target_path"]
+        == (source_runtime / "goal-channel-targets.json").resolve()
+    )
+    assert captured["expected_goal_id"] == GOAL_ID
+
+
 @pytest.mark.parametrize(
     ("remote_record_ids", "expected_ok", "expected_blocker"),
     [
@@ -2228,3 +2514,284 @@ def test_sync_preserves_provider_failure_blocker(
     assert payload["readback_verified"] is False
     assert payload["details"]["successful_write_count"] == 1
     _assert_public_packet(payload)
+
+
+def test_cli_deliver_operation_projects_typed_stage_blockers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI keeps the typed blocker, stage, and honest write state."""
+
+    project = tmp_path / "typed-stage-project"
+    source_registry_path = project / ".loopx" / "registry.json"
+    source_registry_path.parent.mkdir(parents=True)
+    source_registry = _registry(project)
+    source_registry["goals"][0]["repo"] = str(project)
+    source_registry_path.write_text(json.dumps(source_registry), encoding="utf-8")
+
+    monkeypatch.setattr(
+        goal_channel_cli,
+        "resolve_extension_activation",
+        lambda *args, **kwargs: {"ok": True},
+    )
+
+    def deliver_raises(**kwargs: object) -> object:
+        raise GoalChannelDeliveryStageError(
+            "Goal Channel delivery send failed",
+            blocker="provider_send_rejected",
+            failure_stage="send_operation_card",
+            external_write_performed=False,
+        )
+
+    monkeypatch.setattr(
+        goal_channel_operation_cli,
+        "deliver_goal_channel_operation_card",
+        deliver_raises,
+    )
+    printed: dict[str, Any] = {}
+    result = goal_channel_cli.handle_goal_channel_command(
+        argparse.Namespace(
+            command="goal-channel",
+            goal_channel_command="deliver-operation",
+            goal_id=GOAL_ID,
+            proposal_id="proposal-typed-stage",
+            binding_path=None,
+            target_path=None,
+            execute=True,
+            subcommand_format="json",
+            format=None,
+        ),
+        registry_path=source_registry_path,
+        runtime_root_arg=None,
+        print_payload=lambda payload, fmt, renderer: printed.update(payload),
+        output_format=lambda args: "json",
+    )
+
+    assert result == 1
+    assert printed["ok"] is False
+    assert printed["blocker"] == "provider_send_rejected"
+    assert printed["failure_stage"] == "send_operation_card"
+    assert printed["external_write_performed"] is False
+    assert "extension_activation" not in printed
+    assert "provider rejected" not in json.dumps(printed)
+    _assert_public_packet(printed)
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "blocker"),
+    [
+        # A send with no provider answer may already be live in the chat.
+        ("send_operation_card", "delivery_outcome_unknown"),
+        # The readback proved the write; only the local receipt failed.
+        ("record_delivery_receipt", "delivery_receipt_write_failed"),
+    ],
+)
+def test_cli_deliver_operation_treats_unknown_write_as_performed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    blocker: str,
+) -> None:
+    """An unknown provider outcome is never projected as a clean receipt."""
+
+    project = tmp_path / "unknown-outcome-project"
+    source_registry_path = project / ".loopx" / "registry.json"
+    source_registry_path.parent.mkdir(parents=True)
+    source_registry = _registry(project)
+    source_registry["goals"][0]["repo"] = str(project)
+    source_registry_path.write_text(json.dumps(source_registry), encoding="utf-8")
+
+    monkeypatch.setattr(
+        goal_channel_cli,
+        "resolve_extension_activation",
+        lambda *args, **kwargs: {"ok": True},
+    )
+
+    def deliver_unknown(**kwargs: object) -> object:
+        raise GoalChannelDeliveryStageError(
+            "Goal Channel delivery outcome is unknown",
+            blocker=blocker,
+            failure_stage=failure_stage,
+            external_write_performed=None,
+        )
+
+    monkeypatch.setattr(
+        goal_channel_operation_cli,
+        "deliver_goal_channel_operation_card",
+        deliver_unknown,
+    )
+    printed: dict[str, Any] = {}
+    result = goal_channel_cli.handle_goal_channel_command(
+        argparse.Namespace(
+            command="goal-channel",
+            goal_channel_command="deliver-operation",
+            goal_id=GOAL_ID,
+            proposal_id="proposal-unknown-outcome",
+            binding_path=None,
+            target_path=None,
+            execute=True,
+            subcommand_format="json",
+            format=None,
+        ),
+        registry_path=source_registry_path,
+        runtime_root_arg=None,
+        print_payload=lambda payload, fmt, renderer: printed.update(payload),
+        output_format=lambda args: "json",
+    )
+
+    assert result == 1
+    assert printed["ok"] is False
+    assert printed["blocker"] == blocker
+    assert printed["failure_stage"] == failure_stage
+    assert printed["external_write_performed"] is True
+    assert printed["details"]["external_write_outcome"] == "unknown"
+    assert "extension_activation" not in printed
+    _assert_public_packet(printed)
+
+
+def test_gate_notice_delivers_request_body_instead_of_compact_label(tmp_path: Path) -> None:
+    """The same long request survives preview, send, readback and duplicate retry."""
+    binding_path = _gate_test_binding(tmp_path)
+    body = "Review the public release candidate and its validation evidence. " * 6
+    body += "The decision is whether to publish version 2.0 to the stable channel."
+    quota = {
+        "state": "operator_gate", "notify_user_on_gate": True,
+        "interaction_contract": {"user_channel": {
+            "action_required": True, "notify": "NOTIFY", "actions": ["[P0] Release review"],
+        }},
+        "user_todo_summary": {"gate_open_items": [{
+            "todo_id": "todo_release_review", "task_class": "user_gate", "status": "open",
+            "text": body, "note": "Only the stable-channel publication needs a decision.",
+            "evidence": "https://example.org/release/2.0",
+        }]},
+    }
+    message, _ = goal_channel_contracts.gate_message(
+        goal_id=GOAL_ID, objective="Public release", quota_packet=quota, kanban_url="",
+    )
+    assert body in message
+    assert "todo_release_review" in message
+    assert "Only the stable-channel publication needs a decision." in message
+    assert "https://example.org/release/2.0" in message
+    assert "bounded preview" in message
+    calls: list[list[str]] = []
+    runner = _fake_runner(calls)
+    first = _notify_test_gate(tmp_path=tmp_path, binding_path=binding_path, quota_packet=quota, runner=runner)
+    again = _notify_test_gate(tmp_path=tmp_path, binding_path=binding_path, quota_packet=quota, runner=runner)
+    assert first["status"] == "sent_verified"
+    assert first["readback_verified"] is True
+    assert again["status"] == "already_sent"
+    sends = [args for args in calls if "+messages-send" in args]
+    assert len(sends) == 1
+    assert body in sends[0][sends[0].index("--text") + 1]
+
+
+def test_gate_notice_redacts_and_bounds_additional_context() -> None:
+    message, _ = goal_channel_contracts.gate_message(
+        goal_id=GOAL_ID, objective="Public release", kanban_url="",
+        quota_packet={"user_todo_summary": {"gate_open_items": [{
+            "todo_id": "todo_release_review", "text": "Review " + "public facts " * 200,
+            "note": "See /tmp/private-review.txt and api_key=synthetic_fixture_secret_123456789",
+            "evidence": "https://example.org/release/2.0",
+        }]}},
+    )
+    assert "/tmp/private-review.txt" not in message
+    assert "synthetic_fixture_secret_123456789" not in message
+    assert len(message) < 2000
+    assert "Review the current request in LoopX" in message
+
+
+def test_notify_cli_compact_quota_joins_same_read_complete_request(tmp_path: Path, monkeypatch) -> None:
+    from copy import deepcopy
+    from loopx.control_plane.todos.quota_summary import compact_quota_todo_summary_for_payload
+
+    body = "Review public release evidence and independent checks. " * 7
+    body += "Learning only. Expires at 2026-10-01T07:00:00Z; do not execute after expiry."
+    canonical = {"todo_id": "todo_release_review", "role": "user", "task_class": "user_action",
+                 "done": False, "status": "open", "updated_at": "2026-10-01T06:00:00Z",
+                 "text": body, "note": "Version 2.0 release review; not execution authority.",
+                 "evidence": "https://example.org/release/2.0"}
+    status = {"attention_queue": {"items": [{"goal_id": GOAL_ID,
+               "user_todos": {"items": [canonical]}}]}}
+    before = deepcopy(status)
+    reads = []
+    monkeypatch.setattr(goal_channel_cli, "registry_project_root", lambda _: tmp_path)
+    monkeypatch.setattr(goal_channel_cli, "collect_status", lambda **kwargs: reads.append(kwargs) or status)
+    def quota_from_status(observed, **kwargs):
+        assert observed is status
+        return {"goal_id": GOAL_ID, "state": "operator_gate", "notify_user_on_gate": True,
+                "interaction_contract": {"user_channel": {"action_required": True, "notify": "NOTIFY"}},
+                "user_todo_summary": compact_quota_todo_summary_for_payload({"gate_open_items": [canonical]})}
+    monkeypatch.setattr(goal_channel_cli, "build_quota_should_run", quota_from_status)
+    quota = goal_channel_cli._quota_packet(registry_path=tmp_path / "registry.json", runtime_root_arg=None,
+                                           goal_id=GOAL_ID, agent_id="fixture-agent")
+    assert len(reads) == 1  # no second provider read or snapshot race
+    short = quota["user_todo_summary"]["gate_open_items"][0]
+    assert len(short["text"]) <= 180 and "note" not in short
+    message, _ = goal_channel_contracts.gate_message(goal_id=GOAL_ID, objective="Release", quota_packet=quota,
+                                                    kanban_url="https://example.org/loopx")
+    assert body in message and canonical["note"] in message and canonical["evidence"] in message
+    assert "Expires at 2026-10-01T07:00:00Z" in message
+    calls = []
+    binding_path = _gate_test_binding(tmp_path)
+    result = _notify_test_gate(tmp_path=tmp_path, binding_path=binding_path, quota_packet=quota, runner=_fake_runner(calls))
+    assert result["status"] == "sent_verified" and result["readback_verified"] is True
+    sent = next(args for args in calls if "+messages-send" in args)
+    binding = read_goal_channel_binding(binding_path)["bindings"][GOAL_ID]
+    expected, _ = goal_channel_contracts.gate_message(
+        goal_id=GOAL_ID, objective=_registry(tmp_path)["goals"][0]["objective"],
+        quota_packet=quota, kanban_url=binding["kanban"]["base_url"],
+    )
+    assert sent[sent.index("--text") + 1] == expected
+    assert status == before
+    # A trailing content/evidence change beyond scheduler bounds is material.
+    old_generation = goal_channel_contracts.quota_human_gate_state_generation(quota)
+    canonical["note"] += " Additional public counterevidence."
+    assert goal_channel_contracts.quota_human_gate_state_generation(quota) != old_generation
+
+
+@pytest.mark.parametrize("mismatch", ["missing", "other_goal", "revision", "lifecycle", "overflow"])
+def test_notify_complete_source_mismatch_or_overflow_is_not_decision_ready(mismatch: str) -> None:
+    canonical = {"todo_id": "todo_release_review", "role": "user", "task_class": "user_action",
+                 "done": False, "status": "open", "updated_at": "2026-10-01T06:00:00Z",
+                 "text": "Review public release evidence. " * 10 + "Expiry: 2026-10-01T07:00:00Z."}
+    selected = {**canonical, "text": canonical["text"][:177] + "..."}
+    snapshot = {"goal_id": GOAL_ID, "items": [canonical]}
+    if mismatch == "missing":
+        snapshot["items"] = []
+    if mismatch == "other_goal":
+        snapshot["goal_id"] = "other-goal"
+    if mismatch == "revision":
+        canonical["updated_at"] = "2026-10-01T06:01:00Z"
+    if mismatch == "lifecycle":
+        canonical["status"] = "deferred"
+    if mismatch == "overflow":
+        canonical["note"] = "x" * 451
+    message, _ = goal_channel_contracts.gate_message(
+        goal_id=GOAL_ID, objective="Release", kanban_url="https://example.org/loopx",
+        quota_packet={"user_todo_summary": {"gate_open_items": [selected]}, "request_snapshot": snapshot},
+    )
+    assert "not decision-ready" in message and "todo_release_review" in message
+    assert "https://example.org/loopx" in message
+    assert "Reply with" not in message and canonical["text"] not in message
+
+
+def test_refresh_auto_notify_uses_same_complete_snapshot(tmp_path: Path, monkeypatch) -> None:
+    from loopx.control_plane.todos.quota_summary import compact_quota_todo_summary_for_payload
+    _, run = _refresh_gate_fixture(tmp_path, monkeypatch)
+    body = "Review public release evidence. " * 12 + "Learning only; expires at 2026-10-01T07:00:00Z."
+    todo = {"todo_id": "todo_release_review", "role": "user", "task_class": "user_action",
+            "done": False, "status": "open", "updated_at": "2026-10-01T06:00:00Z", "text": body,
+            "note": "Independent review, no execution authority."}
+    status = {"attention_queue": {"items": [{"goal_id": GOAL_ID, "user_todos": {"items": [todo]}}]}}
+    reads = []
+    monkeypatch.setattr(goal_channel_lifecycle, "collect_status", lambda **kwargs: reads.append(kwargs) or status)
+    monkeypatch.setattr(goal_channel_lifecycle, "build_quota_should_run", lambda *args, **kwargs: {
+        "goal_id": GOAL_ID, "state": "operator_gate", "notify_user_on_gate": True,
+        "user_todo_summary": compact_quota_todo_summary_for_payload({"gate_open_items": [todo]}),
+    })
+    calls = []
+    result = run(_fake_runner(calls))
+    assert result["status"] == "sent_verified" and result["readback_verified"] is True
+    assert len(reads) == 1
+    sent = next(args for args in calls if "+messages-send" in args)
+    assert body in sent[sent.index("--text") + 1] and todo["note"] in sent[sent.index("--text") + 1]

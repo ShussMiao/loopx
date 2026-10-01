@@ -7,7 +7,7 @@ from ..agents.agent_scope_frontier import (
     agent_scope_frontier_action as _agent_scope_frontier_action,
 )
 from ..todos.contract import TODO_TASK_CLASS_ADVANCEMENT
-from ..todos.projection import todo_item_is_actionable_open, todo_item_task_class
+from ..todos.todo_semantics import todo_item_is_actionable_open, todo_item_task_class
 from .autonomous_replan_obligation import todo_lifecycle_settlement_obligation
 
 
@@ -165,6 +165,8 @@ def protocol_replan_action_packet_instruction(payload: dict[str, Any]) -> str:
         if isinstance(packet.get("writeback_contract"), dict)
         else {}
     )
+    if packet.get("settlement_only") is True:
+        return protocol_action_text(writeback_contract.get("rule"))
     if uncovered.get("required_any_of") and writeback_contract.get(
         "successor_command"
     ):
@@ -273,7 +275,7 @@ def resolve_canonical_primary_action(payload: dict[str, Any], *, mode: str) -> s
             "surface the scoped user gate, then advance one non-gated fallback"
         )
     if mode == "bounded_delivery_with_user_notice":
-        return protocol_first_candidate_action(payload) or "advance one bounded validated segment"
+        return protocol_first_candidate_action(payload) or "advance scope-bounded work with validation"
     if mode == "task_orchestration":
         contract = (
             payload.get("task_orchestration_contract")
@@ -321,7 +323,7 @@ def resolve_canonical_primary_action(payload: dict[str, Any], *, mode: str) -> s
     if mode == "boundary_projection_repair":
         return "repair goal_boundary.write_scope projection before attempting the selected write"
     if mode == "bounded_delivery":
-        return protocol_first_candidate_action(payload) or "advance one bounded validated segment"
+        return protocol_first_candidate_action(payload) or "advance scope-bounded work with validation"
     if mode == "mapped_noop_if_unchanged":
         return "confirm no new instruction/evidence/todo/stale source/safe handoff, then quiet no-op"
     if execution_obligation.get("contract_obligation"):
@@ -343,3 +345,98 @@ def build_primary_action_projection(payload: dict[str, Any], *, mode: str) -> di
     if resolution_trace:
         projection["resolution_trace"] = resolution_trace
     return projection
+
+
+def _interaction_must_attempt(
+    execution_obligation: dict[str, Any],
+    *,
+    mode: str,
+    user_required: bool,
+    scoped_user_gate_fallback: bool,
+    bounded_delivery_with_user_notice: bool,
+) -> bool:
+    if mode == "governed_capability_intent":
+        return bool(execution_obligation.get("must_attempt_work"))
+    if user_required and not (
+        scoped_user_gate_fallback or bounded_delivery_with_user_notice
+    ):
+        return False
+    return bool(execution_obligation.get("must_attempt_work"))
+
+
+def _interaction_delivery_allowed(
+    payload: dict[str, Any],
+    execution_obligation: dict[str, Any],
+    *,
+    mode: str,
+    user_required: bool,
+    scoped_user_gate_fallback: bool,
+    bounded_delivery_with_user_notice: bool,
+) -> bool:
+    if mode == "governed_capability_intent":
+        return bool(execution_obligation.get("must_attempt_work"))
+    if mode == "mapped_noop_if_unchanged":
+        return False
+    if user_required and not (
+        scoped_user_gate_fallback or bounded_delivery_with_user_notice
+    ):
+        return False
+    return bool(
+        execution_obligation.get(
+            "delivery_allowed",
+            payload.get("normal_delivery_allowed")
+            or payload.get("recovery_delivery_allowed")
+            or payload.get("self_repair_allowed")
+            or payload.get("should_run"),
+        )
+    )
+
+
+def interaction_quiet_noop_allowed(
+    *,
+    mode: str,
+    user_required: bool,
+    must_attempt: bool,
+) -> bool:
+    if user_required or must_attempt:
+        return False
+    return _agent_scope_frontier_action(mode) is not None or mode in {
+        "monitor_quiet_skip",
+        "mapped_noop_if_unchanged",
+        "quota_throttled",
+        "blocked_wait",
+        "user_gate_cooldown_wait",
+        "terminal_no_followup",
+        "peer_coordination_blocked",
+        "agent_monitor_only",
+        "skip",
+    }
+
+
+def interaction_execution_flags(
+    payload: dict[str, Any], *, mode: str, user_required: bool,
+    blocked_successor_wait_observation: bool,
+) -> tuple[bool, bool]:
+    execution_obligation = payload.get("execution_obligation") if isinstance(payload.get("execution_obligation"), dict) else {}
+    scoped_user_gate_fallback = mode == "scoped_user_gate_fallback"
+    bounded_delivery_with_user_notice = mode == "bounded_delivery_with_user_notice"
+    must_attempt = _interaction_must_attempt(
+        execution_obligation,
+        mode=mode,
+        user_required=user_required,
+        scoped_user_gate_fallback=scoped_user_gate_fallback,
+        bounded_delivery_with_user_notice=bounded_delivery_with_user_notice,
+    )
+    if mode == "automation_prompt_upgrade":
+        must_attempt = True
+    if blocked_successor_wait_observation:
+        must_attempt = True
+    delivery_allowed = _interaction_delivery_allowed(
+        payload,
+        execution_obligation,
+        mode=mode,
+        user_required=user_required,
+        scoped_user_gate_fallback=scoped_user_gate_fallback,
+        bounded_delivery_with_user_notice=bounded_delivery_with_user_notice,
+    )
+    return must_attempt, delivery_allowed

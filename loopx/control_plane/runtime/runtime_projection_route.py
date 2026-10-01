@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
+import threading
 from typing import Any, Iterable
 
 from ..goals.activation import (
@@ -21,6 +23,7 @@ RUNTIME_PROJECTION_ROUTE_DIAGNOSTICS_SCHEMA_VERSION = (
     "runtime_projection_route_diagnostics_v0"
 )
 GOAL_SOURCE_RUNTIME_ROUTE_SCHEMA_VERSION = "goal_source_runtime_route_v0"
+SOURCE_REGISTRY_READ_TIMEOUT_SECONDS = 1.0
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -497,13 +500,17 @@ def _source_routes_for_registry(
     runtime_root: Path,
     goal_id: str | None,
     activation_state_filter: GoalActivationState | str | None = None,
+    source_registry_read_timeout_seconds: float = SOURCE_REGISTRY_READ_TIMEOUT_SECONDS,
+    registry: dict[str, Any] | None = None,
 ) -> list[tuple[Path, Path, str, str | None]]:
-    registry = load_registry(registry_path)
+    if registry is None:
+        registry = load_registry(registry_path)
     is_global = bool(registry.get("registry_role") == "global-local") or _same_path(
         registry_path,
         global_registry_path(runtime_root),
     )
     routes: list[tuple[Path, Path, str, str | None]] = []
+    source_reads: dict[str, tuple[dict[str, Any] | None, str | None]] = {}
     for goal in registry_goals(registry):
         current_goal_id = str(goal.get("id") or "")
         if not current_goal_id or (goal_id and current_goal_id != goal_id):
@@ -521,21 +528,69 @@ def _source_routes_for_registry(
         )
         if source_registry is None:
             continue
-        source_error = None
-        if source_registry.exists():
-            try:
-                source_payload = load_registry(source_registry)
-                source_runtime = resolve_runtime_root(source_payload, None)
-            except (OSError, ValueError, json.JSONDecodeError):
-                source_runtime = runtime_root
-                source_error = "source_registry_unreadable"
-        else:
+        source_key = str(source_registry)
+        if source_key not in source_reads:
+            source_reads[source_key] = _read_source_registry_with_deadline(
+                source_registry,
+                timeout_seconds=source_registry_read_timeout_seconds,
+            )
+        source_payload, source_error = source_reads[source_key]
+        if source_payload is None:
             source_runtime = runtime_root
-            source_error = "source_registry_missing"
+        else:
+            source_runtime = resolve_runtime_root(source_payload, None)
         item = (source_registry, source_runtime, current_goal_id, source_error)
         if item not in routes:
             routes.append(item)
     return routes
+
+
+def _read_source_registry_with_deadline(
+    path: Path,
+    *,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read one diagnostic source without letting its file provider stall callers.
+
+    The worker is intentionally daemonized: diagnostic reads are read-only and a
+    provider-level ``open`` cannot be cancelled safely from the parent thread.
+    A timed-out worker therefore cannot hold CLI process shutdown or mutate the
+    registry binding. Every later diagnostic call starts a fresh read, so a
+    hydrated provider recovers without registry repair.
+    """
+
+    result: queue.Queue[
+        tuple[dict[str, Any] | None, str | None, Exception | None]
+    ] = queue.Queue(maxsize=1)
+
+    def read() -> None:
+        try:
+            if not path.exists():
+                result.put((None, "source_registry_missing", None))
+                return
+            payload = load_registry(path)
+        except Exception as exc:  # Propagate the existing loader contract.
+            result.put((None, None, exc))
+        else:
+            result.put((payload, None, None))
+
+    threading.Thread(
+        target=read,
+        name="loopx-source-registry-read",
+        daemon=True,
+    ).start()
+    try:
+        payload, status, error = result.get(timeout=max(0.0, timeout_seconds))
+    except queue.Empty:
+        return None, "source_registry_timeout"
+    if status is not None:
+        return None, status
+    if error is not None:
+        if isinstance(error, (OSError, ValueError, json.JSONDecodeError)):
+            return None, "source_registry_unreadable"
+        raise error
+    assert payload is not None
+    return payload, None
 
 
 def collect_runtime_projection_route_diagnostics(
@@ -544,6 +599,8 @@ def collect_runtime_projection_route_diagnostics(
     runtime_root: Path,
     goal_id: str | None = None,
     activation_state_filter: GoalActivationState | str | None = None,
+    source_registry_read_timeout_seconds: float = SOURCE_REGISTRY_READ_TIMEOUT_SECONDS,
+    registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     source_routes = _source_routes_for_registry(
@@ -551,8 +608,11 @@ def collect_runtime_projection_route_diagnostics(
         runtime_root=runtime_root,
         goal_id=goal_id,
         activation_state_filter=activation_state_filter,
+        source_registry_read_timeout_seconds=source_registry_read_timeout_seconds,
+        registry=registry,
     )
-    registry = load_registry(registry_path)
+    if registry is None:
+        registry = load_registry(registry_path)
     registry_is_global = bool(registry.get("registry_role") == "global-local") or _same_path(
         registry_path,
         global_registry_path(runtime_root),
@@ -562,7 +622,11 @@ def collect_runtime_projection_route_diagnostics(
             items.append(
                 {
                     "goal_id": current_goal_id,
-                    "status": "missing",
+                    "status": (
+                        "unavailable"
+                        if source_error == "source_registry_timeout"
+                        else "missing"
+                    ),
                     "reason": source_error,
                 }
             )
@@ -623,16 +687,32 @@ def collect_runtime_projection_route_diagnostics(
 
     counts = {
         status: sum(1 for item in items if item.get("status") == status)
-        for status in ("healthy", "ready", "single_runtime", "missing", "ambiguous", "lagging")
+        for status in (
+            "healthy",
+            "ready",
+            "single_runtime",
+            "missing",
+            "unavailable",
+            "ambiguous",
+            "lagging",
+        )
     }
     return {
         "schema_version": RUNTIME_PROJECTION_ROUTE_DIAGNOSTICS_SCHEMA_VERSION,
+        "registry": str(registry_path.resolve()),
+        "runtime_root": str(runtime_root.resolve()),
+        "goal_filter": goal_id,
+        "activation_state_filter": (
+            normalize_goal_activation_state(activation_state_filter).value
+            if activation_state_filter is not None else None
+        ),
         "available": bool(items),
         "goal_count": len(items),
         "healthy": not any(
-            item.get("status") in {"missing", "ambiguous", "lagging"}
+            item.get("status") in {"missing", "unavailable", "ambiguous", "lagging"}
             for item in items
         ),
+        "source_registry_read_timeout_seconds": source_registry_read_timeout_seconds,
         "counts": counts,
         "items": items,
     }

@@ -11,10 +11,10 @@ separate Loader rows:
   Session successfully invokes the exact `loopx` skill. It then asks LoopX
   whether another turn may run and queues the authoritative heartbeat task
   into that live DSH Agent.
-- the package-root Host registers a loopback-only `/loopx` Connection channel,
-  and its web Client contributes a compact GoalBar between DSH's native GoalBar
-  and Queue dock rows. It renders only for one exact live
-  `(goalId, loopxAgentId)` binding.
+- the package-root Host registers GoalBar at the authenticated
+  `/api/loopx.goalbar` route required by DSH 0.1.5. Its web Client adds a compact
+  GoalBar between DSH's native GoalBar and Queue dock rows, visible only for one
+  exact live `(goalId, loopxAgentId)` binding.
 
 Installing the plugin and starting DSH load and prepare these capabilities;
 neither creates a binding nor activates the Driver. The GoalBar
@@ -39,9 +39,14 @@ deferred atomicity limit are specified in the versioned
 Requirements are Node.js 22.19+, `pnpm`, Python 3.11+ with `pip`, and network
 access for the first DSH start when no compatible LoopX CLI is already
 installed. LoopX itself is deliberately not a prerequisite. The initializer
-honors an explicit `PYTHON_BIN`, otherwise it checks `python3`, `python3.14`, `python3.13`,
-`python3.12`, and `python3.11` and keeps the first interpreter that satisfies
-the requirement. If it must install or upgrade LoopX, it writes an isolated
+honors an explicit `PYTHON_BIN`; otherwise it tries `python3`, then discovers
+`python3.<minor>` executables on the supplied `PATH` in descending numeric order.
+Installation still checks the Python version and pip; reopening the managed
+runtime uses the same discovery and validates the LoopX CLI. No hard-coded
+minor-version list is maintained. When selecting Python for installation, an
+invalid explicit interpreter fails instead of falling back. Managed-runtime
+readback keeps the existing CLI fallback behavior. If the plugin must install
+or upgrade LoopX, it writes an isolated
 copy under `$DSH_AGENTS_HOME/runtime/dsh-loopx-plugin` (default
 `~/.agents/runtime/dsh-loopx-plugin`) and never mutates the system Python
 environment. This works with externally managed Python distributions that
@@ -53,10 +58,15 @@ Install the prebuilt release into the web profile:
 
 ```bash
 dsh plugin --profile web add \
-  "https://github.com/huangruiteng/loopx/releases/download/dsh-loopx-plugin-v0.1.1-beta.4/dsh-loopx-plugin-0.1.1-beta.4.tgz"
+  "https://github.com/loopx-project/loopx/releases/download/dsh-loopx-plugin-v0.1.1-beta.5/dsh-loopx-plugin-0.1.1-beta.5.tgz"
 ```
 
-For a source checkout, the equivalent build-and-install path is:
+The prebuilt release above retains its original DSH compatibility. This source
+checkout targets DSH 0.1.5-rc.1 or newer within the 0.1.x line; it does not
+publish a new plugin release. The exported legacy RPC registration remains
+available to explicit callers, but plugin startup always uses the shared API.
+
+For the DSH 0.1.5 source build, use:
 
 ```bash
 cd packages/dsh-loopx-plugin
@@ -124,10 +134,40 @@ Start/Pause. Focused Client tests cover Session-generation replacement and old
 request cancellation without duplicating that matrix in the packed smoke.
 The Docker smoke packs the current plugin and builds the current LoopX
 release-candidate wheel, then starts both in a clean Debian container with the
-supported DSH release. It proves PEP 668-compatible private installation, the
-managed launcher, startup readiness, and first-session `loopx` skill
-discovery. It requires Docker, `uv`, and network access for base images and
+DSH 0.1.5-rc.2 release candidate. It proves PEP 668-compatible private installation,
+the managed launcher, startup readiness, installed `loopx` skill files, launch-
+token authentication, and an authenticated GoalBar read through DSH's shared
+API carrier. It requires Docker, `uv`, and network access for base images and
 never opens a browser or configures a model provider.
+
+## Maintainer release and marketplace handoff
+
+A DSH plugin release is complete only after its immutable GitHub asset exists
+and an update pull request has been opened against the upstream
+[`awesome-dsh-plugin`](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)
+marketplace. Marketplace maintainers retain merge authority; publishing a
+LoopX release does not grant authority over that catalog.
+
+For every DSH plugin release:
+
+1. Update the package version and this README's pinned install URL. Run the
+   typecheck, tests, and the built, packed, runtime, profile, and Docker smokes
+   listed above.
+2. Prepare complete bilingual GitHub release notes. Run
+   `examples/release/release-readiness-doc-smoke.py` with one `--surface` for
+   every optional capability changed by the release.
+3. Merge the exact reviewed commit, pack from that immutable tag target, and
+   publish both the version tag and `dsh-loopx-plugin-<version>.tgz` asset.
+4. Read the remote release body back and rerun the release-readiness smoke.
+   Download the remote asset and verify that its SHA-256 matches the local
+   package before advertising it.
+5. In a clean fork branch of `awesome-dsh-plugin`, update only
+   `data/plugins/huangruiteng__loopx--packages-dsh-loopx-plugin.yml` to the new
+   immutable asset URL. Confirm the URL resolves, then run
+   `node scripts/generate-readme.mjs --check` and `git diff --check`.
+6. Open an upstream marketplace pull request and link it from the release
+   closeout. Do not describe the release as marketplace-published until that
+   pull request is merged by the upstream maintainers.
 
 ## Shadow observer (default off)
 
@@ -163,9 +203,10 @@ loopx reliability-diagnostics status  --goal-id <goal-id> --format json
 
 Unless all required variables are valid, the independent observer row
 registers no hook and writes no file. When enabled, it consumes only
-`session/created`, `session/event`, and `session/disposed`; it skips
-`assistant/chunk` and records tool names, turn and step numbers, typed end
-reasons, and ids only, never arguments, outputs, prompts, or paths. Events for
+`session/created`, `session/event`, and `session/disposed`; it skips the retired
+token-level `assistant/chunk` rows older logs still replay, and records tool
+names, turn and step numbers, typed end reasons, and ids only, never arguments,
+outputs, prompts, or paths. Events for
 any session other than the exact configured session are rejected as
 `identity_invalid`. The stats record pins worker/model/task/environment/tools/
 budget plus adapter and observer revisions, declares source coverage, and
@@ -179,12 +220,17 @@ C1 run, and measured observer overhead remain separate evidence gates.
 
 ## GoalBar authority and privacy boundary
 
-`/loopx` is registered with Connection authority `loopback`. Loopback is a
-network reachability fence, not user authentication, and Phase 1 does not
-support LAN or remote browsers. The browser supplies only its injected DSH
-Session id and, for an action, the last validated Goal/Agent pair. The Host
-re-derives cwd and thread identity from the live DSH Agent, freshly resolves
-the binding, and executes only fixed LoopX argv.
+The GoalBar carrier uses Connection's authenticated `/api/loopx.goalbar`
+Fetch route. Explicit callers of the deprecated RPC registration can still
+register `/loopx`; plugin startup does not select it automatically. Both pass
+Connection's Host/Origin trust fence and browser authentication, and this
+package adds no second credential of its own. The deployment's reachability
+policy — loopback by default, or declared `trustedHosts` — decides which
+browsers can reach the host at all; Phase 1 does not support LAN or remote
+browsers. The browser supplies only its injected DSH Session id and, for an
+action, the last validated Goal/Agent pair. The Host re-derives cwd and thread
+identity from the live DSH Agent, freshly resolves the binding, and executes
+only fixed LoopX argv.
 
 The wire allowlist contains ids, activation, live Agent status, full-lane
 counts, cursors, opaque source revisions, and fixed error codes. It excludes

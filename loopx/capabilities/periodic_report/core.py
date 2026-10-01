@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from ...control_plane.runtime.public_safety import SECRET_LIKE_SURFACE_PATTERN
+
 
 REQUEST_SCHEMA = "periodic_report_run_request_v0"
 RUN_SCHEMA = "periodic_report_v0"
@@ -35,11 +37,6 @@ _REPORTABLE_TRIGGER_KINDS = {
 }
 _LOCAL_PATH_SURFACE_PATTERN = re.compile(
     r"(?<!<)/(?:Users|Volumes|home|var/folders|tmp|private/tmp)/[^\s`'\"<>]+"
-)
-_SECRET_LIKE_SURFACE_PATTERN = re.compile(
-    r"(?i)(?:\bbearer\s+[a-z0-9._~+/=-]{16,}|"
-    r"(?<![a-z0-9_])(?:ak|sk)[-_=:][a-z0-9_=-]{10,}|"
-    r"\b(?:api[_-]?key|password|secret|token)\s*[=:]\s*[^\s`'\"<>]{12,})"
 )
 _FORBIDDEN_RAW_KEYS = {
     "credential",
@@ -140,7 +137,7 @@ def _reject_raw_keys(value: object, label: str) -> None:
             _reject_raw_keys(item, f"{label}[{index}]")
     elif isinstance(value, str) and (
         _LOCAL_PATH_SURFACE_PATTERN.search(value)
-        or _SECRET_LIKE_SURFACE_PATTERN.search(value)
+        or SECRET_LIKE_SURFACE_PATTERN.search(value)
     ):
         raise ValueError(f"{label} contains a private path or credential-like value")
 
@@ -176,6 +173,29 @@ def _normalize_window(raw: object) -> dict[str, str]:
     if start_value >= end_value:
         raise ValueError("period_window.start_at must be earlier than end_at")
     return {"start_at": start_at, "end_at": end_at}
+
+
+def _validate_report_window_for_trigger(
+    *, generated_at: str, period_window: Mapping[str, str], trigger_receipt: Mapping[str, Any] | None
+) -> None:
+    """Keep cadence digests retrospective while leaving event updates incremental.
+
+    A calendar boundary is an eligibility signal, not permission to report an
+    unfinished interval.  Event-driven updates may still use the same bounded
+    run envelope, but their trigger receipt—not the calendar—defines why the
+    update is being published.
+    """
+
+    if not trigger_receipt or trigger_receipt.get("report_kind") != "cadence_digest":
+        return
+    generated = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    end_at = datetime.fromisoformat(
+        str(period_window["end_at"]).replace("Z", "+00:00")
+    )
+    if end_at > generated:
+        raise ValueError(
+            "cadence_digest period_window.end_at must not be later than generated_at"
+        )
 
 
 def _normalize_profile(raw: object) -> dict[str, str]:
@@ -660,6 +680,11 @@ def build_periodic_report_run(request: Mapping[str, Any]) -> dict[str, Any]:
     trigger_receipt = _normalize_trigger_receipt(payload.get("trigger_receipt"))
     if trigger_receipt is not None and trigger_receipt["profile"] != profile:
         raise ValueError("trigger_receipt.profile must match the run profile")
+    _validate_report_window_for_trigger(
+        generated_at=generated_at,
+        period_window=period_window,
+        trigger_receipt=trigger_receipt,
+    )
     sources = _normalize_sources(payload.get("source_snapshots"))
     retry_policy = _normalize_retry_policy(payload.get("retry_policy", {}))
     artifact = _normalize_artifact(

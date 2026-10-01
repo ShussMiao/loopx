@@ -9,7 +9,10 @@ from typing import Any
 
 import pytest
 
-from loopx.cli_commands import project_lifecycle
+from loopx.cli_commands import (
+    project_lifecycle,
+    project_lifecycle_refresh_state,
+)
 from loopx.control_plane.capability_hooks import (
     POST_WRITEBACK_HOOK_RESULT_SCHEMA_VERSION,
     PostWritebackHookRegistration,
@@ -18,6 +21,10 @@ from loopx.extensions.lark.goal_channel_contracts import (
     human_gate_auto_notify_marker_path,
     write_human_gate_auto_notify_marker,
 )
+from tests.control_plane import test_refresh_external_delivery as settlement_fixtures
+from tests.control_plane.test_quota_settlement_cli import AGENT_ID, GOAL_ID, TODO_ID, TURN_ID
+
+settlement_session = settlement_fixtures.session
 
 
 def _args(*, suppress_external_sinks: bool = False) -> argparse.Namespace:
@@ -98,7 +105,7 @@ def test_refresh_state_applies_goal_channel_delivery_postcondition(
 ) -> None:
     captured: dict[str, Any] = {}
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "refresh_state_run",
         lambda **kwargs: {
             "ok": True,
@@ -108,7 +115,7 @@ def test_refresh_state_applies_goal_channel_delivery_postcondition(
         },
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_explore_graph_after_material_refresh",
         lambda **kwargs: {
             "enabled": False,
@@ -119,7 +126,7 @@ def test_refresh_state_applies_goal_channel_delivery_postcondition(
         },
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_human_gate_after_refresh",
         lambda **kwargs: gate_sync,
     )
@@ -147,7 +154,7 @@ def test_refresh_state_forwards_external_sink_suppression(
 ) -> None:
     captured_kwargs: dict[str, Any] = {}
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "refresh_state_run",
         lambda **kwargs: {
             "ok": True,
@@ -157,7 +164,7 @@ def test_refresh_state_forwards_external_sink_suppression(
         },
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_explore_graph_after_material_refresh",
         lambda **kwargs: {
             "enabled": False,
@@ -181,7 +188,7 @@ def test_refresh_state_forwards_external_sink_suppression(
         }
 
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_human_gate_after_refresh",
         sync_gate,
     )
@@ -214,7 +221,7 @@ def test_refresh_state_rejects_non_standard_usage_json_constants(
         refresh_calls.append(kwargs)
         return {"ok": True, "appended": True, "dry_run": False}
 
-    monkeypatch.setattr(project_lifecycle, "refresh_state_run", _record_refresh)
+    monkeypatch.setattr(project_lifecycle_refresh_state, "refresh_state_run", _record_refresh)
 
     args = _args()
     args.usage_json = (
@@ -235,9 +242,22 @@ def test_refresh_state_rejects_non_standard_usage_json_constants(
     assert refresh_calls == []
 
 
+@pytest.mark.parametrize(
+    ("error_type", "reason"),
+    [
+        (ValueError, "invalid_input_or_config"),
+        (TimeoutError, "timeout"),
+        (PermissionError, "permission_denied"),
+        (FileNotFoundError, "runtime_unavailable"),
+        (OSError, "io_error"),
+        (RuntimeError, "unexpected_failure"),
+    ],
+)
 def test_refresh_state_redacts_goal_channel_exception_details(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+    reason: str,
 ) -> None:
     captured: dict[str, Any] = {}
     registry_path = tmp_path / ".loopx" / "registry.json"
@@ -262,7 +282,7 @@ def test_refresh_state_redacts_goal_channel_exception_details(
         )
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "refresh_state_run",
         lambda **kwargs: {
             "ok": True,
@@ -272,7 +292,7 @@ def test_refresh_state_redacts_goal_channel_exception_details(
         },
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_explore_graph_after_material_refresh",
         lambda **kwargs: {
             "enabled": False,
@@ -284,13 +304,13 @@ def test_refresh_state_redacts_goal_channel_exception_details(
     )
 
     def fail_with_private_details(**kwargs: Any) -> dict[str, Any]:
-        raise ValueError(
+        raise error_type(
             f"private binding failed at {tmp_path}/.loopx/goal-channel.json "
             "for oc_private_fixture"
         )
 
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_human_gate_after_refresh",
         fail_with_private_details,
     )
@@ -310,6 +330,55 @@ def test_refresh_state_redacts_goal_channel_exception_details(
     )
     assert str(tmp_path) not in serialized
     assert "oc_private_fixture" not in serialized
+    assert captured["goal_channel_gate_sync"]["failure"]["stage"] == "lifecycle"
+    assert captured["goal_channel_gate_sync"]["failure"]["reason_code"] == reason
+    assert captured["goal_channel_gate_sync"]["failure"]["external_write_status"] == "unknown"
+    assert f"lifecycle ({reason})" in captured["error"]
+
+
+def test_notification_failure_keeps_exact_primary_settlement_and_one_spend(
+    settlement_session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, _, args, run, journal, index = settlement_session
+    failure = {
+        "enabled": True, "ok": False, "status": "failed",
+        "failure": {"stage": "provider_send", "reason_code": "timeout",
+                    "external_write_status": "unknown"},
+        "failure_summary": "Goal Channel notification failed at provider_send (timeout)",
+        "delivery_postcondition": {"satisfied": False, "blocks_delivery": True},
+    }
+    monkeypatch.setattr(project_lifecycle_refresh_state, "sync_human_gate_after_refresh",
+                        lambda **kwargs: dict(failure))
+    first = run(args, expected=1)
+    identity = first["settlement_identity"]
+    assert first["settlement_progress"]["state"] == "spend_required"
+    assert first["refresh_recovery"]["reason"] == "first_writeback"
+    assert "provider_send (timeout)" in first["error"]
+    rendered = project_lifecycle_refresh_state.render_state_refresh_markdown(first)
+    assert "provider_send (timeout)" in rendered and "spend_required" in rendered
+    written = index.read_bytes()
+    replay = run(args, expected=1)
+    assert replay["settlement_identity"] == identity
+    assert replay["idempotent_replay"] is True
+    rendered_replay = project_lifecycle_refresh_state.render_state_refresh_markdown(replay)
+    assert "provider_send (timeout)" in rendered_replay and "spend_required" in rendered_replay
+    assert index.read_bytes() == written
+
+    spend = ["quota", "spend-slot", "--goal-id", GOAL_ID, "--agent-id", AGENT_ID,
+             "--todo-id", TODO_ID, "--turn-instance-id", TURN_ID,
+             "--slots", "1", "--source", "heartbeat", "--execute"]
+    run(spend)
+    run(spend)
+    rows = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    assert sum(row.get("classification") == "quota_slot_spent" for row in rows) == 1
+    assert sum(row.get("classification") == "validated_change" for row in rows) == 1
+    settled_index = index.read_bytes()
+    monkeypatch.setattr(project_lifecycle_refresh_state, "sync_human_gate_after_refresh",
+                        lambda **kwargs: {"enabled": False, "ok": True})
+    recovered = run(args)
+    assert recovered["settlement_identity"] == identity
+    assert recovered["settlement_progress"]["state"] == "settled"
+    assert index.read_bytes() == settled_index
 
 
 def test_refresh_state_dispatches_and_replays_post_writeback_sidecar(
@@ -355,7 +424,7 @@ def test_refresh_state_dispatches_and_replays_post_writeback_sidecar(
         producer=producer,
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "refresh_state_run",
         lambda **kwargs: {
             "ok": True,
@@ -372,29 +441,36 @@ def test_refresh_state_dispatches_and_replays_post_writeback_sidecar(
         },
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "read_heartbeat_settlement",
         lambda *args, **kwargs: SimpleNamespace(
-            delivery=SimpleNamespace(failure=None)
+            identity=SimpleNamespace(value=None),
+            delivery=SimpleNamespace(failure=None),
+            progress={
+                "schema_version": "quota_settlement_progress_v0",
+                "state": "settled",
+                "next_step": None,
+                "quota_spend_source": "heartbeat",
+            },
         ),
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "settlement_result_payload",
         lambda result: {"status": "settled"},
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "resolve_runtime_root",
         lambda *args, **kwargs: runtime_root,
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_explore_graph_after_material_refresh",
         lambda **kwargs: {"enabled": False},
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_human_gate_after_refresh",
         lambda **kwargs: {"enabled": False},
     )
@@ -438,7 +514,7 @@ def test_refresh_state_disabled_post_writeback_hook_has_zero_projection_calls(
         return {}
 
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "refresh_state_run",
         lambda **kwargs: {
             "ok": True,
@@ -448,12 +524,12 @@ def test_refresh_state_disabled_post_writeback_hook_has_zero_projection_calls(
         },
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_explore_graph_after_material_refresh",
         lambda **kwargs: {"enabled": False},
     )
     monkeypatch.setattr(
-        project_lifecycle,
+        project_lifecycle_refresh_state,
         "sync_human_gate_after_refresh",
         lambda **kwargs: {"enabled": False},
     )

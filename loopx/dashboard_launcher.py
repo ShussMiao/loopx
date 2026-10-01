@@ -12,6 +12,7 @@ import time
 from urllib.parse import quote
 import webbrowser
 
+from .kiro_cli_goal_mode import KIRO_CLI_BIN
 from .release_manifest import release_runtime_identity
 
 
@@ -99,7 +100,7 @@ def _listener_pids(port: int) -> list[int]:
         result = subprocess.run(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -124,7 +125,7 @@ def _is_same_user_loopx_chat_process(pid: int) -> bool:
         result = subprocess.run(
             ["ps", "-ww", "-p", str(pid), "-o", "uid=", "-o", "command="],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
@@ -209,6 +210,7 @@ def launch_dashboard(
     goal_id: str | None = None,
     codex_bin: str = "codex",
     claude_bin: str = "claude",
+    kiro_cli_bin: str = KIRO_CLI_BIN,
     lark_cli_bin: str | None = None,
     assets_dir: Path | None = None,
     verbose: bool = False,
@@ -227,6 +229,10 @@ def launch_dashboard(
             cwd=release_root,
             env=environment,
         )
+
+    if assets_dir is None:
+        from .presentation.chat_bundle import validate_bundle
+        validate_bundle(default_packaged_assets_dir(), source_root=Path(__file__).resolve().parents[1])
 
     existing_chat = _probe_existing_chat(
         host,
@@ -279,6 +285,7 @@ def launch_dashboard(
         goal_id=goal_id,
         codex_bin=codex_bin,
         claude_bin=claude_bin,
+        kiro_cli_bin=kiro_cli_bin,
         lark_cli_bin=lark_cli_bin,
         assets_dir=resolved_assets,
         verbose=verbose,

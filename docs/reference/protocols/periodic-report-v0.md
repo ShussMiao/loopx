@@ -28,10 +28,178 @@ for custom or unattended operation. Enabled custom profiles declare:
 - one or more renderer bindings;
 - zero or more required, optional, or disabled extension sink bindings.
 
-Use a host Automation only when the report must run unattended on an RRULE.
-The Automation schedule and project profile must agree; ordinary in-session
-generation does not need an Automation. External delivery still requires an
-explicit sink binding and its independent runtime authority/readback checks.
+For unattended reports, keep the existing general-purpose host wakeup and
+configure the optional calendar in the `periodic_report` subscription. The
+capability checks calendar boundaries when that host wakes; it does not create
+a separate report Automation or promise delivery at an exact wall-clock time.
+External delivery still requires an explicit sink binding and its independent
+runtime authority/readback checks.
+
+### Optional daily or weekly calendar
+
+In Personal Workspace, open **Settings → Capability Center**. Choose **Device
+defaults** or **One Goal** and select the target Goal, then choose **Periodic
+reports**. Enable the subscription, choose its profile and Goal
+Channel route, then turn on **Calendar reports**. Choose daily or weekly,
+the weekday for weekly reports, and a local time. The existing subscription
+timezone also owns the calendar timezone. Preview and apply use the same
+revision-checked configuration API as other capability settings.
+
+The corresponding subscription configuration is:
+
+```json
+{
+  "enabled": true,
+  "profile_preset": "weekly-progress",
+  "route_ref": "report-channel",
+  "timezone": "Asia/Shanghai",
+  "schedule": {
+    "schema_version": "periodic_report_schedule_v0",
+    "schedule_id": "weekly-report",
+    "rrule": "FREQ=WEEKLY;BYDAY=FR;BYHOUR=18;BYMINUTE=0",
+    "timezone": "Asia/Shanghai"
+  }
+}
+```
+
+The local evaluator accepts one daily or weekly occurrence, a real IANA
+timezone, and one weekday for weekly schedules. Unsupported recurrence fields
+and mismatched timezones are rejected before configuration is applied. A
+spring-forward time that does not exist is skipped; a repeated fall-back time
+occurs once, at its first offset.
+
+Turning off **Calendar reports** submits `schedule: null`. The stored
+subscription then has no calendar and retains existing stage-boundary behavior.
+A Goal override is a complete configuration: clearing its calendar does not
+silently inherit the machine calendar. **Restore machine defaults** removes
+the whole Goal override. Disabling the subscription prevents automatic
+generation and delivery, including when a calendar remains saved.
+Stopped, paused and archived Goals likewise have no active standing delivery
+subscription; an already-admitted calendar cannot reactivate their work.
+
+The first eligible wake freezes the latest completed calendar interval. An
+unfinished interval remains unchanged across restarts and later wakeups; after
+its verified delivery, missed intervals coalesce to the latest completed one.
+The journal records admission and references the existing publication cursor;
+it is not another source of report progress. A generated report or a delivery
+Todo does not acknowledge publication. Only the exact covered trigger in a
+verified publication cursor does so.
+
+Registration reordering retains the frozen reporter. A subscription edit can
+supersede an unprepared window: admission archives the predecessor before
+replacing it, under the same lock used by editorial preparation. Restarting
+between those writes repeats the replacement safely; it does not record a
+publication. The replacement uses the current subscription and elected reporter.
+Admission resolves registration, lifecycle and subscription again under its
+journal lock; a previously constructed hook is not current authority.
+
+Once any editorial or generation artifact exists, a subscription change or
+reporter removal produces an explicit unavailable state and preserves the old
+window. Restoring the reporter and matching subscription resumes it. Reporter
+removal alone also preserves an unprepared window until the subscription is
+updated or the reporter restored. The runtime never silently retargets prepared
+work. Invalid journal or conflicting predecessor contents fail closed rather
+than starting a second report.
+
+Explicit requests retain first priority, followed by validated stage reports,
+then automatic calendar work. A calendar waiting for authored text cannot hide
+an existing request or stage intent. A corrupt calendar fails its own hook and
+does not suppress other valid report intents; when none remain, the consumer
+surfaces the calendar error rather than claiming an empty healthy queue.
+
+Calendar source coverage currently includes readable facts for the reporting
+Agent, with completed facts restricted to the frozen interval. Reports must
+disclose this partial coverage; no readable completion is not proof of no work,
+and a Goal calendar does not imply exhaustive history for all its Agents.
+
+### Report modes: weekly digest and automatic update
+
+The product has two report modes under one capability; they are not mutually
+exclusive switches and they do not create two delivery pipelines:
+
+- A **cadence digest** is retrospective. `cadence_due` is only the eligibility
+  signal. The run must cover the latest completed interval as a half-open
+  window, `[period_window.start_at, period_window.end_at)`, and the end of that
+  window must not be later than `generated_at`. Restarting or a late wake may
+  coalesce missed calendar boundaries, but it never turns an in-progress
+  interval into a report.
+- An **automatic update** is event-driven. Material blockers, recoveries,
+  decisions, validated outcomes, and bounded milestones map to
+  `exception_update` or `milestone_update` (and an explicit request maps to
+  `manual_update`). Its window is the bounded evidence context for that event,
+  not an implied week, and it may bypass the normal cooldown only where the
+  trigger policy allows it.
+
+Both modes use the same trigger decision, generation bundle, publication
+candidate, sink receipts, and publication cursor. If a due calendar boundary
+and a material event are observed together, the trigger decision coalesces them
+into one idempotent run and the higher-priority event selects the report kind;
+it does not emit a second weekly message. A profile may enable either mode or
+both by listing the corresponding trigger kinds in `enabled_kinds`. The
+recipient may still choose a single channel or audience, but that is a routing
+choice rather than a second source of report state.
+
+Late-arriving facts after a cadence window has been published belong to the
+next eligible event/update (or an explicitly labelled correction), and must not
+silently rewrite the already verified publication cursor. This keeps a weekly
+report useful as a stable look-back while automatic updates remain timely.
+
+### Composition with Todo continuation
+
+The revision-guarded `loopx handoff prepare/inspect/adopt` flow transfers a
+canonical Todo between execution sessions or registered Agents. It does not
+transfer a report subscription, a prepared calendar window, a publication
+cursor, or a manager request's return audience. Successful Todo adoption is
+not evidence that a report was delivered.
+
+A manager forwarding new context should keep using the manager inbox and let
+the receiving Agent decide whether to revise its plan. It must not invoke
+Todo ownership transfer merely to deliver a message. When a real worker
+replacement is requested, reuse the existing continuation note (summary,
+attempts, next steps, decisions, source references) and revision-guarded
+transfer authority rather than introducing another task store.
+
+A same-Agent session replacement can resume the frozen calendar window and
+its delivery artifacts. A cross-Agent replacement cannot currently adopt a
+prepared calendar window: its original reporter remains part of the window
+identity. Such a replacement stays explicitly unavailable until the original
+reporter is restored; transferring its delivery Todo alone does not resolve
+this boundary. Supporting that case requires a separately reviewed migration
+that binds the old window, subscription revision, artifact identity and
+verified sink receipts. It must reconcile partial sends before changing the
+reporter and preserve the original manager request and return audience.
+
+Any future migration should appear through the existing frontend and Lark
+request tracking, with the same receipt and evidence references exposed by
+the CLI. Neither UI may turn a successful ownership claim into a completion
+badge. This paragraph describes the integration boundary, not a shipped
+cross-Agent report migration.
+
+### Host handoff boundary
+
+`quota should-run` exposes the capability-owned pending intent before normal
+host work. `turn plan` and `turn run-once` represent it as
+`capability_action_required`, with no host invocation or host transaction. The
+CLI includes a command/argv handoff bound to the invoked registry and runtime.
+The command is part of the signed action projection and cannot be replaced by
+an older replan command during envelope compaction.
+
+`turn plan` and `turn run-once` without `--execute` inspect already-admitted
+intents without dispatching mutating inbox/calendar hooks. They do not reserve
+a new due window. An executing wake (`quota should-run` or
+`turn run-once --execute`) admits it and recomputes the live decision before
+host work. When that preflight writes private state, its plan reports
+`effects.state_written: true` and `boundary.read_only: false`; admission is not
+generation, delivery, or quota spend.
+
+This is a capability adapter handoff, not a completed report or a user approval
+gate. Even `turn run-once --execute` does not execute this command as a shell
+or pretend that it ran a host turn. An agent-managed wake can consume it through
+the existing capability CLI. The consumer first prepares an editorial request;
+the reasoning agent authors the required response, then consumes again to
+freeze a generation and queue the existing delivery Todo. A fully unattended
+managed Turn runner still needs an adapter for that editorial handoff; the
+calendar setting alone does not supply one.
 
 `periodic_report_activation_v0` is the effect-free inspection receipt. It
 records whether generation is allowed, the normalized profile digest, and the
@@ -73,24 +241,42 @@ independently idempotent messages and each one must pass exact readback. Before
 each write, the provider scans the complete Goal Channel history from the frozen
 generation time and reuses an exact card, chat, and Bot-sender match. An incomplete
 history read fails closed; the provider's stable one-hour idempotency key covers
-the remaining concurrent-send race. The command does not accept a chat, profile,
-App identity, or sender override. Instead,
-the Lark extension resolves the current Goal's local-private Goal Channel
-binding and requires `mode=project_bot`, Bot sender identity, a non-default
-profile, exact Bot App id and display name, and an enabled Lark channel.
+the remaining concurrent-send race. That provider key is versioned and bound to
+the final announcement kind, title, body, and footer, so a renderer change after
+an interrupted send cannot return an older, semantically different card under
+the new retry. The command does not accept a chat, profile, App identity, or
+sender override. Its route authority has two explicit, non-interchangeable
+forms. When the Goal has a durable Goal Channel binding, that binding's
+`target_ref` must match the effective periodic-report subscription. When no
+Goal Channel binding exists, an enabled effective `periodic_report`
+subscription with an explicit `route_ref` is the independent standing
+authority, and the named target registry entry supplies the project-Bot route.
+This unbound path constructs only an adapter-local resolved route; it neither
+creates a durable Goal Channel binding nor authorizes `operation.execute` or
+another Goal Channel producer. Both forms require `mode=project_bot`, Bot
+sender identity, a non-default profile, exact Bot App id and display name, and
+an enabled Lark channel.
 Before sending, it live-verifies that the bound profile authenticates as the
 same Bot App and can reach the same chat. After sending, it reads back the
 exact interactive card from that chat and requires the provider-native message
 sender to be an `app` whose id equals the bound Bot App id. Revalidating the
 profile alone is not sender proof.
-Missing bindings, local-user mode, identity drift, or incomplete readback fail
-closed; no environment-default or user-identity fallback exists.
+Missing route authority, local-user mode, identity drift, or incomplete
+readback fail closed; no environment-default or user-identity fallback exists.
+
+路由授权只有两种显式且不可混用的来源：若 Goal 已存在持久化 Goal Channel
+binding，其 `target_ref` 必须与当前生效的周期报告订阅一致；若不存在 binding，
+则必须由已启用且显式配置 `route_ref` 的 `periodic_report` 订阅提供独立的持续授权，
+并从具名 target registry 解析 project Bot 路由。后一条路径只生成适配器内存中的
+resolved route，不会写入 Goal Channel binding，也不能授权 `operation.execute` 或
+其他 Goal Channel producer。缺少上述任一授权、使用本地用户身份、身份漂移或
+读回不完整时都必须在写入前关闭失败；环境变量默认路由和用户身份都不能兜底。
 
 The governed pending-intent consumer persists the normalized generation bundle
 and writes one runnable, agent-owned delivery successor. The current effective
 `periodic_report` subscription is re-read before consumption; `enabled: true`
 with an explicit `route_ref` is the standing authority for this automatic
-stage-boundary delivery. Its Goal, source, effective revision, and route are
+stage-boundary or configured calendar delivery. Its Goal, source, effective revision, and route are
 frozen into `periodic_report_delivery_authority_v0` and must still match before
 each external message write. Disabling the subscription or changing its effective
 revision/route suppresses the queued action even when a separate explicit Goal
@@ -104,11 +290,14 @@ drift.
 `periodic_report_project_progress_projection_v0` is the built-in,
 domain-neutral source input. It groups typed project facts into progress,
 capability evolution, risks, next actions, and supporting evidence, with no
-more than eight primary audience items. Issue Fix has no special standing in
-either schema. It may register a peer source adapter under the same contract as
-release, research, operations, or another domain. OpenViking is likewise an
-optional archive/query provider behind a sink extension; it does not own
-trigger, selection, rendering, or delivery.
+more than eight primary audience items. The snapshot covers the whole Goal:
+facts produced by any Agent lane are selectable, the requesting `agent_id`
+ranks that Agent's own outcomes and next action ahead of a peer lane's, so the
+audience-item cap cannot evict the reporter's own progress, and a row no Agent
+claimed stays out because it has no producer. Issue Fix has no special standing in either schema. It may register a
+peer source adapter under the same contract as release, research, operations, or
+another domain. OpenViking is likewise an optional archive/query provider behind
+a sink extension; it does not own trigger, selection, rendering, or delivery.
 
 `periodic_report_v0` is the LoopX control contract for one bounded report run.
 It binds a period window and a profile to typed source snapshots, one rendered
@@ -163,7 +352,10 @@ does not parse rendered Markdown or infer titles from fingerprints. Its
 interaction semantics are `attention_kind=progress`, `interaction=inform`,
 `delivery=surface`, and `writable=false`. Compact counts distinguish facts
 added since the preceding verified publication from facts whose semantic
-fingerprint changed.
+fingerprint changed. "Already published" is a Goal-level property: every cursor
+file the Goal recorded contributes its published fingerprints, so a fact another
+lane delivered is not announced again by this lane, including by a lane that has
+never published. Each lane's own baseline still decides what counts as changed.
 
 Generation alone does not expose this projection. The publication candidate
 binds its exact SHA-256, and the Goal Channel sink may advance that binding into the

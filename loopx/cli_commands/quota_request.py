@@ -13,6 +13,13 @@ QUOTA_SHOULD_RUN_DETAIL_SECTIONS = (
     "vision",
 )
 QUOTA_MONITOR_POLL_DETAIL_SECTIONS = ("decisions",)
+QUOTA_PLAN_DETAIL_SECTIONS = ("agent-todos", "user-todos")
+QUOTA_COMMAND_DETAIL_SECTIONS = {
+    "status": QUOTA_PLAN_DETAIL_SECTIONS,
+    "plan": QUOTA_PLAN_DETAIL_SECTIONS,
+    "should-run": QUOTA_SHOULD_RUN_DETAIL_SECTIONS,
+    "monitor-poll": QUOTA_MONITOR_POLL_DETAIL_SECTIONS,
+}
 QUOTA_DETAIL_SECTIONS = (
     *QUOTA_SHOULD_RUN_DETAIL_SECTIONS,
     *QUOTA_MONITOR_POLL_DETAIL_SECTIONS,
@@ -26,8 +33,11 @@ def register_quota_monitor_poll_request_arguments(
         "--todo-id",
         help=(
             "For Codex App `quota should-run`, select one currently projected "
-            "eligible action through typed same-turn qualification; otherwise "
-            "name the accountable Todo settlement target."
+            "eligible action through typed same-turn qualification. For "
+            "`quota monitor-poll`, name the observed monitor Todo; a committed "
+            "advancement settlement Todo remains separate under the auxiliary "
+            "no-spend observation contract. Otherwise name the accountable "
+            "Todo settlement target."
         ),
     )
     quota_parser.add_argument("--target-key", help="Stable monitor target key for `quota monitor-poll` metadata writeback.")
@@ -87,11 +97,39 @@ def register_quota_monitor_poll_request_arguments(
             "that must not block the bound agent lane."
         ),
     )
+    quota_parser.add_argument("--task-lease-idempotency-key",
+        help="Current Monitor execution key for canonical quota monitor-poll; requires --task-lease-expected-version.")
+    quota_parser.add_argument("--task-lease-expected-version", type=int,
+        help="Current Monitor lease version, checked atomically with observation and successors; never renews the lease.")
+    quota_parser.add_argument("--use-current-task-lease", action="store_true",
+        help=("For an executing, turn-scoped monitor-poll with --todo-id, resolve the canonical "
+              "lease proof or replay the exact prior transaction proof. Does not acquire or renew a lease."))
     quota_parser.add_argument("--next-claimed-by", help="Registered agent id to claim the `--next-agent-todo` follow-up.")
 
 
 def validate_quota_command_request(args: argparse.Namespace) -> None:
     command = args.quota_command
+    lease_key = getattr(args, "task_lease_idempotency_key", None)
+    lease_version = getattr(args, "task_lease_expected_version", None)
+    use_current_lease = bool(getattr(args, "use_current_task_lease", False))
+    if use_current_lease:
+        if command != "monitor-poll" or not args.execute:
+            raise QuotaCommandValidationError("--use-current-task-lease requires executing quota monitor-poll")
+        if not args.todo_id or not args.turn_instance_id or not args.agent_id:
+            raise QuotaCommandValidationError(
+                "--use-current-task-lease requires --todo-id, --turn-instance-id, and --agent-id"
+            )
+        if lease_key is not None or lease_version is not None:
+            raise QuotaCommandValidationError(
+                "--use-current-task-lease cannot be combined with explicit task lease proof"
+            )
+    if lease_key is not None or lease_version is not None:
+        if command != "monitor-poll":
+            raise QuotaCommandValidationError("task lease proof is only valid with quota monitor-poll")
+        if not lease_key or lease_version is None or lease_version < 1 or lease_version > 9007199254740991:
+            raise QuotaCommandValidationError("Monitor lease proof requires an execution key and positive safe-integer version")
+        if not (args.todo_id or args.target_key):
+            raise QuotaCommandValidationError("Monitor lease proof requires --todo-id or --target-key")
     begin_turn = bool(getattr(args, "begin_turn", False))
     if command not in {"status", "plan"} and not args.goal_id:
         raise QuotaCommandValidationError(
@@ -147,9 +185,7 @@ def quota_detail_sections_from_args(args: argparse.Namespace) -> frozenset[str]:
         sections.add("scheduler")
     if "all" in sections:
         sections.update(
-            QUOTA_MONITOR_POLL_DETAIL_SECTIONS
-            if args.quota_command == "monitor-poll"
-            else QUOTA_SHOULD_RUN_DETAIL_SECTIONS
+            QUOTA_COMMAND_DETAIL_SECTIONS.get(args.quota_command, ())
         )
         sections.discard("all")
     return frozenset(sections)

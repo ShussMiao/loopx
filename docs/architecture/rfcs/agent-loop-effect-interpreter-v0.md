@@ -3,7 +3,9 @@
 | Field | Value |
 |---|---|
 | Status | Accepted |
+| Supersedes / closes | none |
 | Date | 2026-08-08 |
+| Last normative revision | 2026-10-01 |
 | Author | LoopX maintainers |
 | Scope | Public control-plane docs, packet contracts, refactor direction, test strategy |
 
@@ -410,6 +412,13 @@ Stop or narrow M7 when any kill criterion holds:
   `work_lane_contract`, and `scheduler_hint`.
 - focused tests and docs that pin the lens.
 
+The quota closeout adapter now consumes receipt-derived settlement progress
+from the TS readback instead of independently treating a spend run as settled.
+Normal refresh, replay and spend responses share that projection; executable
+commands bind the original actor and route. Receipt repair reuses the existing
+idempotent writer. This is a bounded M7.4 adoption with no shared executor or
+new authority store; it does not certify terminal Todo or Goal acceptance.
+
 ### What Is Missing
 
 - A generic shared executor is deliberately absent. The current adapters share
@@ -579,6 +588,18 @@ It is not a generic composition framework and does not move model, user, host
 scheduler, credential, or third-party authority behind a universal executor.
 Every replaced Python semantic path is deleted in the same cutover PR.
 
+**2026-10-01 identity-boundary slice:** `effect_program.ts` now owns one decoder
+for executable Todo/replan identities consumed by Turn settlement and journal
+validation. The internal discriminated union excludes dual targets and mutation;
+executable values exclude `unbound`. Supported v0, scoped v1 and schema-less
+adapter inputs preserve effect IDs. Non-string IDs, unsupported declared
+versions and contradictory binding metadata fail before provider dispatch or
+receipt replay. The journal reader reuses this rule instead of maintaining its
+own v1 binding comparison. Evidence lives in the existing effect-program,
+settlement-parity, journal-effect and inspect-journal CLI tests, including real
+File readback. This qualifies the identity boundary only; composite crash/lease
+recovery and full provider conformance remain separate acceptance.
+
 M7.4: expand one bounded family at a time only when it removes duplicate
 knowledge and switches a real production caller. Todo, monitor, capability,
 scheduler, and gate state machines keep their domain transition invariants.
@@ -629,6 +650,52 @@ Example replacements:
   `effect_program_from_ordered_steps` before rendering or validation;
 - `turn_driver/executor` should derive result status and next phase through
   `interpret_turn_result_packet` before committing a receipt.
+
+## Semantic control and execution ownership
+
+LoopX's semantic control plane preserves work meaning across Turns, Agents and
+runtimes: intent, ownership, dependencies, authority, evidence and continuation.
+Its execution responsibility covers the typed transactions and settlement
+steps it actually owns. Agent/capability reasoning proposes domain outcomes;
+the kernel checks their binding, admission and lifecycle obligations. Domain
+verifiers and users still judge the substance of an outcome.
+
+| Boundary | Owner | Observable commitment |
+| --- | --- | --- |
+| Domain judgment | Agent and capability | Proposed action/outcome with scoped evidence |
+| Control decision | Existing typed domain kernel | Legal next action and required proof from explicit facts |
+| Internal execution | Owning transaction/effect adapter | Durable state transition and bound receipt |
+| External execution | Host/provider | Its actual model/tool/environment effect and factual readback |
+| Presentation | Read-model owner | Evidence-backed state and available actions, with freshness limits |
+
+Sharing an algebra does not transfer execution authority. Host continuation,
+sandbox snapshots, model/tool interception and external rollback require their
+own supported runtime contracts; an effect plan or transcript does not prove
+those capabilities. No generic executor or second permission owner is added.
+
+## Decision replay, effect recovery and simulation
+
+| Operation | Inputs and promise | Limit |
+| --- | --- | --- |
+| Pure decision replay | Fixed trusted facts, command and rule version reproduce a decision | Does not execute effects or restore current authority |
+| Committed-effect recovery | Same logical identity and verified durable receipts skip committed steps and resume the owning protocol | Does not prove an unknown external effect never happened |
+| Counterfactual simulation | Explicitly substituted facts and a controlled interpreter compare possible decisions | Not evidence that the real provider or model would produce that outcome |
+
+Record versions, identity, ordering and relevant outcomes at the existing
+receipt boundary. Never rerun a model and call its new output historical
+replay. `unknown`, permission denial, cancellation, budget rejection and
+committed success retain their different recovery meanings. Cancellation does
+not erase an in-flight external effect. Retry must retain identity and follow
+the provider's guarantees; unsupported readback remains unknown.
+
+Adapter conformance compares observable effect order, short-circuit point,
+receipts, authority rejection and recovery, not only equal return values.
+Identity and associativity apply to regrouping the same ordered program, not
+reordering or speculative parallel execution. Preserve the existing decision
+against a universal executor until a real shared authority boundary justifies
+one. Use [composition verification](composable-state-machines-recovery-verification-v0.md)
+for multi-domain sequences and [provider acceptance](provider-effect-acceptance-v0.md)
+for protected external effects; neither contract implies cross-system exactly-once.
 
 ## State Machine As Interpretation Table
 

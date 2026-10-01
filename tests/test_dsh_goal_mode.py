@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from loopx import dsh_goal_mode
+from loopx.cli_commands import turn_dsh_host
 from loopx.control_plane.quota.turn_envelope import (
     turn_envelope_action_signature_document,
 )
@@ -134,6 +135,31 @@ def test_dsh_session_id_uses_a_versioned_lineage_digest() -> None:
     assert first_id == turn_host_adapter._derive_session_id(first, TURN_KEY)
 
 
+def test_dsh_source_session_id_is_scoped_to_the_exact_goal_instance() -> None:
+    instance_a = _lineage_request(
+        goal_id="goal",
+        agent_id="agent",
+        todo_id="todo",
+    )
+    instance_a["goal_ref"] = {
+        "goal_id": "goal",
+        "goal_instance_id": "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }
+    instance_b = {
+        **instance_a,
+        "goal_ref": {
+            "goal_id": "goal",
+            "goal_instance_id": "ginst_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+    }
+
+    first_id = turn_host_adapter._derive_session_id(instance_a, TURN_KEY)
+    second_id = turn_host_adapter._derive_session_id(instance_b, TURN_KEY)
+
+    assert first_id.startswith("dsh-lineage-v2-")
+    assert first_id != second_id
+
+
 def test_dsh_session_id_preserves_missing_lineage_component_positions() -> None:
     missing_agent = _lineage_request(goal_id="goal", todo_id="todo")
     missing_todo = _lineage_request(goal_id="goal", agent_id="todo")
@@ -147,6 +173,24 @@ def test_dsh_session_id_preserves_missing_lineage_component_positions() -> None:
     assert turn_host_adapter._derive_session_id(
         _lineage_request(goal_id=False, agent_id=0, todo_id=""), TURN_KEY
     ) == "dsh-" + "0" * 24
+
+
+def test_dsh_fresh_iteration_session_id_is_scoped_to_the_turn_key() -> None:
+    request = _lineage_request(goal_id="goal", agent_id="agent", todo_id="todo")
+    request["session"] = {
+        "context_policy": {
+            "schema_version": "loopx_iteration_context_policy_v0",
+            "mode": "fresh",
+            "scope": "iteration",
+        }
+    }
+    first_key = "sha256:" + "1" * 64
+    second_key = "sha256:" + "2" * 64
+
+    first_id = turn_host_adapter._derive_session_id(request, first_key)
+    assert first_id.startswith("dsh-iteration-v1-")
+    assert first_id == turn_host_adapter._derive_session_id(request, first_key)
+    assert first_id != turn_host_adapter._derive_session_id(request, second_key)
 
 
 def test_dsh_host_passes_lineage_session_id_to_the_runner(
@@ -176,6 +220,84 @@ def test_dsh_host_passes_lineage_session_id_to_the_runner(
 
     assert session_ids[0] != session_ids[1]
     assert session_ids[0] == session_ids[2]
+
+
+def test_dsh_host_forwards_the_resolved_credential_to_the_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def run_fake_dsh_turn(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return '{"result_kind":"wait"}'
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", run_fake_dsh_turn)
+    credential = {
+        "DEEPSEEK_API_KEY": "fixture-machine-key",
+        "DEEPSEEK_BASE_URL": "https://provider.invalid",
+    }
+    config = turn_host_adapter.DshHostConfig(
+        workspace=tmp_path,
+        env=credential,
+    )
+
+    turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+
+    assert calls[0]["env"] == {
+        **credential,
+        "LOOPX_TURN_GOAL_ID": "g",
+        "LOOPX_TURN_AGENT_ID": "a",
+        "LOOPX_TURN_TODO_ID": "",
+        "LOOPX_TURN_WORKSPACE": str(tmp_path.resolve()),
+    }
+    assert calls[0]["env"] is not credential
+
+
+@pytest.mark.parametrize(
+    "resolved,expected",
+    [
+        ({"DEEPSEEK_API_KEY": "fixture-machine-key"},
+         {"DEEPSEEK_API_KEY": "fixture-machine-key"}),
+        ({"DEEPSEEK_API_KEY": "fixture-env-key",
+          "DEEPSEEK_BASE_URL": "https://provider.invalid",
+          "UNRELATED_SERVICE_SECRET": "must-not-travel"},
+         {"DEEPSEEK_API_KEY": "fixture-env-key",
+          "DEEPSEEK_BASE_URL": "https://provider.invalid"}),
+        ({"UNRELATED_SERVICE_SECRET": "must-not-travel"}, {}),
+    ],
+)
+def test_turn_runner_projects_only_the_resolved_operator_provider_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resolved: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    captured: list[turn_host_adapter.DshHostConfig] = []
+
+    def capture(_request: object, *, config: turn_host_adapter.DshHostConfig) -> dict:
+        captured.append(config)
+        return {"ok": True}
+
+    monkeypatch.setattr(turn_dsh_host, "run_dsh_host", capture)
+    args = SimpleNamespace(
+        dsh_provider=None,
+        dsh_model=None,
+        dsh_reasoning_effort=None,
+        dsh_max_tokens=16_384,
+        dsh_home=None,
+        dsh_cordis=None,
+        dsh_runtime_bin=None,
+        timeout_seconds=60,
+        dsh_runner=None,
+    )
+    runner = turn_dsh_host.build_dsh_host_runner(
+        args,
+        workspace=tmp_path,
+        environ=resolved,
+    )
+
+    assert runner({}) == {"ok": True}
+    assert dict(captured[0].env or {}) == expected
 
 
 def test_dsh_goal_mode_is_a_first_class_subpackage() -> None:
@@ -235,6 +357,7 @@ def test_prompt_requests_one_typed_public_safe_json_result() -> None:
     assert "primary_action" in prompt
     assert "result_kind" in prompt
     assert "validated_progress" in prompt
+    assert "iteration_failed" in prompt
     # Boundary discipline stays in the prompt text.
     assert "write_scope" in prompt
     assert "credentials" in prompt
@@ -268,6 +391,23 @@ def test_build_result_rejects_unsupported_result_kinds() -> None:
     )
     assert result["result_kind"] == "wait"
     assert result["classification"] == "unsupported_host_result_kind"
+
+
+def test_build_result_preserves_iteration_failed_as_a_typed_stop() -> None:
+    request = _signed_request()
+    result = turn_host_adapter.build_result(
+        request,
+        {
+            "result_kind": "iteration_failed",
+            "classification": "iteration check failed",
+            "summary": "the bounded attempt did not validate",
+            "next_action": "start a new controller-authorized iteration",
+        },
+    )
+
+    assert result["result_kind"] == "iteration_failed"
+    assert result["classification"] == "iteration check failed"
+    assert "delivery_outcome" not in result
 
 
 def test_build_result_shapes_material_results_with_required_fields() -> None:
@@ -508,6 +648,7 @@ def test_build_sdk_config_targets_the_current_sdk_surface(tmp_path: Path) -> Non
     config = turn_host_adapter.build_sdk_config(
         provider="deepseek-official",
         model="deepseek-v4-flash",
+        reasoning_effort="high",
         workspace=tmp_path,
         dsh_home=dsh_home,
         max_tokens=1024,
@@ -518,6 +659,7 @@ def test_build_sdk_config_targets_the_current_sdk_surface(tmp_path: Path) -> Non
     assert set(config) <= {
         "provider",
         "model",
+        "reasoning_effort",
         "cwd",
         "dsh_home",
         "max_tokens",
@@ -525,11 +667,90 @@ def test_build_sdk_config_targets_the_current_sdk_surface(tmp_path: Path) -> Non
         "dsh_bin",
         "request_timeout_seconds",
     }
+    assert config["reasoning_effort"] == "high"
     assert config["dsh_home"] == str(dsh_home)
     assert config["dsh_bin"] == "/opt/dsh/bin/dsh"
     assert config["patches"] == (str(cordis.expanduser().resolve()),)
     for legacy_field in ("session_root", "cordis", "runtime_bin"):
         assert legacy_field not in config
+
+
+def test_build_sdk_config_omits_an_unset_reasoning_effort(tmp_path: Path) -> None:
+    # A caller that explicitly passes no effort must not have one invented for
+    # it: the SDK distinguishes "provider default" from a named effort.
+    config = turn_host_adapter.build_sdk_config(
+        provider="deepseek-official",
+        model="deepseek-v4-flash",
+        reasoning_effort=None,
+        workspace=tmp_path,
+        dsh_home=tmp_path / "dsh-home",
+        max_tokens=None,
+        cordis=None,
+        runtime_bin=None,
+        request_timeout_seconds=None,
+    )
+    assert "reasoning_effort" not in config
+
+
+def test_build_sdk_config_carries_a_caller_pinned_runtime_environment(
+    tmp_path: Path,
+) -> None:
+    # A Chat channel pins its own segments read-only through the runtime
+    # environment; the adapter forwards it instead of reinterpreting it.
+    config = turn_host_adapter.build_sdk_config(
+        provider="deepseek-official",
+        model="deepseek-v4-flash",
+        reasoning_effort="high",
+        workspace=tmp_path,
+        dsh_home=tmp_path / "dsh-home",
+        max_tokens=None,
+        cordis=None,
+        runtime_bin=None,
+        request_timeout_seconds=None,
+        env={"DSH_PERMISSION_MODE": "read-only"},
+    )
+    assert config["env"] == {"DSH_PERMISSION_MODE": "read-only"}
+
+    unpinned = turn_host_adapter.build_sdk_config(
+        provider="deepseek-official",
+        model="deepseek-v4-flash",
+        reasoning_effort="high",
+        workspace=tmp_path,
+        dsh_home=tmp_path / "dsh-home",
+        max_tokens=None,
+        cordis=None,
+        runtime_bin=None,
+        request_timeout_seconds=None,
+    )
+    assert "env" not in unpinned
+
+
+def test_host_config_resolves_the_shared_managed_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LOOPX_TURN_MODEL", raising=False)
+    monkeypatch.delenv("DSH_MODEL", raising=False)
+    profile = turn_host_adapter.DshHostConfig(workspace=tmp_path).resolved_profile()
+    assert (
+        profile["provider"],
+        profile["model"],
+        profile["reasoning_effort"],
+    ) == (
+        turn_host_adapter.DEFAULT_PROVIDER,
+        turn_host_adapter.DEFAULT_MODEL,
+        turn_host_adapter.DEFAULT_REASONING_EFFORT,
+    )
+    assert profile["model_source"] == "product_default"
+
+    monkeypatch.setenv("LOOPX_TURN_MODEL", "fixture-model")
+    overridden = turn_host_adapter.DshHostConfig(
+        workspace=tmp_path, model="argument-model"
+    ).resolved_profile()
+    assert overridden["model"] == "argument-model"
+    assert overridden["model_source"] == "explicit_argument"
+    # An explicit field wins alone: the others still follow the environment.
+    assert overridden["reasoning_effort"] == turn_host_adapter.DEFAULT_REASONING_EFFORT
 
 
 def test_dsh_home_resolution_prefers_config_then_environment(
@@ -541,11 +762,11 @@ def test_dsh_home_resolution_prefers_config_then_environment(
     environment = tmp_path / "environment-home"
     monkeypatch.setenv("DSH_HOME", str(environment))
 
-    assert turn_host_adapter._resolve_dsh_home(workspace, configured) == configured
-    assert turn_host_adapter._resolve_dsh_home(workspace, None) == environment
+    assert turn_host_adapter.resolve_dsh_home(workspace, configured) == configured
+    assert turn_host_adapter.resolve_dsh_home(workspace, None) == environment
 
     monkeypatch.delenv("DSH_HOME")
-    assert turn_host_adapter._resolve_dsh_home(workspace, None) == (
+    assert turn_host_adapter.resolve_dsh_home(workspace, None) == (
         workspace / ".local" / ".dsh-sessions"
     )
 
@@ -585,6 +806,129 @@ def test_terminal_error_reason_extraction() -> None:
     )
     normalized = turn_host_adapter.normalize_runner_outcome(sdk_result)
     assert normalized["finish_reason"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("final_response", "expected"),
+    [("", "no_final"), ("  ", "no_final"), ('{"result_kind":', "partial")],
+)
+def test_terminal_output_budget_state_rejects_every_max_token_fragment(
+    final_response: str,
+    expected: str,
+) -> None:
+    assert (
+        turn_host_adapter.terminal_output_budget_state(
+            {
+                "final_response": final_response,
+                "finish_reason": "max-tokens",
+                "events": [],
+            }
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("final_response", "expected_reason"),
+    [
+        ("", "dsh_output_budget_exhausted_no_final"),
+        ('{"result_kind":"validated_progress"}', "dsh_output_budget_exhausted_partial"),
+    ],
+)
+def test_run_dsh_host_maps_max_tokens_to_non_retryable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    final_response: str,
+    expected_reason: str,
+) -> None:
+    monkeypatch.setattr(
+        turn_host_adapter,
+        "run_dsh_turn",
+        lambda **_kwargs: {
+            "final_response": final_response,
+            "finish_reason": "max-tokens",
+            "events": [
+                {
+                    "type": "turn/end",
+                    "data": {"reason": {"kind": "max-tokens"}},
+                }
+            ],
+        },
+    )
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path)
+
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+
+    assert excinfo.value.reason == expected_reason
+    assert excinfo.value.failure_kind == "output_budget_exhausted"
+    assert build_host_failure_record(excinfo.value.failure_kind, attempt=1) == {
+        "schema_version": "loopx_turn_host_failure_v0",
+        "kind": "output_budget_exhausted",
+        "attempt": 1,
+        "retryable": False,
+    }
+
+
+def test_generic_adapter_returns_typed_iteration_failure_on_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        turn_host_adapter,
+        "run_dsh_turn",
+        lambda **_kwargs: {
+            "final_response": "",
+            "finish_reason": "max-tokens",
+            "events": [],
+        },
+    )
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path)
+    request = _signed_request()
+
+    result = turn_host_adapter._execute_turn_host_request(
+        request,
+        turn_host_adapter.extract_turn_authority(request),
+        config=config,
+        terminal_errors_as_host_failure=False,
+    )
+
+    assert result["result_kind"] == "iteration_failed"
+    assert result["classification"] == "dsh_output_budget_exhausted_no_final"
+    assert "blindly rerun" in result["next_action"]
+
+
+def test_dsh_host_config_has_a_bounded_product_default(tmp_path: Path) -> None:
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path)
+
+    assert config.max_tokens == 16_384
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True])
+def test_dsh_host_rejects_invalid_output_token_limit_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    invoked = False
+
+    def runner(**_kwargs: object) -> dict[str, object]:
+        nonlocal invoked
+        invoked = True
+        return {"final_response": "", "finish_reason": "completed", "events": []}
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", runner)
+    config = turn_host_adapter.DshHostConfig(
+        workspace=tmp_path,
+        max_tokens=invalid,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+
+    assert excinfo.value.reason == "dsh_output_token_limit_rejected"
+    assert excinfo.value.failure_kind == "contract_rejected"
+    assert invoked is False
 
 
 @pytest.mark.parametrize(
@@ -694,3 +1038,28 @@ def test_subprocess_terminal_error_keeps_the_legacy_wait_contract() -> None:
     assert result["result_kind"] == "wait"
     assert result["classification"] == "no_typed_host_result"
     assert "dsh execution failed" not in completed.stderr
+
+
+def test_dsh_sdk_overrides_follow_each_verified_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = []
+    monkeypatch.setenv("LOOPX_TURN_GOAL_ID", "ambient-wrong-goal")
+
+    def runner(**kwargs):
+        calls.append(kwargs["env"])
+        return '{"result_kind":"wait"}'
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", runner)
+    pinned = {"LOOPX_TURN_TODO_ID": "stale-todo", "DSH_PERMISSION_MODE": "read-only"}
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path, env=pinned)
+    turn_host_adapter.run_dsh_host(_signed_request(todo_id="first"), config=config)
+    turn_host_adapter.run_dsh_host(_signed_request(todo_id="second"), config=config)
+    turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+    assert [env["LOOPX_TURN_TODO_ID"] for env in calls] == ["first", "second", ""]
+    for env in calls:
+        assert env["LOOPX_TURN_GOAL_ID"] == "g"
+        assert env["LOOPX_TURN_AGENT_ID"] == "a"
+        assert env["LOOPX_TURN_WORKSPACE"] == str(tmp_path.resolve())
+        assert env["DSH_PERMISSION_MODE"] == "read-only"
+    assert pinned["LOOPX_TURN_TODO_ID"] == "stale-todo"

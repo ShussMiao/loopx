@@ -30,7 +30,9 @@ REQUIRED_PHRASES = (
     '"agent_model": "peer_v1"',
     "independent worktrees",
     "Review remains `action_kind=review`",
-    "Dormant registered agents and closed, blocked, or deferred todos are not coordinator candidates.",
+    "Only currently actionable candidates appear under `eligible_peer_lanes`.",
+    "Closed, blocked, or deferred Todos are excluded.",
+    "appears under `blocked_peer_lanes`",
 )
 
 FORBIDDEN_PHRASES = (

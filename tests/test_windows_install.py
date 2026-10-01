@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -33,6 +34,137 @@ def _run_loopx(
     )
 
 
+def _windows_user_path(pwsh: str) -> str:
+    result = subprocess.run(
+        [
+            pwsh,
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            (
+                "$value = [Environment]::GetEnvironmentVariable('Path', 'User'); "
+                "if ($null -eq $value) { 'null' } else { "
+                "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($value)) }"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    return result.stdout.strip()
+
+
+def _restore_windows_user_path(pwsh: str, encoded_path: str) -> None:
+    env = dict(os.environ)
+    env["LOOPX_TEST_USER_PATH"] = encoded_path
+    subprocess.run(
+        [
+            pwsh,
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            (
+                "$encoded = $env:LOOPX_TEST_USER_PATH; "
+                "$value = if ($encoded -eq 'null') { $null } else { "
+                "[Text.Encoding]::UTF8.GetString("
+                "[Convert]::FromBase64String($encoded)) }; "
+                "[Environment]::SetEnvironmentVariable('Path', $value, 'User')"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        timeout=30,
+    )
+
+
+def test_chat_bundle_preflight_preserves_stdout_with_legacy_pointer(
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    bundle_builder = source_root / "bundle_builder.py"
+    bundle_builder.write_text("print('bundle progress')\n", encoding="utf-8")
+    pointer = tmp_path / "current-release.json"
+    pointer.write_text('{"release_id":"known-good"}\n', encoding="utf-8")
+
+    windows_install._ensure_chat_bundle(
+        bundle_builder=bundle_builder,
+        source_root=source_root,
+        python=Path(sys.executable),
+        pointer=pointer,
+    )
+
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == ["bundle progress"]
+
+
+def test_authority_upgrade_runs_from_candidate_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_root = tmp_path / "releases" / "candidate"
+    skills_dir = tmp_path / "codex" / "skills"
+    observed_command: list[str] = []
+    observed_env: dict[str, str] = {}
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        observed_command.extend(command)
+        observed_env.update(kwargs["env"])
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(windows_install.subprocess, "run", run)
+
+    windows_install._upgrade_authority_archive(
+        release_root,
+        python=Path(sys.executable),
+        skills_dir=skills_dir,
+    )
+
+    assert observed_command == [
+        sys.executable,
+        "-I",
+        str(release_root / "scripts" / "loopx_entry.py"),
+        "--format",
+        "json",
+        "authority-archive",
+        "upgrade",
+        "--all-known",
+        "--execute",
+    ]
+    assert observed_env["LOOPX_RELEASE_ROOT"] == str(release_root)
+    assert observed_env["CODEX_HOME"] == str(skills_dir.parent)
+    assert observed_env["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_authority_upgrade_failure_reports_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            2,
+            stdout="",
+            stderr="loopx runtime error: LOOPX_RELEASE_ROOT is not set",
+        )
+
+    monkeypatch.setattr(windows_install.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="LOOPX_RELEASE_ROOT is not set"):
+        windows_install._upgrade_authority_archive(
+            tmp_path / "release",
+            python=Path(sys.executable),
+            skills_dir=tmp_path / "codex" / "skills",
+        )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows installer regression")
 def test_windows_installer_promotes_release_and_runs_doctor(tmp_path: Path) -> None:
     pwsh = shutil.which("pwsh")
@@ -45,33 +177,39 @@ def test_windows_installer_promotes_release_and_runs_doctor(tmp_path: Path) -> N
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-    install = subprocess.run(
-        [
-            pwsh,
-            "-NoLogo",
-            "-NoProfile",
-            "-File",
-            str(repo_root / "scripts" / "install-windows.ps1"),
-            "-Python",
-            sys.executable,
-            "-InstallRoot",
-            str(install_root),
-            "-BinDir",
-            str(bin_dir),
-            "-SkillsDir",
-            str(skills_dir),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        timeout=180,
-    )
+    original_user_path = _windows_user_path(pwsh)
+    try:
+        install = subprocess.run(
+            [
+                pwsh,
+                "-NoLogo",
+                "-NoProfile",
+                "-File",
+                str(repo_root / "scripts" / "install-windows.ps1"),
+                "-Python",
+                sys.executable,
+                "-InstallRoot",
+                str(install_root),
+                "-BinDir",
+                str(bin_dir),
+                "-SkillsDir",
+                str(skills_dir),
+                "-AddToUserPath",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=180,
+        )
+    finally:
+        _restore_windows_user_path(pwsh, original_user_path)
 
     assert install.returncode == 0, install.stderr
     installed = json.loads(install.stdout)
+    assert f"LoopX Windows user PATH includes: {bin_dir}" in install.stderr
     pointer_path = install_root / "current-release.json"
     assert installed["pointer"] == str(pointer_path)
     assert (bin_dir / "loopx.ps1").is_file()
@@ -90,10 +228,6 @@ def test_windows_installer_promotes_release_and_runs_doctor(tmp_path: Path) -> N
         "loopx-global-gates",
         "loopx-global-todos",
         "loopx-global-risks",
-        "loop-global-summary",
-        "loop-global-gates",
-        "loop-global-todos",
-        "loop-global-risks",
     }
     assert expected_skills == {
         path.name for path in skills_dir.iterdir() if (path / "SKILL.md").is_file()
@@ -146,10 +280,7 @@ def test_windows_installer_promotes_release_and_runs_doctor(tmp_path: Path) -> N
             "windows-probe",
             "--objective",
             "Verify the native Windows PowerShell lifecycle",
-            "--no-onboarding-scan",
             "--no-global-sync",
-            "--codex-app-heartbeat",
-            "no",
         ],
         env=launch_env,
     )
@@ -182,10 +313,17 @@ def test_windows_installer_promotes_release_and_runs_doctor(tmp_path: Path) -> N
     quota = _run_loopx(
         pwsh=pwsh,
         launcher=launcher,
-        args=[*common, "quota", "should-run", "--goal-id", "windows-probe"],
+        args=[
+            *common,
+            "quota",
+            "should-run",
+            "--goal-id",
+            "windows-probe",
+            "--verbose",
+        ],
         env=launch_env,
     )
-    assert quota.returncode == 0, quota.stderr
+    assert quota.returncode == 0, quota.stderr or quota.stdout
     quota_payload = json.loads(quota.stdout)
     assert quota_payload["should_run"] is True
 
@@ -300,7 +438,7 @@ def test_windows_installer_keeps_pointer_when_candidate_validation_fails(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows installer regression")
-def test_windows_installer_rolls_back_late_user_surface_failure(
+def test_windows_installer_rolls_back_user_surfaces_and_retains_upgraded_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -347,4 +485,6 @@ def test_windows_installer_rolls_back_late_user_surface_failure(
         '{"release_id":"known-good"}\n'
     )
     assert existing_skill.read_text(encoding="utf-8") == "# known-good skill\n"
-    assert not (install_root / "releases" / "rejected-late").exists()
+    retained_candidate = install_root / "releases" / "rejected-late"
+    assert retained_candidate.is_dir()
+    assert (retained_candidate / "scripts" / "loopx_entry.py").is_file()

@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import argparse
 import re
 from typing import Any
 
 from . import __version__
-from .cli_runtime import GLOBAL_OPTIONS_WITH_EQUALS, GLOBAL_OPTIONS_WITH_VALUE
+from .cli_runtime import (
+    GLOBAL_OPTIONS_WITH_EQUALS, GLOBAL_OPTIONS_WITH_VALUE, add_subcommand_format,
+)
 
 HELP_FLAGS = {"-h", "--help"}
+
+
+def register_command_reference(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "commands",
+        help="Show grouped LoopX command reference for operators and contributors.",
+    )
+    add_subcommand_format(parser)
 
 
 COMMAND_GROUPS: list[dict[str, object]] = [
@@ -28,6 +39,10 @@ COMMAND_GROUPS: list[dict[str, object]] = [
             {
                 "command": "loopx first-run-report",
                 "purpose": "Print a local first-run receipt and an optional public feedback issue link.",
+            },
+            {
+                "command": "loopx usage-ping [status|enable|disable]",
+                "purpose": "Show or change the default-on basic usage statistics and its exact payload.",
             },
             {
                 "command": "loopx slash-commands --install",
@@ -84,12 +99,28 @@ COMMAND_GROUPS: list[dict[str, object]] = [
                 "purpose": "Set up, inspect, sync, or notify the provider channel bound to one goal.",
             },
             {
+                "command": "loopx goal-portfolio --help",
+                "purpose": "Read bounded, source-covered evidence across explicitly selected Goals.",
+            },
+            {
+                "command": "loopx manager-inbox --help",
+                "purpose": "Read source-bound Manager context and record the receiving Agent's decision.",
+            },
+            {
                 "command": "loopx goal-lifecycle --help",
                 "purpose": "Preview, stop, or resume a Goal without deleting its history, todos, or evidence.",
             },
             {
                 "command": "loopx evidence-log --goal-id <goal-id> --agent-id <agent-id> --thin",
                 "purpose": "Read the current agent's thin public-safe ledger before replan or handoff.",
+            },
+            {
+                "command": "loopx agent-capabilities --help",
+                "purpose": "Inspect or correct a registered Agent's observed runtime capabilities.",
+            },
+            {
+                "command": "loopx handoff --help",
+                "purpose": "Prepare, inspect, or adopt one explicit cross-agent Todo handoff.",
             },
             {
                 "command": "loopx machine-config --help",
@@ -228,6 +259,10 @@ COMMAND_GROUPS: list[dict[str, object]] = [
                 "purpose": "Qualify one exact final diff against an enabled project policy and receipt contract.",
             },
             {
+                "command": "loopx goal-acceptance",
+                "purpose": "Configure, inspect or verify a versioned Goal acceptance basis.",
+            },
+            {
                 "command": "loopx integration-branch --help",
                 "purpose": "Detect reviewed source-branch drift and rebuild one local integration branch.",
             },
@@ -242,6 +277,14 @@ COMMAND_GROUPS: list[dict[str, object]] = [
                 "purpose": "Safely retire explicitly named orphaned global goal routes.",
             },
             {"command": "loopx register-agent", "purpose": "Register an automation agent."},
+            {
+                "command": "loopx agent-directory",
+                "purpose": "Produce the local, goal-scoped peer agent directory this host can hand work to.",
+            },
+            {
+                "command": "loopx resolve-peer-route",
+                "purpose": "Resolve an existing peer to one exact host route before sending work.",
+            },
             {"command": "loopx lark-kanban", "purpose": "Project LoopX state into a Feishu/Lark Base board."},
             {
                 "command": "loopx presentation",
@@ -258,6 +301,10 @@ COMMAND_GROUPS: list[dict[str, object]] = [
             {
                 "command": "loopx connector",
                 "purpose": "List, register, rank, and record usage for public connector providers.",
+            },
+            {
+                "command": "loopx external-evidence",
+                "purpose": "Plan, admit, and retire provenance-bound external evidence.",
             },
             {"command": "loopx issue-fix", "purpose": "Build public-safe issue or PR fix workflow packets."},
             {
@@ -294,11 +341,16 @@ COMMAND_GROUPS: list[dict[str, object]] = [
 # command an intentional manual-visibility decision instead of a silent omission.
 MANPAGE_COMMAND_HELP_ONLY = frozenset(
     {
+        "agent-context",
         "archive-runtime",
+        "automation-prompts",
+        "automation-cadence",
+        "authority-archive",
         "authority-shadow",
         "backup-state",
         "capability",
         "chat-endpoint",
+        "checkpoint-context",
         "codex-cli-bounded-visible-pilot-adapter",
         "codex-cli-exec-handoff",
         "codex-cli-local-driver-plan",
@@ -313,6 +365,7 @@ MANPAGE_COMMAND_HELP_ONLY = frozenset(
         "codex-cli-visible-local-driver-pilot",
         "codex-cli-visible-session-proof",
         "configure-goal",
+        "delegation",
         "content-ops",
         "decision-context",
         "dash",
@@ -323,6 +376,7 @@ MANPAGE_COMMAND_HELP_ONLY = frozenset(
         "global-risks",
         "global-summary",
         "global-todos",
+        "goal-actions",
         "goal-alignment",
         "amendment-proposal",
         "goal-amendment-proposal",
@@ -331,6 +385,7 @@ MANPAGE_COMMAND_HELP_ONLY = frozenset(
         "import-doc-registry-authority",
         "lark-inbox",
         "migrate-state",
+        "native-child",
         "ml-experiment",
         "opencode2-goal-worker",
         "operator-gate",

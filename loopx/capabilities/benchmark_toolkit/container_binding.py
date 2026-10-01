@@ -29,7 +29,7 @@ class DockerContainerBinding:
 def _run_command(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         argv,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         capture_output=True,
         check=False,
     )

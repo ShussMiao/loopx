@@ -1,18 +1,142 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from typing import Any
 
-# Increment when review requirements change without changing the packet shape.
-REVIEW_POLICY_REVISION = 1
+from .review_body import REQUIRED_FINAL_SECTIONS, review_body_requirements
+from .approval_closeout import approval_closeout_contract
 
-REQUIRED_FINAL_SECTIONS = [
-    "动机",
-    "改动思路",
-    "具体改动",
-    "对主干的风险",
-    "我的整体评价",
-]
+# Increment when review requirements change without changing the packet shape.
+REVIEW_POLICY_REVISION = 13
+
+# A red check is an observation, not evidence that the reviewed PR caused it.
+# This contract belongs to review judgment; merge readiness still owns whether
+# an unresolved required check permits integration.
+VALIDATION_FAILURE_ATTRIBUTION = {
+    "dispositions": [
+        "pr_regression", "pre_existing_unrelated", "external_unrelated", "unresolved",
+    ],
+    "non_blocking_dispositions": ["pre_existing_unrelated", "external_unrelated"],
+    "common_fields": ["disposition", "causal_scope_analysis", "affected_invariant_evidence"],
+    "pre_existing_fields": [
+        "base_revision", "head_revision", "same_command",
+        "baseline_observation", "head_observation",
+        "baseline_failure_signature", "head_failure_signature",
+    ],
+    "external_fields": ["independent_evidence", "retry_or_recovery_owner"],
+    "rule": (
+        "Classify every required failed or skipped validation before choosing a review verdict. "
+        "A pre-existing failure is non-blocking for review only when the same check on an "
+        "immutable base and exact head has the same normalized failing identity and detail, "
+        "the PR does not alter that failure's causal path, and the changed invariant has "
+        "independent passing evidence. Equal aggregate counts alone are insufficient. "
+        "An external failure needs independent outage or infrastructure evidence, a recovery "
+        "owner, and separate coverage of the changed invariant. Otherwise classify it as "
+        "pr_regression or unresolved and request changes. Report unrelated red checks and "
+        "their recovery separately from the PR verdict: APPROVE may be correct while merge "
+        "readiness remains on hold. Never relax a hard limit or required check to make it green."
+    ),
+}
+
+OUTCOME_IMPACT_ASSESSMENT = {
+    "dimensions": ["long_horizon", "user_experience"],
+    "decision_values": ["preserved", "improved", "accepted_tradeoff", "regression", "not_yet_proven", "not_applicable"],
+    "fields": ["decision", "reason", "inspected_path"],
+    "applicable_fields": ["before_after", "evidence_refs"],
+    "blocking_decisions": ["regression", "not_yet_proven"],
+    "rule": (
+        "Judge whether the whole PR preserves sustained useful work and the user's ability to reach "
+        "the intended outcome, even when its local feature works. For long_horizon, follow the "
+        "affected entrypoint through action, durable result and later continuation: repeated turns, "
+        "retry/restart, accumulated state, scheduling fairness or dependency return as applicable. "
+        "Look for starvation, endless replan/retry, lost commitments, duplicated effects and growing "
+        "cost without progress. A successful single call or blocker receipt is insufficient. "
+        "For user_experience, compare the real affected CLI, UI or messaging journey: setup and "
+        "repeated intervention, truthful state/readback, actionable failure, correction/cancel and "
+        "recovery. Inspect existing companion surfaces; a backend success is not a usable journey. "
+        "For an affected user journey, establish the ordinary task and expected result before "
+        "reading the implementation path. In existing before_after and walkthrough evidence, "
+        "compare required navigation, re-entry of known information, clarification, confirmation "
+        "and recovery steps with the shortest valid path through the existing authority boundary. "
+        "Explain what new information or authority each mandatory step supplies; a form that "
+        "works can still be redundant. Optional editing is not a mandatory decision. Do not "
+        "remove necessary scoped consent or correctness checks to minimize clicks. "
+        "For visible changes inspect the rendered whole viewport with representative populated "
+        "data, not only component presence: target/owner, hierarchy, truthful freshness/order "
+        "and the next action must be understandable together. Follow one risk-relevant "
+        "correction, cancel, reload or unavailable path through state readback. Identify source "
+        "revision, built/installed surface and any mocked boundary in existing evidence refs. "
+        "A fixture that supplies fresh sorted data cannot prove production freshness or sorting; "
+        "a screenshot cannot prove persistence or adoption. Reuse unchanged evidence with an "
+        "invalidation check; do not demand every viewport/state or paid model calls per PR. "
+        "Reuse concrete walkthrough and validation references; select bounded cases by changed "
+        "risk rather than requiring a long soak or every surface for every PR. Derive expected "
+        "outcomes from the accepted product contract, not from the patch. A deliberate safety, "
+        "budget or external-dependency wait is valid when its owner, release condition and resume "
+        "or terminal route are explicit; do not remove safeguards merely to keep running. "
+        "accepted_tradeoff requires an independent acceptance_basis and bounded_cost_and_recovery; "
+        "author intent alone cannot justify hidden friction or waive authority. For regression or "
+        "not_yet_proven name minimum_repair. For not_applicable identify the inspected path and "
+        "why it cannot materially affect this dimension. These declarations do not prove truth."
+    ),
+}
+
+# One bounded replacement for the former free-text compatibility justification.
+COMPATIBILITY_ASSESSMENT = {
+    "decision_values": ["not_applicable", "retain", "simplify_now", "follow_up", "not_yet_proven"],
+    "fields": ["decision", "reason"],
+    "applicable_fields": [
+        "consumer_inventory", "deployment_boundary", "persisted_contract",
+        "simpler_alternative", "validation_evidence",
+    ],
+    "deployment_boundary_values": ["co_deployed", "independent", "persisted_only", "mixed", "unknown"],
+    "blocking_decisions": ["simplify_now", "not_yet_proven"],
+    "rule": (
+        "Assess compatibility added, retained or removed at the touched boundary. "
+        "Name real callers/readers with source references and their upgrade boundary; "
+        "separate transient request decoding from persisted data/receipt/replay contracts. "
+        "Old receipts do not by themselves require an old request decoder; co-deployment "
+        "does not permit dropping persisted formats. Compare consolidation into one current "
+        "contract with explicit semantic variants against parallel version branches. "
+        "Check implicit null/absent/version-selected modes for a named typed alternative. "
+        "Re-review this tradeoff even after the previous correctness bug is fixed. "
+        "Retain compatibility for evidenced independent consumers or persisted obligations, "
+        "with its retirement/migration condition in reason. If a materially cheaper equivalent "
+        "design is required in this PR, choose simplify_now and request that bounded repair; "
+        "for a non-blocking improvement choose follow_up and name the concrete suggestion "
+        "and why deferral is safe. Do not require a new tracking task or delete versions "
+        "merely to reduce their count. Use not_yet_proven for a material unknown and "
+        "not_applicable plus a scoped reason when this boundary has no compatibility change. "
+        "Reuse walkthrough and validation references, including historical readback and "
+        "mixed-version cases where applicable; the checker validates declarations, not truth."
+    ),
+}
+
+SCOPE_COVERAGE_ASSESSMENT = {
+    "decision_values": ["not_applicable", "verified", "overbroad", "not_yet_proven"],
+    "fields": ["decision", "reason"],
+    "applicable_fields": ["authorized_scope", "scope_source", "enforcement_selector", "recovery_owner", "cases"],
+    "case_ids": ["covered_subject", "uncovered_same_container", "new_subject_after_activation",
+                 "scope_escape_attempt", "recovery_to_progress"],
+    "case_fields": ["case_id", "status", "input_and_authority", "expected_outcome",
+                    "observed_outcome", "entrypoint_and_evidence"],
+    "case_statuses": ["passed", "failed", "unverified", "not_applicable"],
+    "rule": (
+        "For an added, widened or retained gate on the touched caller path, separate authorization "
+        "to enable it, the subjects it covers, and whether each covered subject is ready/bound. "
+        "Goal/project activation alone does not prove authority over every current or future item. "
+        "Establish scope from owner intent or the accepted contract, never from the selector being reviewed. "
+        "Run covered, uncovered-in-the-same-container and newly-created-subject counterfactuals through "
+        "the real entrypoint; also test that mutable fields cannot let covered work escape. "
+        "For explicitly authorized global scope, assert that future subjects are intentionally covered. "
+        "Trace refusal through its authorized recovery owner to renewed useful work; a blocker receipt, "
+        "replan ACK or retry recommendation alone is not recovery. Share existing walkthrough/validation "
+        "references. Each inapplicable case needs a scoped reason. If the boundary contains no gate or "
+        "coverage decision, use not_applicable plus the inspected path. Retest the opposite failure "
+        "direction after a bypass or overblocking fix; fixing the latest finding is not whole-PR proof."
+    ),
+}
 
 CODE_AREAS = {
     "product_runtime",
@@ -26,6 +150,16 @@ EXAMPLE_OR_SMOKE_AREAS = {"test_or_example"}
 BEHAVIORAL_POLICY_AREAS = {"public_entry_or_policy", "agent_instruction_surface"}
 
 NEGATIVE_PATH_AREAS = CODE_AREAS | BEHAVIORAL_POLICY_AREAS
+
+SEMANTIC_CANDIDATE_DECISIONS = (
+    "reuse_existing",
+    "extend_vocabulary",
+    "create_vocabulary",
+    "local_only",
+    "external_input",
+    "compatibility_only",
+    "unknown",
+)
 
 
 def _as_mapping(value: Any) -> Mapping[str, Any]:
@@ -52,16 +186,19 @@ def _review_order(
     return [str(item.get("path") or "") for item in ranked[:limit] if item.get("path")]
 
 
-def _section(label: str, word_hint: str, instruction: str) -> dict[str, str]:
+def _section(label: str, minimum: int, instruction: str) -> dict[str, Any]:
     return {
         "label": label,
-        "word_hint": word_hint,
+        "word_hint": f"至少 {minimum} 个正文字符；不含标题、链接地址、代码和重复行",
+        "minimum_prose_characters": minimum,
         "content": "",
         "agent_instruction": instruction,
     }
 
 
 def build_review_template(item: Mapping[str, Any]) -> dict[str, Any]:
+    floors = review_body_requirements(behavior_bearing=bool(
+        set(_as_mapping(item.get("areas"))) & (CODE_AREAS | BEHAVIORAL_POLICY_AREAS)))
     key_files = [
         candidate
         for candidate in _as_sequence(item.get("key_files"))
@@ -73,65 +210,87 @@ def build_review_template(item: Mapping[str, Any]) -> dict[str, Any]:
         "sections": [
             _section(
                 "动机",
-                "200-350字",
-                "Use evidence `problem_context`: old behavior, affected caller, concrete cost, before/after outcome, and why the nearest smaller fix is or is not enough.",
+                floors["动机"],
+                "Use `problem_context`: verified goal basis, old behavior, before/after outcome and delivery verdict. Explain outcome_impact on sustained progress and the user journey, including accepted tradeoffs or scoped inapplicability. Distinguish completing the scoped goal from a justified increment; explain why this is a complete useful slice, not just why the code works.",
             ),
             _section(
                 "改动思路",
-                "300-500字",
+                floors["改动思路"],
                 "Use `architecture_flow`, `repository_reuse`, and `walkthroughs`: entry point, authoritative state, decision boundary, positive path, existing implementation comparison, and ownership trade-off. For introduced or newly enforced state, explain derivation versus irreducible intent and the real producer/trigger, not just its serializer.",
             ),
             _section(
                 "具体改动",
-                "450-800字",
+                floors["具体改动"],
                 "Use `changed_line_classification` and `symbol_map`. Code changes require `### 关键代码讲解` for 2-5 behavior-bearing exact-head symbols; docs-only changes use `### 关键内容讲解`.",
             ),
             _section(
                 "对主干的风险",
-                "250-500字",
-                "Use `failure_analysis`, `walkthroughs.negative`, and `validation_matrix`; trace each finding from triggering state to observed outcome and minimum repair. When `scope_fit` applies, name the active production caller or explicitly record a coverage-only boundary. When `change_proportionality` applies, compare verified problem impact with mechanism and maintenance cost; a resolved implementation blocker does not justify approval when the full exact-head scope remains disproportionate. For opt-in changes, prove disabled-path parity through `default_off_isolation`; do not infer isolation from an absent feature object. Use `authority_semantics` to verify that public protocol names do not claim a broader actor lifecycle or authority model than the implementation provides. Surface typed-state-rule, domain-neutrality, behavior-change-disclosure, and guidance-vs-obligation findings when their evidence applies.",
+                floors["对主干的风险"],
+                "Use `failure_analysis`, `walkthroughs.negative`, and `validation_matrix`; trace each finding from triggering state to observed outcome and minimum repair. When `scope_fit` applies, name the active production caller or explicitly record a coverage-only boundary. When `change_proportionality` applies, compare verified problem impact with mechanism and maintenance cost; a resolved implementation blocker does not justify approval when the full exact-head scope remains disproportionate. For opt-in changes, prove disabled-path parity through `default_off_isolation`; do not infer isolation from an absent feature object. Use `authority_semantics` to verify that public protocol names do not claim a broader actor lifecycle or authority model than the implementation provides. For a `semantic_alignment` contract impact or finding, include a concise `### 语义与 CI 对齐` subsection; ordinary `not_applicable` triage needs no separate subsection. For a blocker, name the current obligation, triggering change, observed evidence, minimum repair and rerun command. Surface typed-state-rule, domain-neutrality, behavior-change-disclosure, and guidance-vs-obligation findings when their evidence applies.",
             ),
             _section(
                 "我的整体评价",
-                "150-300字",
-                "Use `observable_semantics` to report baseline/head comparisons and remaining compatibility gaps; equal decision codes are insufficient. Use `code_volume`, `change_proportionality`, `default_off_isolation`, `authority_semantics`, validation results, residual risk, and exact-head freshness to state the verdict and the evidence needed for re-review.",
+                floors["我的整体评价"],
+                "State the `problem_context.outcome_impact` decisions for long_horizon and user_experience, including material tradeoffs and unresolved evidence. Use `observable_semantics` to report baseline/head comparisons and remaining compatibility gaps; equal decision codes are insufficient. Use `code_volume` (including its compatibility assessment and bounded simplification decision), `change_proportionality`, `default_off_isolation`, `authority_semantics`, validation results, residual risk, and exact-head freshness to state the verdict and the evidence needed for re-review. For semantic or constraint-related changes, state whether the PR reuses an existing vocabulary, extends one, creates one, stays local, or remains unknown, and link any required registry/RFC/CI repair.",
             ),
         ],
         "review_order": _review_order(key_files),
         "output_hint": (
             "Render the verified structured result using the five sections. "
-            "The capability-owned review_execution_contract is the evidence and completeness authority."
+            "The capability-owned review_execution_contract is the evidence and completeness authority. Save the exact final Markdown in result.review_body before check-result; publish that checked body and read it back. Section floors reject empty shells, not certify reasoning. Explain concrete paths and counterexamples; do not pad or duplicate evidence to meet a floor."
         ),
     }
 
 
-def build_review_execution_contract() -> dict[str, Any]:
+def build_review_execution_contract(*, wait_for_ci: bool = True) -> dict[str, Any]:
     return {
         "schema_version": "pull_request_review_execution_contract_v2",
         "policy_revision": REVIEW_POLICY_REVISION,
+        "approval_closeout": approval_closeout_contract(),
         "purpose": (
             "Define the evidence that must exist before a detailed review verdict; "
             "host skills route this contract but must not reimplement it."
         ),
         "evidence_status_values": ["verified", "unverified", "not_applicable"],
         "decision_procedure": {
-            "order": ["challenge_design", "falsify_claims", "inspect_implementation", "reconcile_verdict"],
+            "order": [
+                "establish_goal",
+                "challenge_design",
+                "falsify_claims",
+                "inspect_implementation",
+                "reconcile_verdict",
+            ],
+            "establish_goal": (
+                "Resolve the current requested outcome from the user request, issue/task, "
+                "accepted contract or demonstrated regression. Check changed direction "
+                "and existing related work before accepting the author's narrowed frame. "
+                "Use problem_context for one delivery judgment, referencing existing "
+                "walkthrough/validation evidence rather than another report. A roadmap "
+                "id is optional; never impose this repository's roadmap on another repo "
+                "or copy private goals into public review."
+            ),
             "challenge_design": (
                 "Before explaining how the patch works, make the strongest evidence-backed "
                 "case for not shipping it. Compare doing nothing, a smaller fix in the existing "
-                "owner, and the proposed design. Read the target repository's architecture "
+                "owner, and the proposed design against sustained useful work and the user journey. "
+                "A locally correct feature can still strand later work or impose unjustified user "
+                "intervention; assess both dimensions in problem_context.outcome_impact against the "
+                "accepted product contract. Read the target repository's architecture "
                 "and contribution rules: identify canonical state, decision/effect owner, "
                 "and capability/provider placement. A new CLI calling a new helper proves "
                 "reachability, not demand or correct ownership. Prefer derived state over "
                 "manual synchronization and deletion/relocation over a second authority. "
-                "Do not impose LoopX-specific architecture on other repositories."
+                "Use code_volume.compatibility_assessment to challenge assumed compatibility "
+                "needs before accepting additional protocol branches. Simplification includes "
+                "deletion and consolidation, not only helper extraction. Do not impose "
+                "LoopX-specific architecture on other repositories."
             ),
             "falsify_claims": (
                 "Choose the strongest material promise, not the easiest failing input. "
                 "Ask what could still be false when the author's tests pass, then probe "
                 "that counterexample through the owning real boundary. Parent exit does "
                 "not prove descendants drained; receipt/hash existence does not prove "
-                "authentic execution; feature-on success does not prove baseline parity. "
+                "authentic execution; feature-on success does not prove baseline parity. A gate may prevent bypass and still wrongly capture independent work: prove its enabled-but-out-of-scope and future-subject behavior as well. A recorded blocker is not restored progress. "
                 "If a mock supplies the very postcondition under review, it is not proof. "
                 "Inspect related open/merged changes sharing the contract, not only files "
                 "that conflict textually. Bound the search to shared callers/owners; do "
@@ -146,7 +305,8 @@ def build_review_execution_contract() -> dict[str, Any]:
             ),
             "reconcile_verdict": (
                 "Approve only when positive value, architecture fit, and applicable "
-                "evidence are established. No reproduced bug is not proof of a good design. "
+                "evidence are established. A long_horizon or user_experience regression blocks approval "
+                "even when the requested local feature is delivered and CI passes. No reproduced bug is not proof of a good design. "
                 "Unresolved material evidence means hold/request changes with the exact "
                 "missing observation, not an invented defect. Reject a mechanism when a "
                 "smaller boundary solves the demonstrated problem; do not keep adding "
@@ -158,8 +318,17 @@ def build_review_execution_contract() -> dict[str, Any]:
         "evidence_requirements": [
             {
                 "evidence_id": "problem_context",
+                "outcome_impact": OUTCOME_IMPACT_ASSESSMENT,
                 "required_when": "always",
+                "verdict_values": [
+                    "goal_achieved",
+                    "justified_increment",
+                    "off_goal",
+                    "fragmented",
+                    "not_yet_proven",
+                ],
                 "fields": [
+                    "goal_basis",
                     "author_claim",
                     "old_behavior",
                     "affected_caller_or_operator",
@@ -167,8 +336,35 @@ def build_review_execution_contract() -> dict[str, Any]:
                     "before_after_scenario",
                     "smaller_fix_analysis",
                     "observable_outcome",
+                    "outcome_impact",
                     "non_goals",
                 ],
+                "fields_by_verdict": {
+                    "justified_increment": [
+                        "remaining_gap", "next_step", "boundary_reason",
+                    ],
+                    "off_goal": ["reason", "minimum_repair"],
+                    "fragmented": ["reason", "minimum_repair"],
+                    "not_yet_proven": ["reason", "minimum_repair"],
+                },
+                "rule": (
+                    "Judge the delta against the verified requested outcome, not file/PR/test "
+                    "counts or the author's completion label. goal_achieved closes the named "
+                    "task's acceptance, not an unimplemented parent roadmap. justified_increment "
+                    "requires a real useful delta, the remaining gap, an existing or concrete "
+                    "scoped successor with its owner/dependency, and why this boundary is "
+                    "independently reviewable, testable and reversible. Reuse observable_outcome, "
+                    "walkthroughs and validation_matrix; do not duplicate their evidence. "
+                    "Valid prerequisites, characterization, research findings, documentation "
+                    "and maintenance can qualify without shipping an entire feature or "
+                    "inventing follow-up work for a completed task. Fragmentation means an "
+                    "avoidable stop before the accepted slice's useful outcome, not a small "
+                    "diff. Where applicable, follow dependencies, peer handoff, artifact "
+                    "acceptance and result return through the actual user entrypoints. "
+                    "Missing evidence is not_yet_proven; name the minimum repair. "
+                    "These are reviewer judgments, not automatic semantic detection, Goal "
+                    "settlement, a mandatory roadmap schema or a minimum batch-size policy."
+                ),
             },
             {
                 "evidence_id": "architecture_flow",
@@ -183,28 +379,102 @@ def build_review_execution_contract() -> dict[str, Any]:
                 ],
             },
             {
+                "evidence_id": "semantic_alignment",
+                "required_when": "semantic_alignment_required",
+                "verdict_values": [
+                    "aligned",
+                    "new_semantics_justified",
+                    "not_applicable",
+                    "advisory",
+                    "not_yet_proven",
+                    "violated",
+                ],
+                "fields": ["checked_scope", "impact_reason", "verdict"],
+                "fields_by_verdict": {
+                    "not_applicable": [],
+                    "aligned": ["candidate_decision", "affected_contract", "evidence_refs"],
+                    "new_semantics_justified": ["candidate_decision", "affected_contract", "evidence_refs"],
+                    "advisory": ["candidate_decision", "analysis_limit"],
+                    "not_yet_proven": [
+                        "candidate_decision", "affected_contract", "trigger",
+                        "observed_evidence", "minimum_repair", "validation_commands",
+                    ],
+                    "violated": [
+                        "candidate_decision", "affected_contract", "trigger",
+                        "observed_evidence", "minimum_repair", "validation_commands",
+                    ],
+                },
+                "candidate_decisions": list(SEMANTIC_CANDIDATE_DECISIONS),
+                "rule": (
+                    "Start with bounded triage of the full diff and relevant definitions/callers. "
+                    "Record checked_scope and impact_reason. If no shared contract is affected, "
+                    "use not_applicable and stop; no candidate_decision or full RFC read is required. "
+                    "File previews and unchanged registry paths do not prove absence of impact. "
+                    "For shared values, owners, consumers, projections or persistence changes, "
+                    "read only affected base/head contracts and reuse repository_reuse, "
+                    "observable_semantics and validation_matrix evidence through evidence_refs. "
+                    "Resolve CI obligations from the target repository's current policy; "
+                    "observed check names alone do not establish which checks are required. "
+                    "unknown due solely to bounded analysis is advisory: state analysis_limit "
+                    "and why no affected current obligation lacks required evidence. It is not "
+                    "proof of safety. Use not_yet_proven for missing required evidence on an "
+                    "affected current contract, or violated for a concrete violation. Both block "
+                    "approval and must name the contract, PR trigger, observed evidence, minimum "
+                    "repair and rerun command. Advisory cannot override a required CI failure "
+                    "or concrete blocking finding. Do not promote future/advisory RFC properties "
+                    "to current obligations. For budget failures or changes, distinguish "
+                    "hard limits from regression budgets and presentation caps. Reuse "
+                    "validation_matrix and observable_semantics for base/head measurements under the same workload and metric; "
+                    "assess consumer value, true redundancy, compatibility cost and headroom. "
+                    "Evidence-backed budget increases are valid when the owning contract and "
+                    "tests change together; compare them with compaction or retaining the limit. "
+                    "Preserve the original failure and any remaining evidence gaps. Hard limits "
+                    "still require their owner's authority. Frozen experiment or promotion thresholds "
+                    "cannot be relaxed to relabel an existing result as passing. "
+                    "Reject hiding a failure through unjustified budget increases, "
+                    "deleting decision semantics, cosmetic renaming, narrowing the scan root or "
+                    "comparison workload, or registering an unrelated value. "
+                    "Docs-only reviews may supply this same row when contract impact is found."
+                ),
+            },
+            {
                 "evidence_id": "repository_reuse",
                 "required_when": "behavior_bearing_change",
                 "verdict_values": [
-                    "reused", "separation_justified", "no_existing_candidate",
-                    "unjustified_duplication", "not_yet_proven",
+                    "reused",
+                    "separation_justified",
+                    "no_existing_candidate",
+                    "unjustified_duplication",
+                    "not_yet_proven",
                 ],
                 "fields": [
-                    "searched_revisions", "queries_and_paths", "existing_candidates",
-                    "semantic_comparison", "reuse_or_separation_reason",
-                    "state_model_assessment", "rule_ownership", "validation_evidence", "verdict",
+                    "searched_revisions",
+                    "queries_and_paths",
+                    "existing_candidates",
+                    "semantic_comparison",
+                    "reuse_or_separation_reason",
+                    "state_model_assessment",
+                    "rule_ownership",
+                    "validation_evidence",
+                    "verdict",
                 ],
                 "comparison_dimensions": [
-                    "resource_and_caller", "data_scope_and_filters",
-                    "ordering_and_pagination", "authority_and_sanitization",
+                    "resource_and_caller",
+                    "data_scope_and_filters",
+                    "ordering_and_pagination",
+                    "authority_and_sanitization",
                     "state_retry_and_failure_owner",
                 ],
                 "rule_ownership": {
                     "required_when": "retained_or_parallel_implementations",
                     "row_fields": [
-                        "business_rule", "baseline_owner", "head_owner",
-                        "retained_path_and_caller", "retention_reason",
-                        "deleted_rule_or_exit_condition", "validation",
+                        "business_rule",
+                        "baseline_owner",
+                        "head_owner",
+                        "retained_path_and_caller",
+                        "retention_reason",
+                        "deleted_rule_or_exit_condition",
+                        "validation",
                     ],
                     "rule": (
                         "For migrations, fallback paths, dual providers or old/new entrypoints, "
@@ -225,15 +495,23 @@ def build_review_execution_contract() -> dict[str, Any]:
                 "state_model_assessment": {
                     "required_when": "introduced_or_newly_enforced_state",
                     "classification_values": [
-                        "authoritative_fact", "irreducible_intent",
-                        "derived_projection", "diagnostic_hint",
+                        "authoritative_fact",
+                        "irreducible_intent",
+                        "derived_projection",
+                        "diagnostic_hint",
                     ],
                     "item_fields": [
-                        "field_or_relation", "classification", "existing_canonical_sources",
-                        "derivation_or_irreducibility_evidence", "producer_and_trigger",
-                        "authoring_discovery_path", "update_retire_and_replay_owner",
-                        "missing_stale_or_conflicting_value_behavior", "source_completeness",
-                        "counterfactual_validation", "decision",
+                        "field_or_relation",
+                        "classification",
+                        "existing_canonical_sources",
+                        "derivation_or_irreducibility_evidence",
+                        "producer_and_trigger",
+                        "authoring_discovery_path",
+                        "update_retire_and_replay_owner",
+                        "missing_stale_or_conflicting_value_behavior",
+                        "source_completeness",
+                        "counterfactual_validation",
+                        "decision",
                     ],
                     "rule": (
                         "Before accepting each added or newly enforced declaration, flag, "
@@ -282,6 +560,7 @@ def build_review_execution_contract() -> dict[str, Any]:
             },
             {
                 "evidence_id": "observable_semantics",
+                "scope_coverage": SCOPE_COVERAGE_ASSESSMENT,
                 "required_when": "behavior_bearing_change",
                 "verdict_values": [
                     "equivalent",
@@ -299,6 +578,7 @@ def build_review_execution_contract() -> dict[str, Any]:
                     "intentional_deltas",
                     "regression_sensitivity",
                     "state_projection_counterfactuals",
+                    "scope_coverage",
                     "unverified_dimensions",
                     "verdict",
                 ],
@@ -437,6 +717,7 @@ def build_review_execution_contract() -> dict[str, Any]:
             {
                 "evidence_id": "symbol_map",
                 "required_when": "code_change",
+                "items_field": "items",
                 "item_count": {"minimum": 2, "maximum": 5},
                 "item_fields": [
                     "path",
@@ -459,6 +740,8 @@ def build_review_execution_contract() -> dict[str, Any]:
             {
                 "evidence_id": "walkthroughs",
                 "required_when": "always",
+                "positive_field": "positive",
+                "negative_field": "negative",
                 "positive_fields": [
                     "trigger",
                     "ordered_symbols_or_steps",
@@ -478,8 +761,23 @@ def build_review_execution_contract() -> dict[str, Any]:
             },
             {
                 "evidence_id": "validation_matrix",
+                "ci_policy": "required" if wait_for_ci else "not_consulted",
+                "wait_for_ci": wait_for_ci,
+                "validation_source": (
+                    "Repository-native local validation and final CI observation are required. "
+                    "Attribute failed checks before judging the PR; an unrelated red check "
+                    "may hold merging without requiring code changes on this PR."
+                    if wait_for_ci else
+                    "Repository-native local validation at the reviewed head. "
+                    "Do not fetch, poll, or wait for GitHub CI. Missing, pending, "
+                    "or failed remote CI is not a review evidence gap. Attribute local "
+                    "failures against the base and changed invariant before judging the PR."
+                ),
+                "failure_attribution": VALIDATION_FAILURE_ATTRIBUTION,
                 "required_when": "always",
+                "items_field": "items",
                 "item_fields": [
+                    "case_id",
                     "invariant_or_case",
                     "command_or_check",
                     "status",
@@ -488,9 +786,18 @@ def build_review_execution_contract() -> dict[str, Any]:
                     "skip_or_failure_reason",
                 ],
                 "required_cases": [
-                    "changed invariant positive case",
-                    "material negative or failure case when applicable",
-                    "repository-required checks",
+                    {
+                        "case_id": "changed_invariant_positive",
+                        "required_when": "always",
+                    },
+                    {
+                        "case_id": "material_negative_or_failure",
+                        "required_when": "negative_walkthrough_required",
+                    },
+                    {
+                        "case_id": "repository_required_checks",
+                        "required_when": "always",
+                    },
                 ],
             },
             {
@@ -519,11 +826,12 @@ def build_review_execution_contract() -> dict[str, Any]:
                     "changed_line_shape",
                     "largest_production_hotspots",
                     "active_call_site_evidence",
-                    "compatibility_or_migration_need",
+                    "compatibility_assessment",
                     "verdict",
                     "highest_value_simplification",
                     "behavior_preserving_validation",
                 ],
+                "compatibility_assessment": deepcopy(COMPATIBILITY_ASSESSMENT),
             },
             {
                 "evidence_id": "change_proportionality",
@@ -555,6 +863,8 @@ def build_review_execution_contract() -> dict[str, Any]:
                     "mechanism is implemented. Compare verified frequency, severity, "
                     "blast radius, and recovery cost with production code, new state, "
                     "schema, CLI, caller, migration, and long-term maintenance surface. "
+                    "Reuse code_volume.compatibility_assessment rather than equating historical "
+                    "receipt recovery with a need to preserve every request version. "
                     "Correctness, green CI, and resolution of earlier review findings "
                     "are necessary but do not prove positive value. Treat "
                     "`disproportionate` and `not_yet_proven` as blocking; request the "
@@ -781,6 +1091,7 @@ def build_review_execution_contract() -> dict[str, Any]:
             "exact_head_recheck_required": True,
             "stale_head_verdict_allowed": False,
             "blocking_evidence_verdicts": {
+                "problem_context": ["off_goal", "fragmented", "not_yet_proven"],
                 "repository_reuse": ["unjustified_duplication", "not_yet_proven"],
                 "observable_semantics": ["unintended_drift", "not_yet_proven"],
                 "change_proportionality": [
@@ -795,11 +1106,24 @@ def build_review_execution_contract() -> dict[str, Any]:
                     "misleading",
                     "not_yet_proven",
                 ],
+                "semantic_alignment": ["not_yet_proven", "violated"],
             },
             "required_final_sections": REQUIRED_FINAL_SECTIONS,
         },
         "verdict_policy": {
             "open_pr_blocking_finding": "REQUEST_CHANGES",
+            "unrelated_validation_failure": (
+                "APPROVE when a required red check is independently attributed to an unchanged "
+                "pre-existing failure or external infrastructure, and the PR's changed "
+                "invariant is covered. Record the separate merge-readiness hold; do not ask "
+                "this PR to repair unrelated code or budgets. Unattributed, introduced, or "
+                "worsened failures still block approval."
+            ),
+            "open_pr_unjustified_delivery": (
+                "REQUEST_CHANGES when problem_context is off_goal, fragmented or "
+                "not_yet_proven. Green checks cannot replace an evidenced goal delta; "
+                "a justified bounded increment need not complete its parent goal."
+            ),
             "open_pr_unresolved_semantics": (
                 "REQUEST_CHANGES when observable_semantics is unintended_drift or "
                 "not_yet_proven; equal decision codes, green suites, stricter checks "
@@ -816,6 +1140,12 @@ def build_review_execution_contract() -> dict[str, Any]:
                 "REQUEST_CHANGES when change_proportionality is disproportionate "
                 "or not_yet_proven; correctness, green CI, and resolved earlier "
                 "findings cannot override this gate"
+            ),
+            "open_pr_unresolved_semantic_alignment": (
+                "REQUEST_CHANGES for semantic_alignment not_yet_proven or violated: "
+                "name the affected current contract, PR trigger, observed evidence, "
+                "minimum repair and rerun command. A bounded-analysis advisory alone "
+                "does not block approval or override other required checks."
             ),
             "materially_expanded_rereview": (
                 "Reset change_proportionality from the original problem and review "
@@ -852,6 +1182,7 @@ def build_review_plan(item: Mapping[str, Any]) -> dict[str, Any]:
     smoke_or_example_only = bool(areas & EXAMPLE_OR_SMOKE_AREAS) and not (
         code_change or behavioral_policy_change
     )
+    semantic_alignment_required = behavior_bearing_change
     required_evidence = [
         "problem_context",
         "architecture_flow",
@@ -874,11 +1205,17 @@ def build_review_plan(item: Mapping[str, Any]) -> dict[str, Any]:
             required_evidence.append("scope_fit")
         required_evidence.append("default_off_isolation")
         required_evidence.append("behavior_change_disclosure")
-    if areas & {"product_runtime", "public_entry_or_policy", "agent_instruction_surface"}:
+    if areas & {
+        "product_runtime",
+        "public_entry_or_policy",
+        "agent_instruction_surface",
+    }:
         required_evidence.append("domain_neutrality")
         required_evidence.append("guidance_vs_obligation")
     if smoke_or_example_only:
         required_evidence.append("durable_smoke_value")
+    if semantic_alignment_required:
+        required_evidence.append("semantic_alignment")
     number = item.get("number")
     head_oid = str(item.get("head_oid") or "").strip()
     target_key = f"{number}@{head_oid}" if number and head_oid else None
@@ -909,16 +1246,25 @@ def build_review_plan(item: Mapping[str, Any]) -> dict[str, Any]:
             "behavior_change_disclosure_required": behavior_bearing_change,
             "domain_neutrality_required": bool(
                 areas
-                & {"product_runtime", "public_entry_or_policy", "agent_instruction_surface"}
+                & {
+                    "product_runtime",
+                    "public_entry_or_policy",
+                    "agent_instruction_surface",
+                }
             ),
             "guidance_vs_obligation_required": bool(
                 areas
-                & {"product_runtime", "public_entry_or_policy", "agent_instruction_surface"}
+                & {
+                    "product_runtime",
+                    "public_entry_or_policy",
+                    "agent_instruction_surface",
+                }
             ),
             "smoke_or_example_only": smoke_or_example_only,
             "durable_smoke_value_required": smoke_or_example_only,
             "duplication_scan_required": smoke_or_example_only,
             "batch_pattern_scan_required": smoke_or_example_only,
+            "semantic_alignment_required": semantic_alignment_required,
         },
         "required_evidence_ids": required_evidence,
         "result_template": {
@@ -931,12 +1277,13 @@ def build_review_plan(item: Mapping[str, Any]) -> dict[str, Any]:
             },
             "findings": [],
             "residual_risk": "",
+            "review_body": "",
             "verdict": "unverified",
         },
     }
 
 
-def build_agent_response_contract() -> dict[str, Any]:
+def build_agent_response_contract(*, wait_for_ci: bool = True) -> dict[str, Any]:
     return {
         "schema_version": "pr_review_agent_response_contract_v0",
         "table_only_response_allowed": False,
@@ -944,18 +1291,34 @@ def build_agent_response_contract() -> dict[str, Any]:
         "stats_only_requires_explicit_opt_out": True,
         "queue_table_role": "preface_only",
         "default_review_scope": (
-            "Follow scheduling_policy and its ranked review_sequence, with only an explicit "
-            "request-scoped PR selection allowed to override it."
+            "Follow scheduling_policy and its ranked actionable review_sequence. An explicit "
+            "request-scoped PR selection may override ordering only; it does not override "
+            "the selected row's review_action_kind or exact-head idempotency."
         ),
+        "selection_execution_contract": {
+            "schema_version": "pr_review_selection_execution_contract_v0",
+            "explicit_selection_scope": "ordering_only",
+            "review_action_authority": "pull_requests[].review_action_kind",
+            "review_sequence_membership": "review_action_kind_non_null_only",
+            "no_action_inventory_location": "pull_requests",
+            "generic_rereview_terms_force_fresh_audit": False,
+            "no_action_behavior": "compact_exact_head_conclusion_readback_only",
+            "no_action_execution_artifacts": "plan_and_template_null_commands_empty",
+            "force_fresh_audit_requires": (
+                "An explicit request to rerun evidence despite the unchanged/no-action "
+                "exact head, or a concrete new concern or evidence invalidation, encoded "
+                "as --fresh-audit-exact-head NUMBER@HEAD_OID."
+            ),
+        },
         "required_packet_fields_to_preserve": [
             "agent_response_contract",
             "agent_response_contract.review_execution_contract",
             "result_completeness",
             "scheduling_policy",
             "review_groups",
-            "pull_requests[].review_plan",
-            "pull_requests[].review_template",
-            "pull_requests[].evidence_commands",
+            "pull_requests[review_action_kind!=null].review_plan",
+            "pull_requests[review_action_kind!=null].review_template",
+            "pull_requests[review_action_kind!=null].evidence_commands",
         ],
         "stats_only_opt_out_examples": [
             "只统计",
@@ -966,7 +1329,7 @@ def build_agent_response_contract() -> dict[str, Any]:
             "不用分析",
         ],
         "required_final_sections": REQUIRED_FINAL_SECTIONS,
-        "review_execution_contract": build_review_execution_contract(),
+        "review_execution_contract": build_review_execution_contract(wait_for_ci=wait_for_ci),
         "explanation_depth_contract": {
             "schema_version": "pr_review_explanation_depth_v0",
             "authority": "agent_response_contract.review_execution_contract",
@@ -977,10 +1340,13 @@ def build_agent_response_contract() -> dict[str, Any]:
         "instructions": [
             "Use scheduling_policy plus review_groups as the queue and require result_completeness.complete=true for exhaustive review.",
             "Start with review_execution_contract.decision_procedure, before implementation narration or prior-comment closure.",
-            "Follow the capability-ranked review_sequence; only an explicit request-scoped PR selection may override it, and Todo or monitor prose must not replace the stable policy.",
-            "Execute each pull_requests[].review_plan against the shared review_execution_contract before drafting prose.",
+            "Follow the capability-ranked actionable review_sequence; an explicit request-scoped PR selection may override ordering only, while Todo or monitor prose must not replace the stable policy.",
+            "Before evidence commands, obey pull_requests[].review_action_kind. A null action stays in pull_requests inventory but is excluded from review_sequence, carries no execution artifacts, and remains readback-only; generic re-review wording selects the PR but does not force duplicate evidence for an already concluded or merged no-action row.",
+            "Execute each non-null pull_requests[].review_plan against the shared review_execution_contract before drafting prose.",
             "Do not infer verified evidence from title, labels, changed-file counts, metadata_risk_hint, or green CI alone.",
+            ("Observe final CI in addition to repository-native local validation, then attribute red checks before judging this PR; review approval and merge readiness are separate." if wait_for_ci else "Do not fetch, poll, or wait for CI for review or merge readiness. repository_required_checks means repository-native local validation; attribute base-equivalent failures and keep missing affected-invariant evidence blocking."),
             "Recheck the exact remote head before verdict and publication.",
-            "Render the verified result through pull_requests[].review_template; host skills must not maintain a competing depth checklist.",
+            "After publishing and reading back APPROVE, execute review_execution_contract.approval_closeout; approval alone does not clear another reviewer's effective blocking review.",
+            "Render the verified result through a non-null pull_requests[].review_template; host skills must not maintain a competing depth checklist.",
         ],
     }

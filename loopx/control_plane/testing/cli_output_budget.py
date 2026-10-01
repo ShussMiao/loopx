@@ -4,6 +4,9 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from loopx.control_plane.heartbeat.agent_input import (
+    HEARTBEAT_AGENT_INPUT_SCHEMA_VERSION,
+)
 from loopx.control_plane.testing.cli_output_semantics import (
     action_signature_semantic_sha256,
     json_shape_paths as collect_json_shape_paths,
@@ -40,6 +43,8 @@ class CliOutputBudgetSpec:
     max_lines: dict[str, dict[OutputFormat, int]]
     scale_axis: str | None = None
     max_json_growth_chars_per_unit: int | None = None
+    max_json_fixed_semantic_growth_chars: int = 0
+    output_contract_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -160,16 +165,34 @@ CLI_OUTPUT_BUDGET_SPECS: tuple[CliOutputBudgetSpec, ...] = (
         markdown_anchor="# LoopX Turn Plan",
         max_chars={
             "small": {"json": 12_000, "markdown": 300},
-            "crowded": {"json": 12_000, "markdown": 300},
+            # The crowded fixture exercises the required-vision route. Its
+            # TurnEnvelope intentionally carries the complete authoring schema
+            # that the validator accepts, plus the typed executor and selection
+            # facts needed to decide whether execution is authorized. The
+            # Explicit registry routing adds 75 necessary command characters:
+            # the same fixture measured 14,482 before routing and 14,557 after.
+            # Keep the executable authority binding intact; 14,600 leaves a
+            # 43-character margin without relaxing line or per-Todo growth.
+            # The over-target TurnEnvelope diagnostic remains visible instead
+            # of hiding authority overflow; latest main renders it in 542
+            # characters, leaving a narrow 58-character presentation margin.
+            "crowded": {"json": 14_600, "markdown": 600},
             "multi_agent": {"json": 12_000, "markdown": 300},
         },
         max_lines={
             "small": {"json": 320, "markdown": 12},
-            "crowded": {"json": 320, "markdown": 12},
+            # The same latest-main fixture measures 389 lines. Keep a bounded
+            # 11-line formatting margin while the semantic character budget
+            # above remains the primary cost guard.
+            "crowded": {"json": 400, "markdown": 12},
             "multi_agent": {"json": 320, "markdown": 12},
         },
         scale_axis="todo_count",
         max_json_growth_chars_per_unit=60,
+        # The complete validator-owned vision-authoring schema appears only on
+        # the required-vision route. Account for that fixed semantic packet
+        # separately so it does not relax the per-Todo growth budget.
+        max_json_fixed_semantic_growth_chars=3_800,
     ),
     CliOutputBudgetSpec(
         surface_id="status",
@@ -250,21 +273,28 @@ CLI_OUTPUT_BUDGET_SPECS: tuple[CliOutputBudgetSpec, ...] = (
         owner="heartbeat automation",
         consumer_action="wake and route one bounded turn",
         qualification_policy="absolute_hot_path",
-        cold_path="heartbeat-prompt --compact or --full",
-        semantic_json_keys=("task_body", "quota_guard_command", "interface_budget"),
+        cold_path=(
+            "heartbeat-prompt Markdown diagnostics, --compact, or --full"
+        ),
+        semantic_json_keys=(
+            "schema_version",
+            "task_body",
+            "interface_budget",
+        ),
         markdown_anchor="# Heartbeat Automation Prompt",
         max_chars={
-            "small": {"json": 6_000, "markdown": 5_100},
-            "crowded": {"json": 6_000, "markdown": 5_100},
-            "multi_agent": {"json": 6_000, "markdown": 5_100},
+            "small": {"json": 3_400, "markdown": 5_100},
+            "crowded": {"json": 3_400, "markdown": 5_100},
+            "multi_agent": {"json": 3_400, "markdown": 5_100},
         },
         max_lines={
-            "small": {"json": 58, "markdown": 72},
-            "crowded": {"json": 58, "markdown": 72},
-            "multi_agent": {"json": 58, "markdown": 72},
+            "small": {"json": 18, "markdown": 72},
+            "crowded": {"json": 18, "markdown": 72},
+            "multi_agent": {"json": 18, "markdown": 72},
         },
         scale_axis="todo_count",
         max_json_growth_chars_per_unit=4,
+        output_contract_version=HEARTBEAT_AGENT_INPUT_SCHEMA_VERSION,
     ),
     CliOutputBudgetSpec(
         surface_id="todo_list",
@@ -580,6 +610,12 @@ CLI_OUTPUT_COMMAND_CLASSIFICATIONS: tuple[CliOutputCommandClassification, ...] =
         rationale="explicit local feedback receipt invoked on demand and sends nothing",
     ),
     CliOutputCommandClassification(
+        command_id="usage-ping",
+        qualification="explicit_cold_path_exception",
+        surface_id=None,
+        rationale="operator-invoked consent toggle and payload preview; never sends from this command",
+    ),
+    CliOutputCommandClassification(
         command_id="slash-commands",
         qualification="explicit_cold_path_exception",
         surface_id=None,
@@ -658,6 +694,18 @@ CLI_OUTPUT_COMMAND_CLASSIFICATIONS: tuple[CliOutputCommandClassification, ...] =
         rationale="explicit provider setup, sync, doctor, and gate-notification command family",
     ),
     CliOutputCommandClassification(
+        command_id="goal-portfolio",
+        qualification="explicit_cold_path_exception",
+        surface_id=None,
+        rationale="explicit manager-scoped evidence read with caller-provided goal bounds",
+    ),
+    CliOutputCommandClassification(
+        command_id="manager-inbox",
+        qualification="explicit_cold_path_exception",
+        surface_id=None,
+        rationale="explicit manager-context read and acknowledgement command family",
+    ),
+    CliOutputCommandClassification(
         command_id="goal-lifecycle",
         qualification="explicit_cold_path_exception",
         surface_id=None,
@@ -668,6 +716,18 @@ CLI_OUTPUT_COMMAND_CLASSIFICATIONS: tuple[CliOutputCommandClassification, ...] =
         qualification="qualified_default",
         surface_id="evidence_log_thin",
         rationale="bounded evidence read before replan or handoff",
+    ),
+    CliOutputCommandClassification(
+        command_id="agent-capabilities",
+        qualification="explicit_cold_path_exception",
+        surface_id=None,
+        rationale="explicit inspection or correction of one registered Agent's runtime observations",
+    ),
+    CliOutputCommandClassification(
+        command_id="handoff",
+        qualification="explicit_cold_path_exception",
+        surface_id=None,
+        rationale="explicit cross-agent Todo handoff preparation or adoption",
     ),
     CliOutputCommandClassification(
         command_id="todo",

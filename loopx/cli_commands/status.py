@@ -25,10 +25,15 @@ from ..control_plane.todos.todo_index import (
     compact_agent_lane_todo_index_for_status_display,
 )
 from ..diagnose import collect_diagnosis, render_diagnosis_markdown
+from ..control_plane.handoff.project_agent_context import build_project_agent_handoff
+from ..control_plane.handoff.handoff_fragments import render_handoff_transport
 from ..handoff_budget import build_handoff_interface_budget
 from ..presentation.renderers.status_markdown import render_status_markdown
 from ..quota import build_quota_should_run
-from ..review_packet import build_review_packet, render_review_packet_markdown
+from ..review_packet import (
+    build_review_packet,
+    render_review_packet_markdown,
+)
 from ..status import AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK, collect_status
 from .status_registration import register_status_commands as register_status_commands
 
@@ -44,7 +49,9 @@ def _scan_roots(args: argparse.Namespace) -> list[Path]:
     return scan_roots or [Path(args.scan_root).expanduser()]
 
 
-def _status_collection_limit_for_agent_lane(*, requested_limit: int, agent_id: str | None) -> int:
+def _status_collection_limit_for_agent_lane(
+    *, requested_limit: int, agent_id: str | None
+) -> int:
     safe_limit = max(0, int(requested_limit or 0))
     if str(agent_id or "").strip():
         return max(safe_limit, AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK)
@@ -121,8 +128,11 @@ def review_packet_handoff_only_payload(payload: dict[str, object]) -> dict[str, 
             "project_agent_command": payload.get("project_agent_command"),
             "project_agent_handoff": handoff_text,
             "handoff_text": handoff_text,
-            "project_agent_required_reads": payload.get("project_agent_required_reads") or [],
-            "operator_gate_approved_handoff": payload.get("operator_gate_approved_handoff"),
+            "project_agent_required_reads": payload.get("project_agent_required_reads")
+            or [],
+            "operator_gate_approved_handoff": payload.get(
+                "operator_gate_approved_handoff"
+            ),
             "connected_delivery_handoff": payload.get("connected_delivery_handoff"),
             "handoff_delivery_contract": agent_contract,
             "handoff_interface_budget": handoff_budget,
@@ -131,6 +141,12 @@ def review_packet_handoff_only_payload(payload: dict[str, object]) -> dict[str, 
             "within_budget": handoff_budget.get("within_budget"),
         }
     )
+    fragment_texts = payload.get("project_agent_handoff_fragments")
+    if isinstance(fragment_texts, list) and fragment_texts:
+        result["project_agent_handoff_fragments"] = fragment_texts
+        result["handoff_fragment_manifest"] = payload.get(
+            "handoff_fragment_manifest"
+        )
     return result
 
 
@@ -196,6 +212,7 @@ def handle_status_command(
                 goal_id=args.goal_id,
                 max_age_seconds=args.projection_cache_ttl_seconds,
                 available_capabilities=args.available_capabilities,
+                agent_lane_id=args.agent_id,
             )
         if payload is None:
             payload = collect_status(
@@ -206,6 +223,7 @@ def handle_status_command(
                 include_task_graph=args.include_task_graph,
                 goal_id=args.goal_id,
                 available_capabilities=args.available_capabilities,
+                agent_lane_id=args.agent_id,
             )
             if args.write_projection_cache:
                 cache_metadata = write_status_projection_cache(
@@ -218,6 +236,7 @@ def handle_status_command(
                     payload=payload,
                     max_age_seconds=args.projection_cache_ttl_seconds,
                     available_capabilities=args.available_capabilities,
+                    agent_lane_id=args.agent_id,
                 )
                 payload["projection_cache"] = cache_metadata
             elif cache_metadata:
@@ -239,9 +258,7 @@ def handle_status_command(
             runtime_root, args.goal_id, agent_id=args.agent_id
         )
         if pending_composition_retries is not None:
-            payload["pending_composition_retry_receipts"] = (
-                pending_composition_retries
-            )
+            payload["pending_composition_retry_receipts"] = pending_composition_retries
     except Exception as exc:
         payload = {
             "ok": False,
@@ -373,7 +390,9 @@ def _build_agent_member_projection(
     identity = guard.get("agent_identity")
     if not isinstance(identity, dict):
         return None
-    coordination = item.get("coordination") if isinstance(item.get("coordination"), dict) else {}
+    coordination = (
+        item.get("coordination") if isinstance(item.get("coordination"), dict) else {}
+    )
     profile = _agent_profile_for(coordination, agent_id)
     role = _compact_member_text(profile.get("profile_role"), limit=80)
     claims = _current_claims_with_selected_lane(item, guard=guard, agent_id=agent_id)
@@ -381,7 +400,9 @@ def _build_agent_member_projection(
         "schema_version": "agent_member_v1",
         "agent_id": agent_id,
         "agent_model": "peer_v1",
-        "profile_source": "registry.coordination.agent_profiles" if profile else "quota.agent_identity",
+        "profile_source": "registry.coordination.agent_profiles"
+        if profile
+        else "quota.agent_identity",
         "authority_source": "registry+quota_should_run+todo_projection",
         "current_claims": claims[:10],
         "current_claim_count": len(claims),
@@ -548,11 +569,8 @@ def _sync_agent_replan_obligation_from_guard(
         and (
             "autonomous_replan_obligation" in target
             or (
-                isinstance(
-                    target.get("autonomous_replan_obligations_by_agent"), dict
-                )
-                and agent_id
-                in target["autonomous_replan_obligations_by_agent"]
+                isinstance(target.get("autonomous_replan_obligations_by_agent"), dict)
+                and agent_id in target["autonomous_replan_obligations_by_agent"]
             )
         )
         for target in targets
@@ -603,11 +621,20 @@ def _agent_reward_memory_projection(
         "configured_for_agent",
         "experiment_status",
         "experiment_available",
+        "reason_code",
+        "repair",
         "config_schema_version",
         "automatic_ingest",
         "automatic_recall",
         "fail_open",
         "automation_projection_source",
+        "automation_intent",
+        "host_coverage",
+        "isolation_mode",
+        "enablement_receipt_status",
+        "actor_binding_verified",
+        "writability_verified",
+        "exact_readback_verified",
     ):
         if key in reward_memory:
             compact[key] = reward_memory[key]
@@ -856,15 +883,19 @@ def handle_review_packet_command(
             include_task_graph=not args.handoff_only,
             goal_id=args.goal_id,
             available_capabilities=args.available_capabilities,
+            agent_lane_id=args.agent_id,
         )
         if args.agent_id:
             attach_agent_lane_next_actions(status_payload, agent_id=args.agent_id)
-        payload = build_review_packet(
-            status_payload,
-            goal_id=args.goal_id,
-            action_kind=args.action_kind,
-            review_url=args.review_url,
-        )
+        if args.handoff_only:
+            payload = build_project_agent_handoff(
+                status_payload, goal_id=args.goal_id, action_kind=args.action_kind,
+            )
+        else:
+            payload = build_review_packet(
+                status_payload, goal_id=args.goal_id, action_kind=args.action_kind,
+                review_url=args.review_url,
+            )
     except Exception as exc:
         payload = {
             "ok": False,
@@ -874,7 +905,14 @@ def handle_review_packet_command(
     if args.handoff_only:
         payload = review_packet_handoff_only_payload(payload)
     if args.handoff_only and selected_format != "json" and payload.get("ok"):
-        print(str(payload.get("handoff_text") or ""))
+        fragment_texts = payload.get("project_agent_handoff_fragments")
+        if not isinstance(fragment_texts, list):
+            fragment_texts = []
+        print(
+            render_handoff_transport(
+                str(payload.get("handoff_text") or ""), fragment_texts
+            )
+        )
     else:
         print_payload(payload, selected_format, render_review_packet_markdown)
     return 0 if payload.get("ok") else 1

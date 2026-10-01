@@ -4,29 +4,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loopx"
-version = "1.0.2"
-description = "A lightweight Loop Engineering control plane for long-running agent goals."
+version = "1.2.3"
+description = "A Loop Engineering control plane for long-running agent goals (requires Node.js 22.22.3+)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "LICENSE-MIT"]
 authors = [{ name = "LoopX contributors" }]
+# No Python runtime dependencies, but the TypeScript control plane needs a
+# system Node.js >= 22.22.3 (MINIMUM_NODE_VERSION); pip cannot install it.
 dependencies = []
 
 [project.urls]
-Homepage = "https://huangruiteng.github.io/loopx/"
-Documentation = "https://huangruiteng.github.io/loopx/docs/"
-Repository = "https://github.com/huangruiteng/loopx"
-Issues = "https://github.com/huangruiteng/loopx/issues"
-Changelog = "https://github.com/huangruiteng/loopx/releases"
+Homepage = "https://loopx-project.github.io/loopx/"
+Documentation = "https://loopx-project.github.io/loopx/docs/"
+Repository = "https://github.com/loopx-project/loopx"
+Issues = "https://github.com/loopx-project/loopx/issues"
+Changelog = "https://github.com/loopx-project/loopx/releases"
 
 [project.optional-dependencies]
 deepseek-harness = [
-  "deepseek-harness-sdk==0.1.2a3",
+  "deepseek-harness-sdk==0.1.5rc1",
 ]
 test = [
   "jsonschema>=4.23,<5",
   "mcp==1.28.1",
+  "pyyaml>=6,<7",
   "types-jsonschema>=4.23,<5",
   "pytest>=9.0.3,<10",
   "pytest-cov>=5,<7",
@@ -47,18 +50,23 @@ loopx-openviking-semantic-preference = "loopx.extensions.openviking_semantic_pre
 include = ["loopx*"]
 
 [tool.setuptools.package-data]
-"loopx" = ["web/chat/*.html", "web/chat/assets/*", "web/chat/manifest.webmanifest", "web/chat/pwa/*"]
-"loopx.control_plane" = ["*.json", "*.ts"]
+"loopx" = ["web/chat/*.html", "web/chat/*.json", "web/chat/assets/*", "web/chat/manifest.webmanifest", "web/chat/pwa/*"]
+"loopx.control_plane" = ["*.json", "*.ts", "presentation/*.ts"]
+"loopx.semantics" = ["*.json"]
 "loopx.control_plane.agents" = ["*.ts"]
+"loopx.control_plane.capabilities" = ["*.ts"]
+"loopx.control_plane.collaboration" = ["*.ts"]
 "loopx.control_plane.coordination" = ["*.ts", "*.json"]
 "loopx.control_plane.goals" = ["*.ts"]
 "loopx.control_plane.quota" = ["*.ts"]
+"loopx.control_plane.runtime" = ["*.ts"]
 "loopx.control_plane.scheduler" = ["*.ts"]
-"loopx.control_plane.todos" = ["*.ts"]
+"loopx.control_plane.todos" = ["*.ts", "*.json"]
 "loopx.control_plane.turn_driver" = ["*.ts"]
 "loopx.control_plane.work_items" = ["*.ts"]
 "*" = ["README.md", "README.zh-CN.md", "docs/*.md", "docs/protocols/*.md"]
-"loopx.capabilities.content_ops" = ["templates/*.json"]
+"loopx.capabilities.content_ops" = ["templates/*.json", "experiences/*.json"]
+"loopx.capabilities.manager_context" = ["skills/loopx-manager/SKILL.md"]
 "loopx.extensions.lark" = ["extension.toml", "README.md", "docs/*.md"]
 "loopx.extensions.openviking_periodic_report" = ["extension.toml"]
 "loopx.extensions.openviking_semantic_preference" = ["extension.toml"]
@@ -71,12 +79,14 @@ include = ["loopx*"]
 [tool.setuptools.data-files]
 "share/loopx/skills/loopx-project" = [
   "skills/loopx-project/SKILL.md",
+  "skills/loopx-project/.loopx-skill-scope",
 ]
 "share/loopx/skills/loopx-project/agents" = [
   "skills/loopx-project/agents/openai.yaml",
 ]
 "share/loopx/skills/loopx-pr-program" = [
   "skills/loopx-pr-program/SKILL.md",
+  "skills/loopx-pr-program/.loopx-skill-scope",
 ]
 "share/loopx/skills/loopx-pr-program/agents" = [
   "skills/loopx-pr-program/agents/openai.yaml",
@@ -89,36 +99,47 @@ include = ["loopx*"]
 ]
 "share/loopx/skills/loopx-pr-review" = [
   "skills/loopx-pr-review/SKILL.md",
+  "skills/loopx-pr-review/.loopx-skill-scope",
 ]
 "share/loopx/skills/loopx-pr-review/agents" = [
   "skills/loopx-pr-review/agents/openai.yaml",
 ]
 "share/loopx/skills/loopx-doc-registry" = [
   "skills/loopx-doc-registry/SKILL.md",
+  "skills/loopx-doc-registry/.loopx-skill-scope",
 ]
 "share/loopx/skills/loopx-doc-registry/agents" = [
   "skills/loopx-doc-registry/agents/openai.yaml",
 ]
 "share/loopx/skills/loopx-benchmark" = [
   "skills/loopx-benchmark/SKILL.md",
+  "skills/loopx-benchmark/.loopx-skill-scope",
 ]
 "share/loopx/skills/loopx-benchmark/agents" = [
   "skills/loopx-benchmark/agents/openai.yaml",
 ]
 "share/loopx/skills/loopx-self-repair" = [
   "skills/loopx-self-repair/SKILL.md",
+  "skills/loopx-self-repair/.loopx-skill-scope",
 ]
 "share/loopx/skills/loopx-self-repair/agents" = [
   "skills/loopx-self-repair/agents/openai.yaml",
 ]
 "share/loopx/skills/loopx-self-repair/references" = [
   "skills/loopx-self-repair/references/repair-patterns.md",
+  "skills/loopx-self-repair/references/pattern-lookup.md",
+  "skills/loopx-self-repair/references/targeted-diagnostics.md",
   "skills/loopx-self-repair/references/upstream-issue-escalation.md",
+]
+"share/loopx/skills/loopx-self-repair/scripts" = [
+  "skills/loopx-self-repair/scripts/find_pattern.py",
+  "loopx/lexical_retrieval.py",
 ]
 
 [tool.pytest.ini_options]
 markers = ["stage2c_e2e: real process Stage 2C correctness and recovery acceptance"]
-norecursedirs = ["deprecate"]
+# Private snapshots are not source tests; optional provider tests run in ark-turn.yml.
+norecursedirs = [".local", "deprecate", "packages/loopx-ark-turn"]
 
 [tool.coverage.run]
 source = ["loopx"]
@@ -129,14 +150,11 @@ python_version = "3.11"
 strict = true
 files = [
   "loopx/control_plane/__init__.py",
-  "loopx/control_plane/coordination/executor.py",
-  "loopx/control_plane/coordination/file_provider.py",
-  "loopx/control_plane/coordination/head.py",
+  "loopx/control_plane/coordination/canonical_snapshot.py",
   "loopx/control_plane/coordination/local_authority_shadow_outbox.py",
   "loopx/control_plane/coordination/local_authority_shadow_projection.py",
   "loopx/control_plane/quota/effect_program.py",
   "loopx/control_plane/quota/states.py",
-  "loopx/control_plane/runtime/event_store_migration_bridge.py",
   "loopx/control_plane/runtime/time.py",
   "loopx/control_plane/runtime/trajectory_hygiene.py",
   "loopx/control_plane/scheduler/time.py",
@@ -144,6 +162,7 @@ files = [
   "loopx/control_plane/testing/authority_e2e_ladder.py",
   "loopx/control_plane/testing/authority_e2e_row_support.py",
   "loopx/control_plane/testing/authority_e2e_rows_stage2c.py",
+  "loopx/control_plane/testing/authority_e2e_rows_stage2c2.py",
   "loopx/control_plane/work_items/delivery_batch_scale.py",
   "loopx/control_plane/work_items/delivery_outcome.py",
   "loopx/control_plane/work_items/lifecycle.py",

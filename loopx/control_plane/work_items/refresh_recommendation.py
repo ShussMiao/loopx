@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..agents.agent_lane_recommendation import build_agent_lane_next_action
-from ..coordination.local_authority import read_canonical_todo_fields_if_promoted
+from ..coordination.local_authority import read_canonical_todos_if_promoted, canonical_todo_summary_fields
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
 from ..todos.active_state_todo_parser import parse_active_state_todos
 from ..todos.contract import normalize_todo_id
@@ -26,29 +27,40 @@ RECOMMENDED_ACTION_SOURCE_AGENT_TODO_FALLBACK = "agent_todo_fallback"
 RECOMMENDED_ACTION_SOURCE_DEFAULT = "default_refresh_action"
 
 
+@dataclass(frozen=True)
+class RefreshPlanningSource:
+    state_text: str
+    events: list[dict[str, Any]]
+    todo_fields: dict[str, Any] | None
+    canonical_snapshot: dict[str, Any] | None
+
+
 def load_refresh_planning_source(
     runtime_root: Path,
     goal_id: str,
     state_path: Path,
     *,
     require_display: bool,
-) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+) -> RefreshPlanningSource:
     """Read one shared planning snapshot without repairing its display.
 
     Canonical Todo availability permits observation without Markdown, not an
     edit of missing Next Action narrative. Provider failures propagate.
     """
     events = load_rollout_events(rollout_event_log_path(runtime_root, goal_id))
-    fields = read_canonical_todo_fields_if_promoted(
-        runtime_root=runtime_root, goal_id=goal_id, rollout_events=events,
-    )
+    canonical = read_canonical_todos_if_promoted(runtime_root=runtime_root, goal_id=goal_id)
+    fields = canonical_todo_summary_fields(
+        canonical["todos"], rollout_events=events,
+        goal_acceptance_contract=canonical.get("goal_acceptance_contract"),
+        goal_acceptance_work_guards=canonical.get("goal_acceptance_work_guards"),
+    ) if canonical is not None else None
     try:
         text = state_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         if fields is None or require_display:
             raise FileNotFoundError(f"state file does not exist: {state_path}") from None
         text = ""
-    return text, events, fields
+    return RefreshPlanningSource(text, events, fields, canonical)
 
 
 def _first_valid_action(values: list[str]) -> str | None:

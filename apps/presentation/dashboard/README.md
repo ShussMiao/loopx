@@ -9,12 +9,33 @@ Personal Workspace is the operator UI for Goals, Tasks, Chat, and outputs.
 The CLI and versioned control-plane projections remain the sources of truth;
 the UI does not create a second state authority.
 
+## Workspace Language / 工作区语言
+
+On first use, the workspace follows the browser's ordered language preferences:
+English uses English, and Chinese uses the available Simplified Chinese catalog.
+If neither language matches or language information is unavailable, it uses
+English. This replaces the previous unconditional Chinese default.
+
+Choose **Settings → Language** to override detection. Explicit choices remain in
+the existing `loopx-pw-locale` browser storage entry and survive reloads and
+upgrades on the same origin. A different host/port, cleared browser storage, or a
+fresh desktop webview starts detection again. When storage is blocked, language
+changes last for the current session only.
+
+首次打开时，工作区按浏览器语言偏好顺序选择英文或简体中文；没有匹配语言或无法
+获取语言信息时使用英文，替代原来固定使用中文的默认行为。
+可在 **设置 → 语言** 手动选择，同一站点来源下的刷新和升级会保留选择。
+更换主机或端口、清除浏览器存储或使用新的桌面 WebView 后会重新检测；浏览器
+禁止存储时，手动选择仅在当前会话有效。
+
+Validate this behavior with `npm run smoke:workspace-locale`; the same cases also
+run in the full development and packaged personal-workspace browser smokes.
+
 ## Fresh Clone Public Preview
 
-No private LoopX state is required for the first dashboard preview. The
-app bundles `examples/status.example.json` as its public-safe example source,
-so a fresh checkout can validate and open the UI before starting any local
-status server:
+No private LoopX state is required to validate the dashboard. The app bundles
+`examples/status.example.json` as its public-safe example source, and
+`smoke:demo-readiness` checks it without a local status server:
 
 ```bash
 cd apps/presentation/dashboard
@@ -23,15 +44,14 @@ npm run smoke:demo-readiness -- --skip-browser
 npm run dev:web
 ```
 
-Then open `http://127.0.0.1:5173/`. Use the bundled example source for a public
-demo, or switch to a loopback status URL only after you have started
-`loopx serve-status` locally. Do not commit `status.local.json` or live
-status exports; they can contain local registry/runtime paths and private
-project summaries.
-
-`npm run dev:web` starts only the Vite UI with the bundled example. `npm run dev`
-also starts the loopback status and Chat services and therefore requires a
-Python 3.11+ interpreter; see the development section below.
+`npm run dev:web` starts only the Vite UI at `http://127.0.0.1:5173/`. The
+workspace reads `/status.json` through the Vite proxy from `loopx serve-status`
+on port 8766 and the Chat APIs from `loopx chat` on port 8767, so without those
+services it opens on a status-load error. Start them locally, or use
+`npm run dev`, which also starts the loopback status and Chat services and
+therefore requires a Python 3.11+ interpreter; see the development section
+below. Do not commit `status.local.json` or live status exports; they can
+contain local registry/runtime paths and private project summaries.
 
 Personal Workspace owns Goal, Task, Chat, output, and report workflows. Run
 `loopx dashboard` for the installed local workspace; see the
@@ -105,6 +125,31 @@ URL and opens the browser/PWA route, then exits without starting a second
 server. The desktop shell reuses the same services in the opposite order, so
 the browser/PWA and native entry points can be started in either order.
 
+### Built-In Chat Agents
+
+The Agent picker is served by `/api/chat/capabilities`, so its rows come from
+the running LoopX process rather than from browser state. The built-ins are
+Codex (app-server), Claude Code, Kiro CLI, and the direct Claude/OpenAI API
+lanes; owner-registered ACP endpoints are appended after them. A row's
+`available` flag is a live probe, so an uninstalled host renders as needing
+configuration instead of failing when a session opens.
+
+Kiro CLI is reached through its own ACP agent (`kiro-cli acp`) using the same
+ACP stdio adapter as owner-registered endpoints. Override the executable when
+it is not on `PATH` under the documented name:
+
+```bash
+loopx dashboard --kiro-cli-bin /path/to/kiro-cli
+```
+
+The trust boundary is unchanged: LoopX Chat answers every ACP
+`session/request_permission` with `cancelled` and exposes no client host tools,
+so a Kiro tool call that needs approval is refused rather than auto-approved.
+LoopX passes no `--trust-all-tools`. Reaching the host this way drives one
+read-only Chat session; it is not the governed `/goal` loop, which is entered
+from a Kiro CLI session through the
+[Kiro CLI goal-mode adapter](../../../loopx/kiro_cli_goal_mode/README.md).
+
 Source-checkout development is a separate mode:
 
 ```bash
@@ -122,12 +167,20 @@ LoopX services are already running separately. Vite proxies the default
 The full-stack launcher needs a Python 3.11+ interpreter for the status and
 Chat services. It honors `LOOPX_PYTHON` first, then the Python recorded by the
 LoopX installer in `.loopx-python`, then the repository `.venv`,
-`python3.13`/`python3.12`/`python3.11` on `PATH`, and common Homebrew locations.
-If your default `python3` is older, point it at an existing interpreter:
+versioned interpreters discovered on `PATH` in descending numeric order, the
+unversioned `python3`, and common Homebrew locations. Every discovered executable
+must pass the Python compatibility probe; there is no fixed minor-version list.
+Prepare the project environment and launch from the repository root:
 
 ```bash
-LOOPX_PYTHON=/path/to/python3.12 npm run dev
+uv sync --extra test
+uv run --extra test bash scripts/dashboard-dev.sh
 ```
+
+An explicit `LOOPX_PYTHON` or a valid installer-recorded interpreter still takes
+precedence. To select the project environment explicitly after `uv sync`, set
+`LOOPX_PYTHON` to the absolute path of `.venv/bin/python`. The launcher continues
+to support existing compatible Python installations without requiring uv.
 
 Both the root dashboard and the packaged `/chat/` route expose the same
 installable PWA manifest and icons. The default `loopx dashboard` command opens
@@ -174,8 +227,8 @@ It provides a unified, coherent experience for managing long-running agent Goals
 
   ```bash
   loopx goal-lifecycle --goal-id <goal-id> --operation stop
-  loopx goal-lifecycle --goal-id <goal-id> --operation stop --execute
-  loopx goal-lifecycle --goal-id <goal-id> --operation resume --execute
+  loopx goal-lifecycle --goal-id <goal-id> --operation stop --actor-kind owner --execute
+  loopx goal-lifecycle --goal-id <goal-id> --operation resume --actor-kind owner --execute
   loopx quota status --goal-id <goal-id>
   ```
 
@@ -250,11 +303,13 @@ Wildcard hosts, negated patterns, `IdentityFile`, `ProxyCommand`, hostnames,
 credentials, and config paths are never projected to the browser. The manual
 loopback-URL path remains available for custom forwarding setups.
 
-The browser catalog stores only the selected alias label and loopback URL;
-LoopX does not store SSH credentials or open the tunnel. The active source
-reports its connection health. Local stays interactive, while every custom
-SSH-tunnel source is explicitly read-only even though its forwarded URL is
-loopback.
+The browser catalog stores the selected alias, label, and loopback URL; LoopX
+does not store SSH credentials or open the tunnel. The active source reports
+its connection health. Local stays interactive. A source bound to an exact
+configured alias may stop or resume a Goal through the same typed
+`goal-lifecycle` contract on that remote host. Manual URLs and all other
+remote controls stay read-only; remote lifecycle never falls back to a local
+Goal with the same id.
 
 The switcher intentionally has no synthetic **All** source. Independent status
 feeds do not yet share authority, identity, or deduplication semantics, so
@@ -395,18 +450,6 @@ usable. It uses an installed Playwright package or the Codex bundled runtime
 when available, and starts Vite through the local `vite` package rather than
 depending on `npm` / `npx` being on `PATH`.
 
-The ops decision-freshness smoke protects the detailed `?view=ops` panel with
-two public fixtures: a live-like zero-item summary and a stale/rebase-required
-decision example. It verifies the rendered Chinese/English operator copy,
-counts, top affected goal, and exact-replay wording instead of relying only on
-source-string checks.
-
-The promotion-readiness smoke protects the detailed `?view=ops` panel with
-fresh, stale, and missing readiness fixtures. It verifies the status badges,
-readiness/rerun decision, artifact window, age, reason, and source-of-truth copy
-for canary promotion readiness. The canonical fixture/browser script is
-`examples/dashboard-promotion-readiness-browser-smoke.mjs`; use the npm script
-above instead of calling ad hoc duplicate filenames.
 The grouped demo-readiness path also runs `examples/promotion-gate-smoke.py`
 before browser checks, so the structured `gate_state`, `can_promote`, and
 `should_warn` contract is covered even when browser smokes are skipped.
@@ -415,3 +458,7 @@ The throttled smoke protects the "quiet scheduling state" first screen. The
 operator-gate smoke protects planned high-complexity goals: they should appear
 as controller/user actions, not Codex-ready work. Those older browser smokes
 still use the local Playwright CLI wrapper.
+
+## Packaged frontend delivery
+
+Generated Chat assets are not committed. See [frontend delivery](../../../docs/development/frontend-delivery.md) for source rebuilds, SHA-bound CI artifacts, package validation and the one-delivery upgrade window.

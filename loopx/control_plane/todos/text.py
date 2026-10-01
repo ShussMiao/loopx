@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import re
+from typing import Any
 
-
-TODO_PRIORITY_PREFIX_PATTERN = re.compile(r"^\[(P[0-4])\]\s+", re.IGNORECASE)
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from .todo_semantics import todo_priority_label
 
 
 def normalize_new_todo(text: str) -> str:
@@ -14,17 +14,16 @@ def normalize_new_todo(text: str) -> str:
 
 
 def todo_priority_prefix(text: str | None) -> str | None:
-    match = TODO_PRIORITY_PREFIX_PATTERN.match(str(text or "").strip())
-    if not match:
-        return None
-    return match.group(1).upper()
+    return todo_priority_label({"text": str(text or "")})
 
 
-def inherit_todo_priority(next_text: str, source_text: str | None) -> str:
-    normalized = normalize_new_todo(next_text)
-    if todo_priority_prefix(normalized):
-        return normalized
-    source_priority = todo_priority_prefix(source_text)
-    if not source_priority:
-        return normalized
-    return f"[{source_priority}] {normalized}"
+def plan_todo_priority(todo: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+    try:
+        result = effect_runtime_result("todo.priority.plan", {
+            "schema_version": "todo_priority_request_v0", "todo": todo, "intent": intent,
+        })
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+    if not isinstance(result, dict):
+        raise RuntimeError("Todo priority plan must be an object")
+    return result

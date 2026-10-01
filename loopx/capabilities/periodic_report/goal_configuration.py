@@ -5,6 +5,8 @@ from copy import deepcopy
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .cadence import normalize_report_cadence
+
 
 GoalPeriodicReportChange = tuple[bool, dict[str, Any] | None]
 
@@ -20,7 +22,7 @@ def configuration_summary(goal: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def normalize_configuration(value: Mapping[str, Any]) -> dict[str, Any]:
-    allowed = {"enabled", "profile_preset", "route_ref", "timezone"}
+    allowed = {"enabled", "profile_preset", "route_ref", "timezone", "schedule"}
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise ValueError(
@@ -30,22 +32,29 @@ def normalize_configuration(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(enabled, bool):
         raise TypeError("periodic_report.enabled must be a boolean")
     timezone = str(value.get("timezone") or "UTC").strip()
-    try:
-        ZoneInfo(timezone)
-    except ZoneInfoNotFoundError as exc:
-        raise ValueError("periodic_report.timezone is unknown") from exc
+    if timezone != "UTC":
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("periodic_report.timezone is unknown") from exc
     profile_preset = str(value.get("profile_preset") or "").strip()
     route_ref = str(value.get("route_ref") or "").strip()
     if enabled and (not profile_preset or not route_ref):
         raise ValueError(
             "enabled periodic_report requires profile_preset and route_ref"
         )
-    return {
+    normalized = {
         "enabled": enabled,
         "profile_preset": profile_preset or None,
         "route_ref": route_ref or None,
         "timezone": timezone,
     }
+    schedule = normalize_report_cadence(value.get("schedule"))
+    if schedule is not None:
+        if schedule["timezone"] != timezone:
+            raise ValueError("schedule.timezone must match periodic_report.timezone")
+        normalized["schedule"] = schedule
+    return normalized
 
 
 def normalize_change(

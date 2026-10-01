@@ -5,16 +5,23 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
+import hashlib
+import re
 
 from ...agent_registry import registered_agent_ids_from_registry
+from ..coordination.authority_source_capture import authority_registry_source
 from ...state_refresh import now_local
 from ..coordination.local_authority import (
+    LOCAL_AUTHORITY_SOURCES,
     LocalCoordinationAuthorityUnavailable,
     read_canonical_todos_if_promoted,
 )
-from ..effect_runtime import effect_runtime_result
+from ..effect_runtime import (
+    CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+    EffectRuntimeResponseAmbiguous,
+    effect_runtime_result,
+)
 from .contract import (
-    build_todo_id,
     normalize_todo_metadata_for_write,
     normalize_todo_task_class,
     todo_done_for_status,
@@ -26,6 +33,7 @@ from .completion_validation_projection import (
 )
 from .completion_validation_store import (
     persist_completion_validation_declaration,
+    prepare_completion_validation_declaration,
     read_completion_validation_declaration,
 )
 from .provider_projection import settle_canonical_todo_projection
@@ -36,17 +44,19 @@ def create_canonical_todo_if_promoted(
     text: str, status: str, actor_agent_id: str | None,
     claimed_by: str | None, metadata: dict[str, Any], dry_run: bool,
     project: Path | None = None, state_file: Path | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, Any] | None:
     canonical = read_canonical_todos_if_promoted(
         runtime_root=runtime_root, goal_id=goal_id
     )
     if canonical is None:
         return None
-    section = "Agent Todo" if role == "agent" else "User Todo"
-    same_role_count = sum(1 for item in canonical["todos"] if item["role"] == role)
-    todo_id = build_todo_id(
-        role=role, source_section=section, index=same_role_count + 1, text=text
-    )
+    if operation_id is not None and not re.fullmatch(r"[A-Za-z0-9_.:-]+", operation_id):
+        raise ValueError("operation_id must be a non-empty public-safe token")
+    operation_id = operation_id if operation_id is not None else f"todo-create:{uuid4().hex}"
+    # Identity is independent of current Todo count: exact retries still address
+    # the original operation after other creates, edits, completion or archive.
+    todo_id = "todo_" + hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:24]
     normalized_metadata = normalize_todo_metadata_for_write(metadata)
     validation_source = {
         **normalized_metadata,
@@ -63,6 +73,8 @@ def create_canonical_todo_if_promoted(
     }
     validation_declaration = completion_validation_declaration(validation_source)
     provider_metadata = project_completion_validation_authority(validation_source)
+    # TS owns the commit timestamp; transport retries must not change intent.
+    provider_metadata.pop("updated_at", None)
     todo = {
         "schema_version": "todo_domain_record_v0",
         "todo_id": todo_id,
@@ -76,27 +88,42 @@ def create_canonical_todo_if_promoted(
             action_kind=provider_metadata.get("action_kind"),
         ),
         **provider_metadata,
+        **{key: metadata[key] for key in ("priority", "title") if key in metadata and metadata.get("priority") is not None},
         **({"claimed_by": claimed_by} if claimed_by else {}),
     }
-    result = effect_runtime_result(
-        "coordination.local_authority.todo_create",
-        {
-            "schema_version": "loopx_local_coordination_todo_create_request_v0",
-            "runtime_root": str(runtime_root.resolve()),
-            "goal_id": goal_id,
-            "todo": todo,
-            "actor_agent_id": actor_agent_id,
-            "registered_agents": registered_agent_ids_from_registry(
-                registry_path, goal_id
-            ),
-            "operation_id": f"todo-create:{uuid4().hex}",
-            "dry_run": dry_run,
-            "observed_at": now_local(),
-        },
-    )
+    with authority_registry_source(registry_path) as registry_source:
+        registered = registered_agent_ids_from_registry(registry_path, goal_id)
+    if validation_declaration is not None and not dry_run:
+        prepare_completion_validation_declaration(runtime_root=runtime_root,
+            goal_id=goal_id, declaration=validation_declaration)
+    try:
+        result = effect_runtime_result(
+            "coordination.local_authority.todo_create",
+            {
+                "schema_version": "loopx_local_coordination_todo_create_request_v1",
+                "runtime_root": str(runtime_root.resolve()),
+                "goal_id": goal_id,
+                "todo": todo,
+                "actor_agent_id": actor_agent_id,
+                "registered_agents": registered,
+                "registry_source": registry_source,
+                "operation_id": operation_id,
+                "dry_run": dry_run,
+                "observed_at": now_local(),
+            },
+            timeout=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+        )
+    except EffectRuntimeResponseAmbiguous as error:
+        raise LocalCoordinationAuthorityUnavailable(
+            "Todo create may have committed; inspect todo receipt with this operation id, "
+            "then retry the same todo add intent with --operation-id",
+            code="todo_create_response_ambiguous",
+            payload={"goal_id": goal_id, "operation_id": operation_id,
+                     "recovery": {"operation_id": operation_id, "retry_with_same_operation_id": True}},
+        ) from error
     if not isinstance(result, dict) or result.get("status") not in {
         "applied", "recovered", "replayed", "no_change", "planned",
-    } or result.get("source_authority") != "file_v0" or (
+    } or result.get("source_authority") not in LOCAL_AUTHORITY_SOURCES or (
         result.get("decision_read_from_provider") is not True
         or result.get("legacy_fallback_used") is not False
     ):
@@ -104,7 +131,7 @@ def create_canonical_todo_if_promoted(
         raise LocalCoordinationAuthorityUnavailable(
             str(payload.get("reason") or "canonical Todo create failed; reread before retry"),
             code=str(payload.get("reason_code") or payload.get("conflict_kind")
-                     or "todo_create_failed"), payload=payload,
+                     or "todo_create_failed"), payload={**payload, "operation_id": operation_id},
         )
     canonical_todo_id = str(result.get("todo_id") or "")
     canonical_todo = result.get("todo")
@@ -123,28 +150,35 @@ def create_canonical_todo_if_promoted(
                 "accepted canonical Todo does not match its private validation declaration",
                 code="todo_create_validation_publication_mismatch",
                 payload={
-                    "source_authority": "file_v0",
+                    "source_authority": result.get("source_authority"),
                     "goal_id": goal_id,
                     "todo_id": canonical_todo_id or None,
                     "provider_status": result.get("status"),
                 },
             )
-        persist_completion_validation_declaration(
-            runtime_root=runtime_root,
-            goal_id=goal_id,
-            todo_id=canonical_todo_id,
-            declaration=validation_declaration,
-        )
+        # A replay describes the original create, not the current validator.
+        # Never deliberately regress the compatibility alias after a revision.
+        current_todo = canonical_todo
+        if result.get("status") in {"recovered", "replayed"}:
+            current = read_canonical_todos_if_promoted(runtime_root=runtime_root, goal_id=goal_id)
+            current_todo = next((item for item in (current or {}).get("todos", [])
+                                 if item.get("todo_id") == canonical_todo_id), {})
+        if current_todo.get("completion_validation_sha256") == expected_digest:
+            persist_completion_validation_declaration(
+                runtime_root=runtime_root, goal_id=goal_id, todo_id=canonical_todo_id,
+                declaration=validation_declaration,
+            )
         if read_completion_validation_declaration(
             runtime_root=runtime_root,
             goal_id=goal_id,
             todo_id=canonical_todo_id,
+            expected_digest=expected_digest,
         ) != validation_declaration:
             raise LocalCoordinationAuthorityUnavailable(
                 "accepted Todo validation declaration failed private-store readback",
                 code="todo_create_validation_publication_readback_mismatch",
                 payload={
-                    "source_authority": "file_v0",
+                    "source_authority": result.get("source_authority"),
                     "goal_id": goal_id,
                     "todo_id": canonical_todo_id,
                     "provider_status": result.get("status"),
@@ -152,6 +186,7 @@ def create_canonical_todo_if_promoted(
             )
     settled = settle_canonical_todo_projection({
         "ok": True,
+        "operation_id": operation_id,
         "goal_id": goal_id,
         "role": role,
         "todo_id": canonical_todo_id or todo_id,

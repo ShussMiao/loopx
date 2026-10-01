@@ -9,12 +9,10 @@ Exit 0 = clean (public-safe); exit 1 = any hit (fail-closed).
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
 from pathlib import Path
 
-from .scanner import ScanResult, compact_json, scan_paths
+from .scanner import compact_json, scan_paths
 
 
 def _iter_text_files(root: Path):

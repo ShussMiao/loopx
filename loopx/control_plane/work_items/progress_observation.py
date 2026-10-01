@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from ...turn_identity import normalize_turn_instance_id
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
 from ..goals.goal_vision_state import normalize_goal_vision_state
 from ..todos.contract import (
     normalize_todo_task_domain,
@@ -36,31 +37,7 @@ TERMINAL_RESULT_CLASSES = {
     ProgressResultClass.EXPLORATION_EXHAUSTED.value,
     ProgressResultClass.NO_FOLLOWUP.value,
 }
-REPLAN_REQUIRED_OUTCOMES = (
-    "new_surface",
-    "new_hypothesis",
-    "new_probe_family",
-    "new_runnable_successor",
-    "coverage_backed_exploration_exhausted",
-    "new_concrete_blocker",
-    "coverage_backed_no_followup",
-)
-VISION_REPLAN_TRIGGER_KINDS = frozenset(
-    {
-        "vision_acceptance_gap",
-        "vision_checkpoint_missing",
-        "vision_outcome_checkpoint_required",
-        "vision_successor_required",
-        "required_agent_vision_missing",
-    }
-)
-VISION_REPLAN_REQUIRED_OUTCOMES = (
-    "fresh_vision_path_outcome",
-    "new_runnable_successor",
-    "new_concrete_blocker",
-    "coverage_backed_exploration_exhausted",
-    "coverage_backed_no_followup",
-)
+# Legacy ACK readback vocabulary; discharge authority lives in replan_semantics.ts.
 FRESH_VISION_PATH_DISPOSITIONS = frozenset(
     {"continue", "no_change", "replan"}
 )
@@ -216,54 +193,13 @@ def typed_progress_repeat_trigger(
     agent_id: str | None,
     threshold: int = PROGRESS_REPEAT_THRESHOLD,
 ) -> dict[str, Any] | None:
-    """Return a repeat trigger only for consecutive equivalent typed rows."""
+    """Compatibility entrypoint for the shared TypeScript history window."""
+    from .replan_history_codec import project_replan_history
 
-    required_count = max(2, int(threshold))
-    normalized_agent_id = str(agent_id or "").strip()
-    observations: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
-    observed_turn_instance_ids: set[str] = set()
-    for run in newest_first_runs:
-        run_agent_id = str(run.get("agent_id") or "").strip()
-        if normalized_agent_id and run_agent_id not in {"", normalized_agent_id}:
-            continue
-        turn_instance_id = _progress_turn_instance_id(run)
-        if turn_instance_id and turn_instance_id in observed_turn_instance_ids:
-            continue
-        observation = progress_observation_from_run(run)
-        if observation is None:
-            if observations:
-                break
-            continue
-        observations.append((run, observation))
-        if turn_instance_id:
-            observed_turn_instance_ids.add(turn_instance_id)
-        if len(observations) >= required_count:
-            break
-    if len(observations) < required_count:
-        return None
-    fingerprints = {item[1]["fingerprint"] for item in observations}
-    if len(fingerprints) != 1:
-        return None
-    result_class = observations[0][1]["result_class"]
-    if result_class not in {
-        ProgressResultClass.UNCHANGED.value,
-        ProgressResultClass.BLOCKED.value,
-    }:
-        return None
-    baseline = observations[0][1]
-    return {
-        "kind": PROGRESS_REPEAT_TRIGGER_KIND,
-        "schema_version": PROGRESS_OBSERVATION_SCHEMA_VERSION,
-        "agent_id": normalized_agent_id or None,
-        "run_count": required_count,
-        "threshold": required_count,
-        "progress_fingerprint": baseline["fingerprint"],
-        "progress_baseline": baseline,
-        "latest_generated_at": str(observations[0][0].get("generated_at") or ""),
-        "oldest_counted_generated_at": str(
-            observations[-1][0].get("generated_at") or ""
-        ),
-    }
+    return project_replan_history(
+        newest_first_runs, operation="progress", agent_id=agent_id,
+        stall_threshold=threshold,
+    )
 
 
 def _has_new_terminal_coverage(
@@ -284,12 +220,35 @@ def _has_new_terminal_coverage(
     return False
 
 
+def _normalized_window(
+    window: Iterable[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Normalize the typed observations an obligation window already holds."""
+
+    normalized: list[dict[str, Any]] = []
+    for item in window or ():
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            normalized.append(normalize_progress_observation(item))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return normalized
+
+
 def semantic_progress_delta(
     observation: Mapping[str, Any] | None,
     *,
     baseline: Mapping[str, Any] | None,
+    window: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Qualify a typed observation as a replan-closing semantic delta."""
+    """Qualify a typed observation as a replan-closing semantic delta.
+
+    `baseline` is the observation the delta kinds are computed against.
+    `window` lists every typed observation already claimed while the
+    obligation formed; the codec reports novelty facts against the whole
+    window so an outcome owner can refuse a replayed claim.
+    """
 
     if not isinstance(observation, Mapping):
         return {"accepted": False, "reason": "typed progress observation missing"}
@@ -299,6 +258,7 @@ def semantic_progress_delta(
         if isinstance(baseline, Mapping)
         else None
     )
+    claimed = _normalized_window(window)
     result_class = current["result_class"]
     delta_kinds: list[str] = []
     if result_class == ProgressResultClass.ADVANCED.value:
@@ -335,10 +295,24 @@ def semantic_progress_delta(
             and _has_new_terminal_coverage(current, prior)
         ):
             delta_kinds.append("coverage_backed_no_followup")
+    # Novelty facts are computed here against the baseline and every claim in
+    # the obligation window; which obligation sources require them behind a
+    # renamed surface, hypothesis or probe family is decided by the TypeScript
+    # outcome owner (work_item.replan_semantics).
+    known_evidence: set[str] = set(prior.get("evidence_ids") or []) if prior else set()
+    known_fingerprints: set[str] = {prior["fingerprint"]} if prior else set()
+    for item in claimed:
+        known_evidence.update(item.get("evidence_ids") or [])
+        known_fingerprints.add(item["fingerprint"])
+    evidence_novel = bool(set(current.get("evidence_ids") or []) - known_evidence)
+    observation_repeated = current["fingerprint"] in known_fingerprints
     return {
         "schema_version": "replan_semantic_delta_v0",
         "accepted": bool(delta_kinds),
         "delta_kinds": delta_kinds,
+        "evidence_novel": evidence_novel,
+        "observation_repeated": observation_repeated,
+        "window_size": len(claimed),
         "observation_fingerprint": current["fingerprint"],
         "baseline_fingerprint": prior.get("fingerprint") if prior else None,
         "reason": (
@@ -349,31 +323,44 @@ def semantic_progress_delta(
     }
 
 
-def required_semantic_outcomes(
+def replan_writeback_requirements(
     obligation: Mapping[str, Any],
-) -> list[str]:
-    """Return exact typed outcomes accepted by this obligation source."""
+) -> dict[str, Any]:
+    """Adapt the shared typed discharge policy for CLI and host projection."""
+    try:
+        result = effect_runtime_result("work_item.replan_semantics.project", {
+            "operation": "requirements", "obligation": dict(obligation),
+        })
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+    if not isinstance(result, Mapping):
+        raise RuntimeError("TypeScript replan requirements must be an object")
+    return dict(result)
 
-    declared = [
-        str(value or "").strip()
-        for value in (obligation.get("satisfying_semantic_outcomes") or [])
-        if str(value or "").strip()
-    ]
-    known = set(REPLAN_REQUIRED_OUTCOMES) | set(VISION_REPLAN_REQUIRED_OUTCOMES)
-    if declared:
-        if any(value not in known for value in declared):
-            raise ValueError(
-                "satisfying_semantic_outcomes contains an unknown typed outcome"
-            )
-        return list(dict.fromkeys(declared))
-    trigger_kinds = {
-        str(trigger.get("kind") or "").strip()
-        for trigger in (obligation.get("triggers") or [])
-        if isinstance(trigger, Mapping)
-    }
-    if trigger_kinds & VISION_REPLAN_TRIGGER_KINDS:
-        return list(VISION_REPLAN_REQUIRED_OUTCOMES)
-    return list(REPLAN_REQUIRED_OUTCOMES)
+
+def required_semantic_outcomes(obligation: Mapping[str, Any]) -> list[str]:
+    return list(replan_writeback_requirements(obligation)["required_any_of"])
+
+
+def guarded_replan_transition_delta(
+    *, guard_scoped: bool, selected_obligation_id: str | None,
+    transition_acks: list[dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """Adapt revalidated canonical receipts to the TS-owned exact Turn gate."""
+    try:
+        result = effect_runtime_result("work_item.replan_semantics.project", {
+            "operation": "turn_transition", "guard_scoped": guard_scoped,
+            "selected_obligation_id": selected_obligation_id,
+            "transition_acks": transition_acks,
+        })
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+    if not isinstance(result, Mapping) or "semantic_delta" not in result:
+        raise RuntimeError("TypeScript guarded replan transition shape mismatch")
+    delta = result["semantic_delta"]
+    if delta is not None and not isinstance(delta, Mapping):
+        raise RuntimeError("TypeScript guarded replan delta must be an object or null")
+    return dict(delta) if delta is not None else None
 
 
 def replan_obligation_trigger_kinds(
@@ -396,20 +383,15 @@ def replan_obligation_trigger_checkpoints(
 ) -> list[dict[str, str]]:
     """Bind an ACK to typed trigger revisions supplied by the obligation."""
 
-    checkpoints: list[dict[str, str]] = []
-    for trigger in obligation.get("triggers") or []:
-        if not isinstance(trigger, Mapping):
-            continue
-        kind = str(trigger.get("kind") or "").strip()
-        frontier_revision = str(trigger.get("frontier_revision") or "").strip()
-        if not kind or not frontier_revision:
-            continue
-        checkpoints.append(
-            {
-                "kind": kind,
-                "frontier_revision": frontier_revision,
-            }
-        )
+    triggers = obligation.get("triggers")
+    if not triggers:
+        return []
+    checkpoints = effect_runtime_result("todo.frontier_revision.project", {
+        "schema_version": "todo_frontier_revision_request_v0",
+        "operation": "trigger_checkpoints", "triggers": triggers,
+    })["trigger_checkpoints"]
+    if not isinstance(checkpoints, list):
+        raise TypeError("typed frontier checkpoint response must be a list")
     return checkpoints
 
 
@@ -437,81 +419,37 @@ def semantic_delta_from_writeback(
             ),
             None,
         )
+    window = obligation.get("progress_window")
+    if not isinstance(window, list):
+        window = next(
+            (
+                trigger.get("progress_window")
+                for trigger in (obligation.get("triggers") or [])
+                if isinstance(trigger, Mapping)
+                and isinstance(trigger.get("progress_window"), list)
+            ),
+            None,
+        )
     observation_delta = semantic_progress_delta(
         progress_observation,
         baseline=baseline if isinstance(baseline, Mapping) else None,
+        window=window if isinstance(window, list) else None,
     )
-    outcomes = list(observation_delta.get("delta_kinds") or [])
-
-    no_followup_consistency_error: str | None = None
-    if "coverage_backed_no_followup" in outcomes:
-        vision_state = ""
-        path_outcome = ""
-        if isinstance(agent_vision, Mapping):
-            vision_state = normalize_goal_vision_state(agent_vision.get("state"))
-            raw_path_delta = agent_vision.get("path_delta")
-            path_delta: Mapping[str, Any] = (
-                raw_path_delta if isinstance(raw_path_delta, Mapping) else {}
-            )
-            path_outcome = str(path_delta.get("outcome") or "").strip()
-        if vision_state != "no_followup" or path_outcome != "stop":
-            outcomes.remove("coverage_backed_no_followup")
-            no_followup_consistency_error = (
-                "coverage-backed no-follow-up requires agent_vision.state="
-                "no_followup and path_delta.outcome=stop"
-            )
-
-    if isinstance(agent_vision, Mapping):
-        raw_patch = agent_vision.get("vision_patch")
-        patch: Mapping[str, Any] = (
-            raw_patch if isinstance(raw_patch, Mapping) else {}
-        )
-        raw_path_delta = agent_vision.get("path_delta")
-        path_delta = (
-            raw_path_delta if isinstance(raw_path_delta, Mapping) else {}
-        )
-        path_outcome = str(path_delta.get("outcome") or "").strip()
-        evidence_refs = [
-            str(value or "").strip()
-            for value in (path_delta.get("evidence_refs") or [])
-            if str(value or "").strip()
-        ]
-        if (
-            str(patch.get("acceptance_summary") or "").strip()
-            and path_outcome in FRESH_VISION_PATH_DISPOSITIONS
-            and evidence_refs
-            and "fresh_vision_path_outcome" not in outcomes
-        ):
-            outcomes.append("fresh_vision_path_outcome")
-
-    required = required_semantic_outcomes(obligation)
-    satisfying = [outcome for outcome in outcomes if outcome in required]
-    if no_followup_consistency_error:
-        satisfying = []
+    vision = dict(agent_vision) if isinstance(agent_vision, Mapping) else {}
+    if vision:
+        vision["state"] = normalize_goal_vision_state(vision.get("state"))
+    try:
+        result = effect_runtime_result("work_item.replan_semantics.project", {
+            "operation": "qualify", "obligation": dict(obligation),
+            "observation_delta": observation_delta, "agent_vision": vision,
+        })
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
     return {
-        "schema_version": "replan_semantic_delta_v0",
-        "accepted": bool(satisfying),
-        "outcomes": outcomes,
-        "satisfying_outcomes": satisfying,
-        "required_any_of": required,
+        **result,
         "trigger_kinds": replan_obligation_trigger_kinds(obligation),
         "trigger_checkpoints": replan_obligation_trigger_checkpoints(obligation),
         "obligation_id": obligation.get("obligation_id"),
-        "observation_fingerprint": observation_delta.get(
-            "observation_fingerprint"
-        ),
-        "reason": (
-            "writeback changes an outcome accepted by this obligation source"
-            if satisfying
-            else no_followup_consistency_error
-            if no_followup_consistency_error
-            else "writeback does not satisfy this obligation's typed outcomes"
-        ),
-        **(
-            {"reason_code": "no_followup_vision_path_inconsistent"}
-            if no_followup_consistency_error
-            else {}
-        ),
     }
 
 
@@ -608,6 +546,9 @@ def build_replan_action_packet(
     agent_id: str | None = None,
     bounded_research_frontier: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    settlement_packet = obligation.get("settlement_action_packet")
+    if isinstance(settlement_packet, Mapping):
+        return dict(settlement_packet)
     context = obligation.get("replan_context")
     if not isinstance(context, Mapping):
         raise TypeError("replan obligation is missing host-projected context")
@@ -646,7 +587,8 @@ def build_replan_action_packet(
             "explore_result_node_refs"
         ),
     )
-    writeback_contract: dict[str, Any] = {}
+    requirements = replan_writeback_requirements(obligation)
+    writeback_contract = requirements["writeback_contract"]
     successor_summary = str(
         selected_gap_values.get("successor_summary") or ""
     ).strip()[:240]
@@ -695,6 +637,7 @@ def build_replan_action_packet(
         "obligation_id": obligation.get("obligation_id"),
         "uncovered_frontier": context.get("uncovered_frontier"),
         "required_outcome": "semantic_delta",
+        "planning_guidance": requirements["planning_guidance"],
         "writeback_contract": writeback_contract,
         "allowed_terminal": [
             ProgressResultClass.EXPLORATION_EXHAUSTED.value,

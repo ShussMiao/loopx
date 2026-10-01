@@ -6,6 +6,7 @@ import type { JsonObject } from "../../loopx/control_plane/effect_program.ts";
 import { canonicalAuthoritySha256 } from "../../loopx/control_plane/coordination/authority_store_codec.ts";
 import * as schemas from "../../loopx/control_plane/coordination/coordination_state_contract.generated.ts";
 import { commitLocalAuthorityShadowEntry, readLocalAuthorityShadow } from "../../loopx/control_plane/coordination/local_authority_shadow.ts";
+import { composeLocalAuthorityShadowHead } from "../../loopx/control_plane/coordination/local_authority_shadow.ts";
 import { bootstrapCoordinationRuntimeShadow, commitCoordinationRuntimeShadow, inspectCoordinationRuntimeShadow,
   qualifyCoordinationRuntimeShadow, readCoordinationRuntimeShadowTodoCandidate, rollbackCoordinationRuntimeShadow } from "../../loopx/control_plane/coordination/runtime_shadow.ts";
 import { fixture, pendingEntry, projection, settleFiles, sourceRequest, todo, type ShadowFixture } from "./shadow_file_fixture.ts";
@@ -166,4 +167,29 @@ test("rollback can archive invalid cursor and pending entries without reading or
     expected_provider_revision: loaded.provider_revision, expected_bootstrap_operation_id: null });
   assert.equal(result.status, "applied"); assert.deepEqual(await readFile(f.statePath), primary);
   assert.equal((await f.store.loadAuthority()).status, "missing");
+});
+
+test("archiving a Todo drops its retained lease from the candidate head", async (t) => {
+  const f = await fixture(t);
+  const lease = { schema_version: "task_lease_v0", goal_id: "goal-a", todo_id: "todo_one", owner: "agent-a",
+    idempotency_key: "k1", version: 1, lease_epoch: 1, status: "released", updated_at: "2026-09-06T00:00:00Z" };
+  const base = { ...projection([todo("todo_one")]), leases: [lease] };
+  // The published Todo partition retains the archived row for audit; the graph
+  // it represents no longer contains `todo_one`. The fold must key off
+  // `archive_state === "active"` like the source projection does, or the
+  // retained archived row re-admits the lease its archive just orphaned.
+  const archivedTodo = { ...todo("todo_one", "done"), archive_state: "archive" };
+  const archived = composeLocalAuthorityShadowHead(base, "goal-a",
+    { partition: "todos", seq: 2 }, projection([archivedTodo]), "sha256:archived");
+  assert.deepEqual(archived.todos, [archivedTodo]);
+  assert.deepEqual(archived.leases, []);
+  // A lease whose Todo is still in the graph survives the same fold.
+  const retained = composeLocalAuthorityShadowHead(base, "goal-a",
+    { partition: "todos", seq: 2 }, projection([todo("todo_one")]), "sha256:retained");
+  assert.deepEqual(retained.leases, [lease]);
+  // The lease partition remains authoritative for its own writes.
+  const leased = composeLocalAuthorityShadowHead(base, "goal-a",
+    { partition: "leases", seq: 3 }, { leases: [] }, "sha256:leased");
+  assert.deepEqual(leased.leases, []);
+  assert.deepEqual(leased.todos, [todo("todo_one")]);
 });

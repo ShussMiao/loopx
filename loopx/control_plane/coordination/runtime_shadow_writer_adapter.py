@@ -11,6 +11,7 @@ from ...registry import find_registry_goal
 from . import local_authority_shadow_outbox as outbox
 from .local_authority_shadow_projection import LEASE_PARTITION
 from .runtime_shadow import resolve_coordination_runtime_shadow_config
+from .shadow_goal_scope import shadow_goal_scope
 from .shadow_management import ShadowManagementError, read_shadow_capture_binding, require_shadow_primary_write_allowed
 
 
@@ -36,6 +37,7 @@ def require_prose_state_write_allowed(
     from ...rollout_event_log import load_rollout_events, rollout_event_log_path
     from ..todos.todo_index import MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL
     from .local_authority_shadow_adapter import todo_partition_projector
+    from .local_authority_shadow_projection import partition_comparison_view
 
     try:
         goal = find_registry_goal(load_registry(registry_path), goal_id)
@@ -46,7 +48,13 @@ def require_prose_state_write_allowed(
         projector = todo_partition_projector(
             goal, state_path=state_path, rollout_events=events,
         )
-        if projector(original_text) != projector(planned_text):
+        # Todo projections include the read-time resume-condition evaluation
+        # clock. Compare the same semantic view used by shadow continuity
+        # digests so an owned prose update is not rejected merely because the
+        # two projections were evaluated milliseconds apart.
+        original_projection = partition_comparison_view(projector(original_text))
+        planned_projection = partition_comparison_view(projector(planned_text))
+        if original_projection != planned_projection:
             raise ActiveStateAuthorityMutationError(
                 "prose update would change canonical Todo or handoff state"
             )
@@ -70,34 +78,42 @@ def begin_todo_runtime_shadow_capture(
     """Create the default-off transaction capture while the Todo lock is held."""
 
     active_binding = read_shadow_capture_binding(runtime_root, goal_id)["status"] == "active"
+    goal_ref: dict[str, str] | None = None
     try:
-        registry = load_registry(registry_path)
-        goal = find_registry_goal(registry, goal_id)
-        enabled = active_binding or resolve_coordination_runtime_shadow_config(goal).enabled
-        from ...rollout_event_log import load_rollout_events, rollout_event_log_path
-        from ..todos.todo_index import MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL
-        from .local_authority_shadow_adapter import todo_partition_projector
+        with shadow_goal_scope(registry_path, goal_id=goal_id) as scope:
+            goal_ref = (
+                dict(scope.goal_ref) if scope.goal_ref is not None else None
+            )
+            enabled = (
+                active_binding
+                or resolve_coordination_runtime_shadow_config(scope.goal).enabled
+            )
+            from ...rollout_event_log import load_rollout_events, rollout_event_log_path
+            from ..todos.todo_index import MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL
+            from .local_authority_shadow_adapter import todo_partition_projector
 
-        events = load_rollout_events(
-            rollout_event_log_path(runtime_root, goal_id),
-            limit=MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
-        )
-        projector = todo_partition_projector(
-            goal,
-            state_path=state_path,
-            rollout_events=events,
-        )
+            events = load_rollout_events(
+                rollout_event_log_path(runtime_root, goal_id),
+                limit=MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
+            )
+            projector = todo_partition_projector(
+                scope.goal,
+                state_path=state_path,
+                rollout_events=events,
+            )
     except Exception:
         enabled = active_binding
         projector = None
     return outbox.TodoPartitionCapture.begin(
         enabled=enabled,
+        registry_path=registry_path,
         runtime_root=runtime_root,
         goal_id=goal_id,
         state_path=state_path,
         write_class=write_class,
         original_text=original_text,
         projector=projector,
+        goal_ref=goal_ref,
     )
 
 
@@ -115,17 +131,44 @@ def require_runtime_shadow_capture_prepared(
 
 
 def write_captured_todo_state(
-    capture: outbox.TodoPartitionCapture, *, runtime_root: Path, goal_id: str,
-    state_path: Path, text: str,
+    capture: outbox.TodoPartitionCapture,
+    *,
+    runtime_root: Path,
+    goal_id: str,
+    state_path: Path,
+    text: str,
 ) -> None:
     """Under the primary lock, prepare before replacement and mark only after durability."""
 
     from ..todos.active_state_editing import atomic_write_state_text
 
-    capture.prepare(text)
-    require_runtime_shadow_capture_prepared(capture, runtime_root=runtime_root, goal_id=goal_id)
-    atomic_write_state_text(state_path, text)
-    capture.committed()
+    def write() -> None:
+        capture.prepare(text)
+        require_runtime_shadow_capture_prepared(
+            capture,
+            runtime_root=runtime_root,
+            goal_id=goal_id,
+        )
+        atomic_write_state_text(state_path, text)
+        capture.committed()
+
+    captured_goal_ref = capture.goal_ref
+    if captured_goal_ref is None:
+        write()
+        return
+    registry_path = capture.registry_path
+    if registry_path is None:
+        raise ShadowManagementError(
+            "goal_instance_id_missing",
+            "exact Todo capture is missing its source registry",
+        )
+    with shadow_goal_scope(registry_path, goal_id=goal_id) as scope:
+        if scope.goal_ref != captured_goal_ref:
+            raise ShadowManagementError(
+                "stale_goal_instance",
+                "Todo capture belongs to a retired Goal instance",
+            )
+        write()
 
 
 def settle_todo_runtime_shadow_capture(
@@ -134,14 +177,11 @@ def settle_todo_runtime_shadow_capture(
     registry_path: Path,
     runtime_root: Path,
     goal_id: str,
-    write_class: str,
     capture: outbox.TodoPartitionCapture,
-    observe_legacy: bool = True,
     emit_disabled: bool = True,
 ) -> dict[str, Any]:
     """Boundedly drain one transaction capture after releasing the Todo lock."""
 
-    from .local_authority_shadow_observation import observe_todo_local_authority_commit
     from .local_authority_shadow_adapter import capture_evidence, drain_local_authority_shadow_outbox
 
     drain = (
@@ -157,15 +197,7 @@ def settle_todo_runtime_shadow_capture(
         payload["coordination_runtime_shadow"] = capture_evidence(
             goal_id=goal_id, capture=capture.outcome, drain=drain,
         )
-    if not observe_legacy:
-        return payload
-    return observe_todo_local_authority_commit(
-        payload,
-        registry_path,
-        goal_id,
-        write_class,
-        runtime_root=runtime_root,
-    )
+    return payload
 
 
 def settle_lease_runtime_shadow_capture(

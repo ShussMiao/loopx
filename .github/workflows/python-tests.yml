@@ -2,6 +2,10 @@ name: Python Tests
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  # Inert until the main ruleset enables a merge queue; queue runs are full.
+  merge_group:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -17,6 +21,8 @@ on:
       - "package.json"
       - "package-lock.json"
       - "pyproject.toml"
+      - "setup.py"
+      - "MANIFEST.in"
       - "tsconfig.control-plane.json"
 
 permissions:
@@ -26,12 +32,19 @@ concurrency:
   group: python-tests-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  LOOPX_USAGE_PING: "0"
+
 jobs:
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     outputs:
       core_tests: ${{ steps.classify.outputs.core_tests }}
+      change_kind: ${{ steps.classify.outputs.change_kind }}
+      python_tests: ${{ steps.classify.outputs.python_tests }}
+      stage2c_tests: ${{ steps.classify.outputs.stage2c_tests }}
+      presentation_tests: ${{ steps.classify.outputs.presentation_tests }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -40,32 +53,112 @@ jobs:
         with:
           python-version: "3.11"
       - name: Validate merge gate semantics
-        run: python -m unittest discover -s scripts/ci -p 'test_review_gate.py'
+        run: python -m unittest discover -s scripts/ci -p 'test_*.py'
       - name: Classify the exact pull-request change
         id: classify
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHECKOUT_SHA: ${{ github.sha }}
+          FORCE_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
         shell: bash
         run: |
           set -euo pipefail
+          extra=()
+          if [[ "$FORCE_FULL" == true ]]; then extra+=(--force-full); fi
           if [[ "$EVENT_NAME" == pull_request ]]; then
-            python scripts/ci/review_gate.py classify --base "$BASE_SHA" --head "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            python scripts/ci/review_gate.py classify --base "$BASE_SHA" --head "$HEAD_SHA" --plan impact-plan.json "${extra[@]}" >> "$GITHUB_OUTPUT"
           else
-            echo 'core_tests=true' >> "$GITHUB_OUTPUT"
+            python scripts/ci/review_gate.py classify --base "$CHECKOUT_SHA" --head "$CHECKOUT_SHA" --non-pr --plan impact-plan.json >> "$GITHUB_OUTPUT"
           fi
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          plan = json.loads(Path("impact-plan.json").read_text())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("## CI job exemptions\n\n")
+              summary.write(f"Change kind: **{plan['change_kind']}**; Python shards: **{plan['python_shards']}**.\n\n")
+              summary.write(plan['reason'] + ".\n\n")
+              summary.write(f"Python: {plan['python_tests']}; Stage2c: {plan['stage2c_tests']}; frontend: {plan['presentation_tests']}.\n\n")
+              summary.write(plan["coverage_scope"] + ". Unknown/mixed changes and main run full. Label ci:full forces full qualification.\n")
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-impact-plan
+          path: impact-plan.json
+          if-no-files-found: error
+          retention-days: 7
 
-  checks:
+  chat-bundle:
     needs: changes
+    if: needs.changes.outputs.core_tests == 'true' || needs.changes.outputs.python_tests == 'true' || needs.changes.outputs.presentation_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/presentation/dashboard/package-lock.json
+      - run: python scripts/chat_bundle.py build --install
+      - run: python scripts/chat_bundle.py verify --source
+      # Publish as soon as the bundle is built and verified so consumers start
+      # in parallel with browser qualification; `checks` still requires it.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+          if-no-files-found: error
+          retention-days: 7
+
+  chat-bundle-browser:
+    needs: [changes, chat-bundle]
     if: needs.changes.outputs.core_tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/presentation/dashboard/package-lock.json
+      - name: Qualify the actual compiled UI
+        working-directory: apps/presentation/dashboard
+        run: |
+          npm ci --ignore-scripts
+          ./node_modules/.bin/playwright install --with-deps chromium
+          npm run smoke:personal-workspace-packaged
+          npm run smoke:chat-turn-acceptance-retry
+          npm run smoke:chat-upgrade
+
+  kernel-static-checks:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.core_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -76,26 +169,19 @@ jobs:
       - name: Set up the TypeScript Effect runtime
         uses: actions/setup-node@v6
         with:
-          node-version: "22.6"
+          node-version: "24"
           cache: npm
           cache-dependency-path: package-lock.json
 
       - name: Install test dependencies
         run: python -m pip install --disable-pip-version-check -e ".[test]"
 
-      - name: Qualify the TypeScript Effect core
-        run: |
-          npm ci --ignore-scripts
-          npm run typecheck:control-plane
-          npm run test:control-plane:coverage
-
-      - name: Upload TypeScript control-plane coverage
-        uses: actions/upload-artifact@v7
-        with:
-          name: typescript-control-plane-coverage
-          path: coverage/control-plane/lcov.info
-          if-no-files-found: error
-          retention-days: 3
+      - name: Verify file authority on the core runtime
+        run: >-
+          node --no-warnings --experimental-strip-types --test
+          tests/control_plane_ts/authority_store.test.ts
+          tests/control_plane_ts/local_authority_runtime.test.ts
+          tests/control_plane_ts/sqlite_runtime_admission.test.ts
 
       - name: Lint test suite
         run: >-
@@ -114,43 +200,283 @@ jobs:
           LOOPX_CLI_OUTPUT_BASE_REF: origin/${{ github.event.pull_request.base.ref || 'main' }}
         run: python examples/control_plane/cli-output-budget-regression-smoke.py
 
-  test-shard:
-    needs: changes
+  typescript-core:
+    name: typescript-core (${{ matrix.shard }}/3)
+    needs: [changes, chat-bundle]
     if: needs.changes.outputs.core_tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up the qualified SQLite runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[test]"
+          npm ci --ignore-scripts
+
+      - name: Type-check the TypeScript Effect core
+        if: matrix.shard == 1
+        run: npm run typecheck:control-plane
+
+      - name: Qualify the TypeScript Effect core
+        env:
+          LOOPX_TEST_REQUIRE_SQLITE_QUALIFIED: "1"
+        run: |
+          mapfile -t files < <(python -m scripts.ci.ts_test_shard --shards 3 --shard ${{ matrix.shard }})
+          test "${#files[@]}" -gt 0
+          NODE_V8_COVERAGE="$PWD/coverage/v8" node --no-warnings --experimental-sqlite \
+            --experimental-strip-types --test "${files[@]}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: typescript-v8-coverage-${{ matrix.shard }}
+          path: coverage/v8/
+          if-no-files-found: error
+          retention-days: 1
+
+  typescript-coverage:
+    needs: [changes, typescript-core]
+    if: needs.changes.outputs.core_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: typescript-v8-coverage-*
+          path: coverage/shards
+      - name: Report complete TypeScript control-plane coverage
+        run: |
+          mkdir -p coverage/v8
+          for shard in 1 2 3; do
+            dir="coverage/shards/typescript-v8-coverage-${shard}"
+            compgen -G "${dir}/*.json" > /dev/null
+            for file in "${dir}"/*.json; do
+              cp "$file" "coverage/v8/${shard}-$(basename "$file")"
+            done
+          done
+          npx c8 report --temp-directory=coverage/v8 --all \
+            --include='loopx/control_plane/**/*.ts' \
+            --exclude='loopx/control_plane/**/*.generated.ts' \
+            --reporter=lcov --reporter=text --reports-dir=coverage/control-plane
+      - name: Upload TypeScript control-plane coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: typescript-control-plane-coverage
+          path: coverage/control-plane/lcov.info
+          if-no-files-found: error
+          retention-days: 3
+
+  dashboard-acceptance:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.core_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
+      - name: Set up the qualified Node.js runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/presentation/dashboard/package-lock.json
+
+      - name: Install Dashboard and coverage dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm ci --ignore-scripts --prefix apps/presentation/dashboard
+
+      - name: Measure Dashboard unit and browser interactions
+        env:
+          LOOPX_DASHBOARD_COVERAGE: "1"
+          LOOPX_PLAYWRIGHT_PACKAGE: ${{ github.workspace }}/apps/presentation/dashboard/node_modules/playwright
+        run: |
+          npm run test:dashboard:coverage
+          cd apps/presentation/dashboard
+          npx playwright install --with-deps chromium --only-shell
+          node ../../../examples/personal-workspace-browser-smoke.mjs
+
+      - name: Upload Dashboard coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-coverage
+          path: coverage/dashboard/*.info
+          if-no-files-found: error
+          retention-days: 3
+
+  checks:
+    # Preserve the required check name while exposing independent failure lanes.
+    if: always() && needs.changes.outputs.core_tests == 'true'
+    needs: [changes, kernel-static-checks, typescript-coverage, dashboard-acceptance, chat-bundle-browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require kernel and Dashboard qualification
+        env:
+          BROWSER_RESULT: ${{ needs.chat-bundle-browser.result }}
+          DASHBOARD_RESULT: ${{ needs.dashboard-acceptance.result }}
+          KERNEL_RESULT: ${{ needs.kernel-static-checks.result }}
+          TYPESCRIPT_RESULT: ${{ needs.typescript-coverage.result }}
+        run: |
+          test "$KERNEL_RESULT" = success
+          test "$TYPESCRIPT_RESULT" = success
+          test "$DASHBOARD_RESULT" = success
+          test "$BROWSER_RESULT" = success
+
+  node-minimum-compatibility:
+    needs: changes
+    if: needs.changes.outputs.core_tests == 'true'
+    runs-on: ubuntu-latest
+    # The full suite runs under this exact Node version in typescript-core.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Qualify the public minimum Node.js runtime
+        env:
+          LOOPX_TEST_REQUIRE_SQLITE_QUALIFIED: "1"
+        run: |
+          npm ci --ignore-scripts
+          npm run typecheck:control-plane
+          # Prove the minimum itself admits SQLite and executes both provider
+          # lifecycle rows. The qualified core lane runs the complete suite.
+          node --no-warnings --experimental-sqlite --experimental-strip-types --test \
+            tests/control_plane_ts/sqlite_runtime_admission.test.ts \
+            tests/control_plane_ts/deferred_hard_lease_lifecycle.test.ts
+
+  node-forward-compatibility:
+    needs: changes
+    # The unsharded full suite outlasts a PR's qualification window, so the
+    # non-blocking probe runs on main and on demand where it can finish.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.core_tests == 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    # This runs the full core conformance suite. Allow forward-runtime/runner
+    # variance without dropping cases or changing individual test deadlines.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Probe the next Node.js runtime
+        run: |
+          npm ci --ignore-scripts
+          npm run typecheck:control-plane
+          npm run test:control-plane
+
+  test-shard:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.python_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
       - uses: actions/setup-node@v6
         with:
-          node-version: "22.6"
+          node-version: "24"
           cache: npm
           cache-dependency-path: package-lock.json
       - name: Install test dependencies
         run: |
           python -m pip install --disable-pip-version-check -e ".[test]"
           npm ci --ignore-scripts
+      - name: Prepare native shell isolation
+        # Ubuntu 24.04 may need an executable-scoped userns profile for bwrap.
+        # Do not disable AppArmor or the system-wide unprivileged-userns guard.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if ! bwrap --unshare-all --ro-bind / / /bin/true; then
+            sudo tee /etc/apparmor.d/loopx-qualification-bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile loopx-qualification-bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+            sudo apparmor_parser -r /etc/apparmor.d/loopx-qualification-bwrap
+          fi
+          bwrap --unshare-all --ro-bind / / /bin/true
       - name: Run test shard
         # Split the whole collection, not a hand-maintained list of directories.
         # Without timing history least_duration alternates equal-weight tests.
         # Each runner retains the measured two-worker pool.
         run: >-
           python -m pytest -q -n 2 -m "not stage2c_e2e"
-          --splits 2 --group ${{ matrix.shard }}
+          --splits 4 --group ${{ matrix.shard }}
           --splitting-algorithm least_duration
           --durations=25 --durations-min=1
+          --junitxml=junit.xml
           --cov=loopx
           --cov-report=term
+      - name: Upload full-shard outcomes for selection audit
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-junit-${{ matrix.shard }}
+          path: junit.xml
+          if-no-files-found: error
+          retention-days: 7
       - name: Upload shard coverage
         uses: actions/upload-artifact@v7
         with:
@@ -162,7 +488,7 @@ jobs:
 
   pytest:
     # Keep the required check name; a skipped/failed shard must not turn it green.
-    if: always() && needs.changes.outputs.core_tests == 'true'
+    if: always() && needs.changes.outputs.python_tests == 'true'
     needs: [changes, checks, test-shard]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -186,9 +512,13 @@ jobs:
           path: coverage-shards
       - name: Combine complete coverage and enforce the existing floor
         run: |
-          test -s coverage-shards/python-coverage-1/.coverage
-          test -s coverage-shards/python-coverage-2/.coverage
-          python -m coverage combine coverage-shards/python-coverage-1/.coverage coverage-shards/python-coverage-2/.coverage
+          shards=()
+          for shard in 1 2 3 4; do
+            path="coverage-shards/python-coverage-${shard}/.coverage"
+            test -s "$path"
+            shards+=("$path")
+          done
+          python -m coverage combine "${shards[@]}"
           python -m coverage report --fail-under=19.6
           python -m coverage xml -o coverage.xml
       - uses: actions/upload-artifact@v7
@@ -200,22 +530,33 @@ jobs:
 
   sonar:
     needs: pytest
+    # Queue refs are temporary; analyse PRs and main, not gh-readonly-queue/*.
+    if: github.event_name != 'merge_group'
     uses: ./.github/workflows/sonarcloud.yml
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
   stage2c-suite:
-    needs: changes
-    if: needs.changes.outputs.core_tests == 'true'
-    name: stage2c (${{ matrix.suite }})
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.stage2c_tests == 'true'
+    name: stage2c (${{ matrix.suite }} ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        suite: [e2e, mutants, installed]
+        include:
+          - {suite: e2e, shard: 1}
+          - {suite: e2e, shard: 2}
+          - {suite: mutants, shard: 0}
+          - {suite: installed, shard: 0}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
@@ -223,7 +564,7 @@ jobs:
           cache-dependency-path: tests/requirements-stage2c-linux-py311.txt
       - uses: actions/setup-node@v6
         with:
-          node-version: "22.6"
+          node-version: "24"
           cache: npm
       - name: Install locked test and package build tools
         run: |
@@ -255,7 +596,7 @@ jobs:
         env:
           LOOPX_SHADOW_COMPARISON_OUTPUT: .local/stage2c-observables
         # Keep each module's shared workspace and ordered parity rows on one worker.
-        run: python -m pytest -q -n 4 --dist loadfile -m stage2c_e2e --durations=20 --junitxml=stage2c-e2e.xml
+        run: python -m pytest -q -n 2 --dist loadfile -m stage2c_e2e -p scripts.ci.module_shard --ci-module-shards 2 --ci-module-shard ${{ matrix.shard }} --durations=20 --junitxml=stage2c-e2e.xml
       - name: Reject deliberate correctness regressions
         if: matrix.suite == 'mutants'
         run: python examples/shared-goal-authority-e2e/mutants.py --output .local/stage2c-mutants
@@ -272,7 +613,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: stage2c-correctness-evidence-${{ matrix.suite }}
+          name: stage2c-correctness-evidence-${{ matrix.suite }}-${{ matrix.shard }}
           include-hidden-files: true
           if-no-files-found: error
           path: |
@@ -284,7 +625,7 @@ jobs:
 
   stage2c-correctness-e2e:
     # Preserve the public check name and reject failed, cancelled or skipped lanes.
-    if: always() && needs.changes.outputs.core_tests == 'true'
+    if: always() && needs.changes.outputs.stage2c_tests == 'true'
     needs: [changes, stage2c-suite]
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -295,15 +636,20 @@ jobs:
         run: test "$STAGE2C_RESULT" = success
 
   windows-powershell:
-    needs: changes
-    if: needs.changes.outputs.core_tests == 'true'
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.python_tests == 'true'
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -314,34 +660,89 @@ jobs:
       - name: Set up the TypeScript Effect runtime
         uses: actions/setup-node@v6
         with:
-          node-version: "22.6"
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/presentation/dashboard/package-lock.json
 
       - name: Install test dependencies
         run: python -m pip install --disable-pip-version-check -e ".[test]"
+
+      - name: Verify native Windows test Python discovery
+        run: node --no-warnings --experimental-strip-types --test tests/control_plane_ts/test_python_runtime.test.ts
 
       - name: Run native Windows lifecycle tests
         run: >-
           python -m pytest -q
           tests/test_command_invocation.py
+          tests/test_doctor_git_encoding.py
           tests/test_doctor_install_freshness.py
           tests/test_file_lock.py
           tests/test_file_lock_cross_process.py
-          tests/control_plane/test_coordination_file_provider.py
           tests/control_plane/test_effect_runtime_integration.py
           tests/control_plane/test_local_authority_shadow_outbox.py
           tests/test_self_update_runtime_activation.py
+          tests/test_windows_atomic_writes.py
           tests/test_windows_install.py
 
-      - name: Run native scheduler facade tests
+      - name: Set up the qualified SQLite runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+
+      - name: Run SQLite CLI integration
+        run: python -m pytest -q tests/control_plane/test_sqlite_authority_cli.py
+
+      - name: Run native scheduler and SQLite authority tests
         run: >-
-          node --no-warnings --experimental-strip-types --test
+          node --no-warnings --experimental-sqlite --experimental-strip-types --test
           tests/control_plane_ts/scheduler_heartbeat_commit.test.ts
           tests/control_plane_ts/scheduler_heartbeat_commit_cli.test.ts
+          tests/control_plane_ts/sqlite_authority_store.test.ts
+          tests/control_plane_ts/local_authority_provider.test.ts
+          tests/control_plane_ts/sqlite_runtime_admission.test.ts
+
+      - name: Install the frontend dependencies for a source rebuild
+        working-directory: apps/presentation/dashboard
+        run: npm ci --ignore-scripts
+
+      - name: Rebuild the Chat bundle where only python.exe is usable
+        working-directory: apps/presentation/dashboard
+        shell: pwsh
+        run: |
+          $shadow = Join-Path $env:RUNNER_TEMP "python-exe-only"
+          New-Item -ItemType Directory -Force -Path $shadow | Out-Null
+          # Supported Windows installs may expose python.exe alone, and a
+          # python3.exe App Execution Alias stub is not runnable. The npm entry
+          # must resolve a real 3.11+ interpreter either way.
+          Set-Content -Path (Join-Path $shadow "python3.exe") `
+            -Value "unusable python3 stand-in" -Encoding ascii
+          $env:PATH = "$shadow;$env:PATH"
+          npm run build:chat
+
+      - name: Verify the Windows-built Chat bundle
+        run: python scripts/chat_bundle.py verify --source
+
+  presentation:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.presentation_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Verify the source-bound Dashboard artifact
+        run: python scripts/chat_bundle.py verify --source
 
   merge-gate:
     # Always publish one stable outcome, including documentation-only PRs.
     if: always()
-    needs: [changes, pytest, stage2c-correctness-e2e, windows-powershell]
+    needs: [changes, checks, pytest, node-minimum-compatibility, stage2c-correctness-e2e, windows-powershell, presentation]
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:

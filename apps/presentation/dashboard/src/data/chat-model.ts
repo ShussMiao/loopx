@@ -1,3 +1,6 @@
+import type { GoalDraft } from "../../../../../loopx/control_plane/collaboration/goal_draft.js";
+export type LoopXModeSettings = { agent_id: string; token_budget: number };
+
 export type ChatTodo = {
   todo_id: string | null;
   role: string | null;
@@ -46,6 +49,23 @@ export type ChatCapabilities = {
   approval_policy: string;
   todo_write: string;
   goal_id: string | null;
+  manager?: {
+    scope: "owner_global";
+    model: string;
+    reasoning_effort: string;
+    runtime: {
+      schema_version: "manager_runtime_effective_profile_v0";
+      runtime_profile: "restricted" | "trusted_owner";
+      source: string;
+      configuration_revision: string;
+      standing_grant: string;
+      sandbox: string;
+      approval_policy: string;
+      tool_classes: string[];
+      status: string;
+      repair?: string;
+    };
+  };
   streaming?: boolean;
   resume?: boolean;
   interrupt?: boolean;
@@ -58,6 +78,25 @@ export type ChatCapabilities = {
     resume: boolean;
     interrupt: boolean;
   }>;
+};
+
+export type CollaborationReadback = {
+  schema_version: "collaboration_request_readback_v0";
+  request_id: string;
+  agent_id: string;
+  goal_id?: string;
+  decision_reason?: string;
+  brief: {
+    purpose: string;
+    context: string;
+    constraints: string[];
+    inputs: { ref: string; description: string; sha256?: string }[];
+    acceptance: string[];
+    return_requirement: string;
+  };
+  read_status: string;
+  decision: string;
+  returns: { phase: string; status: string }[];
 };
 
 export type ChatRouteCandidate = {
@@ -88,10 +127,37 @@ export type TodoProposal = {
   rationale: string;
 };
 
+/**
+ * An admitted steward team plan that rode in a Turn response.
+ *
+ * It is not a Todo and it is not a confirmation: the host validated the plan
+ * before it surfaced it, and the surface that confirms it is the typed
+ * `team.plan` action the manager channel stores as a card. Reading it here only
+ * keeps the answer intact, so a manager Turn that carries a preview still
+ * reaches the owner instead of failing the response schema.
+ */
+export type TeamPlanPreviewProposal = {
+  kind: "steward_team_plan_preview";
+  preview: Record<string, unknown>;
+};
+
+export type AgentProposal = TodoProposal | TeamPlanPreviewProposal;
+
+export function isTodoProposal(proposal: AgentProposal): proposal is TodoProposal {
+  return proposal.kind === "todo";
+}
+
+export function isTeamPlanPreviewProposal(
+  proposal: AgentProposal,
+): proposal is TeamPlanPreviewProposal {
+  return proposal.kind === "steward_team_plan_preview";
+}
+
 export type AgentResponse = {
+  goal_draft?: GoalDraft | null;
   schema_version: "loopx_chat_agent_response_v0";
   message: string;
-  proposals: TodoProposal[];
+  proposals: AgentProposal[];
   gate: {
     kind: string;
     summary: string;

@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from collections.abc import Callable
-from datetime import datetime, timezone
+from contextlib import nullcontext
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from heapq import merge
-from itertools import islice
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any
 
+from .file_lock import exclusive_run_index_lock
 from .authority import goal_authority_registry_summary
 from .control_plane import compact_control_plane_policy
+from .control_plane.goals.activation import (
+    GoalActivationState,
+    goal_activation_state,
+    normalize_goal_activation_state,
+)
+from .control_plane.goals.legacy_event_source import LEGACY_TODO_EVENT_SOURCE_FIELDS
 from .control_plane.quota.monitor_poll import QUOTA_MONITOR_POLL_CLASSIFICATION
 from .control_plane.quota.slot_accounting import (
     QUOTA_SLOT_SPENT_CLASSIFICATION,
     QUOTA_SLOT_VOIDED_CLASSIFICATION,
+)
+from .control_plane.projects.registry_codec import (
+    decode_registry_snapshot as decode_registry_snapshot,
+    load_registry,
 )
 from .control_plane.runtime.run_artifacts import (
     next_run_artifact_paths,
@@ -22,6 +35,7 @@ from .control_plane.runtime.run_artifacts import (
 )
 from .control_plane.runtime.run_context_retention import (
     goal_semantic_history_from_runs,
+    iter_goal_semantic_history_runs,
     latest_runs_with_agent_context,
 )
 from .control_plane.runtime.run_index_duplicates import (
@@ -33,14 +47,10 @@ from .control_plane.runtime.run_index_rebuild import (
     apply_reviewed_collision_rebuild,
     build_collision_rebuild_plan,
     collision_review_groups,
+    split_index_lines,
     validate_reviewed_collision_plan,
 )
-from .control_plane.goals.activation import (
-    GoalActivationState,
-    goal_activation_state,
-    normalize_goal_activation_state,
-)
-from .control_plane.runtime.time import now_local_iso, parse_timestamp
+from .control_plane.runtime.time import chronology_key, now_local_iso
 from .doctor import PROMOTION_READINESS_CLASSIFICATIONS
 from .execution_profile import compact_execution_profile
 from .explore_graph import compact_explore_graph_policy
@@ -51,7 +61,7 @@ from .presentation.markdown import (
     markdown_table_separator,
 )
 from .quota import goal_quota_with_spend_ledger
-from .registry import read_json, registry_goals
+from .registry import registry_goals
 
 STATUS_NEUTRAL_CLASSIFICATIONS = {
     QUOTA_SLOT_SPENT_CLASSIFICATION,
@@ -60,35 +70,77 @@ STATUS_NEUTRAL_CLASSIFICATIONS = {
     *PROMOTION_READINESS_CLASSIFICATIONS,
 }
 AGENT_LANE_PROGRESS_SCOPE = "agent_lane"
-REGISTRY_ATTENTION_FIELDS = (
+REGISTRY_STATUS_FIELDS = (
     "waiting_on",
     "attention_status",
     "operator_question",
     "recommended_action",
     "next_handoff_condition",
+    *LEGACY_TODO_EVENT_SOURCE_FIELDS,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RunIndexAudit:
+    goal_id: str
+    index_path: Path
+    raw_index_records: int
+    unique_runs: int
+    legacy_runtime_goal: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RunHistoryAudit:
+    registry_path: Path
+    runtime_root: Path
+    goal_id: str | None
+    activation_state_filter: str | None
+    include_runtime_goals: bool
+    goal_count: int
+    run_count: int
+    goals: tuple[RunIndexAudit, ...]
+
+    def matches(
+        self,
+        *,
+        registry_path: Path,
+        runtime_root: Path,
+        goal_id: str | None,
+        activation_state_filter: GoalActivationState | str | None,
+        include_runtime_goals: bool,
+    ) -> bool:
+        normalized_activation = (
+            normalize_goal_activation_state(activation_state_filter).value
+            if activation_state_filter is not None
+            else None
+        )
+        return (
+            self.registry_path == registry_path.expanduser().resolve()
+            and self.runtime_root == runtime_root.expanduser().resolve()
+            and self.goal_id == (str(goal_id or "").strip() or None)
+            and self.activation_state_filter == normalized_activation
+            and self.include_runtime_goals is include_runtime_goals
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StatusHistoryCollection:
+    status_history: dict[str, Any]
+    contract_audit: RunHistoryAudit
+
+
+@dataclass(frozen=True, slots=True)
+class RunIndexSnapshot:
+    records: list[dict[str, Any]]
+    raw_count: int
+    digest: str | None
 
 
 def now_local() -> str:
     return now_local_iso()
 
 
-_MIN_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
-
-
-def _chronology_key(value: Any) -> tuple[int, datetime, str]:
-    """Return a UTC-aware ordering key while keeping legacy rows deterministic."""
-
-    raw = str(value or "")
-    try:
-        parsed = parse_timestamp(value)
-    except OverflowError:
-        # UTC conversion can overflow at datetime's representable boundaries.
-        parsed = None
-    if parsed is None:
-        # Malformed or missing legacy rows must never outrank valid timestamps.
-        return (0, _MIN_TIMESTAMP, raw)
-    return (1, parsed, raw)
+_chronology_key = chronology_key
 
 
 def unique_run_paths(runs_dir: Path, generated_at: str) -> tuple[Path, Path]:
@@ -110,7 +162,9 @@ def write_reserved_run_artifacts(
     render_markdown: Callable[[dict[str, Any]], str],
 ) -> None:
     from .control_plane.quota.usage_collector import ingest_usage_into_run_record
-    from .control_plane.work_items.delivery_history import require_consistent_delivery_claim
+    from .control_plane.work_items.delivery_history import (
+        require_consistent_delivery_claim,
+    )
 
     require_consistent_delivery_claim(record)
     require_consistent_delivery_claim(index_record)
@@ -119,22 +173,24 @@ def write_reserved_run_artifacts(
     # the durable run record and its index row before append. Fail closed here so
     # malformed or negative usage never enters run history.
     ingest_usage_into_run_record(record, index_record=index_record)
-    json_path, markdown_path = reserve_unique_run_paths(runs_dir, generated_at)
+    # GH-C07: one lock per goal history index, shared with the repair path.
     index_path = runs_dir / "index.jsonl"
-    index_record["json_path"] = str(json_path)
-    index_record["markdown_path"] = str(markdown_path)
-    payload["json_path"] = str(json_path)
-    payload["markdown_path"] = str(markdown_path)
-    payload["index_path"] = str(index_path)
-    if isinstance(record.get("usage"), dict):
-        payload["usage"] = dict(record["usage"])
-    json_path.write_text(
-        json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    markdown_path.write_text(render_markdown(payload) + "\n", encoding="utf-8")
-    with index_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(index_record, ensure_ascii=False, allow_nan=False) + "\n")
+    with exclusive_run_index_lock(index_path, operation="history_run_append"):
+        json_path, markdown_path = reserve_unique_run_paths(runs_dir, generated_at)
+        index_record["json_path"] = str(json_path)
+        index_record["markdown_path"] = str(markdown_path)
+        payload["json_path"] = str(json_path)
+        payload["markdown_path"] = str(markdown_path)
+        payload["index_path"] = str(index_path)
+        if isinstance(record.get("usage"), dict):
+            payload["usage"] = dict(record["usage"])
+        json_path.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        markdown_path.write_text(render_markdown(payload) + "\n", encoding="utf-8")
+        with index_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(index_record, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def validate_goal_id_path_segment(goal_id: str) -> str:
@@ -146,12 +202,6 @@ def validate_goal_id_path_segment(goal_id: str) -> str:
     if Path(value).name != value:
         raise ValueError("goal id must not include path traversal")
     return value
-
-
-def load_registry(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    return read_json(path)
 
 
 def discover_goal_ids(
@@ -181,31 +231,44 @@ def _indexed_artifact_exists(value: Any, *, artifact_root: Path | None) -> bool:
     return path.exists()
 
 
-def load_index(
+def _observe_run_artifacts(
+    records: Iterable[dict[str, Any]], *, artifact_root: Path | None,
+) -> None:
+    """Fresh request-local observations, shared by full and selected reads."""
+    observed: dict[str, bool] = {}
+    for record in records:
+        for source, target in (("json_path", "json_exists"), ("markdown_path", "markdown_exists")):
+            path = str(record.get(source) or "").strip()
+            if path not in observed:
+                observed[path] = _indexed_artifact_exists(path, artifact_root=artifact_root)
+            record[target] = observed[path]
+
+
+def load_index_snapshot(
     path: Path,
     *,
     artifact_root: Path | None = None,
-) -> tuple[list[dict[str, Any]], int]:
-    if not path.exists():
-        return [], 0
+    include_artifact_status: bool = True,
+) -> RunIndexSnapshot:
+    """Decode the complete index; derived artifact status is optional internally.
+
+    Full readers keep fresh status by default. History collection defers only
+    filesystem observation until its complete semantic selection is known.
+    """
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        return RunIndexSnapshot(records=[], raw_count=0, digest=None)
 
     records: list[dict[str, Any]] = []
     positions: dict[tuple[str, str, str], int] = {}
-    artifact_exists: dict[tuple[str, str], bool] = {}
     raw_count = 0
+    digest = hashlib.sha256()
 
-    def artifact_is_present(value: Any) -> bool:
-        text = str(value or "").strip()
-        cache_key = (text, str(artifact_root or ""))
-        if cache_key not in artifact_exists:
-            artifact_exists[cache_key] = _indexed_artifact_exists(
-                value,
-                artifact_root=artifact_root,
-            )
-        return artifact_exists[cache_key]
-
-    with path.open(encoding="utf-8") as f:
-        for line in f:
+    with stream:
+        for encoded_line in stream:
+            digest.update(encoded_line)
+            line = encoded_line.decode("utf-8")
             if not line.strip():
                 continue
             raw_count += 1
@@ -222,14 +285,30 @@ def load_index(
                 str(item.get("markdown_path") or ""),
             )
             item = dict(item)
-            item["json_exists"] = artifact_is_present(item.get("json_path"))
-            item["markdown_exists"] = artifact_is_present(item.get("markdown_path"))
+            # These are observations, never persisted index authority.
+            item.pop("json_exists", None)
+            item.pop("markdown_exists", None)
             if key in positions:
                 records[positions[key]].update(item)
             else:
                 positions[key] = len(records)
                 records.append(item)
-    return records, raw_count
+    if include_artifact_status:
+        _observe_run_artifacts(records, artifact_root=artifact_root)
+    return RunIndexSnapshot(
+        records=records,
+        raw_count=raw_count,
+        digest=f"sha256:{digest.hexdigest()}",
+    )
+
+
+def load_index(
+    path: Path,
+    *,
+    artifact_root: Path | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    snapshot = load_index_snapshot(path, artifact_root=artifact_root)
+    return snapshot.records, snapshot.raw_count
 
 
 def latest_status_run(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -250,9 +329,27 @@ def collect_history(
     limit: int,
     include_runtime_goals: bool = True,
     activation_state_filter: GoalActivationState | str | None = None,
+    agent_lane_id: str | None = None,
+    registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    registry = load_registry(registry_path)
-    goal_meta = {str(goal.get("id")): goal for goal in registry_goals(registry)}
+    from .capabilities.machine_configuration.builtins import (
+        build_builtin_machine_configuration_registry,
+        project_goal_with_builtin_machine_configuration,
+    )
+    from .capabilities.machine_configuration.store import read_machine_configuration
+
+    if registry is None:
+        registry = load_registry(registry_path)
+    machine_configuration = read_machine_configuration(
+        runtime_root,
+        registry=build_builtin_machine_configuration_registry(),
+    )
+    goal_meta = {
+        str(goal.get("id")): project_goal_with_builtin_machine_configuration(
+            goal, machine_configuration
+        )
+        for goal in registry_goals(registry)
+    }
     activation_filter = (
         normalize_goal_activation_state(activation_state_filter)
         if activation_state_filter is not None
@@ -279,10 +376,12 @@ def collect_history(
         if activation_filter is not None and activation_state is not activation_filter:
             continue
         index_path = runtime_root / "goals" / current_goal_id / "runs" / "index.jsonl"
-        runs, raw_count = load_index(
+        index_snapshot = load_index_snapshot(
             index_path,
-            artifact_root=registry_project_root(registry_path),
+            include_artifact_status=False,
         )
+        runs = index_snapshot.records
+        raw_count = index_snapshot.raw_count
         runs = [
             run
             for _, run in sorted(
@@ -335,15 +434,32 @@ def collect_history(
             "authority_registry": goal_authority_registry_summary(meta) if registry_member else None,
             "quota": quota,
             "index_path": str(index_path),
+            "index_digest": index_snapshot.digest,
             "index_exists": index_path.exists(),
             "raw_index_records": raw_count,
             "unique_runs": len(runs),
             "latest_status_run": latest_status_run(runs),
-            "latest_runs": latest_runs_with_agent_context(runs, limit=limit),
+            "latest_runs": latest_runs_with_agent_context(
+                runs,
+                limit=limit,
+                agent_lane_id=agent_lane_id,
+            ),
             "semantic_history": goal_semantic_history_from_runs(runs),
         }
+        # Reduce the full index first. Old semantic evidence and lane windows
+        # may survive outside --limit; every returned Run still needs fresh
+        # flags. These references also cover the global recent_runs window.
+        status_run = goal_record["latest_status_run"]
+        _observe_run_artifacts(
+            chain(
+                goal_record["latest_runs"],
+                [status_run] if status_run is not None else [],
+                iter_goal_semantic_history_runs(goal_record["semantic_history"]),
+            ),
+            artifact_root=registry_project_root(registry_path),
+        )
         if registry_member:
-            for field in REGISTRY_ATTENTION_FIELDS:
+            for field in REGISTRY_STATUS_FIELDS:
                 if meta.get(field):
                     goal_record[field] = meta.get(field)
         goals.append(goal_record)
@@ -358,6 +474,118 @@ def collect_history(
         "goals": goals,
         "runs": recent_runs,
     }
+
+
+def build_run_history_audit(
+    history: dict[str, Any],
+    *,
+    registry_path: Path,
+    runtime_root: Path,
+    goal_id: str | None,
+    activation_state_filter: GoalActivationState | str | None,
+    include_runtime_goals: bool,
+) -> RunHistoryAudit:
+    normalized_activation = (
+        normalize_goal_activation_state(activation_state_filter).value
+        if activation_state_filter is not None
+        else None
+    )
+    return RunHistoryAudit(
+        registry_path=registry_path.expanduser().resolve(),
+        runtime_root=runtime_root.expanduser().resolve(),
+        goal_id=str(goal_id or "").strip() or None,
+        activation_state_filter=normalized_activation,
+        include_runtime_goals=include_runtime_goals,
+        goal_count=int(history.get("goal_count") or 0),
+        run_count=int(history.get("run_count") or 0),
+        goals=tuple(
+            RunIndexAudit(
+                goal_id=str(item.get("id") or ""),
+                index_path=Path(str(item.get("index_path") or "")),
+                raw_index_records=int(item.get("raw_index_records") or 0),
+                unique_runs=int(item.get("unique_runs") or 0),
+                legacy_runtime_goal=bool(item.get("legacy_runtime_goal")),
+            )
+            for item in history.get("goals") or []
+            if isinstance(item, dict)
+        ),
+    )
+
+
+def history_for_registry_members(
+    history: dict[str, Any],
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    goals = [
+        goal
+        for goal in history.get("goals") or []
+        if isinstance(goal, dict) and goal.get("registry_member") is True
+    ]
+    recent_limit = max(0, limit)
+    recent_runs = list(
+        islice(
+            merge(
+                *(
+                    goal.get("latest_runs", [])[:recent_limit]
+                    for goal in goals
+                    if isinstance(goal.get("latest_runs"), list)
+                ),
+                key=lambda item: _chronology_key(item.get("generated_at")),
+                reverse=True,
+            ),
+            recent_limit,
+        )
+    )
+    return {
+        **history,
+        "goal_count": len(goals),
+        "run_count": sum(int(goal.get("unique_runs") or 0) for goal in goals),
+        "goals": goals,
+        "runs": recent_runs,
+    }
+
+
+def collect_status_history(
+    *,
+    registry_path: Path,
+    runtime_root: Path,
+    goal_id: str | None,
+    limit: int,
+    status_include_runtime_goals: bool,
+    activation_state_filter: GoalActivationState | str | None = None,
+    agent_lane_id: str | None = None,
+    registry: dict[str, Any] | None = None,
+) -> StatusHistoryCollection:
+    history = collect_history(
+        registry_path=registry_path,
+        runtime_root=runtime_root,
+        goal_id=goal_id,
+        limit=limit,
+        include_runtime_goals=True,
+        activation_state_filter=activation_state_filter,
+        agent_lane_id=agent_lane_id,
+        registry=registry,
+    )
+    audit = build_run_history_audit(
+        history,
+        registry_path=registry_path,
+        runtime_root=runtime_root,
+        goal_id=goal_id,
+        activation_state_filter=activation_state_filter,
+        include_runtime_goals=True,
+    )
+    status_history = history
+    if (
+        not status_include_runtime_goals
+        and not str(goal_id or "").strip()
+        and activation_state_filter is None
+    ):
+        status_history = history_for_registry_members(history, limit=limit)
+    return StatusHistoryCollection(
+        status_history=status_history,
+        contract_audit=audit,
+    )
 
 
 def inspect_index_duplicates(
@@ -490,60 +718,68 @@ def repair_index_duplicates(
         if not index_path.exists():
             continue
 
-        raw_lines = index_path.read_text(encoding="utf-8").splitlines()
-        grouped: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
-        for line_number, line in enumerate(raw_lines, start=1):
-            if not line.strip():
-                continue
-            raw_index_records += 1
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(item, dict):
-                continue
-            grouped.setdefault(index_identity(item), []).append((line_number, item))
+        # GH-C07: read and rewrite the index under the same lock the append
+        # path takes. A dry run only reports, so it must not block writers.
+        lock = (
+            exclusive_run_index_lock(index_path, operation="history_index_repair")
+            if execute
+            else nullcontext()
+        )
+        with lock:
+            raw_lines = split_index_lines(index_path.read_text(encoding="utf-8"))
+            grouped: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
+            for line_number, line in enumerate(raw_lines, start=1):
+                if not line.strip():
+                    continue
+                raw_index_records += 1
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                grouped.setdefault(index_identity(item), []).append((line_number, item))
 
-        remove_lines: set[int] = set()
-        for records in grouped.values():
-            if len(records) <= 1:
-                continue
-            decision = duplicate_repair_decision(records)
-            removed_lines = list(decision.get("removed_line_numbers") or [])
-            if decision.get("action") == "preserve_reward_overlay":
-                preserved_reward_overlay_rows += len(records) - 1
-            elif decision.get("repairable"):
-                remove_lines.update(int(line_number) for line_number in removed_lines)
-                removed_row_count += len(removed_lines)
-            else:
-                unrepaired_group_count += 1
+            remove_lines: set[int] = set()
+            for records in grouped.values():
+                if len(records) <= 1:
+                    continue
+                decision = duplicate_repair_decision(records)
+                removed_lines = list(decision.get("removed_line_numbers") or [])
+                if decision.get("action") == "preserve_reward_overlay":
+                    preserved_reward_overlay_rows += len(records) - 1
+                elif decision.get("repairable"):
+                    remove_lines.update(int(line_number) for line_number in removed_lines)
+                    removed_row_count += len(removed_lines)
+                else:
+                    unrepaired_group_count += 1
 
-            first_record = records[0][1]
-            groups.append(
-                {
-                    "goal_id": current_goal_id,
-                    "index_path": str(index_path),
-                    "generated_at": first_record.get("generated_at"),
-                    "json_path": first_record.get("json_path"),
-                    "markdown_path": first_record.get("markdown_path"),
-                    "action": decision.get("action"),
-                    "repairable": decision.get("repairable"),
-                    "line_numbers": decision.get("line_numbers"),
-                    "kept_line_numbers": decision.get("kept_line_numbers"),
-                    "removed_line_numbers": removed_lines,
-                    "reason": decision.get("reason"),
-                }
-            )
+                first_record = records[0][1]
+                groups.append(
+                    {
+                        "goal_id": current_goal_id,
+                        "index_path": str(index_path),
+                        "generated_at": first_record.get("generated_at"),
+                        "json_path": first_record.get("json_path"),
+                        "markdown_path": first_record.get("markdown_path"),
+                        "action": decision.get("action"),
+                        "repairable": decision.get("repairable"),
+                        "line_numbers": decision.get("line_numbers"),
+                        "kept_line_numbers": decision.get("kept_line_numbers"),
+                        "removed_line_numbers": removed_lines,
+                        "reason": decision.get("reason"),
+                    }
+                )
 
-        if execute and remove_lines:
-            rewritten = [
-                line
-                for line_number, line in enumerate(raw_lines, start=1)
-                if line_number not in remove_lines
-            ]
-            tmp_path = index_path.with_suffix(index_path.suffix + ".tmp")
-            tmp_path.write_text("".join(line + "\n" for line in rewritten), encoding="utf-8")
-            tmp_path.replace(index_path)
+            if execute and remove_lines:
+                rewritten = [
+                    line
+                    for line_number, line in enumerate(raw_lines, start=1)
+                    if line_number not in remove_lines
+                ]
+                tmp_path = index_path.with_suffix(index_path.suffix + ".tmp")
+                tmp_path.write_text("".join(line + "\n" for line in rewritten), encoding="utf-8")
+                tmp_path.replace(index_path)
 
     limited_groups = groups[: max(0, limit)]
     return {

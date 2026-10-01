@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -52,6 +53,7 @@ from .selected_todo_tool_behavior import (
     SELECTED_TODO_TOOL_FIXTURE_ACTION_TEXT,
     SELECTED_TODO_TOOL_FIXTURE_TODO_ID,
 )
+from .replan_vision_closeout_behavior import required_vision_scenario_contract
 
 ACTUAL_DEFAULT_MODEL_BEHAVIOR_PORTFOLIO_SCHEMA_VERSION = (
     "actual_default_model_behavior_portfolio_v0"
@@ -74,6 +76,7 @@ _TOOL_ACTOR_KINDS = frozenset(
     }
 )
 _TURN_ACTOR_KINDS = frozenset({"turn", *_TOOL_ACTOR_KINDS})
+_DIAGNOSTIC_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 
 
 @dataclass(frozen=True)
@@ -843,47 +846,6 @@ def _validate_quota_hot_path_compaction_regression(
         raise ValueError("compaction regression must preserve the selected todo")
 
 
-def _validate_required_vision_replan_scenario(
-    source_packet: Mapping[str, Any],
-    contract: Mapping[str, Any],
-) -> None:
-    semantics = model_behavior_semantic_contract_from_packet(
-        source_packet,
-        arm="full_packet",
-    )
-    vision = semantics["vision_continuation"]
-    trigger_kinds = set(vision.get("trigger_kinds", []))
-    required = {
-        "selected_todo_id": None,
-        "user_action_required": False,
-        "must_attempt_work": True,
-        "quiet_noop_allowed": False,
-    }
-    if any(contract.get(field) != value for field, value in required.items()):
-        raise ValueError("required-vision scenario must execute before quiet wait")
-    if vision.get("required") is not True or (
-        "required_agent_vision_missing" not in trigger_kinds
-    ):
-        raise ValueError("required-vision scenario must preserve the profile gap")
-    if semantics["required_reads"]:
-        raise ValueError("required-vision replan must not require a model read ritual")
-    action_packet = source_packet.get("replan_action_packet")
-    obligation = source_packet.get("autonomous_replan_obligation")
-    if not (
-        isinstance(action_packet, Mapping)
-        and isinstance(obligation, Mapping)
-        and action_packet.get("decision") == "replan_required"
-        and action_packet.get("obligation_id") == obligation.get("obligation_id")
-        and dict(obligation.get("replan_context") or {}).get("delivery")
-        == "host_projected"
-    ):
-        raise ValueError(
-            "required-vision scenario must preserve host-delivered replan context"
-        )
-    if semantics["scheduler_action"].get("action") != "run_now":
-        raise ValueError("required-vision scenario must remain immediately runnable")
-
-
 def _validate_planning_horizon_model_scenario(
     source_packet: Mapping[str, Any],
 ) -> None:
@@ -993,8 +955,6 @@ def _validate_control_plane_composition_scenario(
     source_packet: Mapping[str, Any],
     contract: Mapping[str, Any],
 ) -> None:
-    if spec.scenario_id == "turn_required_vision_replan":
-        _validate_required_vision_replan_scenario(source_packet, contract)
     if spec.scenario_id == "turn_scoped_gate_successor_replan":
         signature = quota_action_signature_document(source_packet)
         action = dict(signature.get("action") or {})
@@ -1111,6 +1071,8 @@ def _scenario_contract(
     _validate_identity_scenario_contract(spec, source_packet, contract)
     _validate_planning_context_scenario(spec, source_packet, contract)
     _validate_control_plane_composition_scenario(spec, source_packet, contract)
+    if spec.scenario_id == "turn_required_vision_replan":
+        contract.update(required_vision_scenario_contract(source_packet, contract))
     _validate_compaction_scenario(spec, source_packet, actor_packet, contract)
     if spec.scenario_family == "diagnostic_authority_boundary":
         diagnostic = dict(actor_packet.get("agent_todo_summary") or {})
@@ -1183,6 +1145,11 @@ def _receipt_alignment(
             if receipt.get(field) != expected[field]
         ]
         mismatches.extend(str(item) for item in receipt.get("safety_violations") or [])
+        if spec.scenario_id == "turn_required_vision_replan" and not (
+            receipt.get("semantic_action_accepted") is True
+            and set(receipt.get("selected_semantic_outcomes") or []).intersection(expected["required_semantic_outcomes"])
+        ):
+            mismatches.append("required_vision_outcome_not_accepted")
         if (
             spec.semantic_contract_fields
             and receipt.get("semantic_contract_complete") is not True
@@ -1204,6 +1171,35 @@ def _receipt_alignment(
     return not mismatches, sorted(set(mismatches))
 
 
+def _tool_repeat_diagnostic(receipt: Mapping[str, Any], repeat: int) -> dict[str, Any]:
+    """Retain bounded failure context without commands or provider content."""
+    def count(value: Any) -> int | None:
+        return value if type(value) is int and 0 <= value <= 1_000 else None
+
+    def code(value: Any) -> str | None:
+        if value is None:
+            return None
+        return value if isinstance(value, str) and _DIAGNOSTIC_CODE.fullmatch(value) else "unclassified"
+
+    steps = receipt.get("tool_call_receipts")
+    entries = steps if isinstance(steps, list) else []
+    errors: dict[str, int] = {}
+    for entry in entries[:64]:
+        if not isinstance(entry, Mapping) or not entry.get("error_code"):
+            continue
+        error = code(entry["error_code"]) or "unclassified"
+        errors[error] = errors.get(error, 0) + 1
+    return {
+        "repeat": repeat,
+        "actor_passed": receipt.get("qualification_passed") is True,
+        "failure_code": code(receipt.get("failure_code")),
+        "tool_call_count": count(receipt.get("tool_call_count")),
+        "tool_call_limit": count(receipt.get("tool_call_limit")),
+        "tool_error_counts": dict(sorted(errors.items())),
+        "tool_errors_truncated": len(entries) > 64,
+    }
+
+
 def _scenario_result(
     spec: _ScenarioSpec,
     packet: Mapping[str, Any],
@@ -1222,6 +1218,7 @@ def _scenario_result(
     observed_routes: list[str] = []
     observed_action_kind_sequences: list[list[str]] = []
     failure_codes: list[str] = []
+    repeat_diagnostics: list[dict[str, Any]] = []
     actor_error = False
     observations: list[dict[str, Any]] = []
     for repeat_index in range(ACTUAL_DEFAULT_MODEL_BEHAVIOR_REPEAT_ATTEMPTS):
@@ -1286,6 +1283,8 @@ def _scenario_result(
             break
         aligned, mismatches = _receipt_alignment(spec, receipt, expected)
         receipt_digests.append(_digest(dict(receipt)))
+        if spec.actor_kind in _TOOL_ACTOR_KINDS:
+            repeat_diagnostics.append(_tool_repeat_diagnostic(receipt, repeat_index + 1))
         observations.append(
             {field: receipt.get(field) for field in _HARD_INVARIANT_FIELDS}
         )
@@ -1307,23 +1306,22 @@ def _scenario_result(
         not failure_codes
         and repeats_completed == ACTUAL_DEFAULT_MODEL_BEHAVIOR_REPEAT_ATTEMPTS
     )
-    return (
-        {
-            "scenario_id": spec.scenario_id,
-            "actor_kind": spec.actor_kind,
-            "phase": spec.phase,
-            "expected_route": spec.expected_route,
-            "status": "passed" if passed else "failed",
-            "repeats_required": ACTUAL_DEFAULT_MODEL_BEHAVIOR_REPEAT_ATTEMPTS,
-            "repeats_completed": repeats_completed,
-            "observed_routes": observed_routes,
-            "observed_action_kind_sequences": observed_action_kind_sequences,
-            "failure_codes": sorted(set(failure_codes)),
-            "receipt_digests": receipt_digests,
-        },
-        actor_error,
-        observations,
-    )
+    result = {
+        "scenario_id": spec.scenario_id,
+        "actor_kind": spec.actor_kind,
+        "phase": spec.phase,
+        "expected_route": spec.expected_route,
+        "status": "passed" if passed else "failed",
+        "repeats_required": ACTUAL_DEFAULT_MODEL_BEHAVIOR_REPEAT_ATTEMPTS,
+        "repeats_completed": repeats_completed,
+        "observed_routes": observed_routes,
+        "observed_action_kind_sequences": observed_action_kind_sequences,
+        "failure_codes": sorted(set(failure_codes)),
+        "receipt_digests": receipt_digests,
+    }
+    if spec.actor_kind in _TOOL_ACTOR_KINDS:
+        result["repeat_diagnostics"] = repeat_diagnostics
+    return result, actor_error, observations
 
 
 def _contrast_result(

@@ -65,7 +65,15 @@ _EFFECT_RUNTIME_STARTUP_DEFAULT_REMEDIATION = (
 )
 
 
-def _effect_runtime_startup_recommended_action(diagnostic_code: str) -> str:
+def _effect_runtime_startup_recommended_action(
+    diagnostic_code: str,
+    message: str,
+) -> str:
+    if diagnostic_code == "invalid_idle_timeout":
+        # The TypeScript runtime owns the idle-timeout validation rules and
+        # publishes them as the typed startup message, so the projection must
+        # reuse that message rather than restate the accepted range here.
+        return f"{message} Then retry `loopx start-goal --guided`."
     return _EFFECT_RUNTIME_STARTUP_REMEDIATION_BY_CODE.get(
         diagnostic_code,
         _EFFECT_RUNTIME_STARTUP_DEFAULT_REMEDIATION,
@@ -87,7 +95,8 @@ def _effect_runtime_startup_failure_payload(
             "required_for": ["start-goal", "control_plane"],
         },
         "recommended_action": _effect_runtime_startup_recommended_action(
-            diagnostic_code
+            diagnostic_code,
+            str(exc),
         ),
     }
 
@@ -147,7 +156,8 @@ def register_start_goal_command(subparsers: argparse._SubParsersAction) -> None:
         "--thread-id",
         help=(
             "Stable opaque host thread id used to reuse the bound agent lane. "
-            "Codex App defaults to the ambient CODEX_THREAD_ID when available."
+            "Codex App defaults to CODEX_THREAD_ID and Trae App to "
+            "TRAECLI_THREAD_ID when available."
         ),
     )
     start_goal_parser.add_argument(

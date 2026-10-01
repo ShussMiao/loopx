@@ -165,13 +165,17 @@ def test_collect_history_filters_stopped_goals_before_reading_run_indexes(
         encoding="utf-8",
     )
     loaded_indexes: list[str] = []
-    original_load_index = history_module.load_index
+    original_load_index_snapshot = history_module.load_index_snapshot
 
-    def record_load_index(path: Path, **kwargs: Any):
+    def record_load_index_snapshot(path: Path, **kwargs: Any):
         loaded_indexes.append(path.parts[-3])
-        return original_load_index(path, **kwargs)
+        return original_load_index_snapshot(path, **kwargs)
 
-    monkeypatch.setattr(history_module, "load_index", record_load_index)
+    monkeypatch.setattr(
+        history_module,
+        "load_index_snapshot",
+        record_load_index_snapshot,
+    )
 
     history = collect_history(
         registry_path=registry_path,

@@ -12,10 +12,14 @@ import { FrontstageDeveloperPage } from "./views/frontstage-developer-page";
 import { useEffect } from "react";
 import { resolveLocalStatusUrl } from "./data/local-status-query";
 import { BenchmarkStudyPage } from "./views/benchmark-study-page";
+import { AnswerReportPage } from "./features/personal-workspace/answer-report-page";
 
 const searchSchema = z.object({
   goalId: z.string().optional().default(""),
   statusUrl: z.string().optional().default(""),
+  view: z.enum(["conversation", "overview", "tasks", "files"]).optional(),
+  reportSessionId: z.string().regex(/^[A-Za-z0-9._-]{1,160}$/).optional(),
+  reportMessageId: z.string().regex(/^[A-Za-z0-9._-]{1,160}$/).optional(),
 });
 
 const frontstageSearchSchema = z.object({
@@ -36,7 +40,7 @@ const benchmarkStudySearchSchema = z.object({
 
 // Bookmarks remain valid, but the retired boards no longer ship a second UI.
 function PublicCasesRedirect() {
-  const target = "https://huangruiteng.github.io/loopx/docs/showcases/index.en.html";
+  const target = "https://loopx-project.github.io/loopx/docs/showcases/index.en.html";
   useEffect(() => { window.location.replace(target); }, []);
   return <a href={target}>Open LoopX cases / 浏览案例</a>;
 }
@@ -71,7 +75,12 @@ export const dashboardRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   validateSearch: (search) => searchSchema.parse(search),
-  component: DashboardPage,
+  component: () => {
+    const search = dashboardRoute.useSearch();
+    return search.reportSessionId && search.reportMessageId
+      ? <AnswerReportPage sessionId={search.reportSessionId} messageId={search.reportMessageId} statusUrl={search.statusUrl}/>
+      : <DashboardPage/>;
+  },
 });
 
 export const frontstageRoute = createRoute({

@@ -730,7 +730,7 @@ def assert_exact_todo_gate_only_blocks_target_todo() -> None:
     assert lane_action["source"] == "scoped_user_gate_fallback.selected_executable", lane_action
     assert lane_action["selected_by"] == "scoped_user_gate_fallback", lane_action
     assert lane_action["replaces_gated_goal_next_action"] is True, lane_action
-    assert "todo_benchmark_ledger_cleanup" in payload["protocol_action_packet"]["summary"], payload
+    assert "protocol_action_packet" not in payload, payload
     monitor_ids = {
         item["todo_id"]
         for item in payload["agent_todo_summary"]["first_open_items"]
@@ -1022,8 +1022,8 @@ def assert_agent_without_advancement_candidate_and_only_monitor_work_stays_quiet
     reset = scheduler["reset_policy"]
     assert isinstance(reset["reset_token"], str) and len(reset["reset_token"]) == 16, reset
     assert reset["host_state_key"] == "scheduler_hint.reset_policy.reset_token", reset
-    assert reset["codex_app_initial_interval_minutes"] == 15, reset
-    assert reset["codex_app_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=15", reset
+    assert reset["app_automation_initial_interval_minutes"] == 15, reset
+    assert reset["app_automation_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=15", reset
     assert scheduler["codex_app"]["max_interval_minutes"] == 60, scheduler
     assert len(reset["identity_signature"]) == 12, reset
     assert "identity_snapshot" not in reset, reset
@@ -1032,7 +1032,8 @@ def assert_agent_without_advancement_candidate_and_only_monitor_work_stays_quiet
     assert "profile_signature" not in reset, reset
     assert "reset_condition_summary" not in reset, reset
     assert "no_spend_for_reset" not in reset, reset
-    assert "scheduler=backoff_until_material_transition" in payload["protocol_action_packet"]["summary"], payload
+    assert payload["scheduler_hint"]["action"] == "backoff_until_material_transition", payload
+    assert "protocol_action_packet" not in payload, payload
 
 
 def main() -> int:

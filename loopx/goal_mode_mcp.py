@@ -18,6 +18,9 @@ except ImportError:  # pragma: no cover - exercised on base installs only
 
 from .control_plane.host_adapter_settlement import (
     HostTodoSettlementRequest,
+    host_vision_request,
+    project_host_interaction,
+    refresh_host_todo_vision,
     settle_host_todo_completion,
 )
 
@@ -89,11 +92,11 @@ class GoalModeMCPControlPlane:
             command += ["--registry", registry]
         command += ["--format", "json"]
         result = subprocess.run(
-            [*command, *args], capture_output=True, text=True, timeout=30
+            [*command, *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30
         )
         if legacy_args is not None and self._runtime_profile_flag_is_unsupported(result):
             result = subprocess.run(
-                [*command, *legacy_args], capture_output=True, text=True, timeout=30
+                [*command, *legacy_args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30
             )
         return (result.stdout or "") + (
             ("\n" + result.stderr) if result.returncode else ""
@@ -143,10 +146,19 @@ class GoalModeMCPControlPlane:
         if not goal_id:
             return self.no_goal_message()
         args, legacy_args = self.should_run_args(goal_id, self.bound_agent_id())
-        return self.run_cli(args, legacy_args=legacy_args)
+        return project_host_interaction(self.run_cli(args, legacy_args=legacy_args))
 
     def list_todos(self) -> str:
         return self.should_run()
+
+    def host_prompt(self) -> str:
+        from .claude_goal_mode.scripts.goalmode_cmd import loop_execution_content
+        state = self.state()
+        goal_id, agent_id = state.get("goal_id"), state.get("agent_id")
+        if not goal_id or not agent_id:
+            return json.dumps({"ok": False, "error": "bound Goal and agent are required"})
+        return json.dumps({"ok": True, "goal_id": goal_id, "agent_id": agent_id,
+                           "task_body": loop_execution_content(goal_id, agent_id)})
 
     def claim_task(self, todo_id: str, agent_id: str) -> str:
         goal_id, _ = self.context()
@@ -179,6 +191,9 @@ class GoalModeMCPControlPlane:
         task_lease_idempotency_key: str = "",
         task_lease_expected_version: ExpectedTaskLeaseVersion = None,
         no_follow_up: bool = False,
+        successor_todo_ids: list[str] | None = None,
+        agent_vision: dict[str, Any] | None = None,
+        vision_unchanged_reason: str = "",
     ) -> str:
         goal_id, _ = self.context()
         if not goal_id:
@@ -193,6 +208,13 @@ class GoalModeMCPControlPlane:
                     "error": "next_agent_todo and no_follow_up are mutually exclusive",
                 }
             )
+        if successor_todo_ids is not None and (
+            not isinstance(successor_todo_ids, list)
+            or any(not isinstance(value, str) or not value.strip() for value in successor_todo_ids)
+        ):
+            return json.dumps({"ok": False, "error": "successor_todo_ids must be a list of nonempty ids"})
+        if successor_todo_ids and (next_agent_todo or no_follow_up):
+            return json.dumps({"ok": False, "error": "choose existing successors, a new successor, or no follow-up"})
         args = [
             "todo",
             "complete",
@@ -209,6 +231,8 @@ class GoalModeMCPControlPlane:
         ]
         if next_agent_todo:
             args += ["--next-agent-todo", next_agent_todo]
+        for successor in successor_todo_ids or []:
+            args += ["--successor-todo-id", successor]
         if task_lease_idempotency_key:
             args += ["--task-lease-idempotency-key", task_lease_idempotency_key]
         if task_lease_expected_version is not None:
@@ -218,20 +242,41 @@ class GoalModeMCPControlPlane:
             ]
         if no_follow_up:
             args.append("--no-follow-up")
-        return settle_host_todo_completion(
-            HostTodoSettlementRequest(
-                goal_id=goal_id,
-                agent_id=agent_id,
-                todo_id=todo_id,
-                runtime_profile=self.config.runtime_profile,
-                legacy_host_surface=self.config.legacy_host_surface,
-                scheduler_owner=self.config.scheduler_owner,
-                execution_mode=self.config.execution_mode,
-                completion_args=tuple(args),
-                no_follow_up=no_follow_up,
-            ),
-            run_cli=self.run_cli,
+        request = HostTodoSettlementRequest(
+            goal_id=goal_id,
+            agent_id=agent_id,
+            todo_id=todo_id,
+            runtime_profile=self.config.runtime_profile,
+            legacy_host_surface=self.config.legacy_host_surface,
+            scheduler_owner=self.config.scheduler_owner,
+            execution_mode=self.config.execution_mode,
+            completion_args=tuple(args),
+            no_follow_up=no_follow_up,
         )
+        with host_vision_request(request, agent_vision, vision_unchanged_reason) as authored:
+            return settle_host_todo_completion(authored, run_cli=self.run_cli)
+
+    def review_task_vision(
+        self, todo_id: str, agent_id: str, agent_vision: dict[str, Any] | None = None,
+        vision_unchanged_reason: str = "",
+        read_context_id: str = "",
+    ) -> str:
+        goal_id, _ = self.context()
+        if not goal_id:
+            return self.no_goal_message()
+        identity_error = self._identity_error(agent_id)
+        if identity_error:
+            return identity_error
+        request = HostTodoSettlementRequest(
+            goal_id=goal_id, agent_id=agent_id, todo_id=todo_id,
+            runtime_profile=self.config.runtime_profile,
+            legacy_host_surface=self.config.legacy_host_surface,
+            scheduler_owner=self.config.scheduler_owner, execution_mode=self.config.execution_mode,
+            completion_args=(),
+            checkpoint_read_context_id=read_context_id or None,
+        )
+        with host_vision_request(request, agent_vision, vision_unchanged_reason) as authored:
+            return refresh_host_todo_vision(authored, run_cli=self.run_cli)
 
 
 def create_fastmcp_server(
@@ -249,6 +294,12 @@ def create_fastmcp_server(
     control = GoalModeMCPControlPlane(config, context_resolver)
     server = FastMCP(config.server_name)
 
+    if config.legacy_host_surface == "claude_code":
+        @server.tool()
+        def host_prompt() -> str:
+            """Read current Claude Goal execution rules for this server's bound identity."""
+            return control.host_prompt()
+
     @server.tool()
     def should_run() -> str:
         """Whether the bound goal and agent should run now."""
@@ -265,6 +316,26 @@ def create_fastmcp_server(
         return control.claim_task(todo_id, agent_id)
 
     @server.tool()
+    def review_task_vision(
+        todo_id: str, agent_id: str, agent_vision: dict[str, Any] | None = None,
+        vision_unchanged_reason: str = "",
+        read_context_id: str = "",
+    ) -> str:
+        """Supply a missing vision decision for a previously completed MCP Todo.
+        First call with only todo_id and agent_id to read the current basis.
+        Judge that basis, then call again with its read_context_id and one decision.
+        On stale/replaced context, read and judge again; do not reuse the old decision.
+        Retry a lost response with the same receipt and decision, without a new read.
+        Uses its original Turn, never repeats work or spends again. agent_vision is
+        a goal_vision_replan_contract_v0 packet with state and vision_patch fields.
+        Compare Goal acceptance with evidence; vision_closed closes a stage and
+        still requires a successor, no_followup asserts no remaining scoped work.
+        An unchanged reason requires an existing valid vision. Recheck should_run;
+        checkpoint success alone does not certify Goal completion or clear gates.
+        """
+        return control.review_task_vision(todo_id, agent_id, agent_vision, vision_unchanged_reason, read_context_id)
+
+    @server.tool()
     def complete_task(
         todo_id: str,
         agent_id: str,
@@ -273,8 +344,21 @@ def create_fastmcp_server(
         task_lease_idempotency_key: str = "",
         task_lease_expected_version: ExpectedTaskLeaseVersion = None,
         no_follow_up: bool = False,
+        successor_todo_ids: list[str] | None = None,
+        agent_vision: dict[str, Any] | None = None,
+        vision_unchanged_reason: str = "",
     ) -> str:
-        """Complete one verified todo, write follow-up state, then spend quota."""
+        """Complete verified work and settle once. Link existing planned successors
+        with successor_todo_ids; next_agent_todo creates a NEW Todo, not an id link.
+        no_follow_up closes this Todo's continuation, NOT the Goal's vision.
+        Do not duplicate existing work; only the fresh should_run contract can
+        establish Goal terminal state, regardless of the Todo closeout receipt.
+        Include an authored agent_vision (goal_vision_replan_contract_v0 with state
+        and vision_patch), or an unchanged reason backed by an existing vision.
+        Omission keeps a required checkpoint open; repair with review_task_vision.
+        If settlement failed, correct uncommitted input and retry complete_task
+        with the same completion intent; checkpoint-only recovery cannot spend.
+        """
         return control.complete_task(
             todo_id,
             agent_id,
@@ -283,6 +367,9 @@ def create_fastmcp_server(
             task_lease_idempotency_key=task_lease_idempotency_key,
             task_lease_expected_version=task_lease_expected_version,
             no_follow_up=no_follow_up,
+            successor_todo_ids=successor_todo_ids,
+            agent_vision=agent_vision,
+            vision_unchanged_reason=vision_unchanged_reason,
         )
 
     return server, control

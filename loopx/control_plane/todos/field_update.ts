@@ -1,5 +1,6 @@
 /** Pure field intent planning. Admission, leases, validation and commit stay
  * with the calling lifecycle transaction; this result grants no write right. */
+import {planTodoPriority} from "./priority.ts";
 import type { JsonObject } from "../effect_program.ts";
 import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
 import { requireJsonObject, requireNonEmptyString } from "../runtime_decode.ts";
@@ -9,7 +10,13 @@ import {
   buildTodoCompletionMetadataUpdates,
   TODO_COMPLETION_STATE_REQUEST_SCHEMA,
 } from "./completion_state.ts";
-import { normalizeTodoResumeWhen, TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION } from "./resume_condition.ts";
+import { validateLegacyContinuationPolicyRepair } from "./legacy_continuation_policy_migration.ts";
+import {
+  normalizeTodoResumeWhen,
+  TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+  UNSUPPORTED_TODO_RESUME_CONDITION_MESSAGE,
+} from "./resume_condition.ts";
+import { MONITOR_METADATA_FIELDS, planMonitorMetadata, TODO_MONITOR_METADATA_REQUEST_SCHEMA } from "./monitor_metadata.ts";
 
 export const TODO_FIELD_UPDATE_REQUEST_SCHEMA = "loopx_todo_field_update_request_v0";
 export const TODO_FIELD_UPDATE_RESULT_SCHEMA = "loopx_todo_field_update_result_v0";
@@ -27,16 +34,13 @@ const STRING_FIELDS = ["note", "evidence", "completion_turn_key", "reason", "tas
 const PRESENT_FIELDS = ["required_write_scopes", "required_capabilities", "target_capabilities",
   "explore_result_node_refs", "decision_scope", "required_decision_scopes", "decision_outcome",
   "decision_scope_outcomes"] as const;
-const MONITOR_FIELDS = ["target_key", "monitor_effect_id", "cadence", "next_due_at", "expires_at",
-  "last_checked_at", "result_hash", "consecutive_no_change", "material_change",
-  "material_change_generation", "max_no_change_before_replan", "watch_only"] as const;
 const FLAGS = ["clear_claim", "claim_only", "clear_user_binding", "clear_blocks_agent",
   "clear_global_gate", "clear_resume_when"] as const;
 const INTENT_FIELDS = new Set<string>([...STRING_FIELDS, ...PRESENT_FIELDS, ...FLAGS,
   "status", "claimed_by", "bound_agent", "goal_bound", "blocks_agent", "excluded_agents",
   "global_gate", "unblocks_todo_id", "successor_todo_ids", "completion_continuation",
   "completion_recovery", "completion_metadata_updates_override", "resume_when",
-  "resume_monitor_generation", "no_followup", "monitor_metadata"]);
+  "resume_monitor_generation", "no_followup", "monitor_metadata", "text", "priority", "clear_priority"]);
 
 function optionalString(value: unknown, label: string): string | null {
   if (value === null || value === undefined) return null;
@@ -76,19 +80,6 @@ function validateIntent(value: unknown): JsonObject {
   return intent;
 }
 
-function validateRepair(block: JsonObject, intent: JsonObject, todoId: string): void {
-  const removed = stripPythonWhitespace(String(block.removed_continuation_policy ?? "")).toLowerCase();
-  if (removed !== "primary_review" && removed !== "review_handoff") return;
-  const prefix = `todo_id '${todoId}' uses removed continuation_policy=${removed}; `;
-  if (intent.claim_only) throw new EffectRuntimeRequestError(prefix + "repair it before claiming");
-  const repair = stripPythonWhitespace(String(intent.continuation_policy ?? "")).toLowerCase();
-  const exclusions = Array.isArray(intent.excluded_agents) ? intent.excluded_agents : [];
-  if (repair !== "independent_handoff" || !exclusions.some(agent => existingAgent(agent) !== null)) {
-    throw new EffectRuntimeRequestError(prefix +
-      "repair it explicitly with continuation_policy=independent_handoff and excluded_agents=<author>");
-  }
-}
-
 function bindingUpdates(block: JsonObject, intent: JsonObject, todoId: string): JsonObject {
   const updates: JsonObject = {};
   if (intent.clear_claim) updates.claimed_by = null;
@@ -114,7 +105,11 @@ function bindingUpdates(block: JsonObject, intent: JsonObject, todoId: string): 
   else if (intent.clear_blocks_agent) updates.blocks_agent = null;
   if (present(intent.excluded_agents)) updates.excluded_agents = intent.excluded_agents;
   if (intent.clear_global_gate) updates.global_gate = null;
-  else if (present(intent.global_gate)) updates.global_gate = intent.global_gate;
+  else if (Object.hasOwn(intent, "global_gate")) {
+    // The public record is presence-based: false means the gate is cleared,
+    // never a second persisted state that can shadow a scoped gate.
+    updates.global_gate = intent.global_gate === true ? true : null;
+  }
   return updates;
 }
 
@@ -152,11 +147,13 @@ export function planTodoFieldUpdate(value: unknown): TodoFieldUpdatePlan {
   const resumeWhen = intent.resume_when ? normalizeTodoResumeWhen({
     schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION, resume_when: intent.resume_when,
   }) : null;
-  if (intent.resume_when && !resumeWhen) throw new EffectRuntimeRequestError("unsupported Todo resume condition");
+  if (intent.resume_when && !resumeWhen) {
+    throw new EffectRuntimeRequestError(UNSUPPORTED_TODO_RESUME_CONDITION_MESSAGE);
+  }
   if (resumeWhen && intent.clear_resume_when) {
     throw new EffectRuntimeRequestError("todo update accepts either resume_when or clear_resume_when, not both");
   }
-  validateRepair(block, intent, todoId);
+  validateLegacyContinuationPolicyRepair(block, intent, todoId);
   const status = intent.status ? stripPythonWhitespace(String(intent.status)).toLowerCase() : null;
   if (status !== null && !STATUS.includes(status as Status)) {
     throw new EffectRuntimeRequestError("todo status must be one of: open, done, blocked, deferred");
@@ -170,13 +167,9 @@ export function planTodoFieldUpdate(value: unknown): TodoFieldUpdatePlan {
   if (intent.claim_only && targetStatus !== "open") {
     throw new EffectRuntimeRequestError(`todo claim requires status=open; todo_id '${todoId}' is status='${targetStatus}'`);
   }
-  const updates: JsonObject = {todo_id: todoId, status: targetStatus};
+  const updates: JsonObject = {todo_id: todoId, status: targetStatus, ...planTodoPriority(block, intent)};
   if (normalizedStatus === "done" && !block.completed_at) updates.completed_at = updatedAt;
   else if (normalizedStatus && normalizedStatus !== "done") updates.completed_at = null;
-  // The public editing contract distinguishes omitted/empty text metadata from
-  // present collections and booleans. Never turn [] or false into omission.
-  for (const field of STRING_FIELDS) if (intent[field]) updates[field] = intent[field];
-  for (const field of PRESENT_FIELDS) if (present(intent[field])) updates[field] = intent[field];
   Object.assign(updates, bindingUpdates(block, intent, todoId));
   if (intent.unblocks_todo_id) updates.unblocks_todo_id = intent.unblocks_todo_id;
   if (present(intent.successor_todo_ids)) updates.successor_todo_ids = intent.successor_todo_ids;
@@ -190,10 +183,43 @@ export function planTodoFieldUpdate(value: unknown): TodoFieldUpdatePlan {
   }
   if (present(intent.no_followup)) updates.no_followup = intent.no_followup;
   Object.assign(updates, completionUpdates(block, intent, targetStatus, normalizedStatus));
-  if (present(intent.monitor_metadata)) {
-    const monitor = requireJsonObject(intent.monitor_metadata, "monitor metadata");
-    for (const field of MONITOR_FIELDS) if (Object.hasOwn(monitor, field)) updates[field] = monitor[field];
+  // Presence, rather than truthiness, is the mutation contract. An explicitly
+  // empty scalar clears the compatibility field; omitted values remain
+  // untouched. This fixes the old `if (intent[field])` conflation of omission
+  // and an intentional clear.
+  for (const field of STRING_FIELDS) {
+    if (Object.hasOwn(intent, field)) {
+      // `note` is a display annotation whose historical empty-input contract
+      // is omission/preservation. Other scalar metadata uses empty text as an
+      // explicit clear once it crosses this typed boundary.
+      if (field === "note" && typeof intent[field] === "string" && !intent[field].trim()) continue;
+      updates[field] = intent[field];
+    }
+  }
+  for (const field of PRESENT_FIELDS) {
+    if (Object.hasOwn(intent, field)) updates[field] = intent[field];
+  }
+  // Public update carries the effective scope and raw observation once. The
+  // field plan composes validation and generation without another RPC.
+  const monitorPlan = request.monitor_context == null ? null : planMonitorMetadata({
+    ...requireJsonObject(request.monitor_context, "monitor context"),
+    schema_version: TODO_MONITOR_METADATA_REQUEST_SCHEMA, existing: block, generated_at: updatedAt,
+    reactivate: block.status === "done" && normalizedStatus === "open",
+  });
+  if (monitorPlan?.transition && block.status === "done" && normalizedStatus === "open") {
+    // The new observation cycle cannot carry terminal decisions as current
+    // state. Historical operation receipts retain the original completion.
+    updates.no_followup = null;
+    updates.completion_continuation = null;
+    updates.completion_recovery = null;
+    updates.completion_turn_key = null;
+  }
+  const monitor = monitorPlan?.metadata ?? intent.monitor_metadata;
+  if (present(monitor)) {
+    const metadata = requireJsonObject(monitor, "monitor metadata");
+    for (const field of MONITOR_METADATA_FIELDS) if (Object.hasOwn(metadata, field)) updates[field] = metadata[field];
   }
   return {schema_version: TODO_FIELD_UPDATE_RESULT_SCHEMA, normalized_status: normalizedStatus,
-    target_status: targetStatus, metadata_updates: updates};
+    target_status: targetStatus, metadata_updates: updates,
+    ...(monitorPlan?.transition ? {monitor_poll_transition: monitorPlan.transition} : {})};
 }

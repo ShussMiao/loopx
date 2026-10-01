@@ -1,4 +1,4 @@
-.TH LOOPX 1 "" "LoopX 1.0.2" "User Commands"
+.TH LOOPX 1 "" "LoopX 1.2.3" "User Commands"
 .SH NAME
 loopx \- control-plane helper for long-running agent work
 .SH SYNOPSIS
@@ -34,6 +34,9 @@ Check install, PATH, release snapshot, skills, and import health.
 .TP
 \fBloopx first\-run\-report\fR
 Print a local first\-run receipt and an optional public feedback issue link.
+.TP
+\fBloopx usage\-ping [status|enable|disable]\fR
+Show or change the default\-on basic usage statistics and its exact payload.
 .TP
 \fBloopx slash\-commands \-\-install\fR
 Refresh host slash\-command prompt and skill files.
@@ -75,11 +78,23 @@ Render a handoff or review packet with any required evidence\-log reads.
 \fBloopx goal\-channel \-\-help\fR
 Set up, inspect, sync, or notify the provider channel bound to one goal.
 .TP
+\fBloopx goal\-portfolio \-\-help\fR
+Read bounded, source\-covered evidence across explicitly selected Goals.
+.TP
+\fBloopx manager\-inbox \-\-help\fR
+Read source\-bound Manager context and record the receiving Agent's decision.
+.TP
 \fBloopx goal\-lifecycle \-\-help\fR
 Preview, stop, or resume a Goal without deleting its history, todos, or evidence.
 .TP
 \fBloopx evidence\-log \-\-goal\-id <goal\-id> \-\-agent\-id <agent\-id> \-\-thin\fR
 Read the current agent's thin public\-safe ledger before replan or handoff.
+.TP
+\fBloopx agent\-capabilities \-\-help\fR
+Inspect or correct a registered Agent's observed runtime capabilities.
+.TP
+\fBloopx handoff \-\-help\fR
+Prepare, inspect, or adopt one explicit cross\-agent Todo handoff.
 .TP
 \fBloopx machine\-config \-\-help\fR
 Inspect typed machine policy, preview changes, and apply an exact plan revision.
@@ -186,6 +201,9 @@ Run contract and public/private boundary checks.
 \fBloopx change\-quality \-\-help\fR
 Qualify one exact final diff against an enabled project policy and receipt contract.
 .TP
+\fBloopx goal\-acceptance\fR
+Configure, inspect or verify a versioned Goal acceptance basis.
+.TP
 \fBloopx integration\-branch \-\-help\fR
 Detect reviewed source\-branch drift and rebuild one local integration branch.
 .TP
@@ -204,6 +222,12 @@ Safely retire explicitly named orphaned global goal routes.
 \fBloopx register\-agent\fR
 Register an automation agent.
 .TP
+\fBloopx agent\-directory\fR
+Produce the local, goal\-scoped peer agent directory this host can hand work to.
+.TP
+\fBloopx resolve\-peer\-route\fR
+Resolve an existing peer to one exact host route before sending work.
+.TP
 \fBloopx lark\-kanban\fR
 Project LoopX state into a Feishu/Lark Base board.
 .TP
@@ -218,6 +242,9 @@ Inspect and manage doctor\-verified subprocess extension activations.
 .TP
 \fBloopx connector\fR
 List, register, rank, and record usage for public connector providers.
+.TP
+\fBloopx external\-evidence\fR
+Plan, admit, and retire provenance\-bound external evidence.
 .TP
 \fBloopx issue\-fix\fR
 Build public\-safe issue or PR fix workflow packets.

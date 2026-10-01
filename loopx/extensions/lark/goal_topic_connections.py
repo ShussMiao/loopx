@@ -11,12 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from functools import partial
 from collections.abc import Mapping
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from ...agent_registry import registered_agent_ids_for_goal
+from ...chat_manager import MANAGER_AGENT_GOAL_ID
 from ...control_plane.goals.configure_goal_service import (
     configure_goal_with_global_sync,
 )
@@ -30,6 +31,7 @@ from ..external_connector_runtime import (
     ExternalResponsePolicy,
     ExternalSourceKind,
     build_external_connector_binding,
+    normalize_external_connector_binding,
     project_external_connector_status,
 )
 from .goal_channel_contracts import (
@@ -64,6 +66,7 @@ from .goal_channel_transport import (
     OPEN_ID_PATTERN,
     SAFE_PROFILE_PATTERN,
     bot_group_history_permission_guidance,
+    bot_membership_verified,
     call,
     ensure_bot_chat_membership,
     find_first_string,
@@ -71,8 +74,25 @@ from .goal_channel_transport import (
     lark_args,
     message_readback_verified,
 )
+from .goal_topic_edit import (
+    _unregister_async_inbox,
+    GoalTopicUpgradeError,
+    save_retiring_async_inbox,
+    resolve_existing_goal_topic,
+    resolve_conversation_policy,
+)
+from .goal_topic_inbox import (
+    _agent_inbox_config,
+    _write_agent_inbox_config,
+    agent_inbox_binding_conflict_packet,
+)
+from .manager_routing import decide_manager_event
 from .goal_topic_routing import (
     CaptureScope,
+    IngressMode,
+    ReplyMode,
+    _routing_value,
+    _connection_routing_modes,
     decide_lark_topic_route_event,
 )
 from .presentation.kanban import (
@@ -80,41 +100,13 @@ from .presentation.kanban import (
     CommandRunner,
     default_subprocess_runner,
 )
-from .private_json import write_private_json_atomic
 
 INCOMING_MODES = {"mentions", "all"}
-
-
-class IngressMode(str, Enum):
-    LIVE_STEERING = "live_steering"
-    SESSION_QUEUE = "session_queue"
-    # Read compatibility for bindings created by the first Goal Topic slice.
-    DIRECT_SESSION = "direct_session"
-    ASYNC_INBOX = "async_inbox"
-
-
-class ReplyMode(str, Enum):
-    TOPIC_REPLY = "topic_reply"
 
 
 CAPTURE_SCOPES = {item.value for item in CaptureScope}
 INGRESS_MODES = {item.value for item in IngressMode}
 REPLY_MODES = {item.value for item in ReplyMode}
-
-
-def _routing_value(
-    enum_type: type[CaptureScope | IngressMode | ReplyMode],
-    value: Any,
-    *,
-    default: str,
-    field: str,
-) -> str:
-    normalized = str(value or default).strip().lower()
-    try:
-        return enum_type(normalized).value
-    except ValueError as exc:
-        allowed = ", ".join(item.value for item in enum_type)
-        raise ValueError(f"{field} must be one of: {allowed}") from exc
 
 
 class LarkGroupChatLookupError(RuntimeError):
@@ -124,6 +116,76 @@ class LarkGroupChatLookupError(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("Unable to list groups joined by the selected Lark App")
+
+
+@serialize_goal_binding_mutation
+def rebind_lark_manager_session(
+    *,
+    binding_path: Path,
+    goal_id: str,
+    connection_id: str,
+    expected_session_id: str,
+    session_id: str,
+    executor_endpoint_id: str,
+    executor_endpoint_source: str,
+) -> dict[str, Any]:
+    """Atomically move one durable manager route to a replacement Session.
+
+    The provider audience and Topic remain unchanged. The caller must open and
+    validate the replacement Session before this compare-and-swap changes the
+    local execution binding.
+    """
+
+    payload = read_goal_channel_binding(binding_path)
+    current = binding_for_goal(payload, goal_id, connection_id=connection_id)
+    if not current or current.get("enabled") is not True:
+        raise ValueError("manager connection is no longer durably configured")
+    routing = current.get("routing")
+    routing = dict(routing) if isinstance(routing, Mapping) else {}
+    if routing.get("conversation_kind") != "manager":
+        raise ValueError("connection is not a manager route")
+    current_session_id = str(current.get("session_id") or "")
+    if current_session_id not in {expected_session_id, session_id}:
+        raise ValueError("manager connection changed during Session rebind")
+    connector = current.get("connector")
+    if not isinstance(connector, Mapping):
+        raise ValueError("manager connection has no durable Connector binding")
+    rebound_connector = normalize_external_connector_binding(
+        {**dict(connector), "session_ref": session_id}
+    )
+    updated = {
+        **current,
+        "session_id": session_id,
+        "routing": {
+            **routing,
+            "executor_endpoint_id": executor_endpoint_id,
+            "executor_endpoint_source": executor_endpoint_source,
+        },
+        "connector": rebound_connector,
+    }
+    saved_connection_id = save_goal_connection(
+        binding_path=binding_path,
+        payload=payload,
+        goal_id=goal_id,
+        binding=updated,
+    )
+    readback = binding_for_goal(
+        read_goal_channel_binding(binding_path),
+        goal_id,
+        connection_id=saved_connection_id,
+    )
+    readback_routing = readback.get("routing") if readback else {}
+    readback_connector = readback.get("connector") if readback else {}
+    if (
+        not readback
+        or readback.get("session_id") != session_id
+        or not isinstance(readback_routing, Mapping)
+        or readback_routing.get("executor_endpoint_id") != executor_endpoint_id
+        or not isinstance(readback_connector, Mapping)
+        or readback_connector.get("session_ref") != session_id
+    ):
+        raise OSError("manager Session rebind did not verify")
+    return dict(readback)
 
 
 def _json_value(result: Mapping[str, Any]) -> Any:
@@ -290,58 +352,6 @@ def _target_name(app_ref: str, chat_id: str) -> str:
     return f"{prefix[:48]}-{digest}"
 
 
-def _agent_inbox_config(
-    *,
-    goal: Mapping[str, Any],
-    agent_id: str,
-    app_ref: str,
-    chat_id: str,
-    bot_display_name: str,
-    capture_scope: str,
-    topic_root_message_id: str | None = None,
-) -> tuple[Path, str, dict[str, Any]]:
-    project = Path(str(goal.get("repo") or "")).expanduser().resolve()
-    if not project.is_dir():
-        raise ValueError("Goal repository is unavailable for Agent-scoped inbox setup")
-    digest = hashlib.sha256(
-        f"{goal.get('id')}\0{agent_id}\0{app_ref}\0{chat_id}".encode()
-    ).hexdigest()[:20]
-    config_ref = f".loopx/config/lark-goal-topics/{digest}.json"
-    config_path = project / config_ref
-    payload = {
-        "schema_version": "lark_event_inbox_config_v0",
-        "enabled": True,
-        "inbox_dir": f".loopx/inbox/lark-goal-topics/{digest}",
-        # Goal Topic routing applies this same scope before ingestion. Keeping
-        # the local inbox declaration identical prevents an addressed-only
-        # stream from being projected as thread-complete.
-        "capture_scope": capture_scope,
-        **(
-            {"topic_root_message_id": topic_root_message_id}
-            if topic_root_message_id
-            else {}
-        ),
-        "reply": {
-            "enabled": True,
-            "sender_profile": app_ref,
-            "sender_identity": "bot",
-            "bot_display_name": bot_display_name,
-            "chat_id": chat_id,
-        },
-    }
-    return config_path, config_ref, payload
-
-
-def _write_agent_inbox_config(
-    *,
-    config_path: Path,
-    config_ref: str,
-    payload: Mapping[str, Any],
-) -> str:
-    write_private_json_atomic(config_path, payload)
-    return config_ref
-
-
 @serialize_goal_binding_mutation
 def connect_lark_goal_topic(
     *,
@@ -349,14 +359,19 @@ def connect_lark_goal_topic(
     goal_id: str,
     target_path: Path,
     binding_path: Path,
-    app_ref: str,
-    chat_id: str,
-    chat_name: str,
+    app_ref: str = "",
+    chat_id: str = "",
+    chat_name: str = "",
+    connection_id: str | None = None,
     incoming_mode: str = "mentions",
     agent_id: str | None = None,
     session_id: str | None = None,
     capture_scope: str | None = None,
-    ingress_mode: str = "direct_session",
+    ingress_mode: str | None = None,
+    conversation_kind: str | None = None,
+    turn_trigger: str | None = None,
+    executor_endpoint_id: str | None = None,
+    runtime_root: str | Path | None = None,
     reply_mode: str = "topic_reply",
     registry_path: Path | None = None,
     execute: bool = True,
@@ -364,23 +379,74 @@ def connect_lark_goal_topic(
     cli_bin: str = DEFAULT_CLI_BIN,
 ) -> dict[str, Any]:
     goal = goal_from_registry(registry, goal_id)
+    editing = None
+    if connection_id:
+        edit = resolve_existing_goal_topic(
+            goal=goal,
+            goal_id=goal_id,
+            binding_path=binding_path,
+            target_path=target_path,
+            connection_id=connection_id,
+            app_ref=app_ref,
+            chat_id=chat_id,
+            agent_id=agent_id,
+            capture_scope=capture_scope,
+        )
+        editing = edit.binding
+        app_ref, chat_id, chat_name = edit.app_ref, edit.chat_id, edit.chat_name
+        agent_id, capture_scope = edit.agent_id, edit.capture_scope
+    (
+        conversation_kind,
+        executor_endpoint_id,
+        executor_endpoint_source,
+        ingress_mode,
+    ) = resolve_conversation_policy(
+        editing=editing,
+        conversation_kind=conversation_kind,
+        executor_endpoint_id=executor_endpoint_id,
+        ingress_mode=ingress_mode,
+        runtime_root=runtime_root,
+    )
+    from ...control_plane.collaboration import conversation_trigger
+    if turn_trigger is not None and conversation_kind != "manager":
+        raise ValueError("turn_trigger is only supported for manager connections")
+    effective_turn_trigger = (
+        conversation_trigger(
+            turn_trigger if turn_trigger is not None
+            else (editing or {}).get("routing", {}).get("turn_trigger")
+        )["mode"] if conversation_kind == "manager" else "addressed"
+    )
+    if conversation_kind == "manager":
+        agent_id = MANAGER_AGENT_GOAL_ID
     normalized_agent_id = normalize_todo_claimed_by(agent_id)
     if agent_id and not normalized_agent_id:
         raise ValueError("agent_id must be a public-safe registered Agent id")
-    if normalized_agent_id and normalized_agent_id not in registered_agent_ids_for_goal(
-        goal
+    if (
+        conversation_kind != "manager"
+        and normalized_agent_id
+        and normalized_agent_id not in registered_agent_ids_for_goal(goal)
     ):
         raise ValueError("agent_id must name an Agent registered for the Goal")
-    connection_id = goal_channel_connection_id(goal_id, normalized_agent_id)
+    connection_id = connection_id or goal_channel_connection_id(
+        goal_id, normalized_agent_id
+    )
     ingress_mode = _routing_value(
         IngressMode,
         ingress_mode,
-        default=IngressMode.DIRECT_SESSION.value,
+        default=IngressMode.ASYNC_INBOX.value,
         field="ingress_mode",
     )
-    if ingress_mode != IngressMode.DIRECT_SESSION.value and not normalized_agent_id:
+    if ingress_mode == IngressMode.DIRECT_SESSION.value:
+        raise ValueError(
+            "direct_session is read-only compatibility; use async_inbox, session_queue, or live_steering"
+        )
+    if not normalized_agent_id:
         raise ValueError(f"{ingress_mode} requires a registered agent_id")
-    normalized_session_id = str(session_id or "").strip()
+    normalized_session_id = (
+        ""
+        if ingress_mode == IngressMode.ASYNC_INBOX.value
+        else str(session_id or "").strip()
+    )
     if (
         ingress_mode
         in {
@@ -388,6 +454,7 @@ def connect_lark_goal_topic(
             IngressMode.SESSION_QUEUE.value,
         }
         and not normalized_session_id
+        and (execute or conversation_kind != "manager")
     ):
         raise ValueError(f"{ingress_mode} requires an exact active Agent session")
     reply_mode = _routing_value(
@@ -424,6 +491,15 @@ def connect_lark_goal_topic(
             bot_display_name=profile,
             capture_scope=effective_capture_scope,
         )
+        conflict = agent_inbox_binding_conflict_packet(
+            goal=goal,
+            goal_id=goal_id,
+            agent_id=str(normalized_agent_id),
+            intended_config_path=inbox_config[0],
+            execute=execute,
+        )
+        if conflict:
+            return conflict
 
     target_payload = read_goal_channel_targets(target_path)
     matched = _target_for_connection(
@@ -431,6 +507,16 @@ def connect_lark_goal_topic(
         app_ref=profile,
         chat_id=safe_chat_id,
     )
+    if editing is not None and not reusable_goal_topic_root(
+        read_goal_channel_binding(binding_path),
+        goal_id,
+        connection_id=connection_id,
+        provider_target=matched[1] if matched is not None else None,
+        chat_id=safe_chat_id,
+    ):
+        raise ValueError(
+            "the existing Topic is unavailable; upgrade cannot create a replacement"
+        )
     target_identity = matched[1].get("identity") if matched is not None else None
     target_cli_bin = (
         str(target_identity.get("cli_bin") or "").strip()
@@ -472,6 +558,7 @@ def connect_lark_goal_topic(
                     ),
                     limit=120,
                 ),
+                **({"turn_trigger": effective_turn_trigger} if conversation_kind == "manager" else {}),
                 "incoming_mode": effective_incoming_mode,
                 "capture_scope": effective_capture_scope,
                 "ingress_mode": ingress_mode,
@@ -480,14 +567,28 @@ def connect_lark_goal_topic(
                 "connection_id": connection_id,
             },
         )
-    membership_result = ensure_bot_chat_membership(
-        runner=runner,
-        cli_bin=effective_cli_bin,
-        membership_profile=profile,
-        bot_profile=profile,
-        chat_id=safe_chat_id,
-        app_id=str(identity["app_id"]),
-    )
+    if editing is not None:
+        # Upgrades verify the existing group; they never add members or create topics.
+        membership_result = (
+            BotChatMembershipResult.ALREADY_VERIFIED
+            if bot_membership_verified(
+                runner=runner,
+                cli_bin=effective_cli_bin,
+                profile=profile,
+                chat_id=safe_chat_id,
+                app_id=str(identity["app_id"]),
+            )
+            else BotChatMembershipResult.ALREADY_UNVERIFIED
+        )
+    else:
+        membership_result = ensure_bot_chat_membership(
+            runner=runner,
+            cli_bin=effective_cli_bin,
+            membership_profile=profile,
+            bot_profile=profile,
+            chat_id=safe_chat_id,
+            app_id=str(identity["app_id"]),
+        )
     membership_added = membership_result.external_write_performed
     if membership_result is BotChatMembershipResult.ADD_FAILED:
         return operation_packet(
@@ -625,6 +726,7 @@ def connect_lark_goal_topic(
         message_id=root_message_id,
         expected_text=f"Goal ID: {goal_id}" if reusable_root else topic_text,
         expected_chat_id=safe_chat_id if reusable_root else None,
+        expected_goal_id=goal_id if reusable_root else None,
     ):
         return operation_packet(
             ok=False,
@@ -716,7 +818,8 @@ def connect_lark_goal_topic(
         "message_id": root_message_id,
         "verified_at": now_iso(),
     }
-    saved_connection_id = save_goal_connection(
+    save_connection = partial(
+        save_goal_connection,
         binding_path=binding_path,
         payload=payload,
         goal_id=goal_id,
@@ -724,21 +827,38 @@ def connect_lark_goal_topic(
             **existing,
             "goal_id": goal_id,
             "agent_id": normalized_agent_id,
-            **({"session_id": normalized_session_id} if normalized_session_id else {}),
+            "connection_id": connection_id,
+            "session_id": normalized_session_id or None,
             "provider": "lark",
             "enabled": True,
             "target_ref": target_name,
-            "channel": {"pinned_message_id": root_message_id},
+            "channel": {
+                **dict(existing.get("channel") or {}),
+                "pinned_message_id": root_message_id,
+            },
             "topic": {
-                "name": topic_name,
+                **dict(existing.get("topic") or {}),
+                "name": (existing.get("topic") or {}).get("name", topic_name)
+                if editing
+                else topic_name,
                 "root_message_id": root_message_id,
                 "created_automatically": True,
             },
             "routing": {
+                **({"turn_trigger": effective_turn_trigger} if conversation_kind == "manager" else {}),
                 "incoming_mode": effective_incoming_mode,
                 "capture_scope": effective_capture_scope,
                 "ingress_mode": ingress_mode,
                 "reply_mode": reply_mode,
+                **(
+                    {
+                        "conversation_kind": "manager",
+                        "executor_endpoint_id": executor_endpoint_id,
+                        "executor_endpoint_source": executor_endpoint_source,
+                    }
+                    if conversation_kind == "manager"
+                    else {}
+                ),
                 **({"inbox_config_ref": inbox_config_ref} if inbox_config_ref else {}),
             },
             **({"connector": connector_binding} if connector_binding else {}),
@@ -746,6 +866,20 @@ def connect_lark_goal_topic(
             "receipts": receipts,
         },
     )
+    try:
+        saved_connection_id = (
+            save_retiring_async_inbox(
+                previous=editing,
+                registry_path=registry_path,
+                binding_path=binding_path,
+                goal_id=goal_id,
+                save=save_connection,
+            )
+            if conversation_kind == "manager" and editing is not None
+            else save_connection()
+        )
+    except GoalTopicUpgradeError as exc:
+        return exc.operation_packet(goal_id=goal_id)
     return operation_packet(
         ok=True,
         goal_id=goal_id,
@@ -761,6 +895,7 @@ def connect_lark_goal_topic(
             "chat_name": public_safe_compact_text(chat_name, limit=60),
             "target_ref": target_name,
             "topic_name": topic_name,
+            **({"turn_trigger": effective_turn_trigger} if conversation_kind == "manager" else {}),
             "incoming_mode": effective_incoming_mode,
             "capture_scope": effective_capture_scope,
             "ingress_mode": ingress_mode,
@@ -793,6 +928,19 @@ def list_lark_connections(
     target_payload = read_goal_channel_targets(target_path)
     rows: list[dict[str, Any]] = []
     health_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    targets = target_payload.get("targets")
+    targets = targets if isinstance(targets, Mapping) else {}
+    app_profiles: dict[str, set[str]] = {}
+    for target in targets.values():
+        if not isinstance(target, Mapping) or target.get("enabled") is not True:
+            continue
+        identity = target.get("identity")
+        if not isinstance(identity, Mapping):
+            continue
+        app_id = str(identity.get("bot_app_id") or "")
+        profile = str(identity.get("sender_profile") or "")
+        if app_id and profile:
+            app_profiles.setdefault(app_id, set()).add(profile)
     for goal_id, binding_path in binding_paths.items():
         try:
             goal = goal_from_registry(registry, goal_id)
@@ -835,6 +983,22 @@ def list_lark_connections(
                 if isinstance(runtime_health, Mapping)
                 else {}
             )
+            if (
+                isinstance(runtime_health, Mapping)
+                and listener.get("status") != "listening"
+            ):
+                # An App's profile aliases share one consumer. The standby
+                # alias is served by the listening App owner, not disconnected.
+                for alias in sorted(
+                    app_profiles.get(str(identity.get("bot_app_id") or ""), ())
+                ):
+                    candidate = runtime_health.get(alias)
+                    if (
+                        isinstance(candidate, Mapping)
+                        and candidate.get("status") == "listening"
+                    ):
+                        listener = candidate
+                        break
             listener_status = str(listener.get("status") or "")
             listener_ready = runtime_health is None or listener_status == "listening"
             last_event_status = str(listener.get("last_event_status") or "")
@@ -907,36 +1071,11 @@ def list_lark_connections(
                 if isinstance(binding.get("topic"), Mapping)
                 else {}
             )
-            routing = (
-                binding.get("routing")
-                if isinstance(binding.get("routing"), Mapping)
-                else {}
-            )
+            raw_routing = binding.get("routing")
+            routing = raw_routing if isinstance(raw_routing, Mapping) else {}
             connector_status: dict[str, Any] | None = None
             try:
-                capture_scope = _routing_value(
-                    CaptureScope,
-                    routing.get("capture_scope")
-                    or (
-                        "configured_chat_all"
-                        if routing.get("incoming_mode") == "all"
-                        else "addressed_only"
-                    ),
-                    default=CaptureScope.ADDRESSED_ONLY.value,
-                    field="capture_scope",
-                )
-                ingress_mode = _routing_value(
-                    IngressMode,
-                    routing.get("ingress_mode"),
-                    default=IngressMode.DIRECT_SESSION.value,
-                    field="ingress_mode",
-                )
-                reply_mode = _routing_value(
-                    ReplyMode,
-                    routing.get("reply_mode"),
-                    default=ReplyMode.TOPIC_REPLY.value,
-                    field="reply_mode",
-                )
+                capture_scope, ingress_mode, reply_mode = _connection_routing_modes(routing)
                 raw_connector = binding.get("connector")
                 if raw_connector is not None:
                     if not isinstance(raw_connector, Mapping):
@@ -979,7 +1118,11 @@ def list_lark_connections(
                     "connection_id": str(binding.get("connection_id") or ""),
                     "goal_title": goal_objective(goal),
                     "agent_id": str(binding.get("agent_id") or "") or None,
+                    "conversation_kind": str(
+                        routing.get("conversation_kind") or "goal"
+                    ),
                     "session_bound": bool(binding.get("session_id")),
+                    "turn_trigger": routing.get("turn_trigger", "addressed"),
                     "incoming_mode": str(routing.get("incoming_mode") or "mentions"),
                     "capture_scope": capture_scope,
                     "ingress_mode": ingress_mode,
@@ -1021,9 +1164,18 @@ def decide_lark_topic_event(
     target_payload: Mapping[str, Any],
     binding_payloads: Mapping[str, Mapping[str, Any]],
     event: Mapping[str, Any],
+    runtime_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Return a content-free routing decision for one provider event."""
 
+    manager_decision = decide_manager_event(
+        target_payload=target_payload,
+        binding_payloads=binding_payloads,
+        event=event,
+        runtime_root=runtime_root,
+    )
+    if manager_decision is not None:
+        return manager_decision
     chat_id = str(event.get("chat_id") or "")
     root_id = str(event.get("root_id") or "")
     message_id = str(event.get("message_id") or "")
@@ -1077,35 +1229,10 @@ def decide_lark_topic_event(
                 or binding_channel.get("pinned_message_id")
                 or ""
             )
-            routing = (
-                binding.get("routing")
-                if isinstance(binding.get("routing"), Mapping)
-                else {}
-            )
+            raw_routing = binding.get("routing")
+            routing = raw_routing if isinstance(raw_routing, Mapping) else {}
             try:
-                capture_scope = _routing_value(
-                    CaptureScope,
-                    routing.get("capture_scope")
-                    or (
-                        "configured_chat_all"
-                        if routing.get("incoming_mode") == "all"
-                        else "addressed_only"
-                    ),
-                    default=CaptureScope.ADDRESSED_ONLY.value,
-                    field="capture_scope",
-                )
-                ingress_mode = _routing_value(
-                    IngressMode,
-                    routing.get("ingress_mode"),
-                    default=IngressMode.DIRECT_SESSION.value,
-                    field="ingress_mode",
-                )
-                reply_mode = _routing_value(
-                    ReplyMode,
-                    routing.get("reply_mode"),
-                    default=ReplyMode.TOPIC_REPLY.value,
-                    field="reply_mode",
-                )
+                capture_scope, ingress_mode, reply_mode = _connection_routing_modes(routing)
                 connector = binding.get("connector")
                 if connector is not None:
                     if not isinstance(connector, Mapping):
@@ -1227,11 +1354,13 @@ def route_lark_topic_event(
     target_payload: Mapping[str, Any],
     binding_payloads: Mapping[str, Mapping[str, Any]],
     event: Mapping[str, Any],
+    runtime_root: str | Path | None = None,
 ) -> dict[str, str] | None:
     decision = decide_lark_topic_event(
         target_payload=target_payload,
         binding_payloads=binding_payloads,
         event=event,
+        runtime_root=runtime_root,
     )
     route = decision.get("route")
     return dict(route) if isinstance(route, Mapping) else None
@@ -1336,32 +1465,6 @@ def _without_goal_topic_connection(
             removed = stored
             mutable.pop(goal_id, None)
     return mutable, removed
-
-
-def _unregister_async_inbox(
-    *, removed: Mapping[str, Any] | None, registry_path: Path | None, goal_id: str
-) -> tuple[dict[str, Any] | None, str]:
-    routing = removed.get("routing") if isinstance(removed, Mapping) else None
-    routing = routing if isinstance(routing, Mapping) else {}
-    agent_id = str(removed.get("agent_id") or "").strip() if removed else ""
-    if routing.get("ingress_mode") != IngressMode.ASYNC_INBOX.value or not agent_id:
-        return None, agent_id
-    if registry_path is None:
-        error = "source registry path is required to unregister the Agent inbox"
-        return {"ok": False, "error": error}, agent_id
-    try:
-        return configure_goal_with_global_sync(
-            registry_path=registry_path,
-            goal_id=goal_id,
-            runtime_root_override=None,
-            execute=True,
-            lark_event_inbox_agent_id=agent_id,
-            clear_lark_event_inbox_config=True,
-        ), agent_id
-    except (OSError, ValueError, TimeoutError) as exc:
-        # The binding removal already landed; report the cleanup failure as a
-        # failed packet instead of raising past the caller mid-disconnect.
-        return {"ok": False, "error": str(exc)}, agent_id
 
 
 @serialize_goal_binding_mutation

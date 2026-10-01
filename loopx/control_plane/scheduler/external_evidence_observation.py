@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from ..todos.contract import normalize_todo_claimed_by, normalize_todo_id
-from ..todos.projection import (
+from ..todos.todo_semantics import (
     todo_summary_claim_scope_agent_id,
     todo_summary_has_only_future_scoped_monitor_work,
     todo_summary_monitor_due_count,
@@ -112,7 +112,8 @@ def scoped_monitor_watch_without_advancement(summary: dict[str, Any] | None) -> 
         return False
     if not todo_summary_monitor_items(summary):
         return False
-    return todo_summary_open_task_counts(summary).get("advancement", 0) <= 0
+    counts = todo_summary_open_task_counts(summary)
+    return counts["complete"] is True and counts["advancement"] == 0
 
 
 def _monitor_item_matches_handle(

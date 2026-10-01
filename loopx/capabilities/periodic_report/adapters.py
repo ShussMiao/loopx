@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .core import _normalize_trigger_receipt, _reject_raw_keys
+from .core import (
+    _normalize_trigger_receipt,
+    _reject_raw_keys,
+    _SINK_ROLES,
+    _SINK_STATUSES,
+    _SOURCE_STATUSES,
+)
+from ...control_plane.content_digest import ENVELOPED_SHA256_PATTERN
 
 
 SOURCE_RESULT_SCHEMA = "periodic_report_source_result_v0"
@@ -19,11 +26,9 @@ ARTIFACT_SCHEMA = "periodic_report_artifact_v0"
 SINK_RESULT_SCHEMA = "periodic_report_sink_result_v0"
 
 _TOKEN_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
-_SOURCE_STATUSES = {"complete", "partial", "failed", "unknown"}
-_SINK_STATUSES = {"pending", "sent", "failed", "skipped", "unknown"}
-_SINK_ROLES = {"archive", "delivery"}
 _ITEM_CONTENT_KINDS = {
     "capability_change",
+    "coverage",
     "decision",
     "delivery_receipt",
     "next_action",
@@ -33,7 +38,7 @@ _ITEM_CONTENT_KINDS = {
     "runtime",
 }
 _ITEM_VISIBILITIES = {"primary", "supporting"}
-_SUPPORTING_CONTENT_KINDS = {"delivery_receipt", "runtime"}
+_SUPPORTING_CONTENT_KINDS = {"coverage", "delivery_receipt", "runtime"}
 _HIGHLIGHT_TONES = {"attention", "neutral", "positive"}
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
 SourceCollector = Callable[[Mapping[str, Any]], Mapping[str, Any]]
@@ -752,7 +757,7 @@ def _normalize_artifact_result(
     document_digest = _text(
         artifact.get("document_digest"), "artifact.document_digest", maximum=80
     )
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", document_digest):
+    if not ENVELOPED_SHA256_PATTERN.fullmatch(document_digest):
         raise ValueError("artifact.document_digest must use sha256")
     if expected_document is not None:
         expected_document_digest = (

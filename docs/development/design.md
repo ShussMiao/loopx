@@ -24,6 +24,60 @@ LoopX should feel:
 The interface should read like excellent technical documentation that also
 communicates a confident product.
 
+LoopX's value to an owner is delegating long-running work to Agents without
+losing sight or control of it. Every surface should answer, at a glance, what
+is moving, what is waiting on the owner, and what can be trusted, and let the
+owner act on the answer in place. The same honesty is what makes LoopX credible
+to people outside the project: a screenshot of LoopX should never overstate
+progress.
+
+### Earn The User's Attention
+
+Every visible element must provide at least one of these:
+
+1. **High-value information** that changes what the user understands or decides.
+2. **An essential interaction** needed at this point in the user's journey.
+3. **Expressive visual presentation** worth seeing: a clear composition, useful
+   visual comparison, or purposeful motion that improves understanding or delight.
+
+This is an OR rule, not a demand for three justifications per element or for
+maximum minimalism. Decorative density, raw protocol fields, duplicated status,
+and a button for every available capability do not earn attention by existing.
+Judge the whole viewport, including information repeated across components.
+
+Before implementation, inventory the visible elements and their value. Keep
+conversation, results, and decisions prominent; consolidate routine activity;
+offer one-step access to relevant controls and details without a chain of pages.
+Do not collapse failures, missing authority, uncertain observations, or actions
+requiring judgment into a reassuring success summary. Read models select facts;
+they must not invent execution, acceptance, or completion from prose or counts.
+
+Owner-facing state follows four rules:
+
+- **Decide in place.** When LoopX already owns the authority for an owner
+  decision, the surface performs it: choose, confirm once with the stated
+  effect, then read back the recorded outcome and its effect on dependent work.
+  Do not hand the owner a CLI command to copy, a generic "apply" step, or a
+  control whose effect differs from its label. When an action is truly
+  unavailable here, say why in plain language and name where it can be done.
+- **Liveness comes from observation.** Live treatment (a pulsing dot,
+  "executing", "running") requires an observed active worker, session or turn.
+  A stored status, a registration or a count is not activity; unknown stays
+  visibly unknown.
+- **Group by responsibility.** Collaboration surfaces place work under the
+  member, Agent or owner responsible for it, so one glance shows who is doing
+  what and who is blocked. Work with no resolvable owner goes into an explicit
+  "other" group; it is never dropped.
+- **Owner language first.** Primary copy uses the owner's words. Protocol ids,
+  gate kinds, preview mechanics and executor profiles belong in a collapsed
+  diagnostics disclosure.
+
+Review realistic populated, quiet, blocked, and unavailable states on desktop
+and mobile. Show before/after views, name what earns attention and what was
+consolidated, and verify keyboard access and return to the original context.
+Record this in the PR's visual evidence section. The repository first-screen
+preview approval gate still applies.
+
 ## Source Of Truth
 
 - Use this file as the default visual contract for all new LoopX UI work.
@@ -172,12 +226,21 @@ Do not mix marketing pills and application squares in the same control group.
 - Use precise grids rather than masonry.
 - Avoid decorative cards with no information or action.
 
+- Theme and language choices use the same two-column grid in every workspace theme.
+- Omit secondary descriptive lines under workspace page titles, navigation labels, and display choices. Preserve operational status, errors, and action outcomes.
+- Capability navigation shows the localized name; omit the secondary internal identifier. Show Goal/machine badges only in mixed-scope catalogs, not when the page already selects one scope. Configuration forms use shared spacing and a full-width switch row; optional capability and field explanations live in a collapsed configuration-help section. Keep activation consequences and read-only restrictions visible. Goal and machine editors share the enable-row JSON entry point. Goal JSON accepts only registered editable fields and invalidates the previous preview whenever edited; applying still requires a new reviewed preview.
+- Present one Capability Center with an explicit device-default / single-Goal target. Goal entry points preselect their Goal; global entry points never silently choose one. Target changes discard the previous editor draft and preview, fetch the selected configuration, and preserve the existing revision-checked write owner. Distinguish configuration ownership from the currently selected target and editor permission: show device-only, Goal-only or device-default-with-Goal-override from the capability contract, even for read-only capabilities; keep writability in the existing editor status, and never list a machine-only capability in Goal scope. Show the affected scope and effective source before changes; do not turn storage boundaries into competing navigation entries.
+- Keep Steward a first-level destination for the host steward executor/model/effort and runtime grant. Navigation follows purpose; configuration scope does not dictate navigation. See the [per-capability scope decisions](../architecture/rfcs/desktop-execution-frontends-v0.md#settings-ownership-and-scope).
+- Scope each settings catalog to its owner: Goal settings include only capabilities with Goal scope, including Goal-scoped read-only entries. Machine-only capabilities belong in machine or steward settings even when a shared API catalog also describes them.
+
 ### Forms
 
 - White surface, ink text, hairline border, 6px radius.
 - Labels remain visible; placeholders do not replace labels.
 - Focus uses the blue link/focus token with sufficient contrast.
 - Errors use text and iconography in addition to color.
+
+- Settings titles omit eyebrow text. Settings occupy the dynamic viewport height. Capability detail cards shrink to their content and are capped by the available panel height. The settings sidebar, capability catalog, and capability detail scroll independently with contained overscroll. Other settings content scrolls inside the main panel. Narrow screens use a bounded horizontal capability catalog above the detail panel.
 
 ### Code And Terminal Surfaces
 
@@ -192,6 +255,14 @@ Do not mix marketing pills and application squares in the same control group.
 - Prefer compact badges and hairline panels.
 - Keep goal, gate, owner, evidence, risk, budget, and next action visually
   distinguishable.
+- Summarize many records with one hairline count strip of typed states: zero
+  counts recede, states that need the owner take the danger color and an icon,
+  and the scope of the counts (for example "this page only") sits next to it.
+  Counts come from the same typed classification as the labels, never from
+  prose.
+- Detail many owners with a grid of owner cards: identity, one status pill, the
+  owner's own records, and identifiers behind a disclosure. A blocked owner's
+  card may carry a tinted hairline; avoid filling the card with color.
 - Never render raw private state, credentials, provider IDs, or machine paths.
 
 ## Motion
@@ -223,6 +294,12 @@ Do not shrink diagrams or code until they become illegible. Reflow or enable
 bounded horizontal scrolling.
 
 ## UI Reproduction Workflow
+
+For feature development, carry one user task through the
+[task-first delivery workflow](frontend-delivery.md#task-first-delivery--从用户任务开始).
+A visually consistent composition must also eliminate unnecessary re-entry and
+confirmation, identify the affected target, and show truthful state after action.
+
 
 For UI implementation, migration, or reproduction:
 
@@ -264,6 +341,8 @@ parity is required. Framework migration alone must not alter the UI.
 - [ ] Marketing and application controls use the correct shape language.
 - [ ] Desktop and mobile layouts are validated.
 - [ ] Keyboard, focus, contrast, and reduced-motion behavior are preserved.
+- [ ] Owner decisions complete in place with a readback; live treatment is
+      backed by an observed active fact; protocol identifiers are not primary copy.
 - [ ] English and Chinese content remain usable.
 - [ ] Screenshots are provided for first-screen or fidelity-sensitive changes.
 - [ ] No private data or local paths enter the UI or screenshots.

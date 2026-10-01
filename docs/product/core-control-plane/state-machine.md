@@ -27,6 +27,25 @@ public-safe map over the current repository contracts, especially:
   [`loopx/bootstrap.py`](https://github.com/huangruiteng/loopx/blob/main/loopx/bootstrap.py) for project registration,
   read-only-map opt-in, global sync, and host-loop activation.
 
+## Composition Contract
+
+The diagrams below are explanatory views over cooperating owners, not one
+executable global state enum. A transition in one machine is input evidence to
+another only through its declared command, observation or receipt boundary.
+Keep domain state, derived decisions, settlement phase and projection conditions
+separate as defined in [the taxonomy](state-definitions.md#state-taxonomy-and-ownership).
+
+A pure decision selects a legal transition from explicit facts; the owning
+authority still revalidates current scope and commits it. Completing a Todo,
+settling a Turn and delivering its result have different commit points. A lost
+response or delayed display must not repeat an already committed effect.
+
+For changes crossing these machines, use the
+[composition verification contract](../../architecture/rfcs/composable-state-machines-recovery-verification-v0.md):
+name the causal receipts, safety invariants, conditional progress assumptions,
+fault sequences and affected real entrypoints. Preserve independent user and
+agent channels: a scoped user gate can coexist with runnable unrelated work.
+
 ## How The Machines Compose
 
 ```mermaid
@@ -98,7 +117,9 @@ stateDiagram-v2
   Suggested --> Open: promoted / todo add
   Open --> Claimed: claimed_by set
   Claimed --> Running: quota selects this todo
-  Running --> Done: validated evidence or blocker accepted
+  Running --> Done: terminal outcome accepted
+  Running --> Open: in-flight writeback accepted
+  Running --> Blocked: blocker recorded
   Done --> SuccessorOpen: successor or unblock relation exists
   Done --> Archived: no follow-up or archive policy
   Open --> Blocked: status=blocked / blocker reason
@@ -114,7 +135,7 @@ stateDiagram-v2
 | `Suggested` | Suggestion output or planning prompt | Candidate work that has not entered the durable todo list. | Promote to `Open` or drop it. |
 | `Open` | `status=open` or unchecked Markdown item | Durable backlog item. | Claim, block, defer, supersede, or complete. |
 | `Claimed` | `claimed_by=<agent_id>` | Soft ownership/routing signal. It is not a lock. | Run if quota selects it, reassign, block, or complete. |
-| `Running` | Derived from `quota should-run` plus run history | A bounded turn is currently attempting this item. | Write evidence/blocker, then complete or reopen. |
+| `Running` | Derived from `quota should-run` plus run history | A bounded turn is currently attempting this item. | Write back progress or blocker; complete only when the Todo terminal contract is satisfied. |
 | `Done` | `status=done` or checked item plus evidence | The item has a terminal outcome. | Archive, create successor, or expose handoff clearance. |
 | `Blocked` | `status=blocked`, `reason`, capability/gate fields | Known blocker, not vague waiting. | Repair, ask owner, supersede, or reopen. |
 | `Deferred` | `status=deferred`, `resume_when` | Waiting for a concrete condition. | `ResumeReady` when the condition is satisfied. |
@@ -340,7 +361,7 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | `run_now` | `active_work` | 3 / 10 minutes | Work or repair must be attempted. |
 | `backoff_waiting_for_user` | `human_gate` | 30 / 120 minutes | Concrete user/controller action is next. |
-| `backoff_until_reassigned` | `agent_scope_wait` | 10 / 60 minutes, progression 10/20/30/60 | Handoff owner or reassignment may unblock this agent. |
+| `backoff_until_reassigned` | `agent_scope_wait` or `peer_coordination_wait` | 10 / 60 minutes, progression 10/20/30/60 | Handoff owner, peer readiness, coordinator configuration, reassignment, or new local work may unblock this agent. |
 | `backoff_until_material_transition` | `monitor_wait` | 15 / 60 minutes | Monitor-only liveness without compute spend. |
 | `backoff_until_fresh_evidence` | `unchanged_noop` | 60 / 240 minutes | Wait for fresh mapped or post-handoff evidence. |
 | `backoff_until_state_change` | `quiet_wait` | 30 / 120 minutes | No specific user/monitor path is projected. |
@@ -474,12 +495,18 @@ The same ordering applies when an agent records a bounded
 as a goal-frontier `acceptance_gaps[]` entry. If no advancement frontier remains,
 the gap becomes a replan trigger before the lane can quietly back off.
 
-Long runnable lanes also pass through this machine. When the current agent can
-select about 15 advancement todos, or about 20 open todos with advancement work
-still present, quota should trigger a bounded vision replan before continuing
-linearly. The replan reads the agent-scoped evidence log, uses bounded public
+Long runnable lanes also pass through this machine. When the current agent owns
+at least 15 open advancement todos, quota should trigger a bounded vision replan
+before continuing linearly. The replan reads the agent-scoped evidence log, uses bounded public
 research when local evidence is insufficient for a public claim, then groups,
 prunes, or reprioritizes the chain into the next high-value runnable slice.
+Shared unclaimed candidates remain selectable but do not count toward this lane
+threshold. Continuous monitors also do not count: their due schedules and
+no-change review rules remain independent, and the former 20-claimed-open
+threshold no longer creates new Agent-lane obligations. Historical checkpoints
+remain readable. A valid evidence-linked vision path can retain existing runnable
+work and settle the projected Turn without adding another planning Todo. Shared-pool
+churn preserves its obligation identity; owned material changes rearm it.
 
 The same ordering also applies to `vision_checkpoint_v0`: if a role records
 material progress but omits both a vision patch and an unchanged/no-follow-up

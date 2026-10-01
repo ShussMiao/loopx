@@ -78,6 +78,9 @@ class TestPackagedSkills:
         skills_root = REPO_ROOT / "skills"
         for skill_id in PACKAGED_HOST_SKILL_IDS:
             assert (skills_root / skill_id / "SKILL.md").is_file(), skill_id
+            assert (skills_root / skill_id / ".loopx-skill-scope").read_text(
+                encoding="utf-8"
+            ).strip() == "global", skill_id
 
     def test_repo_has_seven_skills(self):
         assert len(REQUIRED_HOST_SKILL_IDS) == 7  # loopx + 6 packaged
@@ -289,6 +292,9 @@ class TestInstallDedupe:
             write_skill_install_readback(
                 skills_dir=alt, skill_ids=[sid], source_root=REPO_ROOT)
 
+            write_skill_install_readback(
+                skills_dir=target, skill_ids=[sid], source_root=REPO_ROOT)
+
             # Dry-run
             dr = retire_duplicate_managed_skills(target, alternate_root=alt,
                                                   execute=False)
@@ -330,7 +336,12 @@ class TestCwdIsolation:
 class TestSkillDeliveryModes:
     def test_host_managed_types(self):
         assert HOST_MANAGED_SKILL_AGENT_TYPES == {
-            "ark-managed-agent", "deepseek-harness-native", "traex-cli", "other-agent"}
+            "ark-managed-agent",
+            "deepseek-harness-native",
+            "trae_app",
+            "traex-cli",
+            "other-agent",
+        }
 
     def test_delivery_mode_per_agent_type(self):
         host_managed = HOST_MANAGED_SKILL_AGENT_TYPES

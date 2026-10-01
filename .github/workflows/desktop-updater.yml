@@ -31,12 +31,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/desktop/loopx-control-plane/src-tauri -> target
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
       - run: python3 scripts/desktop_runtime_bundle.py
       - run: python3 -m unittest discover -s tests/desktop -p 'test_*.py'
       - run: cargo test --locked && cargo clippy --all-targets --locked -- -D warnings
         working-directory: apps/desktop/loopx-control-plane/src-tauri
   identity:
-    if: github.repository == 'huangruiteng/loopx' && ((github.event_name == 'release' && !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v')) || (github.event_name != 'release' && github.ref == 'refs/heads/main'))
+    if: github.repository == 'loopx-project/loopx' && ((github.event_name == 'release' && !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v')) || (github.event_name != 'release' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.identity.outputs.ref }}
@@ -81,7 +84,7 @@ jobs:
           ref: ${{ needs.identity.outputs.ref }}
       - uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          node-version: "24"
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"

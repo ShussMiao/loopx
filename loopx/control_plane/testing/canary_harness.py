@@ -41,7 +41,7 @@ def run_json_cli(
         command,
         cwd=cwd or REPO_ROOT,
         check=False,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         capture_output=True,
     )
     if result.returncode != 0:
@@ -78,7 +78,7 @@ def run_json_cli_result(
         command,
         cwd=cwd or REPO_ROOT,
         check=False,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         capture_output=True,
     )
     if not result.stdout.strip():

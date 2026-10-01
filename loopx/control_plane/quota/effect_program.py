@@ -4,6 +4,7 @@ import shlex
 from collections.abc import Mapping
 from typing import Any
 
+from ..effect_runtime import effect_runtime_result
 from ..effect_program import (
     SETTLEMENT_IDENTITY_SCHEMA_VERSION,
     SETTLEMENT_PLAN_SCHEMA_VERSION,
@@ -59,6 +60,22 @@ def _quoted_turn_ref(turn_instance_id_ref: str) -> str:
     return shlex.quote(turn_instance_id_ref)
 
 
+def _settlement_actor_args(arguments: str, agent_id: str) -> str:
+    """Identity owns the actor; optional host arguments cannot omit or retarget it."""
+    tokens = shlex.split(arguments)
+    actors = []
+    for index, token in enumerate(tokens):
+        if token == "--agent-id":
+            actors.append(tokens[index + 1] if index + 1 < len(tokens) else None)
+        elif token.startswith("--agent-id="):
+            actors.append(token.partition("=")[2])
+    if actors and actors != [agent_id]:
+        raise ValueError("settlement command actor must match its exact identity")
+    if actors:
+        return arguments if arguments[:1].isspace() else f" {arguments}"
+    return f"{arguments} --agent-id {shlex.quote(agent_id)}"
+
+
 def build_codex_app_settlement_plan(
     *,
     goal_id: str,
@@ -69,6 +86,7 @@ def build_codex_app_settlement_plan(
     scoped_cli_args: str,
     lifecycle_actor_args: str,
     turn_instance_id_ref: str | None = None,
+    writeback_path_args: str = "",
     delivery_boundary: str | None = None,
     quota_spend_source: str = "heartbeat",
 ) -> SettlementPlan:
@@ -81,6 +99,7 @@ def build_codex_app_settlement_plan(
         scoped_cli_args=scoped_cli_args,
         lifecycle_actor_args=lifecycle_actor_args,
         turn_instance_id=turn_instance_id_ref or "${LOOPX_TURN:?}",
+        writeback_path_args=writeback_path_args,
         delivery_boundary=delivery_boundary,
         quota_spend_source=quota_spend_source,
     )
@@ -96,6 +115,7 @@ def build_turn_scoped_cli_settlement_plan(
     scoped_cli_args: str,
     lifecycle_actor_args: str,
     turn_instance_id: str,
+    writeback_path_args: str = "",
     delivery_boundary: str | None = None,
     quota_spend_source: str = "heartbeat",
 ) -> SettlementPlan:
@@ -116,6 +136,8 @@ def build_turn_scoped_cli_settlement_plan(
         turn_instance_id=turn_instance_id,
         replan_obligation_id=replan_obligation_id,
     )
+    scoped_cli_args = _settlement_actor_args(scoped_cli_args, identity.agent_id)
+    lifecycle_actor_args = _settlement_actor_args(lifecycle_actor_args, identity.agent_id)
     quoted_turn = _quoted_turn_ref(turn_instance_id)
     binding_arg = (
         f" --todo-id {shlex.quote(todo_id)}"
@@ -129,69 +151,39 @@ def build_turn_scoped_cli_settlement_plan(
         else ""
     )
     cli_prefix = command_prefix.strip() or "loopx"
-    terminal_closeout = (
+    ordinary_completion = (
         f"{cli_prefix} todo complete --goal-id {shlex.quote(goal_id)}{binding_arg}"
         f"{lifecycle_actor_args}{turn_arg} --evidence '<validated evidence>'"
-        " --no-follow-up"
     )
+    terminal_closeout = ordinary_completion + " --no-follow-up"
     writeback = (
         f"{cli_prefix} refresh-state --goal-id {shlex.quote(goal_id)} "
         "--classification <validated_progress> --delivery-batch-scale <scale> "
         f"--delivery-outcome <outcome>{boundary_arg}{binding_arg}{turn_arg}"
-        f"{scoped_cli_args}"
+        f"{scoped_cli_args}{writeback_path_args}"
     )
     spend = (
         f"{cli_prefix} quota spend-slot --goal-id {shlex.quote(goal_id)} --slots 1 "
         f"--source {quota_spend_source} --execute{binding_arg}{turn_arg}"
         f"{scoped_cli_args}"
     )
-    effect_ref = "$.identity.effect_id"
-    return SettlementPlan(
-        identity=identity,
-        steps=(
-            SettlementStep(
-                kind=SettlementStepKind.VALIDATION,
-                owner="agent",
-                precondition="delivery result is independently validated",
-                idempotency_key_ref=effect_ref,
-                expected_receipt="validation_receipt",
-            ),
-            SettlementStep(
-                kind=SettlementStepKind.DURABLE_WRITEBACK,
-                owner="agent",
-                precondition="validation succeeded",
-                idempotency_key_ref=effect_ref,
-                expected_receipt="durable_writeback_receipt",
-                command_template=writeback,
-            ),
-            SettlementStep(
-                kind=SettlementStepKind.QUOTA_SPEND,
-                owner="agent",
-                precondition="matching durable writeback receipt exists",
-                idempotency_key_ref=effect_ref,
-                expected_receipt="quota_spend_receipt",
-                command_template=spend,
-            ),
-            *(
-                (
-                    SettlementStep(
-                        kind=SettlementStepKind.TERMINAL_CLOSEOUT,
-                        owner="agent",
-                        precondition=(
-                            "the selected Todo is final with no runnable successor "
-                            "and matching writeback and quota spend receipts exist"
-                        ),
-                        idempotency_key_ref=effect_ref,
-                        expected_receipt="terminal_closeout_receipt",
-                        command_template=terminal_closeout,
-                        conditional=True,
-                    ),
-                )
-                if todo_id
-                else ()
-            ),
-        ),
-    )
+    payload = effect_runtime_result("settlement.turn_scoped_cli_plan", {
+        "identity": identity.as_dict(), "delivery_boundary": delivery_boundary,
+        "command_templates": {
+            "todo_completion": ordinary_completion, "durable_writeback": writeback,
+            "quota_spend": spend, "terminal_closeout": terminal_closeout,
+        },
+    })
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("ordered_steps"), list):
+        raise RuntimeError("TypeScript CLI settlement plan shape mismatch")
+    return SettlementPlan(identity=identity, steps=tuple(
+        SettlementStep(
+            kind=SettlementStepKind(row["kind"]), owner=row["owner"],
+            precondition=row["precondition"], idempotency_key_ref=row["idempotency_key_ref"],
+            expected_receipt=row["expected_receipt"], command_template=row.get("command_template"),
+            conditional=row.get("conditional", False), command_condition=row.get("command_condition"),
+        ) for row in payload["ordered_steps"]
+    ), _runtime_payload=payload)
 
 
 def settlement_step_command(

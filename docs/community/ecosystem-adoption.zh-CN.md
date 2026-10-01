@@ -2,111 +2,193 @@
 
 > [English](ecosystem-adoption.md)
 
-LoopX 正在被其他开源项目采样、集成和再实现。本页是这份观察的事实化、
-公开安全清单。
+本页由维护者根据公开证据整理，记录其他项目对 LoopX 的使用、集成、研究与再实现。
+具体使用见[工作流与集成](#1-工作流与集成)；尚未成为运行时采用的工作见
+[提案与暂缓采用](#3-提案与暂缓采用)。
 
-> **边界**：收录是事实记录，不代表背书。仅收录公开 GitHub 证据；状态变化
-> （合并、关闭、改名、停滞）由每周扫描刷新，见[维护方式](#维护方式)。
+> **证据边界**：收录是事实记录，不代表背书或生产部署声明。PR 合并只证明代码或
+> 文档已落地；公开发行、限定范围的试点、开放提案各自证明不同的事情。链接中的
+> 验证结果是其作者的报告，不代表本清单独立复现了这些结果。
 
-项目和用户自愿提交的自报条目见仓库根目录的
-[`ADOPTERS.md`](../../ADOPTERS.md)。观察清单与自报目录有意保持不同的证据边界。
+[`ADOPTERS.md`](../../ADOPTERS.md) 是项目和用户主动描述自身使用情况的独立自愿目录。
+登记表为空不等于没有观察到的使用：下列公开证据不以项目所有者提交登记行为前提。
 
-## 1. 真实集成
+## 1. 工作流与集成
 
-在真实流程中调用 LoopX CLI/契约、或把 LoopX 作为 provider 接入的项目。
+- **CGC 2046**（CodingGirlsClub）——已合并的
+  [PR #838](https://github.com/CodingGirlsClub/cgc_2046/pull/838) 记录改用
+  LoopX 与 Codex CLI 组织开发；已合并的
+  [PR #841](https://github.com/CodingGirlsClub/cgc_2046/pull/841) 增加满足条件后
+  合入 `develop` 的流程，指定敏感变更、`main` 与发布仍由人控制。
+  **状态：开发工作流配置已合并**；不代表应用生产运行时依赖 LoopX。
+  核对日期：2026-09-30。
+- **NoKV**——已合并的 [PR #518](https://github.com/NoKV-Lab/NoKV/pull/518)
+  增加用于 LoopX NoKV authority 资格验证的单节点测试环境。作者报告真实一致性
+  检查通过；工具明确不证明生产可用性、故障转移或多 owner 运行。
+  独立的 metadata-runtime 升级验收门禁
+  [issue #511](https://github.com/NoKV-Lab/NoKV/issues/511) 仍开放。
+  **状态：资格验证工具已合并，独立验收尚未关闭**。这比下文 README 中的合作声明
+  多了具体集成产物，不代表 NoKV 在生产中运行 LoopX。核对日期：2026-09-30。
+- **GoTry**（Danceiny）——用 LoopX goals、Codex 任务绑定和心跳管理多条开发路线。
+  [issue #18](https://github.com/Danceiny/gotry/issues/18) 记录接入，已合并的
+  [PR #187](https://github.com/Danceiny/gotry/pull/187) 记录交付验证。
+  **状态：项目自述的开发工作流使用**；不代表旅行应用运行时依赖 LoopX。
+- **mimofan**（XiaomingX）——通过 LoopX Todo 组织 UI/引擎修复。
+  [PR #738](https://github.com/XiaomingX/mimofan/pull/738) 明确提及该工作流并已合并。
+  **状态：开发工作流证据**。
+- **Meta-RLR**（hk20013106）——已合并的
+  [PR #17](https://github.com/hk20013106/RLR/pull/17) 增加 CLI/JSON 维护边界。
+  LoopX 管理维护目标、待办、证据、监视和重规划，科研状态仍由 `research_loop` 所有。
+  **状态：维护集成已合并**；后续自动唤醒
+  [PR #26](https://github.com/hk20013106/RLR/pull/26) 已关闭、未合并。
+- **LoopX Console**（xielixing）——第三方 BitFun MiniApp，通过本机 LoopX CLI、
+  `quota should-run` 和宿主 Agent 修复 GitHub Issue。
+  [源码与安装说明](https://github.com/xielixing/loopx-console)及
+  [发行版本](https://github.com/xielixing/loopx-console/releases)已公开。
+  **状态：独立发布**；是否进入 OpenBitFun 上游是下文的另一项提案。
+- **zyra**（BingruL）——[打包配置](https://github.com/BingruL/zyra/blob/fix/execution-timeouts-and-diagnostics/pyproject.toml)
+  内嵌 LoopX runtime 并注册 CLI 入口。
+  **状态：已观察到源码与打包集成**；未验证部署和持续运行。
+- **Hufu**（Blicae8917）——已合并的
+  [PR #70](https://github.com/Blicae8917/hufu/pull/70) 增加显式启用的 LoopX v0.5.2
+  RunOnce Consumer。真实 transport 和 Host 调用由部署 Provider 提供；状态投影
+  [issue #76](https://github.com/Blicae8917/hufu/issues/76) 仍开放。
+  **状态：限定范围的集成已合并，配套工作尚未完成**。
+- **benjamin-plugins**（Yidada）——已合并的
+  [PR #1](https://github.com/Yidada/benjamin-plugins/pull/1) 增加调用官方 LoopX 内核的
+  Codex 插件。作者报告源码 checkout 上的 CLI 契约 smoke 通过；PyPI 安装未验证，
+  后台调度仍归宿主。**状态：插件已合并**。
+- **Adaptive-Agent-Orchestration-Protocol**（YuemingHub）——已合并的
+  [PR #41](https://github.com/YuemingHub/Adaptive-Agent-Orchestration-Protocol/pull/41)
+  将 LoopX 注册为可选执行连续性 Provider。
+  [issue #42 的试点报告](https://github.com/YuemingHub/Adaptive-Agent-Orchestration-Protocol/issues/42#issuecomment-5249833699)
+  记录了限定范围的 Linux CLI 恢复与门禁测试；
+  [后续回读](https://github.com/YuemingHub/Adaptive-Agent-Orchestration-Protocol/issues/42#issuecomment-5287847666)
+  未证明持续采用。**状态：协议集成与非生产试点**，不代表默认生产采用。
 
-- **Adaptive-Agent-Orchestration-Protocol**（YuemingHub）——把 LoopX 作为
-  可选的长程执行 provider 采纳（[PR #41，已合并](https://github.com/YuemingHub/Adaptive-Agent-Orchestration-Protocol/pull/41)），
-  并在 [issue #57](https://github.com/YuemingHub/Adaptive-Agent-Orchestration-Protocol/issues/57)
-  跟踪 host pilot。状态：已采纳（协议层）。
-- **LoopX Console / BitFun**（xielixing、GCWing）——把 LoopX 控制面打包成
-  BitFun MiniApp：宿主心跳调用 `quota should-run`、按 `scheduler_hint` 调整
-  轮询、用 `heartbeat-prompt --compact` 生成任务体
-  （[loopx-console](https://github.com/xielixing/loopx-console)、
-  [BitFun PR #1808](https://github.com/GCWing/BitFun/pull/1808)、
-  [PR #2006](https://github.com/GCWing/BitFun/pull/2006)）。
-  状态：进行中（新仓库 + 开放 PR）。
-- **Meta-RLR**（hk20013106）——已合并维护边界
-  （[PR #17](https://github.com/hk20013106/RLR/pull/17)）：LoopX 只持有维护
-  目标/todo/evidence/monitor/replan 状态，`research_loop` 保持权威。
-  状态：已合并 / 运行中。
-- **codexia**（milisp、connorodea）——为自动化调度器提出 LoopX
-  `should-run` 预检（上游 [PR #71，已关闭未合并](https://github.com/milisp/codexia/pull/71)，
-  fork 上重新开启 [PR #1](https://github.com/connorodea/codexia-task-management/pull/1)）。
-  状态：尝试中；契约尚未对着 live 安装验证。
-- **spoon-core**（XSpoonAi）——计划增加可选的只读控制上下文中间件
-  （[issue #285](https://github.com/XSpoonAi/spoon-core/issues/285)）。
-  状态：计划中。
-- **OpenViking / NoKV**——已确认合作伙伴；见
-  [README 合作伙伴项目](https://github.com/huangruiteng/loopx/blob/main/README.zh-CN.md#合作伙伴项目)。
+## 2. 机制借鉴
 
-## 2. 采样与借鉴
+下列项目明确引用 LoopX 的思路。原生实现和已接受的设计文档，与依赖 LoopX 运行时
+是不同的关系。
 
-明确把 LoopX 作为灵感或待吸收能力的 issue、PR、书籍或文档。
+- **surogates**（invergent-ai）——[比较与采用计划](https://github.com/invergent-ai/surogates/blob/master/docs/superpowers/plans/2026-08-03-loopx-adoption.md)
+  选择吸收持久授权、目标预算和评估器记忆，保留自身存储及运行时。
+  [PR #188](https://github.com/invergent-ai/surogates/pull/188)、
+  [#190](https://github.com/invergent-ai/surogates/pull/190)、
+  [#191](https://github.com/invergent-ai/surogates/pull/191) 已合并。
+  **状态：代码层借鉴**；实时 PR 状态优先于计划中的旧表格。
+- **future-os**（futuregene）——已合并的
+  [PR #253](https://github.com/futuregene/future-os/pull/253) 和
+  [#255](https://github.com/futuregene/future-os/pull/255) 明确参考 LoopX，
+  用 Rust 实现部分多 Agent 与目标推进机制。**状态：原生再实现**。
+- **gptme-contrib**——已合并的
+  [PR #1373](https://github.com/gptme/gptme-contrib/pull/1373) 将公开/私有证据脱敏思路
+  归因于 LoopX 调研。**状态：代码层借鉴**。
+- **KiroCrew**——已合并的
+  [PR #3229](https://github.com/kirodotdev/KiroCrew/pull/3229) 在持续 Agent RFC 中采用
+  持久 typed gate 和写回后扣预算，同时明确保留不同的唤醒与工作选择机制。
+  **状态：设计采用，仅文档**。
+- **multica**（LRM-Teams）——已合并的
+  [PR #2174](https://github.com/LRM-Teams/multica/pull/2174) 记录五项受 LoopX 启发的
+  协作原则。**状态：仅文档**，没有 LoopX 运行时变更。
 
-- **《深入理解 AI Agent》/ ai-agent-book**（bojieli，约 37k stars）——合并了
-  一章内容，在 13 个维护版本中把 LoopX 锚定为具体的 Loop Engineering
-  framework，并给出 verifier 视角案例与 pin 定的 stable commit
-  （[PR #614](https://github.com/bojieli/ai-agent-book/pull/614)、
-  [chapter 10](https://github.com/bojieli/ai-agent-book/blob/01e54bf2acc28c7ebb9c325b6d93aef79e1b5069/book/chapter10.md)）。
-  状态：已合并 / 教材级。
-- **Mindthus**（rv198-star）——明确的“对比吸收改进总纲（兼容借鉴，不硬融
-  理念）”，带字段级吸收候选：
-  [issue #132](https://github.com/rv198-star/Mindthus/issues/132)（总纲）、
-  [issue #133](https://github.com/rv198-star/Mindthus/issues/133)（范围化
-  human gate + 诚实 fallback 字段）、
-  [issue #138](https://github.com/rv198-star/Mindthus/issues/138)（handoff
-  恢复五问）。状态：开放，等待主项目方审批。
-- **GovernLoop**（liangzhipengdamon-maker）——Phase 0 评估报告
-  （[PR #23](https://github.com/liangzhipengdamon-maker/GovernLoop/pull/23)）
-  把真实问题映射到 LoopX 能力；关键结论：LoopX 是**被动 state kernel**——
-  强于状态持久化、机器可读状态与可恢复性，不适合主动执行路径。
-- **hartevo-desktop**（tangpingqingwa）——借鉴 Prime Agent + LoopX patterns
-  的 durable Mission Control kernel spec
-  （[issue #55](https://github.com/tangpingqingwa/hartevo-desktop/issues/55)）。
-  状态：早期 spec。
-- **stablyai/orca**——引用 LoopX 提出目标设定与自动迭代的 feature request
-  （[issue #12628](https://github.com/stablyai/orca/issues/12628)）。
-  状态：一句话诉求，开放。
-- **polyphemus**（Diekgbbtt）——研究如何集成 LoopX primitives
-  （[issue #89](https://github.com/Diekgbbtt/polyphemus/issues/89)）。
-  状态：一句话诉求，开放。
-- **mingos-foundation**（YuemingHub）——刻意只做实验的 consumer PR，验证
-  LoopX 作为 AAOP execution-continuity provider
-  （[PR #18](https://github.com/YuemingHub/mingos-foundation/pull/18)）。
-  状态：按设计关闭（实验）。
+## 3. 提案与暂缓采用
 
-## 3. 衍生与周边
+- **OpenViking / VikingBot**——开放的
+  [PR #5223](https://github.com/volcengine/OpenViking/pull/5223) 提议增加可选、
+  默认关闭的 LoopX 后台长任务。LoopX 管 Goal/Todo 状态与执行门禁，Bot 提供
+  worker、模型与工具。作者报告以模型替身完成真实 CLI 测试；真实模型端到端
+  验收和 Docker 构建仍未完成。**状态：运行时集成提案，尚未合并或发布**。
+  核对日期：2026-09-30。
+- **Opensiro VSM harness index**——已合并的
+  [PR #607](https://github.com/opensiro/vsm-harness-index/pull/607) 记录固定
+  LoopX 对比实验的可辨识性阻塞；后续
+  [registered-peer harness](https://github.com/opensiro/vsm-harness-index/pull/614)
+  仅完成实验执行框架，未运行真实模型。已合并的
+  [PR #618](https://github.com/opensiro/vsm-harness-index/pull/618) 随后按仅使用
+  公开证据的研究政策停止该自行执行的实验。
+  **状态：保留历史研究产物，该研究未进行且不再计划实跑**；不是新增 benchmark
+  结果或运行时采用。核对日期：2026-09-30。
+- **OpenBitFun**（GCWing）——内置控制台
+  [PR #2836](https://github.com/GCWing/OpenBitFun/pull/2836) 仍开放，替代已关闭未合并的
+  #2382。维护者[表示优先保障 beta 稳定性，之后再评估大特性](https://github.com/GCWing/OpenBitFun/pull/2836#issuecomment-5613986161)。
+  **状态：上游集成提案**，与已独立发布的第三方 LoopX Console 分开记录。
+- **codexia**——上游 [PR #71](https://github.com/milisp/codexia/pull/71) 已关闭未合并，
+  作者解释为误投仓库；下游
+  [PR #1](https://github.com/connorodea/codexia-task-management/pull/1) 仍开放。
+  **状态：下游提案**；作者明确说明 CLI 契约尚未对真实安装验证。
+- **spoon-core**——[issue #285](https://github.com/XSpoonAi/spoon-core/issues/285)
+  提议在模型调用前提供可选、只读的 LoopX 控制上下文。**状态：开放提案**。
+- **GENesis-AGI**——[issue #2123](https://github.com/WingedGuardian/GENesis-AGI/issues/2123)
+  提议在自建持久目标后端前评估 LoopX。**状态：开放评估请求**。
+- **Orca**——[issue #12628](https://github.com/stablyai/orca/issues/12628)
+  请求类似 LoopX 的目标驱动迭代。**状态：开放用户诉求**，不代表维护者接受或已实现。
+- **OpenAgentEmail**——[discussion #180](https://github.com/openagentemail/openagentemail/discussions/180)
+  讨论可选控制面兼容性；
+  [9 月 12 日后续评论](https://github.com/openagentemail/openagentemail/discussions/180#discussioncomment-18407019)
+  建议先做小型、可回退的 Provider 试点，而非进入关键路径。该评论明确注明由 AI 撰写。
+  **状态：讨论与试点提议**。
+- **Quesen**——[discussion #3735](https://github.com/huangruiteng/loopx/discussions/3735)
+  后形成 [prepared-Effect 风险准入方案](https://github.com/Shxnque/quesen/blob/main/docs/integrations/loopx-prepared-effect-packet.md)，
+  明确先做 shadow mode，保留人的授权权威。**状态：集成方案，尚非代码提案**。
+- **8x8-user-edition**——已合并的
+  [PR #63](https://github.com/8x8org/8x8-user-edition/pull/63) 因现有权威与状态系统重叠，
+  暂缓运行时采用，只选择部分协议思路。**状态：暂缓运行时采用**。
+- **Mindthus**——对比吸收
+  [issue #132](https://github.com/rv198-star/Mindthus/issues/132) 已关闭。
+  **状态：已有评估记录**；Issue 关闭本身不证明运行时采用。
+- **GovernLoop**——Phase 0 能力映射
+  [PR #23](https://github.com/liangzhipengdamon-maker/GovernLoop/pull/23) 已关闭未合并。
+  **状态：历史评估提案**。
+- **hartevo-desktop**——[issue #55](https://github.com/tangpingqingwa/hartevo-desktop/issues/55)
+  提议借鉴 Prime Agent 和 LoopX 构建 Mission Control 内核。**状态：开放设计议题**。
+- **polyphemus**——[issue #89](https://github.com/Diekgbbtt/polyphemus/issues/89)
+  研究 LoopX 基础机制。**状态：开放研究请求**。
 
-围绕 LoopX 构建或受其启发的 fork、kit、书籍与同名项目。
+## 4. 学习、传播与合作
 
-- **loopx-book / loopx-book-labs**（cocolord）——中英双语、协议优先的
-  LoopX 开发者书（[loopx-book](https://github.com/cocolord/loopx-book)、
-  [labs](https://github.com/cocolord/loopx-book-labs)），带可运行 labs：
-  项目接入、issue-to-PR、standalone extension。
-- **foreman**（needware）——把 LoopX 内核迁移为原生 TypeScript 的提案，
-  pin 定上游 authority commit（[PR #1](https://github.com/needware/foreman/pull/1)）。
-  已邀请上游协作；见该 PR 评论串。
-- **Fork 贡献**：内网离线 bundle + OpenCode 协作 kit
-  （[Allenskoo856](https://github.com/Allenskoo856/loopx/pull/1)）、
-  dashboard 英文本地化（[manoelcalixto，已合并](https://github.com/manoelcalixto/loopx/pull/1)）、
-  fork CI fail-safe（[Kankandesuyo](https://github.com/Kankandesuyo/loopx/pull/1)）、
-  原生 Windows 资格验证（[hk20013106，已关闭](https://github.com/hk20013106/loopx/pull/1)）。
-- **同名独立项目**（非上游代码）：rye567/loopx（质量门禁 kit）、
-  lcmax/Loopx（agent loop 设计 skill）、hugh-zhan9/loopx（docs-first 工程
-  纪律）。列出仅为品牌澄清，不代表关联关系。
+- **《深入理解 AI Agent》/ ai-agent-book**（bojieli）——已合并的
+  [PR #614](https://github.com/bojieli/ai-agent-book/pull/614) 将 LoopX 引入为具体的
+  Loop Engineering 框架；[第 10 章](https://github.com/bojieli/ai-agent-book/blob/main/book/chapter10.md)
+  引用固定版本并保留实验性证据边界。**状态：教学材料**，不是读者采用统计。
+- **NAVER fe-news**——[2026 年 9 月通讯](https://github.com/naver/fe-news/blob/master/issues/2026-09.md)
+  用韩文介绍 LoopX 及安装路径。**状态：编辑内容收录**，不代表 NAVER 部署声明。
+- **OpenViking / NoKV**——[OpenViking README](https://github.com/volcengine/OpenViking/blob/main/README.md)
+  列出 LoopX；[NoKV README](https://github.com/NoKV-Lab/NoKV/blob/main/README.md)
+  将其列为活跃开源合作。**状态：公开项目关系**；这些条目本身不证明运行时依赖。
+- **loopx-book / loopx-book-labs**（cocolord）——双语、协议优先的
+  [开发者书](https://github.com/cocolord/loopx-book)与
+  [可运行实验](https://github.com/cocolord/loopx-book-labs)，覆盖项目接入、Issue 到 PR
+  和独立扩展。**状态：教学资源**。
 
-## 不在此清单内
+## 5. 衍生实现
 
-- Trending/digest 机器人与一句话提及（github-trending、BuilderPulse、
-  agents-radar 等）属于认知信号，不作为采用证据列出。
-- 无关的同名匹配（如 x86 `LOOPx` 指令、音频 loop 工具）不收录。
+- **loopx-HPC**（Sande33p）——独立 fork 内的
+  [PR #1](https://github.com/Sande33p/loopx-HPC/pull/1) 已合并，增加可选 scientific
+  campaign、PBS/Slurm 和 MLflow 集成。**状态：下游代码已合并**；作者明确说明
+  真实 HPC 验收尚未完成。
+- **foreman**（needware）——[PR #1](https://github.com/needware/foreman/pull/1)
+  提议将固定上游提交的 LoopX 内核迁移到原生 TypeScript。
+  **状态：开放提案**，不是已合并的运行时迁移。
+
+## 证据限制
+
+- 项目自身的开发工作流、打包集成、协议借鉴和内容收录是不同关系，不应相加为
+  生产采用者数量。
+- Stars、未修改的 fork、自动 Trending/digest 转载以及无关同名项目不是采用证据。
+- 创作者自用与用户归因案例在[Showcase 清单](../showcases/README.md)保留各自来源边界。
+  例如 [MFS 重构案例](../showcases/cases/independent-public-engine-refactor.md) 明确区分
+  公开合并的 PR 与用户自述的 LoopX 归因。
 
 ## 维护方式
 
-- 每周扫描（7d）由 LoopX value-explorer monitor
-  （`github-loopx-mention-scan`）执行：`gh search code "huangruiteng/loopx"`、
-  `gh search issues loopx`、`gh search prs loopx`、`gh search repos loopx`。
-- 每次扫描后，通过 pull request 更新本文件；material transition 另行创建
-  具体跟进 todo。
-- 最近核对：2026-08-15。
+- 每次复核后通过 PR 同步更新中英文，检查正文、当前 PR 合并状态、替代链接与后续
+  评论。记录核对日期，不把旧标签当作当前证据。
+- 发现入口包括 `gh search code "huangruiteng/loopx"`、`gh search issues loopx`、
+  `gh search prs loopx` 和 `gh search repos loopx`；只审阅公开证据，排除重复及无关匹配。
+- 观察条目集中维护在本页；项目可在 [`ADOPTERS.md`](../../ADOPTERS.md) 自愿确认自身使用。
+  不根据本清单代替项目提交自报条目。
+- 最近复核：**2026-09-19**。公开来源调研于 9 月 18 日完成；链接中的 PR/Issue 状态于
+  9 月 19 日刷新。
+- 局部更新：**2026-09-30**，覆盖上述 CGC 2046、NoKV 资格验证工具、VikingBot
+  提案及已停止的 Opensiro 研究。其余条目沿用此前的核对边界，不代表全表重新验真。

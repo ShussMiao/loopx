@@ -2,34 +2,35 @@
 
 <h1 align="center">LoopX</h1>
 
-<img src="docs/assets/loopx-social-preview.png" alt="LoopX Loop Engineering 展示图" width="420">
+**给 Agent 一个目标，让工作持续向前。**
 
-**面向长程 Agent 的开放、有状态、Provider-neutral 控制面。**
+面向长程 Agent 与个人 Agent 团队的开源、本地优先控制面。<br>
+<sub>跨会话保留目标、决策与证据，连接 Codex、Claude Code、DeepSeek Harness 等已有运行时。</sub>
 
-<sub>在 Codex、Claude Code、Cursor 等 agent harness 之上，持久保存目标、gate、todo、证据、quota 与交接状态。LoopX 负责跨轮次的状态与执行边界，harness 负责有界执行。</sub>
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/loopx-project/loopx?filter=v*&display_name=tag)](https://github.com/loopx-project/loopx/releases/latest) [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/XmGgQyCFZd)
 
-<a href="https://trendshift.io/repositories/102379?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-102379"><img src="https://trendshift.io/api/badge/repositories/102379" alt="huangruiteng/loopx 在 Trendshift 的趋势排名" width="220" height="48"></a>
+<a href="https://trendshift.io/repositories/102379"><img src="https://trendshift.io/api/badge/repositories/102379" alt="loopx-project/loopx 在 Trendshift 的趋势排名" width="220" height="48"></a>
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/huangruiteng/loopx?filter=v*&display_name=tag)](https://github.com/huangruiteng/loopx/releases/latest) [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/XmGgQyCFZd) [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml) [![Local first](https://img.shields.io/badge/control--plane-local--first-brightgreen.svg)](docs/public-private-boundary.md) [![Loop Agents](https://img.shields.io/badge/status-loop%20agents%20active-brightgreen.svg)](docs/product/release-readiness.md)
+[开始使用](#试用-loopx) · [个人工作区](#认识个人-agent-工作区) · [LHTB 结果](#lhtb-results) · [文档](https://loopx-project.github.io/loopx/docs/) · [English](README.md)
 
-[产品首页](https://huangruiteng.github.io/loopx/) · [博客](https://huangruiteng.github.io/loopx/blog/zh/) · [文档](https://huangruiteng.github.io/loopx/docs/) · [开发者手册](https://huangruiteng.github.io/loopx/docs/book/) · [试用 LoopX](#试用-loopx) · [查看真实 Loop](#证据) · [理解工作原理](#为什么需要-loopx) · [English](README.md)
+**[LHTB](https://zli12321.github.io/LHTB/index.html) · 46 个任务 · GPT-5.6 Sol：**LoopX 1.0.3 Heartbeat 平均 Reward 达到 **0.4948**，较 **Plain Codex 提升 17.3%**，较**原生 Codex Goal 提升 10.6%**。<br>
+<sub><a href="#lhtb-results">查看结果与通过率 ↓</a></sub>
 
 </div>
 
 ---
 
-LoopX 是开放且 Provider-neutral 的轻量 state kernel，也是 local-first
-的 Loop Engineering 控制面。它运行在不同 agent harness 之上，而不是替代
-它们：LoopX 提供长程状态、语义决策、治理、恢复与人机协同，让跨轮次、
-跨工具、跨 agent 的工作可审阅、可恢复、可接力。
+**最大化 Agent 的有效产出，最小化人的注意力投入。** LoopX 让目标持久存在，
+让 Agent 持续推进、分工协作、在中断后接着做。模型与工具由你选择的运行时提供；
+LoopX 管理下一步工作、验收依据，以及什么时候需要你判断。
 
-> 让 Loop 持续向前，让关键判断留在人手里。
+<a id="学习-loopx"></a>
 
-## 学习 LoopX
-
-- **开发者手册** - 从控制面基础到项目接入和开发者贡献的双语学习路径。[简体中文](https://huangruiteng.github.io/loopx/docs/book/) · [English](https://huangruiteng.github.io/loopx/docs/book/en/)
-- **快速开始** - 安装、连接项目并运行第一个受治理的 Loop。[指南](docs/guides/getting-started.md)
-- **文档站** - 完整参考与运维文档。[LoopX Docs](https://huangruiteng.github.io/loopx/docs/)
+| 你想做什么 | 从这里开始 |
+| --- | --- |
+| 让编程或研究 Agent 跨会话持续干活 | [安装并连接项目](#试用-loopx) |
+| 在一个入口管理个人项目、定时任务与待决事项 | [个人 Agent 工作区](#认识个人-agent-工作区) |
+| 让多个 Agent 分工协作，交付可验收的结果 | [Agent 协作指南](docs/product/use-cases/cross-runtime/README.md#中文指南) |
 
 ## 认识个人 Agent 工作区
 
@@ -57,17 +58,22 @@ loopx dashboard
 ```
 
 `loopx dashboard` 是受支持的浏览器 / PWA 启动方式。也可从
-[1.0 Release](https://github.com/huangruiteng/loopx/releases/tag/v1.0.0) 下载桌面预览版，
+[1.0 Release](https://github.com/loopx-project/loopx/releases/tag/v1.0.0) 下载桌面预览版，
 复用同一组 loopback 服务与 Goal 状态。Apple Silicon macOS 支持签名 App 更新，
 将桌面壳与内置运行时配套升级，并提供修复与恢复入口；需要 Python 3.11+，
 App 为 ad-hoc 签名，尚未 notarize。Windows 预览版目前手动更新，需单独安装 CLI。
 [桌面安装、更新与源码开发指南](apps/desktop/loopx-control-plane/README.md)。
+
+<details>
+<summary>能力设置与可复现工作区场景</summary>
 
 <img src="docs/assets/personal-workspace/capability-1.0.webp" alt="工作区实录：配置子任务数量上限与允许的职责范围" width="960">
 
 在源码 checkout 中运行 `python -m demo.workspace serve`，可探索社区活动、家庭能源比较
 和社区网站发布三个复杂项目；每个项目有四个工作角色、18 项任务、两项决策与两项观察。
 上图来自这份可复现工作区。[场景与回放说明](demo/workspace/README.md)。
+
+</details>
 
 [观看 32 秒完整演示](docs/assets/personal-workspace/loopx-dashboard-launch.mp4)
 · [阅读工作区指南](docs/guides/personal-workspace-user-guide.md)
@@ -81,28 +87,19 @@ App 为 ad-hoc 签名，尚未 notarize。Windows 预览版目前手动更新，
 
 LoopX 把长期控制状态留在同一层紧凑状态里：
 
-```text
-目标 / issue / project
-   │
-   ▼
-LoopX state：objective + gate + todo + scope + evidence + quota
-   │
-   ├─ 需要人类判断？ ── 是 ─▶ 提出具体问题并等待
-   │
-   ├─ 有安全侧路？ ─────────▶ 执行一个有界 agent slice
-   │
-   ▼
-Codex / Claude Code / Cursor / shell agent 执行一轮
-   │
-   ▼
-写回证据 + handoff + next todo ─▶ quota 决定下一次 tick
-```
+<picture>
+  <source media="(max-width: 640px)" srcset="docs/assets/harness-neutral.zh.mobile.svg">
+  <img src="docs/assets/harness-neutral.zh.svg" alt="Harness 执行每一轮，LoopX 延续整份工作。" width="1200">
+</picture>
 
 Agent runtime 负责执行，LoopX 负责治理跨运行延续的控制状态，让工程、
 研究、discovery 和运营 Loop 能持续推进。它不是又一个 agent framework，也不是
 绑定某一 Provider 的编排 runtime。
 
-![LoopX control-plane board](docs/assets/control-plane-board.svg)
+<picture>
+  <source media="(max-width: 640px)" srcset="docs/assets/control-plane-board.zh.mobile.svg">
+  <img src="docs/assets/control-plane-board.zh.svg" alt="一轮工作是受约束的状态迁移，不是定时器。" width="1200">
+</picture>
 
 一个形象化理解是：LoopX 是
 **[面向长程 Agent 的可执行看板](docs/development/control-plane-course/00-concept-primer.md)**。
@@ -125,14 +122,71 @@ LoopX 适合：
 LoopX 不是生产自动化控制器。危险权限、生产写入、公开发布和最终 ownership
 仍由人类负责。
 
+### 个人 Agent、数字团队与自我改进
+
+[Meta Muse](https://about.fb.com/news/2026/09/introducing-muse-personal-ai-agent/)
+与 [Grok Bot](https://x.ai/news/introducing-grok-bot) 正在让“把工作交给常驻的个人 Agent”
+变得更容易理解。LoopX 选择的是开放、Provider-neutral 的控制面路线，
+连接你已经在用的 Agent，而不是提供这两款托管产品的等价替代。
+
+- **个人 Agent：**通过已发布的工作区与关联飞书入口查看目标、调整方向、处理决策。
+  [常驻管家与语义交接 RFC](docs/architecture/rfcs/capable-manager-semantic-handoff-v0.zh-CN.md)
+  进一步探索“一个能干活的管家入口，背后一支 Agent 团队”；完整闭环仍在验收中。
+- **Agent 团队：**共享目标，不抹平各自的工作责任。通过认领、证据和明确的结果回传，
+  将实现与审阅接起来。[三 Agent 协作示例](examples/collaboration-delivery/README.md)
+  展示了一个有界场景，包括中途纠正与两轮审阅。
+- **自我改进：**用 [Reward Memory](loopx/capabilities/reward_memory/README.md)
+  将反馈带入下一次尝试，用 [Explore](loopx/capabilities/explore/README.md) 评估候选改动，
+  两者均按需启用。与 **RSI（递归自我改进）** 的交集在于“提出改动—验证—审阅—保留”的
+  工程闭环，而不是宣称 LoopX 已实现模型自主升级或能力递归增长。
+
+个人管家是一种交互角色，不是另一套状态权威。后台执行仍需要可用的主机和已配置的运行时。
+[整体路线图](docs/architecture/rfcs/loopx-overall-roadmap-v0.zh-CN.md)
+区分了已交付的基础与下一步需要验收的端到端能力。
+
 <a id="看几个例子"></a>
 
 ## 证据
 
+<a id="lhtb-results"></a>
+
+### LHTB：同一模型，更高的平均 Reward
+
+**46 个相同任务上，LoopX 1.0.3 Heartbeat 平均 Reward 达到 0.4948：**
+较 **Plain Codex 提升 17.3%**，较**原生 Codex Goal 提升 10.6%**。
+三者均使用 GPT-5.6 Sol、max 推理档位，关闭 Web Search。
+[Long-Horizon Terminal-Bench](https://zli12321.github.io/LHTB/index.html) 不只考察代码：任务覆盖研究复现、科学仿真、
+多模态分析、专业工作流、游戏与系统工程等方向。
+
+| 执行模式 | 平均 Reward ↑ | 严格通过率（≥0.95） | 通过率（≥0.80） |
+| --- | ---: | ---: | ---: |
+| Plain Codex | 0.4218 | 7/46（15.2%） | 12/46（26.1%） |
+| 原生 Codex Goal | 0.4475 | 4/46（8.7%） | 14/46（30.4%） |
+| **LoopX 1.0.3 Heartbeat** | **0.4948** | **7/46（15.2%）** | **15/46（32.6%）** |
+
+≥0.80 是事后补充观察口径，≥0.95 仍是 benchmark 的严格通过阈值。
+本组没有恰好等于 0.80 的分数，因此这里的计数与研究简报的 >0.80 一致。
+
+相对原生 Goal，逐题 Reward **23 胜、13 平、10 负**。
+严格通过题数与 Plain Codex 相同；平均 Reward 也计入部分完成的得分，
+因此均分提升不代表每题都改善，也不代表比 Plain 完整解决了更多任务。
+
+每个任务、每种模式仅一条有效轨迹；包含指定替代运行，运行时与预算不完全相同，
+部分 Heartbeat 替代运行使用了更长预算。这是观测到的系统结果，
+不是等预算效率结论，也未单独识别 LoopX 的因果增益。
+
+[交互结果、逐题对比与方法](https://loopx-project.github.io/loopx/benchmarks/lhtb/?lang=zh)
+· [五臂研究与边界](benchmark/LHTB/studies/five-arm-gpt56sol-max/README.md)
+· [公开逐题分数](benchmark/LHTB/studies/five-arm-gpt56sol-max/data.json)
+
+Benchmark 之外，LoopX 也有可检查的长程项目证据。
 OpenViking 的公开贡献序列与脱敏的 owner-run Auto ML showcase 各自跨越
 **200+ 小时自然时长**，保留多轮 Todo、决策和证据更新。这里衡量的是项目经过的
 wall-clock 时间，不是连续模型执行时长或无人值守的生产自治。点击原图查看
 公开安全的任务图、证据分支和跨轮决策；各案例分别说明来源与可复现边界。
+
+<details>
+<summary>早期 200+ 小时项目轨迹：OpenViking 与 ML 实验</summary>
 
 ### 开源 Issue Fix
 
@@ -160,23 +214,9 @@ evidence、无效谱系、运行中复现和 promote / stop gate 留在同一张
 </a>
 
 这张 public-safe graph 保留了该 200+ 小时自然时间窗口中的决策谱系。它是
-owner-run showcase，不代表连续算力执行、独立复现、生产结果，也不代表公司或
-雇主背书；脱敏后的图片本身不足以让第三方独立复现实验。
+owner-run showcase，不代表连续算力执行、独立复现或生产结果。
 
-### Auto Research
-
-**可复现的公开 KNN demo：Proposer、executor、evaluator/promoter 并行迭代，
-todo、quota、证据与 targeted wake 同屏可见。**
-
-<a href="docs/assets/auto-research-multi-agent-showcase.png">
-  <img src="docs/assets/auto-research-multi-agent-showcase.png" alt="Auto Research 多 Agent 工作区：proposer、executor、evaluator/promoter、todo、quota、证据与 targeted wake 同屏推进">
-</a>
-
-这张截图来自 LoopX 内置的 exact-KNN demo。公开 task、可编辑与受保护文件、
-deterministic CPU evaluator、dev / held-out 命令均在仓库内。可按
-[showcase walkthrough](docs/product/use-cases/auto-research/decentralized-auto-research-showcase.md)
-或 [demo 命令路径](demo/auto_research/README.md)复现工作流；它是 demo
-结果，不是生产研究结论。
+</details>
 
 ### 真实项目中的使用
 
@@ -197,31 +237,34 @@ creator dogfooding、reproducible demo 和证据强度标签见
 
 ### 探索性 Benchmark 研究
 
-- **[SWE-Marathon](https://huangruiteng.github.io/loopx/benchmarks/swe-marathon/?lang=zh)**：
+- **[SWE-Marathon](https://loopx-project.github.io/loopx/benchmarks/swe-marathon/?lang=zh)**：
   在相同的 15 个任务上对照 5 种执行模式，比较自验证行为、得分与成本。
   更多自验证并未稳定转化为更高得分。
-- **[DeepSWE 行为分析](https://huangruiteng.github.io/loopx/benchmarks/deepswe/behavior-discovery/)**：
+- **[LHTB × LoopX](https://loopx-project.github.io/loopx/benchmarks/lhtb/?lang=zh)**：
+  从[上方核心结果](#lhtb-results)进入五种执行机制、逐题对比、退步案例
+  与探索性任务类型分析。
+- **[DeepSWE 行为分析](https://loopx-project.github.io/loopx/benchmarks/deepswe/behavior-discovery/)**：
   通过精选案例观察领域提示、需求保留与验证选择之间的关系，提出有待复验的机制假设。
 
-SWE-Marathon 每个任务、每种模式仅运行一次；DeepSWE 包含精选案例与事后分析。
-目前两者均不足以证明普遍的性能提升。
+SWE-Marathon 与 LHTB 每个任务、每种模式仅保留一条有效轨迹；DeepSWE 包含精选案例与
+事后分析。
 
 更多可检查入口：
 
-- [产品首页](https://huangruiteng.github.io/loopx/)：查看产品叙事、快速开始和长程证据；
+- [产品首页](https://loopx-project.github.io/loopx/)：查看产品叙事、快速开始和长程证据；
 - [Showcase 全量目录](docs/showcases/README.md)和
   [中英双语托管索引](docs/showcases/index.html)；
-- [跨 runtime 实现审阅演示](docs/product/use-cases/cross-runtime/cross-runtime-impl-review-demo.md)；
+- [Agent 协作指南](docs/product/use-cases/cross-runtime/README.md#中文指南)：产物依赖、独立审阅与结果回传；
 - 公开[用户手册](https://my.feishu.cn/wiki/CaL5wMk9ui17ngkWzeUcMlAYnZg)。
 
 <a id="快速开始"></a>
 
 ## 试用 LoopX
 
-要求：Python 3.11+ 与 Node.js 22.6+。使用 console scripts 已加入 `PATH` 的
-Python 环境；macOS 和 Linux 使用 POSIX shell，原生 Windows 使用 PowerShell 7。
-Node.js 运行 LoopX 自动启动、空闲退出的 TypeScript Effect core，无需手工维护 daemon。
-Git 仅用于源码贡献与 clone/canary 工作流。
+要求：Python 3.11+ 与 Node.js 22.22.3+，推荐使用 Node.js 24 LTS。使用 console
+scripts 已加入 `PATH` 的 Python 环境；macOS 和 Linux 使用 POSIX shell，原生
+Windows 使用 PowerShell 7。Node.js 运行 LoopX 自动启动、空闲退出的 TypeScript
+Effect core，无需手工维护 daemon。Git 仅用于源码贡献与 clone/canary 工作流。
 
 无需 clone，直接从 PyPI 安装：
 
@@ -276,6 +319,7 @@ loopx start-goal --guided --project . --goal-text "你的长程目标"
 | Pi | 用 `loopx slash-commands --install --surface pi` 安装 opt-in goal extension，然后在受信任的 Pi 会话里用 `/loopx <任务>`。 | 由 LoopX quota gate 的可见 Pi goal extension（`loopx_goal_activate` + `agent_settled` 续跑） |
 | ZCode | 用 `loopx slash-commands --install --surface zcode` 安装 skill facade，然后在项目里的 ZCode 会话中调用 `$loopx` skill（或 `/loopx <复杂任务>`）。 | ZCode 会话自身的 turn loop；每次续跑都从 `quota should-run` 进入 |
 | Antigravity CLI（agy） | 用 `loopx slash-commands --install --surface agy` 安装 skill facade，然后在项目里的 `agy` 会话中调用 `loopx` skill（或 `/loopx <复杂任务>`）。 | 会话原生 `/goal` 循环（审计至 `<!-- GOAL_COMPLETE -->`）加 `schedule` 自唤醒，随会话存活；facade 指示每次 turn/唤醒都先过 `quota should-run`——advisory 节流，非宿主强制 gate |
+| Kiro CLI | 用 `loopx slash-commands --install --surface kiro-cli` 安装 skill facade，然后在项目里的 `kiro-cli` 会话中执行 `/loopx <复杂任务>`。 | 会话原生 `/goal --max <N> <任务> Done when: <验收条件>` 循环，验收条件写入目标语句本身（宿主由该语句推导验收标准），由宿主自己的迭代预算兜底（默认 5），并通过内置 `goal` 完成契约收口；facade 指示每次 turn 与迭代都先过 `quota should-run`——advisory 节流，非宿主强制 gate |
 | DeepSeek Harness（dsh） | 安装 [DSH 原生 Plugin](packages/dsh-loopx-plugin/README.md)，在技能选择器中点 `loopx`，然后直接描述任务；[dsh goal-mode adapter](loopx/dsh_goal_mode/README.md) 继续支持 headless turn。 | 原生同会话续跑与 GoalBar，或 headless dsh 工作段；两条路径都遵守 LoopX authority |
 | Cursor、shell、自有 runner | 使用同一 installer 和 `loopx doctor`，再手动连接或由 runner 调用。 | 你的 shell、scheduler 或 runner |
 
@@ -284,7 +328,8 @@ loopx start-goal --guided --project . --goal-text "你的长程目标"
 [Codex App host command registry](docs/reference/protocols/codex-app-host-command-registry-v0.md)、
 [Codex CLI packaged install](docs/product/runtimes/codex-cli/codex-cli-packaged-install.md)和
 [Claude Code adapter](loopx/claude_goal_mode/README.md)、
-[KunlunCode 原生 Goal adapter](docs/guides/kunluncode-adapter.zh-CN.md)，以及
+[KunlunCode 原生 Goal adapter](docs/guides/kunluncode-adapter.zh-CN.md)、
+[Kiro CLI goal-mode adapter](loopx/kiro_cli_goal_mode/README.md)，以及
 [DeepSeek Harness turn adapter](loopx/dsh_goal_mode/README.md)。
 
 可查看 [60 秒 DSH × LoopX Replan 真实录屏和可复现
@@ -311,10 +356,15 @@ loopx quota spend-slot      # 为完成并验证的 slice 记账
 如果 LoopX 帮你跑通了第一个任务，欢迎用一分钟提交一条公开反馈（可选，无任何
 遥测；不要粘贴日志、路径、凭据、内部项目名或 goal 内容）：
 
-- [首次运行反馈](https://github.com/huangruiteng/loopx/issues/new?template=first_run.yml)
-- [长程使用案例](https://github.com/huangruiteng/loopx/issues/new?template=usage_story.yml)
+- [首次运行反馈](https://github.com/loopx-project/loopx/issues/new?template=first_run.yml)
+- [长程使用案例](https://github.com/loopx-project/loopx/issues/new?template=usage_story.yml)
 
 `loopx first-run-report` 会在本地打印同样的预填链接，不会发送任何数据。
+
+基础使用统计在首次显著告知后默认开启：每日随机 ID 心跳用于平台支持与持续使用分析，
+另行发送不带 ID 的 CLI 汇总，不采集内容。可在设置 → 能力中心，或通过
+`loopx usage-ping disable` / `LOOPX_USAGE_PING=0` 统一关闭；
+`loopx usage-ping status` 可预览数据。详见[基础使用统计](docs/reference/usage-ping.zh-CN.md)。
 
 成功连接后应该满足：
 
@@ -327,7 +377,7 @@ loopx quota spend-slot      # 为完成并验证的 slice 记账
 Clone 安装只面向需要 live canary wrapper 的贡献者：
 
 ```bash
-git clone https://github.com/huangruiteng/loopx ~/loopx
+git clone https://github.com/loopx-project/loopx ~/loopx
 ~/loopx/scripts/install-local.sh
 loopx doctor
 ```
@@ -388,6 +438,7 @@ Capability 把上述通用原语组成 outcome-owned 工作泳道。先按结果
 | --- | --- | --- |
 | 把公开 issue 推进为可审查、有证据的变更 | [Issue Fix](loopx/capabilities/issue_fix/README.zh-CN.md) | `loopx capability show issue-fix --format json` |
 | 在交付前对精确 final diff 做质量验收 | [Change Quality](loopx/capabilities/change_quality/README.md) | `loopx capability show change-quality-qualification --format json` |
+| 在周期复审之前发现“忙碌但偏离目标”的工作轮次 | [进展评估哨兵](loopx/capabilities/progress_review/README.zh-CN.md) | `loopx capability show progress-review-sentinel --format json` |
 | 维护由多个已审查分支组成、持续变化的集成栈 | [Integration Branch](loopx/capabilities/integration_branch/README.md) | `loopx capability show integration-branch-reconcile --format json` |
 | 在不丢失假设和发现的前提下探索不确定研究问题 | [Explore](loopx/capabilities/explore/README.zh-CN.md) | `loopx capability show explore --format json` |
 | 基于当前证据和已验证结果重新建立决策上下文 | [Decision Context](loopx/capabilities/decision_context/README.zh-CN.md) | `loopx capability show decision-context --format json` |
@@ -426,14 +477,11 @@ loopx configure-goal --goal-id <goal-id>
 不带 `--execute` 时，它只报告当前/默认状态、适用条件、边界和可复制命令，
 不会修改项目状态。
 
-### Preset 与 Auto Research
+### 周期性工作 Preset
 
 安全 preset 覆盖 Daily Triage、Changelog Draft 和 PR Watch。更高级的 CI /
 Dependency Sweeper 需要明确授权、隔离 worktree、verifier、quota/cost gate 和人工
-review。Auto Research 通过 proposer、executor、evaluator/promoter 协作，同时保持
-quota 和证据可见。详见
-[入门 Preset 指南](docs/product/foundations/beginner-loop-presets.md)和
-[Auto Research Demo Path](demo/auto_research/README.md)。
+review。详见[入门 Preset 指南](docs/product/foundations/beginner-loop-presets.md)。
 
 ```bash
 loopx preset list
@@ -463,11 +511,15 @@ treatment 和 guardrail 的任务，不替代生产审批。先读
 解释 operator model；[Project-Level Reward Model](docs/product/foundations/project-level-reward-model.md)
 定义产出数量、质量、token cost 和 user attention cost 的保守价值信号。
 
+一个具体的协作路径见 [Agent 协作指南](docs/product/use-cases/cross-runtime/README.md#中文指南)：
+builder 使用 analyst 的产物实现方案，交给 reviewer 独立审阅，接收用户纠正后重新验证，
+最后回到原对话交付。指南区分了可运行的同主机示例与早期跨运行时设计草案。
+
 ### App 与 Projection
 
 - 本地 read-first UI：[Dashboard Guide](apps/presentation/dashboard/README.md)
-- 公开产品概览：[产品首页](https://huangruiteng.github.io/loopx/)
-- 文档门户：[线上文档](https://huangruiteng.github.io/loopx/docs/)
+- 公开产品概览：[产品首页](https://loopx-project.github.io/loopx/)
+- 文档门户：[线上文档](https://loopx-project.github.io/loopx/docs/)
 - 飞书投影：[Lark Kanban Adapter](docs/integrations/lark-kanban-control-plane-adapter.md)
 - 通用 host 集成：[Integration Guide](docs/integration.md)
 - 自有 multi-agent runner：
@@ -517,28 +569,30 @@ LoopX 当前有三个活跃战略计划和一个架构与研究孵化器。这�
 
 - **长程 Benchmark 与证据：**在互补 benchmark 环境中建立可复现的能力证据，
   并开展受控的机制研究。
-  [方向 Tracker](https://github.com/huangruiteng/loopx/issues/3243)
+  [方向 Tracker](https://github.com/loopx-project/loopx/issues/3243)
 - **Operator Surface 与 IM Integration：**建设 operator workspace、session
-  record 与有界协作表面；当前在专用 integration branch 孵化，由 `@maxliux5`
-  作为 implementation lead。
-  [方向 Tracker](https://github.com/huangruiteng/loopx/issues/3244)
+  record 与有界协作表面。Personal Workspace 已交付；统一管家、执行与恢复
+  旅程仍在验收，由 `@maxliux5` 作为 implementation lead。
+  [方向 Tracker](https://github.com/loopx-project/loopx/issues/3244)
 - **Shared Goal Authority 与跨 Host 协作：**为显式共享 goal 提供
   provider-neutral 协调；NoKV 是尚未晋级的 provider candidate，而不是新的控制面
   权威。
-  [方向 Tracker](https://github.com/huangruiteng/loopx/issues/3245)
+  [方向 Tracker](https://github.com/loopx-project/loopx/issues/3245)
 - **架构与研究孵化器：**以明确不同的成熟度推进 Effect Program hardening、
   TypeScript parity migration、hierarchical stride、research exploration、human
   attention、artifact lifecycle 与 memory utility。
-  [方向 Tracker](https://github.com/huangruiteng/loopx/issues/3246)
+  [方向 Tracker](https://github.com/loopx-project/loopx/issues/3246)
 
 完整阶段、promotion gate、贡献者安全切片和 ownership 边界见
 [当前技术方向地图](docs/project/technical-directions.zh-CN.md)；社区讨论使用置顶的
-[GitHub Discussion](https://github.com/huangruiteng/loopx/discussions/2851)。核心控制面
+[GitHub Discussion](https://github.com/loopx-project/loopx/discussions/2851)。核心控制面
 可靠性继续作为这些计划共同的底座。
 
 ## 进阶文档
 
-按当前任务选择入口；[线上文档](https://huangruiteng.github.io/loopx/docs/)
+[产品首页](https://loopx-project.github.io/loopx/) · [博客](https://loopx-project.github.io/loopx/blog/zh/) · [开发者手册](https://loopx-project.github.io/loopx/docs/book/)
+
+按当前任务选择入口；[线上文档](https://loopx-project.github.io/loopx/docs/)
 提供发布后的浏览入口，[完整文档索引](docs/README.md)仍是权威地图。这里仅保留
 精选入口；每个分类索引负责承接更深层的文档和版本化协议。
 
@@ -623,7 +677,7 @@ agent 项目里的反馈：控制面帮到了哪里、哪里太重，哪些 gate
 仍然不够清楚。
 
 - 可复现 bug、安装问题、功能建议：请提
-  [GitHub Issue](https://github.com/huangruiteng/loopx/issues)。
+  [GitHub Issue](https://github.com/loopx-project/loopx/issues)。
 - 文档修正、showcase 补充、小型 public-safe 示例：欢迎开 PR。
 - 参与社区讨论：可加入 [Discord 社区](https://discord.gg/XmGgQyCFZd)，也可在
   下方直接加入飞书群或通过微信申请入群。
@@ -676,7 +730,7 @@ benchmark 证据、operator surface 与 IM integration、shared-goal 跨 host �
 ## Star 趋势
 
 <p align="center">
-  <a href="https://github.com/huangruiteng/loopx/stargazers"><img src="https://huangruiteng.github.io/loopx/site-assets/star-history.svg" alt="LoopX GitHub Star 历史趋势，来自已校验快照" width="800"></a><br>
+  <a href="https://github.com/loopx-project/loopx/stargazers"><img src="https://loopx-project.github.io/loopx/site-assets/star-history.svg" alt="LoopX GitHub Star 历史趋势，来自已校验快照" width="800"></a><br>
   <sub>由仓库授权的 workflow 每 6 小时基于 GitHub 官方 stargazer 时间戳生成；仅当拉取条数与 GitHub 当前 Star 总数一致时发布。GitHub 图片缓存可能延迟刷新。</sub>
 </p>
 

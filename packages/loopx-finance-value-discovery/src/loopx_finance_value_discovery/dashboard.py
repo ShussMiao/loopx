@@ -10,6 +10,7 @@ from .presentation_compat import require_presentation_api
 require_presentation_api()
 
 from .presentation_view import validate_decision_research_view  # noqa: E402
+from .source_coverage import SOURCE_PERIOD_METRIC_FIELDS  # noqa: E402
 
 
 FINANCE_RESEARCH_DASHBOARD_INPUT_SCHEMA_VERSION = "finance_research_dashboard_input_v0"
@@ -545,9 +546,7 @@ def _artifacts(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
     rows: list[dict[str, Any]] = []
-    for index, item in enumerate(
-        _list(value, context="input.artifacts", maximum=20)
-    ):
+    for index, item in enumerate(_list(value, context="input.artifacts", maximum=20)):
         context = f"input.artifacts[{index}]"
         record = _record(
             item,
@@ -734,6 +733,8 @@ def build_finance_research_dashboard_packet(
             "subtitle",
             "adjudication",
             "metrics",
+            "source_period_metrics",
+            "spot_market_identity",
             "dashboard_summaries",
             "research_layers",
             "entities",
@@ -789,6 +790,23 @@ def build_finance_research_dashboard_packet(
                 allowed={"id", "label", "value", "detail", "tone"},
                 minimum=1,
                 maximum=12,
+            ),
+            **(
+                {
+                    "source_period_metrics": _simple_records(
+                        record.get("source_period_metrics"),
+                        context="input.source_period_metrics",
+                        allowed=SOURCE_PERIOD_METRIC_FIELDS,
+                        maximum=24,
+                    )
+                }
+                if "source_period_metrics" in record
+                else {}
+            ),
+            **(
+                {"spot_market_identity": record.get("spot_market_identity")}
+                if "spot_market_identity" in record
+                else {}
             ),
             "dashboard_summaries": _simple_records(
                 record.get("dashboard_summaries"),

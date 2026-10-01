@@ -33,8 +33,8 @@ const approvedRequires = new Set([
   'react-dom',
   'react-dom/client',
   '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-runtime/client',
   '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-ui-renderer/client',
   '@deepseek-ai/dsh-client-ui-slots',
 ])
 const packedStaticEntries = new Set([
@@ -338,21 +338,35 @@ function coordinatorHarness() {
   }
 }
 
-async function openPackedConnection(installed, host, service) {
-  const installedRequire = createRequire(join(installed, 'package.json'))
-  const dshRequire = createRequire(installedRequire.resolve('@deepseek-ai/dsh/package.json'))
+async function openPackedConnection(host, service) {
+  const harnessRequire = createRequire(join(packageRoot, 'package.json'))
+  const dshRequire = createRequire(harnessRequire.resolve('@deepseek-ai/dsh/package.json'))
   const appRequire = createRequire(dshRequire.resolve('@deepseek-ai/dsh-web-app/package.json'))
   const [{ Context }, { HostConnectionService }, { WebServer }] = await Promise.all([
-    import(pathToFileURL(installedRequire.resolve('@deepseek-ai/cordis')).href),
-    import(pathToFileURL(installedRequire.resolve('@deepseek-ai/dsh-client-connection')).href),
+    import(pathToFileURL(harnessRequire.resolve('@deepseek-ai/cordis')).href),
+    import(pathToFileURL(harnessRequire.resolve('@deepseek-ai/dsh-client-connection')).href),
     import(pathToFileURL(appRequire.resolve('@deepseek-ai/dsh-host-webserver')).href),
   ])
   const ctx = new Context()
   await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
-  await ctx.plugin(HostConnectionService, [])
-  const disposeRpc = host.registerGoalBarConnectionRpc(ctx.connection, service)
+  // 0.1.5 constructs the service as `(ctx, trustedHosts, browserAuth)`. The
+  // deployment's Connection plugin owns the concrete browser-auth face and is
+  // gated on a `credentials` service, so this carrier probe supplies its own
+  // permissive face to isolate the host-half state machine; the real fence is
+  // asserted by the real-profile phase against the installed application.
+  const connection = new HostConnectionService(ctx, [], {
+    isAuthenticated: () => true,
+    authorizeIndex: () => true,
+    authenticatedUrl: url => url,
+  })
+  const disposeRpc = host.registerGoalBarConnectionRpc(connection, service)
   return {
     baseUrl: `http://127.0.0.1:${String(ctx.webServer.port)}`,
+    // This phase registers the standalone authenticated `/loopx` channel
+    // explicitly, so its client must address that channel. The shared
+    // `/api/loopx.goalbar` route is owned by the real-profile phase, which goes
+    // through the installed `registerGoalBarConnectionTransport` dispatcher.
+    sharedApi: false,
     disposeRpc,
     close: () => ctx.fiber.dispose(),
   }
@@ -374,7 +388,10 @@ async function exercisePackedService(installed) {
   const session = {
     id: sessionId,
     header: { version: 0, id: sessionId, createdAt: 1, cwd: installed },
+    // The fixture owns the log: `events` stays its mutable store for the
+    // harness, and `snapshotEvents()` is the installed-generation reader.
     events,
+    snapshotEvents: () => events,
     surface: { nodes: [] },
   }
   const agent = {
@@ -417,9 +434,16 @@ async function exercisePackedService(installed) {
     retryDelaysMs: [0, 0],
     watchTimeoutMs: 50,
   })
-  const connection = await openPackedConnection(installed, host, service)
+  const connection = await openPackedConnection(host, service)
   const call = async (endpoint, payload, signal) => {
-    const result = await rpc(connection.baseUrl, endpoint, payload, {}, signal)
+    const result = await rpc(
+      connection.baseUrl,
+      endpoint,
+      payload,
+      {},
+      signal,
+      connection.sharedApi,
+    )
     assert.equal(result.response.status, 200)
     assert.equal(result.body.rpcId, result.rpcId)
     return result.body.result
@@ -675,6 +699,15 @@ async function createClientModuleSystem(context, staticModules) {
             rev: 'dsh-loopx-plugin-runtime-smoke',
             external: [],
           }],
+          // 0.1.5 requires every entry to belong to exactly one initial-load
+          // batch, so the synthetic manifest carries the application batch the
+          // real host composes around this single row.
+          batches: [{
+            phase: 'application',
+            url: `/plugins/${packageId}/client.js`,
+            rev: 'dsh-loopx-plugin-runtime-smoke',
+            entries: [packageId],
+          }],
         },
         staticModules,
       },
@@ -750,10 +783,14 @@ async function materializeServedClient(source) {
 
 async function waitForWebUrl(child, output) {
   return await new Promise((resolveUrl, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`DSH URL timeout\n${output.text}`)), 20_000)
+    const timeout = setTimeout(() => reject(new Error(
+      `DSH URL timeout\n${redactWebOutput(output.text)}`,
+    )), 20_000)
     const inspect = chunk => {
       output.text += chunk.toString()
-      const match = output.text.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+)/u)
+      const match = output.text.match(
+        /dsh web: (http:\/\/127\.0\.0\.1:\d+(?:\/\?[A-Za-z0-9_-]+=[A-Za-z0-9_-]+)?)/u,
+      )
       if (match) {
         clearTimeout(timeout)
         resolveUrl(match[1])
@@ -763,9 +800,43 @@ async function waitForWebUrl(child, output) {
     child.stderr.on('data', inspect)
     child.once('exit', (code, signal) => {
       clearTimeout(timeout)
-      reject(new Error(`DSH exited before URL (code=${code}, signal=${signal})\n${output.text}`))
+      reject(new Error(
+        `DSH exited before URL (code=${code}, signal=${signal})\n${redactWebOutput(output.text)}`,
+      ))
     })
   })
+}
+
+function redactWebOutput(value) {
+  return value.replace(/([?&][A-Za-z0-9_-]+=)[A-Za-z0-9_-]+/gu, '$1<redacted>')
+}
+
+async function openAuthenticatedWeb(launchUrl) {
+  const url = new URL(launchUrl)
+  if (!url.searchParams.has('token')) {
+    return {
+      baseUrl: url.origin,
+      headers: {},
+      index: await fetch(url, { signal: AbortSignal.timeout(5_000) }),
+    }
+  }
+  const exchange = await fetch(url, {
+    redirect: 'manual',
+    signal: AbortSignal.timeout(5_000),
+  })
+  assert.equal(exchange.status, 303)
+  const cookie = exchange.headers.get('set-cookie')?.split(';', 1)[0]
+  assert(cookie, 'DSH launch-token exchange omitted its browser session cookie')
+  const cleanUrl = new URL(exchange.headers.get('location') ?? '/', url)
+  const headers = { cookie }
+  return {
+    baseUrl: cleanUrl.origin,
+    headers,
+    index: await fetch(cleanUrl, {
+      headers,
+      signal: AbortSignal.timeout(5_000),
+    }),
+  }
 }
 
 async function stopChild(child) {
@@ -786,13 +857,22 @@ async function stopChild(child) {
   await closed
 }
 
-async function rpc(baseUrl, endpoint, payload, extraHeaders = {}, signal) {
+async function rpc(
+  baseUrl,
+  endpoint,
+  payload,
+  extraHeaders = {},
+  signal,
+  sharedApi = false,
+) {
   const rpcId = randomUUID()
   const requestSignal = signal ?? AbortSignal.timeout(5_000)
-  const response = await fetch(`${baseUrl}/loopx/${endpoint}`, {
+  const wireEndpoint = sharedApi ? 'loopx.goalbar' : endpoint
+  const channel = sharedApi ? 'api' : 'loopx'
+  const response = await fetch(`${baseUrl}/${channel}/${wireEndpoint}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...extraHeaders },
-    body: JSON.stringify({ type: 'client-request', rpcId, method: endpoint, payload }),
+    body: JSON.stringify({ type: 'client-request', rpcId, method: wireEndpoint, payload }),
     signal: requestSignal,
   })
   const body = response.headers.get('content-type')?.includes('json')
@@ -801,12 +881,14 @@ async function rpc(baseUrl, endpoint, payload, extraHeaders = {}, signal) {
   return { response, body, rpcId }
 }
 
-async function hostRpc(baseUrl, method, payload) {
+async function hostRpc(baseUrl, method, args, extraHeaders = {}) {
   const rpcId = randomUUID()
   const response = await fetch(`${baseUrl}/api/${method}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
+    headers: { 'content-type': 'application/json', ...extraHeaders },
+    // The 0.1.5 gateway accepts exactly one plain-object `args` field as the
+    // Remote-method payload instead of the bare request object.
+    body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args } }),
     signal: AbortSignal.timeout(5_000),
   })
   assert.equal(response.status, 200)
@@ -851,7 +933,13 @@ function disconnectableRpc(baseUrl, endpoint, payload) {
   }
 }
 
-async function exerciseRealDshWeb(home, env, cliLog) {
+async function exerciseRealDshWeb(
+  home,
+  env,
+  cliLog,
+  skipSessionFixture,
+  sharedApi,
+) {
   const output = { text: '' }
   const child = spawn(dshBin, ['--profile', 'web', '--port', '0', '--no-open'], {
     cwd: packageRoot,
@@ -860,8 +948,11 @@ async function exerciseRealDshWeb(home, env, cliLog) {
   })
   let baseUrl
   try {
-    baseUrl = await waitForWebUrl(child, output)
-    const index = await fetch(baseUrl, { signal: AbortSignal.timeout(5_000) })
+    const launchUrl = await waitForWebUrl(child, output)
+    const authenticated = await openAuthenticatedWeb(launchUrl)
+    baseUrl = authenticated.baseUrl
+    const index = authenticated.index
+    const authHeaders = authenticated.headers
     assert.equal(index.status, 200)
     const html = await index.text()
     const bootText = /(?:window\.__DSH_BOOT__|globalThis\["__DSH_BOOT__"\])\s*=\s*(\{.*?\})<\/script>/su
@@ -873,10 +964,11 @@ async function exerciseRealDshWeb(home, env, cliLog) {
     assert.deepEqual(row.inject, [
       '@deepseek-ai/dsh-client-connection',
       '@deepseek-ai/dsh-client-locale',
-      '@deepseek-ai/dsh-client-runtime',
       '@deepseek-ai/dsh-client-ui-conversation',
+      '@deepseek-ai/dsh-client-ui-renderer',
     ])
     const bundle = await fetch(new URL(row.url, baseUrl), {
+      headers: authHeaders,
       signal: AbortSignal.timeout(5_000),
     })
     assert.equal(bundle.status, 200)
@@ -889,14 +981,23 @@ async function exerciseRealDshWeb(home, env, cliLog) {
     assert(
       await stat(join(env.DSH_AGENTS_HOME, 'skills', 'loopx', 'SKILL.md'))
         .then(() => true, () => false),
-      `automatic initialization did not create the isolated loopx skill: ${initializationLog}\n${output.text}`,
+      `automatic initialization did not create the isolated loopx skill: ${initializationLog}\n${redactWebOutput(output.text)}`,
     )
-    await hostRpc(baseUrl, 'session.create', { sessionId, cwd: packageRoot })
-    const skillCatalog = await hostRpc(baseUrl, 'skill.list', { sessionId })
-    assert(
-      skillCatalog.skills.some(skill => skill.name === 'loopx'),
-      `automatic initialization did not expose the loopx skill before DSH readiness: ${JSON.stringify(skillCatalog)}\n${output.text}`,
-    )
+    if (!skipSessionFixture) {
+      // 0.1.5 namespaces Remote endpoints as `<namespace>/<method>` and names
+      // the wire arguments after the Host method's own parameter, so the
+      // session and skill hosts are addressed by namespace and `request`.
+      await hostRpc(baseUrl, 'session/create', {
+        request: { sessionId, cwd: packageRoot },
+      }, authHeaders)
+      const skillCatalog = await hostRpc(baseUrl, 'skills/list', {
+        request: { sessionId },
+      }, authHeaders)
+      assert(
+        skillCatalog.skills.some(skill => skill.name === 'loopx'),
+        `automatic initialization did not expose the loopx skill before DSH readiness: ${JSON.stringify(skillCatalog)}\n${redactWebOutput(output.text)}`,
+      )
+    }
 
     const startupCalls = (await readFile(cliLog, 'utf8')).trim().split('\n')
     assert.equal(startupCalls.length, 4, `unexpected automatic initialization calls: ${startupCalls.join(' | ')}`)
@@ -905,8 +1006,19 @@ async function exerciseRealDshWeb(home, env, cliLog) {
     assert(startupCalls[2].includes('--install'))
     assert(startupCalls[3].includes('workflow-skills'))
 
-    const malformed = await rpc(baseUrl, 'goalbar/read', { reflected: 'must-not-return' })
-    assert.equal(malformed.response.status, 200)
+    const malformed = await rpc(
+      baseUrl,
+      'goalbar/read',
+      { reflected: 'must-not-return' },
+      authHeaders,
+      undefined,
+      sharedApi,
+    )
+    assert.equal(
+      malformed.response.status,
+      200,
+      `GoalBar route unavailable: ${JSON.stringify(malformed.body)}\n${redactWebOutput(output.text)}`,
+    )
     assert.equal(malformed.body.rpcId, malformed.rpcId)
     assert.equal(malformed.body.result.ok, false)
     assert.equal(malformed.body.result.error.code, 'bad-request')
@@ -914,7 +1026,7 @@ async function exerciseRealDshWeb(home, env, cliLog) {
 
     const read = await rpc(baseUrl, 'goalbar/read', {
       v: requestVersion, op: 'read', sessionId: 'runtime-no-agent',
-    })
+    }, authHeaders, undefined, sharedApi)
     const unavailable = read.body.result.value.result
     assert.equal(unavailable.kind, 'fault')
     assert.equal(unavailable.code, 'session_unavailable')
@@ -923,7 +1035,7 @@ async function exerciseRealDshWeb(home, env, cliLog) {
 
     const rejected = await rpc(baseUrl, 'goalbar/read', {
       v: requestVersion, op: 'read', sessionId: 'runtime-no-agent',
-    }, { origin: 'http://non-loopback.invalid' })
+    }, { ...authHeaders, origin: 'http://non-loopback.invalid' }, undefined, sharedApi)
     assert.equal(rejected.response.status, 403)
     assert.equal(rejected.body, 'forbidden')
     await new Promise(resolveWait => setTimeout(resolveWait, 150))
@@ -939,6 +1051,10 @@ async function exerciseRealDshWeb(home, env, cliLog) {
 
 async function main() {
   const suppliedTarball = parseArgs(process.argv.slice(2))
+  const dshVersion = run(dshBin, ['--version']).trim()
+  const expectedDshVersion = process.env.DSH_EXPECTED_VERSION
+  if (expectedDshVersion) assert.equal(dshVersion, expectedDshVersion)
+  const skipSessionFixture = process.env.DSH_RUNTIME_SKIP_SESSION_FIXTURE === '1'
   const temp = await mkdtemp(join(tmpdir(), 'dsh-loopx-goalbar-runtime-'))
   const home = join(temp, 'dsh-home')
   const tarball = suppliedTarball ?? join(temp, 'dsh-loopx-plugin.tgz')
@@ -1000,7 +1116,17 @@ esac
       '--prefer-offline', '--ignore-scripts',
     ], env)
     installed = await realpath(join(home, 'profiles', 'web', 'node_modules', packageId))
-    await exerciseRealDshWeb(home, env, cliLog)
+    const dshInstallRequire = createRequire(
+      join(dirname(dirname(dshBin)), '..', 'package.json'),
+    )
+    const installedDshRequire = createRequire(
+      dshInstallRequire.resolve('@deepseek-ai/dsh/package.json'),
+    )
+    const installedConnection = await import(pathToFileURL(
+      installedDshRequire.resolve('@deepseek-ai/dsh-client-connection'),
+    ).href)
+    const sharedApi = Reflect.has(installedConnection.HostConnectionService.prototype, 'fetch')
+    await exerciseRealDshWeb(home, env, cliLog, skipSessionFixture, sharedApi)
     await exercisePackedService(installed)
     const installedDump = run(dshBin, ['--profile', 'web', '--dump-config'], env)
     let previousRow = -1
@@ -1027,8 +1153,8 @@ esac
   }
   process.stdout.write([
     'dsh-loopx GoalBar runtime smoke passed',
-    '  real-profile: packed install, awaited automatic initialization, immediate /loopx skill readback, boot graph, served/materialized Client, loopback fence, process teardown, idle no-extra-CLI',
-    '  packed-rc7-connection: live mid-turn binding, lease revision reconciliation, runtime-only update, pending-watch abort, successful Start/Pause, handler disposal',
+    `  real-profile: DSH ${dshVersion}, packed install, awaited automatic initialization, immediate /loopx skill readback, boot graph, served/materialized Client, loopback fence, process teardown, idle no-extra-CLI`,
+    '  packed-connection: live mid-turn binding, lease revision reconciliation, runtime-only update, pending-watch abort, successful Start/Pause, handler disposal',
     '  client-lifecycle: slot coexistence/session injection plus ordinary-unload and cached-reapply CSS cleanup',
     '  manual-evidence: mounted Client-to-carrier Start/Pause stays in the owner-reviewed packed-browser gate',
   ].join('\n') + '\n')

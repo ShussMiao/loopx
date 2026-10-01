@@ -66,10 +66,19 @@ function ordered(items: readonly Item[]): Item[] {
   return [...items].sort((a, b) => a.priority - b.priority || a.index - b.index);
 }
 
+function itemIdentity(entry: Item): string {
+  // A canonical Todo id owns identity across compact/display and lossless
+  // candidate projections. Fall back to the legacy presentation identity only
+  // for rows that predate typed Todo ids.
+  return entry.id
+    ? JSON.stringify(["todo", entry.id])
+    : JSON.stringify(["projection", entry.payload.text, entry.payload.index]);
+}
+
 function unique(items: readonly Item[]): Item[] {
   const seen = new Set<string>();
   return items.filter((entry) => {
-    const key = JSON.stringify([entry.id ?? "", entry.payload.text, entry.payload.index]);
+    const key = itemIdentity(entry);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -167,12 +176,24 @@ function decodeSources(value: unknown): Record<SourceKey, Item[]> {
 
 function deferredPlan(sources: Record<SourceKey, Item[]>, capabilities: unknown) {
   let deferredItems = deferred(sources.deferred_items.length ? sources.deferred_items : sources.items);
-  let candidates = deferred(sources.deferred_resume_candidates).filter((entry) => entry.payload.resume_ready === true);
+  const projectedCandidates = deferred(sources.deferred_resume_candidates);
+  let candidates = projectedCandidates.filter((entry) => entry.payload.resume_ready === true);
   let capacityFields: JsonObject | null = null;
   if (capabilities !== null) {
-    deferredItems = resolveCapacity(deferredItems, sources.items,
+    // deferred_items is a bounded presentation lane while
+    // deferred_resume_candidates retains semantically selected rows that may
+    // fall outside that display window. Re-evaluate their union so supplying
+    // runtime capabilities cannot erase an already projected ready successor.
+    // Put the explicit candidate lane first so its lossless payload wins when
+    // the same Todo is also present in a compact display lane.
+    const displayIdentities = new Set(deferredItems.map(itemIdentity));
+    const reevaluated = resolveCapacity(ordered(unique([
+      ...projectedCandidates,
+      ...deferredItems,
+    ])), sources.items,
       requireStringArray(capabilities, "available_capabilities"));
-    candidates = deferredItems.filter((entry) => entry.payload.resume_ready === true);
+    deferredItems = reevaluated.filter((entry) => displayIdentities.has(itemIdentity(entry)));
+    candidates = reevaluated.filter((entry) => entry.payload.resume_ready === true);
     capacityFields = { deferred_items: payloads(deferredItems), deferred_resume_candidates: payloads(candidates) };
     // Existing summary readers treat an empty explicit deferred lane as absent,
     // including after capacity resolution; retain that compatibility fallback.

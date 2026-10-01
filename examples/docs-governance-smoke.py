@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+from enum import Enum
 import sys
 
 
@@ -14,6 +15,8 @@ DOCS = REPO_ROOT / "docs"
 ROOT_DOCS = {
     "README.md",
     "architecture.md",
+    "community.md",
+    "community.zh-CN.md",
     "heartbeat-automation-prompt.md",
     "index.md",
     "integration.md",
@@ -79,12 +82,17 @@ MOVED_PATHS = {
 
 # docs/index.md .md targets that stay outside mkdocs nav on purpose.
 # Prefer fixing mkdocs.yaml nav for public hosted entry points instead.
-DOCS_INDEX_NAV_ALLOWLIST: dict[str, str] = {}
+DOCS_INDEX_NAV_ALLOWLIST: dict[str, str] = {
+    "community.md": "hosted community entry linked below the first screen; top-nav promotion remains owner-reviewed",
+    "community.zh-CN.md": "zh locale sibling for the hosted community entry",
+}
 
 # docs/README.md catalog .md targets that stay outside mkdocs top nav on purpose.
 DOCS_CATALOG_NAV_ALLOWLIST = {
     "architecture/README.md": "architecture tree index; RFCs linked from Reference nav",
     "archive/README.md": "excluded from hosted site via exclude_docs",
+    "community.md": "community entry linked from the hosted index below the first screen",
+    "community.zh-CN.md": "zh locale sibling for the community entry",
     "community/open-strategy-reviews.md": "community process; catalog-only entry",
     "community/open-strategy-reviews.zh-CN.md": "zh locale sibling for community reviews",
     "development/contributor-tasks.md": "contributor board; not a hosted docs primary page",
@@ -97,6 +105,25 @@ DOCS_CATALOG_NAV_ALLOWLIST = {
     "reference/effect-interpreter-packet.md": "deep packet doc reachable from Reference",
     "research/README.md": "research evidence index; not a top-nav primary",
     "update-notes/README.md": "dated progress notes; catalog-only entry",
+}
+
+# These RFCs predate the bilingual RFC rule. New and modified RFCs must carry
+# a same-basename Chinese mirror; keep this legacy list explicit until each is
+# migrated rather than silently weakening the invariant.
+RFC_BILINGUAL_LEGACY_ALLOWLIST = {
+    "agent-im-openviking-collaboration-v0.md",
+    "benchmark-study-upload-dashboard-v0.md",
+    "goal-usage-token-cost-v0.md",
+    "provider-neutral-turn-start-inbox-hook-v0.md",
+    "single-owner-local-daemon-v0.md",
+    # Existing mirrors that predate reciprocal language links.
+    "cross-session-memory-substrate-v0.md",
+    "desktop-execution-frontends-v0.md",
+    "goal-channel-collaboration-v0.md",
+    "obelisk-session-evidence-provider-v0.md",
+    "post-outcome-memory-utility-attribution-v0.md",
+    "goal-direction-baseline-v0.md",
+    "harness-selection-dsh-pi-v0.md",
 }
 
 # Stable README advanced-docs entry links under docs/ that must stay reachable.
@@ -162,6 +189,351 @@ def iter_relative_md_targets(text: str) -> list[str]:
             continue
         targets.append(target)
     return targets
+
+
+def check_rfc_language_mirrors() -> None:
+    """Require bilingual mirrors for new RFCs and validate reciprocal links."""
+    rfc_dir = DOCS / "architecture" / "rfcs"
+    for english in sorted(rfc_dir.glob("*.md")):
+        if english.name in {"README.md", "TEMPLATE.md"} or english.name.endswith(".zh-CN.md"):
+            continue
+        if english.name in RFC_BILINGUAL_LEGACY_ALLOWLIST:
+            continue
+        chinese = english.with_name(f"{english.stem}.zh-CN.md")
+        if not chinese.exists():
+            raise AssertionError(f"RFC missing required Chinese mirror: {english.name}")
+        english_text = english.read_text(encoding="utf-8")
+        chinese_text = chinese.read_text(encoding="utf-8")
+        assert chinese.name in english_text, f"RFC missing English -> Chinese link: {english.name}"
+        assert english.name in chinese_text, f"RFC missing Chinese -> English link: {chinese.name}"
+        assert "semantic mirror" in english_text.lower(), english.name
+        assert "语义镜像" in chinese_text, chinese.name
+
+
+LEDGER_ENTRY_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*$")
+# The appendix that points at the ledger directory is whichever one an RFC has
+# free: an RFC whose Appendix A carries other content adopts a later letter
+# rather than renumbering history and forcing every open branch to re-resolve it.
+LEDGER_APPENDIX_HEADING = re.compile(
+    r"^## Appendix [A-Z]: (?:[A-Za-z ]+ and )?[Ee]xecution ledger", re.MULTILINE
+)
+def check_rfc_status_index() -> None:
+    """Derived lifecycle index must be current and every RFC header well-formed.
+
+    `scripts/generate_rfc_status_index.py --check` fails when STATUS.md or
+    STATUS.zh-CN.md is stale, when an RFC lacks a parseable lifecycle status or a
+    `Supersedes / closes` declaration, or when a dated log heading is still above
+    an RFC's appendices. The generated file is the only enumerating surface; the
+    README retains delivery facts and does not cache lifecycle states.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "generate_rfc_status_index.py"),
+            "--check",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == 0, (
+        "RFC status index check failed; run `python3 scripts/generate_rfc_status_index.py "
+        f"--write` and fix reported headers:\n{result.stdout}{result.stderr}"
+    )
+
+
+def check_rfc_status_index_rules() -> None:
+    """Exercise the status-index rules through the real CLI on a scratch tree.
+
+    `check_rfc_status_index` proves this repository is clean; it cannot prove the
+    rules reject anything, because a rule that accepted every document would also
+    pass. So the generator and the RFC directory are copied into a temporary
+    root, and each fixture below is staged as a real RFC, indexed in the README,
+    and run through `--write`/`--check`. Positive fixtures assert the tree still
+    checks out, negative fixtures assert the named problem is reported.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="rfc-status-index-") as tmp:
+        root = Path(tmp)
+        rfcs = root / "docs" / "architecture" / "rfcs"
+        shutil.copytree(DOCS / "architecture" / "rfcs", rfcs)
+        (root / "scripts").mkdir()
+        generator = root / "scripts" / "generate_rfc_status_index.py"
+        shutil.copy(REPO_ROOT / "scripts" / "generate_rfc_status_index.py", generator)
+        readme = rfcs / "README.md"
+        pristine_readme = readme.read_text(encoding="utf-8")
+        staged: list[str] = []
+
+        def run(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, str(generator), *args],
+                capture_output=True,
+                text=True,
+                cwd=root,
+            )
+
+        def stage(
+            slug: str,
+            *,
+            status: str,
+            supersedes: str = "none",
+            superseded_by: str | None = None,
+            body: str = "",
+            mirror: bool = False,
+        ) -> None:
+            header = [f"# Fixture {slug}", "", f"- **RFC status:** {status}"]
+            header.append(f"- **Supersedes / closes:** {supersedes}")
+            if superseded_by is not None:
+                header.append(f"- **Superseded by:** {superseded_by}")
+            (rfcs / f"{slug}.md").write_text(
+                "\n".join(header) + "\n" + body, encoding="utf-8"
+            )
+            if mirror:
+                (rfcs / f"{slug}.zh-CN.md").write_text(
+                    "\n".join(
+                        [
+                            f"# 夹具 {slug} v0",
+                            "",
+                            f"- **RFC status：** {status}",
+                            f"- **替代 / 关闭：** {'无' if supersedes == 'none' else supersedes}",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+            staged.append(
+                f"\n- [Fixture {slug}]({slug}.md)\n"
+            )
+            readme.write_text(pristine_readme + "".join(staged), encoding="utf-8")
+
+        def reset() -> None:
+            for path in rfcs.glob("fixture-*.md"):
+                path.unlink()
+            staged.clear()
+            readme.write_text(pristine_readme, encoding="utf-8")
+
+        def check_after_write() -> tuple[int, str]:
+            # `--write` first, so the only failure left is a rule violation.
+            run("--write")
+            result = run("--check")
+            return result.returncode, result.stdout + result.stderr
+
+        assert run("--check").returncode == 0, (
+            "the copied RFC tree is not clean to start with"
+        )
+
+        typed_tail = {
+            "slug": "fixture-alpha-v0",
+            "status": "Accepted, with remaining implementation",
+        }
+        positive: list[tuple[str, list[dict[str, object]]]] = [
+            ("a typed lifecycle value with a descriptive tail", [typed_tail]),
+            (
+                "a normative heading that says checkpoint without a date",
+                [
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Accepted",
+                        "body": "\n## Checkpoint persistence contract\n\nState is flushed.\n",
+                    }
+                ],
+            ),
+            (
+                "dated history kept in an appendix",
+                [
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Accepted",
+                        "body": (
+                            "\n## Appendix A: Execution ledger (non-normative)\n\n"
+                            "### 2026-09-24 — shipped\n\nEntry text.\n"
+                        ),
+                    }
+                ],
+            ),
+            (
+                "a supersession chain declared in both directions",
+                [
+                    {
+                        "slug": "fixture-old-v0",
+                        "status": "Superseded",
+                        "superseded_by": "fixture-new-v0.md",
+                    },
+                    {
+                        "slug": "fixture-new-v0",
+                        "status": "Accepted",
+                        "supersedes": "[fixture-old-v0.md](fixture-old-v0.md)",
+                    },
+                ],
+            ),
+            (
+                "a Chinese mirror carrying the supersession declaration",
+                [{"slug": "fixture-alpha-v0", "status": "Accepted", "mirror": True}],
+            ),
+        ]
+        for case, fixtures in positive:
+            for fixture in fixtures:
+                stage(**fixture)
+            code, output = check_after_write()
+            assert code == 0, f"{case}: expected a clean run\n{output}"
+            reset()
+
+        negative: list[tuple[str, list[dict[str, object]], str]] = [
+            (
+                "an untyped lifecycle value",
+                [
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Drafting notes are not a lifecycle state",
+                    }
+                ],
+                "does not begin with a lifecycle state",
+            ),
+            (
+                "`Superseded by: none`",
+                [
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Superseded",
+                        "superseded_by": "none",
+                    }
+                ],
+                "`none` is not a successor",
+            ),
+            (
+                "a successor that does not exist",
+                [
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Superseded",
+                        "superseded_by": "missing-successor-v0.md",
+                    }
+                ],
+                "`Superseded by` names missing-successor-v0.md, which is not an RFC",
+            ),
+            (
+                "a successor that never acknowledges its predecessor",
+                [
+                    {"slug": "fixture-new-v0", "status": "Accepted"},
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Superseded",
+                        "superseded_by": "fixture-new-v0.md",
+                    },
+                ],
+                "does not name it in `Supersedes / closes`",
+            ),
+            (
+                "a predecessor that never acknowledges its successor",
+                [
+                    {"slug": "fixture-old-v0", "status": "Accepted"},
+                    {
+                        "slug": "fixture-new-v0",
+                        "status": "Accepted",
+                        "supersedes": "[fixture-old-v0.md](fixture-old-v0.md)",
+                    },
+                ],
+                "does not declare `Superseded by: fixture-new-v0.md`",
+            ),
+            (
+                "a `Supersedes / closes` value that is neither none nor an RFC",
+                [
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Accepted",
+                        "supersedes": "later",
+                    }
+                ],
+                "must be `none` or name the RFCs",
+            ),
+            (
+                "a dated log heading above the appendices",
+                [
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Accepted",
+                        "body": "\n### 2026-09-24 — shipped\n\nEntry text.\n",
+                    }
+                ],
+                "dated log heading belongs in ledger/fixture-alpha-v0/",
+            ),
+            (
+                "a dated checkpoint heading above the appendices",
+                [
+                    {
+                        "slug": "fixture-alpha-v0",
+                        "status": "Accepted",
+                        "body": "\n### Checkpoint 2026-09-24 — shipped\n\nEntry text.\n",
+                    }
+                ],
+                "dated log heading belongs in ledger/fixture-alpha-v0/",
+            ),
+        ]
+        for case, fixtures, expected in negative:
+            for fixture in fixtures:
+                stage(**fixture)
+            code, output = check_after_write()
+            assert code != 0, f"{case}: expected {expected!r}, but the check passed"
+            assert expected in output, f"{case}: expected {expected!r} in\n{output}"
+            reported = [
+                line for line in output.splitlines() if line.startswith("fixture-")
+            ]
+            assert len(reported) == 1, (
+                f"{case}: expected exactly the {expected!r} problem, reported {reported}"
+            )
+            reset()
+
+
+def check_rfc_ledger_entries() -> None:
+    """Validate the per-file RFC execution ledger.
+
+    The ledger exists so that two branches adding an entry on the same day touch
+    two different files instead of the same append cluster. That only holds while
+    every entry is its own file with a sortable name, so the naming is checked
+    rather than described. Nothing enumerates the entries: an index line would
+    reintroduce exactly the shared line this directory removes.
+    """
+    ledger = DOCS / "architecture" / "rfcs" / "ledger"
+    if not ledger.is_dir():
+        return
+    assert (ledger / "README.md").exists(), "ledger README missing"
+    assert (ledger / "README.zh-CN.md").exists(), "ledger README missing its Chinese mirror"
+    # Several RFCs carry an execution-ledger appendix, so entries are shared and
+    # must say which one they belong to. The RFC slug is a directory, and the
+    # directory has to name a real RFC: an entry cannot claim an RFC that does
+    # not exist, and the per-RFC listing stays the index.
+    scopes = sorted(path for path in ledger.iterdir() if path.is_dir())
+    assert scopes, "ledger has no per-RFC directories"
+    for scope in scopes:
+        rfc_document = DOCS / "architecture" / "rfcs" / f"{scope.name}.md"
+        assert rfc_document.is_file(), (
+            f"ledger directory {scope.name}/ does not name an RFC: "
+            f"{rfc_document.relative_to(DOCS.parent)} does not exist"
+        )
+        assert LEDGER_APPENDIX_HEADING.search(
+            rfc_document.read_text(encoding="utf-8")
+        ), (
+            f"{scope.name} has a ledger directory but no execution-ledger appendix"
+        )
+        for entry in sorted(scope.glob("*.md")):
+            if entry.name.endswith(".zh-CN.md"):
+                english = entry.with_name(entry.name[: -len(".zh-CN.md")] + ".md")
+                assert english.exists(), (
+                    f"ledger entry has a Chinese mirror with no English original: {entry.name}"
+                )
+                continue
+            assert LEDGER_ENTRY_NAME.match(entry.stem), (
+                f"ledger entry must be named YYYY-MM-DD-slug.md, got: {entry.name}"
+            )
+            chinese = entry.with_name(f"{entry.stem}.zh-CN.md")
+            assert chinese.exists(), f"ledger entry missing required Chinese mirror: {entry.name}"
+            assert entry.read_text(encoding="utf-8").strip(), f"empty ledger entry: {entry.name}"
+            assert chinese.read_text(encoding="utf-8").strip(), f"empty ledger entry: {chinese.name}"
 
 
 def mkdocs_nav_paths(mkdocs_text: str) -> set[str]:
@@ -359,23 +731,132 @@ def assert_effect_interpreter_docs_are_canonical() -> None:
         assert fragment in lecture, fragment
 
 
+CONTRIBUTOR_BOARD_CLAIMABLE_LANES = (
+    "## Lane A: Adoption Defects (P0)",
+    "## Lane B: Roadmap Gaps (R1 / R2 / G1)",
+    "## Lane C: RFC Obligations",
+)
+CONTRIBUTOR_BOARD_MAX_CLAIMABLE_ROWS = 25
+class ContributorTaskStatus(str, Enum):
+    AVAILABLE = "Available"
+    CLAIMED = "Claimed"
+    NEEDS_DESIGN = "Needs design"
+    BLOCKED = "Blocked"
+
+
+def contributor_task_status(raw: str) -> ContributorTaskStatus:
+    for state in ContributorTaskStatus:
+        if re.fullmatch(rf"{re.escape(state.value)}(?: \([^()]+\)|: .+)?", raw):
+            return state
+    raise AssertionError(f"unexpected contributor task status: {raw}")
+
+
+def contributor_board_claimable_rows(board: str) -> list[str]:
+    rows: list[str] = []
+    for lane in CONTRIBUTOR_BOARD_CLAIMABLE_LANES:
+        start = board.index(lane)
+        end = board.find("\n## ", start + len(lane))
+        section = board[start : end if end != -1 else len(board)]
+        for line in section.splitlines():
+            if not line.startswith("| GH-"):
+                continue
+            rows.append(line)
+    return rows
+
+
 def assert_contributor_task_board_is_current() -> None:
-    tasks = compact(read("docs/development/contributor-tasks.md"))
+    board = read("docs/development/contributor-tasks.md")
+    tasks = compact(board)
+    history = compact(read("docs/development/contributor-tasks-history.md"))
+
+    # The board only lists open, anchored work; landed context lives in the
+    # history file so the board cannot drift back into a progress log.
     for required in (
+        "## Task Admission Rule",
+        "## Retired Task Generators",
+        "contributor-tasks-history.md",
+        "| Roadmap |",
+        "| RFC obligation |",
+        "| Reproduced adoption defect |",
+    ):
+        assert required in tasks, required
+    for lane in CONTRIBUTOR_BOARD_CLAIMABLE_LANES:
+        assert lane in board, lane
+    rows = contributor_board_claimable_rows(board)
+    assert rows, "contributor board has no claimable rows"
+    assert len(rows) <= CONTRIBUTOR_BOARD_MAX_CLAIMABLE_ROWS, len(rows)
+    import runpy
+
+    # The RFC generator owns lifecycle parsing; the board consumes that contract.
+    rfc_source = runpy.run_path(str(REPO_ROOT / "scripts/generate_rfc_status_index.py"))
+    rfcs = {record.path.name: record.state for record in rfc_source["collect"]()}
+    roadmap = read("docs/architecture/rfcs/loopx-overall-roadmap-v0.md")
+    canonical_cards = set()
+    for line in roadmap.splitlines():
+        plain = line.replace("**", "").replace("`", "")
+        match = re.match(r"^(?:#{2,6}\s+|\|\s*)([SGR]\d{1,2})(?=\s|[:：|.—–-])", plain)
+        if match:
+            canonical_cards.add(match.group(1))
+    landed_ids = {match.group(1) for match in re.finditer(r"^\| (GH-[A-Za-z0-9]+) \|", read("docs/development/contributor-tasks-history.md").split("## Product Manager Cut")[0], re.MULTILINE)}
+    for row in rows:
+        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+        assert len(cells) == 5, row
+        task_id, anchor, gap, validation, status = cells
+        state = contributor_task_status(status)
+        assert task_id not in landed_ids, f"{task_id}: already landed; cannot remain claimable"
+        cards = set(re.findall(r"\b[SGR]\d{1,3}\b", anchor))
+        assert cards <= canonical_cards, f"{task_id}: unknown roadmap card {cards - canonical_cards}"
+        links = re.findall(r"\]\(\.\./architecture/rfcs/([a-z0-9-]+(?:\.zh-CN)?\.md)(?:#[^)]*)?\)", anchor)
+        for filename in links:
+            canonical = filename.replace(".zh-CN.md", ".md")
+            assert canonical in rfcs, f"{task_id}: missing canonical RFC {canonical}"
+            if state in {ContributorTaskStatus.AVAILABLE, ContributorTaskStatus.CLAIMED}:
+                assert rfcs[canonical] == "Accepted", f"{task_id}: RFC is not an Accepted claimable design"
+        public_issue = re.search(r"https://github\.com/(?:loopx-project|huangruiteng)/loopx/(?:issues|pull)/[1-9]\d*", anchor)
+        assert cards or links or public_issue, f"{task_id}: missing canonical anchor"
+        assert "Exit:" in gap, f"{task_id}: gap column must state an exit"
+        assert validation, f"{task_id}: validation column is empty"
+    for stale in (
+        "## Product Manager Cut",
+        "## Recent Maintainer Progress",
+        "## Turn Loop Controller Plan",
+        "Contributor implication:",
+        "| GH-C37 | Design",
+        "| GH-C89 | governance | Claimed",
+    ):
+        assert stale not in tasks, stale
+    for landed in (
+        "| GH-C04 |",
+        "| GH-C06 |",
+        "| GH-C89 |",
+        "| GH-C96 |",
+        "| GH-C100 |",
+    ):
+        assert landed in history, landed
+    for required in (
+        "## Product Manager Cut",
+        "## Recent Maintainer Progress",
+        "## Turn Loop Controller Plan",
+        "contributor-tasks.md#task-admission-rule",
         "The four canonical global manager CLI commands are shipped",
         "`/loop-goal-summary` remains host-only and outside this contributor slice",
         "A shared typed Effect Program drives quota, Turn, task-lease, and todo-completion settlement",
         "The scheduler remains outside settlement",
         "M7 parity fixtures plus a read-only journal inspection/`interpret_turn_journal` lens shipped",
         "do not extract a shared executor until two adapters share execution ownership",
+        "Landed: #4659 owns `update` registration and dispatch",
+        "Landed via #4422: the provider-neutral parity fixture",
     ):
-        assert required in tasks, required
+        assert required in history, required
     for stale in (
         "Implement `/loopx-global-todos` or `/loopx-global-risks` next",
         "Implement `/loopx-global-risks` next",
         "Implement the remaining canonical `/loopx-global-risks` command",
         "global risks and goal summary stay host-only",
         "Add one negative fixture proving fail-closed legacy upgrade",
+        "| P2 | Maintainability | CLI ownership and hot-module extraction | GH-C06 / #4803 | In review |",
+        "Claimed: PR #4803 extracts",
+        "Characterize the shipped file-backed `claim_work` executor with a provider-neutral parity fixture (#3700)",
         "| GH-C82 |",
         "| GH-C59 |",
         "| GH-C61 |",
@@ -397,6 +878,7 @@ def assert_contributor_task_board_is_current() -> None:
         "| GH-C97 |",
     ):
         assert stale not in tasks, stale
+        assert stale not in history, stale
 
 
 def assert_contributor_task_links_are_current() -> None:
@@ -475,11 +957,11 @@ def assert_technical_direction_governance_is_current() -> None:
         assert required in rfc_index, required
     assert "## Status matrix" not in rfc_index
 
+    # The task board routes to canonical direction/roadmap owners instead of
+    # duplicating their mutable maturity table.
     for required in (
-        "Long-Horizon Benchmarks and Evidence",
-        "Operator Surface and IM Integration",
-        "Shared Goal Authority and Cross-host Coordination",
-        "Architecture and Research Incubator",
+        "../project/technical-directions.md",
+        "../architecture/rfcs/loopx-overall-roadmap-v0.md",
     ):
         assert required in tasks, required
 
@@ -814,6 +1296,10 @@ def main() -> int:
     ]:
         assert required in compact_multi_agent_product_recipe, required
 
+    check_rfc_language_mirrors()
+    check_rfc_ledger_entries()
+    check_rfc_status_index()
+    check_rfc_status_index_rules()
     print("docs-governance-smoke ok")
     return 0
 

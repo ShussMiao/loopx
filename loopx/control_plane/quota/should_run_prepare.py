@@ -30,10 +30,10 @@ from ..effect_program import ReceiptBoundMonitorPhase, ReceiptBoundReplayPhase
 from ..goals.goal_frontier import (
     build_goal_frontier_projection_context_from_status,
 )
+from ..quota.blocked_transition_notice import build_blocked_transition_notice
 from ..quota.error_codes import HeartbeatReceiptIdentityConflictError
-from ..quota.goal_boundary import (
-    effective_available_capabilities as _effective_available_capabilities,
-)
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..agents.capability_memory import resolve_agent_capabilities
 from ..quota.goal_boundary import (
     goal_boundary as _goal_boundary,
 )
@@ -69,6 +69,8 @@ from ..scheduler.execution_context import (
     SchedulerExecutionContextResolution,
 )
 from ..todos.contract import (
+    TODO_STATUS_BLOCKED,
+    TODO_STATUS_DEFERRED,
     TODO_STATUS_OPEN,
     TODO_TASK_CLASS_ADVANCEMENT,
     TODO_TASK_CLASS_BLOCKER,
@@ -79,19 +81,11 @@ from ..todos.contract import (
     normalize_todo_resume_when,
     normalize_todo_status,
 )
-from ..todos.projection import (
+from ..todos.todo_semantics import (
     todo_item_is_actionable_open as projection_todo_item_is_actionable_open,
-)
-from ..todos.projection import (
     todo_item_is_due_monitor as projection_todo_item_is_due_monitor,
-)
-from ..todos.projection import (
     todo_item_is_expired_monitor as projection_todo_item_is_expired_monitor,
-)
-from ..todos.projection import (
     todo_item_next_due_at as projection_todo_item_next_due_at,
-)
-from ..todos.projection import (
     todo_item_task_class as projection_todo_item_task_class,
 )
 from ..todos.quota_summary import (
@@ -112,6 +106,7 @@ from ..work_items.work_lane import (
     lark_inbox_reply_due_work_lane_contract,
     operator_inbox_material_review_due_work_lane_contract,
     preserve_heartbeat_receipt_bound_work_lane,
+    receipt_bound_deferred_work_lane,
     scoped_user_gate_due_monitor_contract,
     work_lane_contract_is_lark_inbox_reply_due,
     work_lane_contract_is_operator_inbox_material_review_due,
@@ -186,23 +181,31 @@ class _QuotaDecisionPreparation:
 def _preserve_receipt_bound_replan_obligation(
     replan_obligation: Mapping[str, Any] | None,
     receipt_bound_replan_obligation_id: str | None,
+    *, guard_scoped: bool = False,
+    replay_phase: ReceiptBoundReplayPhase | None = None,
+    transition_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     preserved_replan_id = normalize_todo_replan_obligation_id(
         receipt_bound_replan_obligation_id
     )
     if not preserved_replan_id:
         return dict(replan_obligation) if replan_obligation is not None else None
-    current_replan_id = normalize_todo_replan_obligation_id(
-        (replan_obligation or {}).get("obligation_id")
-    )
-    if current_replan_id != preserved_replan_id:
-        raise HeartbeatReceiptIdentityConflictError(
-            "heartbeat receipt settlement identity conflicts with the "
-            "current autonomous replan obligation"
-        )
-    preserved_replan_obligation = dict(replan_obligation or {})
-    preserved_replan_obligation["selection_binding"] = "heartbeat_receipt"
-    return preserved_replan_obligation
+    try:
+        result = effect_runtime_result("work_item.replan_semantics.project", {
+            "operation": "receipt_bound_obligation",
+            "current_obligation": dict(replan_obligation) if replan_obligation is not None else None,
+            "selected_obligation_id": preserved_replan_id, "guard_scoped": guard_scoped,
+            "replay_phase": replay_phase.value if replay_phase is not None else None,
+            "transition_candidates": transition_candidates or [],
+        })
+    except EffectRuntimeRejected as exc:
+        if exc.diagnostic_code == "heartbeat_receipt_identity_conflict":
+            raise HeartbeatReceiptIdentityConflictError(str(exc)) from None
+        raise
+    obligation = result.get("obligation") if isinstance(result, Mapping) else None
+    if not isinstance(obligation, Mapping) or obligation.get("obligation_id") != preserved_replan_id:
+        raise RuntimeError("TypeScript receipt-bound replan obligation shape mismatch")
+    return dict(obligation)
 
 
 def _same_todo_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
@@ -236,6 +239,8 @@ def _blocked_priority_fallback(
         return None
 
     blocked_items: list[dict[str, Any]] = []
+    transition_notices: list[dict[str, Any]] = []
+    owner_visible_blocker = False
     for item in first_open:
         if not isinstance(item, dict):
             continue
@@ -267,6 +272,21 @@ def _blocked_priority_fallback(
         if not text:
             continue
         blocked_items.append(compact_todo_summary_item(item, text=text))
+        # A scheduled future monitor window is a deferral, not a blocker, so it
+        # never earns an owner notice. An advancement item that is blocked, or
+        # that waits on an unsatisfied resume condition, does: the owner is
+        # told why the higher-priority work is not moving while fallback
+        # delivery continues, without being asked to act.
+        if not future_monitor and (
+            status == TODO_STATUS_BLOCKED or resume_condition_pending
+        ):
+            owner_visible_blocker = True
+            notice = build_blocked_transition_notice(
+                item,
+                selected_executable=selected,
+            )
+            if notice is not None:
+                transition_notices.append(notice)
 
     if not blocked_items:
         return None
@@ -276,14 +296,22 @@ def _blocked_priority_fallback(
         "schema_version": "blocked_priority_fallback_v0",
         "kind": "blocked_priority_fallback",
         "severity": "warning",
-        "notify_user": False,
+        "notify_user": owner_visible_blocker,
         "requires_user_action": False,
         "reason": (
-            "a higher-priority agent todo is blocked, deferred, or scheduled "
-            "for a future monitor window before the "
-            "selected executable fallback"
+            (
+                "a higher-priority agent todo is blocked before the selected "
+                "executable fallback; the fallback continues and no owner "
+                "action is required"
+            )
+            if owner_visible_blocker
+            else (
+                "a higher-priority agent todo is deferred or scheduled for a "
+                "future monitor window before the selected executable fallback"
+            )
         ),
         "blocked_items": blocked_items[:3],
+        "blocked_transition_notices": transition_notices[:3],
         "selected_executable": selected_item,
         "recommended_action": (
             "Keep the blocked core todo visible in status while selecting fallback; "
@@ -433,6 +461,35 @@ def _build_agent_work_lane(
     return monitor_only, work_lane, task_orchestration
 
 
+def _deferred_receipt_bound_work_lane(
+    *, todo_id: str, source_items: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Keep a deferred Todo's old receipt visible without selecting new work."""
+
+    if any(
+        normalize_todo_id(source_item.get("todo_id")) == todo_id
+        and normalize_todo_status(source_item.get("status")) == TODO_STATUS_DEFERRED
+        for source_item in source_items
+    ):
+        return receipt_bound_deferred_work_lane(todo_id=todo_id)
+    return None
+
+
+def _with_auxiliary_gate_scope(
+    work_lane: dict[str, Any] | None, gates: list[dict[str, Any]], *, agent_id: str | None,
+) -> dict[str, Any] | None:
+    if not isinstance(work_lane, dict):
+        return work_lane
+    auxiliary = work_lane.get("auxiliary_monitor_poll")
+    if not isinstance(auxiliary, dict) or not isinstance(auxiliary.get("monitor_due_items"), list):
+        return work_lane
+    from ..todos.decision_scope import todo_gate_scope_projections
+    scopes = todo_gate_scope_projections(gates, auxiliary["monitor_due_items"], agent_id=agent_id)
+    selected_scope = next((scope for scope in scopes
+        if scope.get("todo_id") == auxiliary.get("selected_todo_id")), None)
+    return {**work_lane, "auxiliary_monitor_poll": {**auxiliary, "gate_scope": selected_scope}}
+
+
 def _prepare_quota_should_run_item(
     status_payload: dict[str, Any],
     *,
@@ -454,6 +511,7 @@ def _prepare_quota_should_run_item(
     receipt_bound_monitor_phase: ReceiptBoundMonitorPhase | None,
     receipt_bound_replay_phase: ReceiptBoundReplayPhase | None,
     receipt_bound_replan_obligation_id: str | None,
+    receipt_bound_replan_guard_scoped: bool = False,
 ) -> _QuotaDecisionPreparation:
     quota = item.get("quota") if isinstance(item.get("quota"), dict) else {}
     state = str(quota.get("state") or "unknown")
@@ -469,11 +527,11 @@ def _prepare_quota_should_run_item(
         agent_id=requested_agent_id,
         public_safe_compact_text=_protocol_action_text,
     )
-    effective_available_capabilities = _effective_available_capabilities(
-        available_capabilities,
-        item=item,
-        project_asset=project_asset,
+    availability = resolve_agent_capabilities(
+        status_payload, goal_id=safe_goal_id, agent_identity=agent_identity,
+        item=item, project_asset=project_asset, available=available_capabilities,
     )
+    effective_available_capabilities = availability["effective"]
     user_todo_summary = select_quota_todo_summary(
         item.get("user_todos"),
         project_asset.get("user_todos") if project_asset else None,
@@ -630,7 +688,7 @@ def _prepare_quota_should_run_item(
             agent_todo_summary=agent_todo_summary,
             agent_todo_source_items=task_orchestration_agent_items,
             user_todo_source_items=task_orchestration_user_blockers,
-            available_capabilities=available_capabilities,
+            available_capabilities=availability["runtime_available"],
             monitor_debt_arbitration=monitor_debt_arbitration,
         )
     )
@@ -719,12 +777,25 @@ def _prepare_quota_should_run_item(
             and candidate.get("selection_binding") == "heartbeat_receipt"
         ):
             receipt_bound_agent_next_action = candidate
-            preserved_work_lane = preserve_heartbeat_receipt_bound_work_lane(
-                work_lane_contract,
-                selected_todo=candidate,
+            work_lane_contract = (
+                preserve_heartbeat_receipt_bound_work_lane(
+                    work_lane_contract,
+                    selected_todo=candidate,
+                )
+                or work_lane_contract
             )
-            if isinstance(preserved_work_lane, dict):
-                work_lane_contract = preserved_work_lane
+        else:
+            # The old Turn still owns its committed settlement identity, but a
+            # deferred Todo is not an executable candidate.  A successor may be
+            # selected only by a fresh Turn; do not leak it through work-lane
+            # fallback on this replay.
+            work_lane_contract = (
+                _deferred_receipt_bound_work_lane(
+                    todo_id=receipt_bound_todo_id,
+                    source_items=agent_todo_planning_source_items,
+                )
+                or work_lane_contract
+            )
     if inbox_priority_due:
         task_orchestration_contract = capability_gate = capability_monitor_contract = None
         capability_monitor_fallback = scoped_user_gate_fallback = workspace_guard = None
@@ -765,6 +836,9 @@ def _prepare_quota_should_run_item(
         else _preserve_receipt_bound_replan_obligation(
             goal_frontier_context.get("replan_obligation"),
             receipt_bound_replan_obligation_id,
+            guard_scoped=receipt_bound_replan_guard_scoped,
+            replay_phase=receipt_bound_replay_phase,
+            transition_candidates=goal_frontier_context.get("replan_transition_candidates"),
         )
     )
     replan_scope = goal_frontier_context.get("replan_scope") or {}
@@ -790,10 +864,12 @@ def _prepare_quota_should_run_item(
         recovery_allowed = False
         reason = str(projection_gap_repair.get("reason") or reason)
     boundary_projection_repair = None
+    # Resolve exact identity before Agent/display compaction. Live callers supply
+    # the complete source; pure status callers use only their supplied snapshot.
     requested_action_candidate = (
         build_explicit_advancement_next_action(
             agent_identity=agent_identity,
-            agent_todo_items=agent_todo_source_items,
+            agent_todo_items=agent_todo_planning_source_items,
             available_capabilities=effective_available_capabilities,
             todo_id=requested_action_todo_id,
             selection_binding="pending_action_selection",
@@ -817,7 +893,7 @@ def _prepare_quota_should_run_item(
         project_asset=project_asset,
         agent_lane_recommendation=agent_lane_recommendation,
         effective_available_capabilities=effective_available_capabilities,
-        runtime_available_capabilities=available_capabilities,
+        runtime_available_capabilities=availability["runtime_available"],
         receipt_bound_todo_id=receipt_bound_todo_id,
         requested_action_todo_id=requested_action_todo_id,
         requested_action_candidate=requested_action_candidate,
@@ -836,7 +912,10 @@ def _prepare_quota_should_run_item(
         self_repair_allowed=self_repair_allowed,
         monitor_debt_arbitration=monitor_debt_arbitration,
         agent_monitor_only=agent_monitor_only,
-        work_lane_contract=work_lane_contract,
+        work_lane_contract=(
+            _with_auxiliary_gate_scope(work_lane_contract, task_orchestration_user_blockers,
+                agent_id=boundary_agent_id) if scoped_user_gate_fallback else work_lane_contract
+        ),
         receipt_bound_agent_next_action=receipt_bound_agent_next_action,
         task_orchestration_contract=task_orchestration_contract,
         capability_gate=capability_gate,

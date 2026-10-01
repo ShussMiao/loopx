@@ -27,16 +27,13 @@ TODO_EVENT_KINDS = {
     "complete": "todo_complete",
     "supersede": "todo_supersede",
     "archive-completed": "todo_archive_completed",
-    "capture-followups": "todo_capture_followups",
 }
 
 
 def todo_error_payload(args: argparse.Namespace, exc: Exception) -> dict[str, object]:
     payload: dict[str, object] = {
         "ok": False,
-        "dry_run": True
-        if args.todo_command == "suggest"
-        else not bool(args.execute)
+        "dry_run": not bool(args.execute)
         if args.todo_command in {"archive-completed", "project-markdown"}
         else bool(args.dry_run),
         "added": False,
@@ -84,7 +81,8 @@ def append_todo_rollout_event(
         and getattr(args, "no_follow_up", False)
     )
     if (
-        not payload.get("ok")
+        args.todo_command == "receipt"
+        or not payload.get("ok")
         or payload.get("dry_run")
         or (payload.get("idempotent_replay") and not turn_instance_id)
     ):

@@ -6,7 +6,6 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { canonicalAuthorityBytes } from "../../loopx/control_plane/coordination/authority_store_codec.ts";
-import { LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA } from "../../loopx/control_plane/coordination/coordination_state_contract.generated.ts";
 import { commitLocalAuthorityShadowEntry } from "../../loopx/control_plane/coordination/local_authority_shadow.ts";
 
 test("a drained entry cannot silently bootstrap a missing candidate", async (t) => {
@@ -15,7 +14,6 @@ test("a drained entry cannot silently bootstrap a missing candidate", async (t) 
   const projection = { handoff_mode: "hard_lease", todos: [] };
   const digest = `sha256:${createHash("sha256").update(canonicalAuthorityBytes(projection)).digest("hex")}`;
   const result = await commitLocalAuthorityShadowEntry({
-    schema_version: LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA,
     runtime_root: root,
     goal_id: "goal-a",
     entry: {

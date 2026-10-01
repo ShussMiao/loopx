@@ -13,6 +13,7 @@ scanning a chronological list.
 - [`event_store_migration_bridge_v0`](event-store-migration-bridge-v0.md): Event store migration bridge v0
 - [`file_lock_acquisition_v0`](file-lock-acquisition-v0.md): Bounded file-lock acquisition and operator recovery v0
 - [`global_manager_command_v0`](global-manager-command-v0.md): Global manager command v0
+- [Manager evidence and continuity v0](manager-evidence-and-continuity-v0.md): proposed coverage, scoped requests, and restart acceptance for the built-in manager
 - [`goal_vision_replan_contract_v0`](goal-vision-replan-contract-v0.md): Goal vision replan contract v0
 - [`local_state_write_correctness_v0`](local-state-write-correctness-v0.md): Local state write correctness v0
 - [`loopx_goal_command_v0`](loopx-goal-command-v0.md): LoopX goal command v0
@@ -21,8 +22,9 @@ scanning a chronological list.
 - [`quota_planning_horizon_v0`](quota-planning-horizon-v0.md): Bounded agent planning horizon v0
 - [`rollback_packet_v0`](rollback-packet-v0.md): Rollback packet v0
 - [`task_graph_projection_v0`](task-graph-projection-v0.md): Task graph projection v0
+- [`typed_date_resume_trigger_v0`](typed-date-resume-trigger-v0.md): timezone-aware one-shot Todo resume and stable due receipt v0
+- [`typed_date_resume_trigger_v0`](typed-date-resume-trigger-v0.zh-CN.md): timezone-aware one-shot Todo resume and stable due receipt v0 (中文)
 - [`todo_detail_cold_path_v0`](todo-detail-cold-path-v0.md): Todo detail cold path v0
-- [`todo_suggestion_prompt_v0`](todo-suggestion-prompt-v0.md): Todo suggestion prompt v0
 - [`turn_envelope_v0`](turn-envelope-v0.md): Turn envelope v0
 - [`loop_turn_loop_disposition_v0`](turn-loop-controller-v0.md): Loop Turn Loop Disposition v0
 
@@ -38,6 +40,7 @@ scanning a chronological list.
 - [`material_lifecycle_architecture_v0`](material-lifecycle-architecture-v0.zh-CN.md): Material lifecycle architecture v0 (中文)
 - [`multi_agent_three_layer_minimality_contract_v0`](multi-agent-three-layer-minimality-v0.md): Multi-agent three-layer minimality v0
 - [`multi_agent_visible_launcher_v0`](multi-agent-visible-launcher-v0.md): Multi-agent visible launcher v0
+- [`peer_agent_directory_v0`](peer-agent-directory-and-observation-v0.md): Peer agent directory, bounded observation and delivery v0
 - [`peer_agent_runtime_v1`](peer-agent-runtime-v1.md): Peer agent runtime v1
 - [`peer_supervisor_v0`](peer-supervisor-v0.md): Peer supervisor v0
 - [`periodic_report_v0`](periodic-report-v0.md): Periodic report v0
@@ -45,6 +48,8 @@ scanning a chronological list.
 - [`reward_memory_architecture_v0`](../../../loopx/capabilities/reward_memory/README.md): Reward memory architecture v0
 - [`reward_memory_architecture_v0`](../../../loopx/capabilities/reward_memory/README.zh-CN.md): Reward memory architecture v0 (中文)
 - [`reward_memory_corpus_registry_v0`](reward-memory-corpus-registry-v0.md): Reward memory corpus registry v0
+- [`memory_utility_projection_v0`](reward-memory-utility-projection-v0.md): Reward memory utility projection v0
+- [`memory_utility_projection_v0`](reward-memory-utility-projection-v0.zh-CN.md): Reward memory utility projection v0 (中文)
 - [`trajectory_hygiene_v0`](trajectory-hygiene-v0.md): Trajectory hygiene v0
 
 ## Runtime And Host Integration

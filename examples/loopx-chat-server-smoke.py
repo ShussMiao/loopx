@@ -214,6 +214,7 @@ def main() -> None:
         build_bounded_chat_status_projection,
     )
     from loopx.chat_endpoints import AgentEndpointRegistry
+    from loopx.chat_manager import manager_executor_endpoint_default
 
     try:
         ChatHTTPServer(("127.0.0.1", 70_000), ChatRequestHandler)
@@ -563,6 +564,35 @@ def main() -> None:
                 "max_children": 0,
             }, disabled_goal
 
+            for model_config in (
+                {"model": "gpt-5.6-luna", "reasoning_effort": "max"},
+                {"model": "gpt-5.6-luna"},
+                None,
+            ):
+                model_request = {"goal_id": GOAL_ID, "enabled": False, "model_config": model_config}
+                before_model_preview = registry.read_bytes()
+                code, model_preview = request_json(
+                    f"{base_url}/api/chat/goal-subagents/dry-run", method="POST", body=model_request,
+                )
+                assert code == 200, model_preview
+                assert registry.read_bytes() == before_model_preview
+                code, tampered_model = request_json(
+                    f"{base_url}/api/chat/goal-subagents/apply", method="POST",
+                    body={**model_request, "model_config": {"model": "another-model"}, "preview_id": model_preview["preview_id"]},
+                )
+                assert code == 409, tampered_model
+                assert registry.read_bytes() == before_model_preview
+                code, model_applied = request_json(
+                    f"{base_url}/api/chat/goal-subagents/apply", method="POST",
+                    body={**model_request, "preview_id": model_preview["preview_id"]},
+                )
+                assert code == 200, model_applied
+                assert model_applied["after"]["orchestration"].get("model_config") == model_config
+                model_status = wait_for_json(f"{base_url}/status.json")
+                model_goal = next(item for item in model_status["run_history"]["goals"] if item["id"] == GOAL_ID)
+                assert model_goal["spawn_policy"].get("model_config") == model_config
+                assert model_goal["spawn_policy"]["spawn_allowed"] is False
+
             code, created = request_json(
                 f"{base_url}/api/chat/sessions",
                 method="POST",
@@ -574,9 +604,19 @@ def main() -> None:
             code, manager_created = request_json(
                 f"{base_url}/api/chat/sessions",
                 method="POST",
-                body={"goal_id": GOAL_ID, "context_kind": "manager"},
+                body={"context_kind": "manager"},
             )
+            # The steward channel owns its executor default. This client sends
+            # no pick, so the session must land on whatever the channel resolves
+            # on this machine -- never on an executor the caller's client
+            # happens to ship with.
+            expected_manager_endpoint = manager_executor_endpoint_default()
             assert code == 201, manager_created
+            assert manager_created["agent_id"] == expected_manager_endpoint, manager_created
+            assert (
+                manager_created["session"]["executor_endpoint_id"]
+                == expected_manager_endpoint
+            ), manager_created
             assert manager_created["session"]["channel_id"] == "manager", manager_created
             assert manager_created["session_id"] != session_id, manager_created
             code, manager_resumed = request_json(
@@ -586,9 +626,18 @@ def main() -> None:
             )
             assert code == 200 and manager_resumed["resumed"] is True, manager_resumed
             assert manager_resumed["session_id"] == manager_created["session_id"], manager_resumed
-            assert manager_resumed["goal_id"] == GOAL_ID, manager_resumed
+            assert manager_resumed["goal_id"] == "loopx-manager", manager_resumed
+            # An explicit pick still travels, and it resumes the same channel
+            # conversation instead of silently opening a second one.
+            code, manager_explicit = request_json(
+                f"{base_url}/api/chat/sessions",
+                method="POST",
+                body={"context_kind": "manager", "agent_id": expected_manager_endpoint},
+            )
+            assert code == 200 and manager_explicit["resumed"] is True, manager_explicit
+            assert manager_explicit["session_id"] == manager_created["session_id"], manager_explicit
             listed_manager = wait_for_json(
-                f"{base_url}/api/chat/sessions?agent_id=codex&channel_id=manager"
+                f"{base_url}/api/chat/sessions?channel_id=manager"
             )
             assert [item["session_id"] for item in listed_manager["sessions"]] == [
                 manager_created["session_id"]
@@ -614,6 +663,10 @@ def main() -> None:
             assert [message["text"] for message in projection_snapshot["messages"]] == [
                 "现在该做什么？",
                 "当前没有阻塞。",
+            ], projection_snapshot
+            assert [message["message_id"] for message in projection_snapshot["messages"]] == [
+                projection_exchange["user_message_id"],
+                projection_exchange["answer_message_id"],
             ], projection_snapshot
 
             code, turn = request_json(

@@ -8,15 +8,20 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-export const LOCAL_COORDINATION_MUTATION_REQUEST_SCHEMA = "loopx_local_coordination_mutation_request_v0";
-export const LOCAL_COORDINATION_MUTATION_RESULT_SCHEMA = "loopx_local_coordination_mutation_result_v0";
+export const COORDINATION_SOURCE_TRANSFER_REQUEST_SCHEMA = "loopx_coordination_source_transfer_v0";
+export const COORDINATION_SOURCE_TRANSFER_RESULT_SCHEMA = "loopx_coordination_source_transfer_result_v0";
+
 export const LOCAL_COORDINATION_TODO_READ_REQUEST_SCHEMA = "loopx_local_coordination_todo_read_request_v0";
 export const LOCAL_COORDINATION_TODO_READ_RESULT_SCHEMA = "loopx_local_coordination_todo_read_result_v0";
 export const LOCAL_COORDINATION_TODO_LIST_REQUEST_SCHEMA = "loopx_local_coordination_todo_list_request_v0";
 export const LOCAL_COORDINATION_TODO_LIST_RESULT_SCHEMA = "loopx_local_coordination_todo_list_result_v0";
+export const LOCAL_COORDINATION_TODO_SNAPSHOT_PAGE_REQUEST_SCHEMA = "loopx_canonical_snapshot_page_request_v0";
+export const LOCAL_COORDINATION_TODO_SNAPSHOT_PAGE_RESULT_SCHEMA = "loopx_canonical_snapshot_page_result_v0";
 export const LOCAL_COORDINATION_PROMOTION_REQUEST_SCHEMA = "loopx_local_coordination_promotion_request_v0";
 export const LOCAL_COORDINATION_PROMOTION_RESULT_SCHEMA = "loopx_local_coordination_promotion_result_v0";
 export const LOCAL_COORDINATION_PROMOTION_RECEIPT_SCHEMA = "loopx_local_coordination_promotion_receipt_v0";
+export const LOCAL_COORDINATION_PROMOTION_REVIEW_REQUEST_SCHEMA = "loopx_local_coordination_promotion_review_request_v0";
+export const LOCAL_COORDINATION_PROMOTION_REVIEW_RESULT_SCHEMA = "loopx_local_coordination_promotion_review_result_v0";
 
 export const COORDINATION_RUNTIME_SHADOW_COMMIT_REQUEST_SCHEMA = "loopx_coordination_runtime_shadow_commit_v0";
 export const COORDINATION_RUNTIME_SHADOW_COMMIT_RESULT_SCHEMA = "loopx_coordination_runtime_shadow_result_v0";
@@ -24,6 +29,7 @@ export const COORDINATION_RUNTIME_SHADOW_RECEIPT_SCHEMA = "loopx_coordination_ru
 export const COORDINATION_RUNTIME_SHADOW_INSPECT_REQUEST_SCHEMA = "loopx_coordination_runtime_shadow_inspect_v0";
 export const COORDINATION_RUNTIME_SHADOW_INSPECT_RESULT_SCHEMA = "loopx_coordination_runtime_shadow_inspection_v0";
 export const COORDINATION_RUNTIME_SHADOW_BOOTSTRAP_REQUEST_SCHEMA = "loopx_coordination_runtime_shadow_bootstrap_v0";
+export const COORDINATION_RUNTIME_SHADOW_EXACT_BOOTSTRAP_REQUEST_SCHEMA = "loopx_coordination_runtime_shadow_bootstrap_v1";
 export const COORDINATION_RUNTIME_SHADOW_BOOTSTRAP_RESULT_SCHEMA = "loopx_coordination_runtime_shadow_bootstrap_result_v0";
 export const COORDINATION_RUNTIME_SHADOW_ROLLBACK_REQUEST_SCHEMA = "loopx_coordination_runtime_shadow_rollback_v0";
 export const COORDINATION_RUNTIME_SHADOW_ROLLBACK_RESULT_SCHEMA = "loopx_coordination_runtime_shadow_rollback_result_v0";
@@ -33,6 +39,7 @@ export const COORDINATION_RUNTIME_SHADOW_TODO_READ_REQUEST_SCHEMA = "loopx_coord
 export const COORDINATION_RUNTIME_SHADOW_TODO_READ_RESULT_SCHEMA = "loopx_coordination_runtime_shadow_todo_read_result_v0";
 
 export const LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA = "loopx_coordination_runtime_shadow_binding_v0";
+export const LOCAL_AUTHORITY_SHADOW_EXACT_BINDING_SCHEMA = "loopx_coordination_runtime_shadow_binding_v1";
 export const LOCAL_AUTHORITY_SHADOW_CONFIG_SCHEMA = "loopx_local_authority_shadow_config_v0";
 export const LOCAL_AUTHORITY_SHADOW_REQUEST_SCHEMA = "loopx_local_authority_shadow_request_v0";
 export const LOCAL_AUTHORITY_SHADOW_PROJECTION_SCHEMA = "loopx_local_authority_shadow_projection_v0";
@@ -42,7 +49,8 @@ export const LOCAL_AUTHORITY_SHADOW_OUTBOX_ENTRY_SCHEMA = "loopx_local_authority
 export const LOCAL_AUTHORITY_SHADOW_OUTBOX_COMMIT_SCHEMA = "loopx_local_authority_shadow_outbox_commit_v1";
 export const LOCAL_AUTHORITY_SHADOW_DRAIN_CURSOR_SCHEMA = "loopx_local_authority_shadow_drain_cursor_v0";
 export const LOCAL_AUTHORITY_SHADOW_TRANSACTION_PROJECTION_SCHEMA = "loopx_coordination_runtime_shadow_projection_v0";
-export const LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA = "loopx_coordination_runtime_shadow_commit_entry_request_v1";
+export const LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA = "loopx_shadow_entry_delivery_request_v0";
+export const LOCAL_AUTHORITY_SHADOW_EXACT_COMMIT_ENTRY_REQUEST_SCHEMA = "loopx_shadow_entry_delivery_request_v1";
 export const LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_RESULT_SCHEMA = "loopx_coordination_runtime_shadow_commit_entry_result_v0";
 export const LOCAL_AUTHORITY_SHADOW_READ_REQUEST_SCHEMA = "loopx_coordination_runtime_shadow_outbox_read_v0";
 export const LOCAL_AUTHORITY_SHADOW_READ_RESULT_SCHEMA = "loopx_coordination_runtime_shadow_outbox_read_result_v0";
@@ -51,8 +59,11 @@ export const LOCAL_AUTHORITY_SHADOW_TRANSACTION_RECEIPT_SCHEMA = "loopx_coordina
 export const LOCAL_AUTHORITY_SHADOW_TRANSACTION_EVIDENCE_SCHEMA = "loopx_local_authority_shadow_evidence_v1";
 
 export const SHADOW_MANAGEMENT_STATE_SCHEMA = "loopx_shadow_management_state_v1";
+export const SHADOW_MANAGEMENT_EXACT_STATE_SCHEMA = "loopx_shadow_management_state_v2";
 export const SHADOW_MANAGEMENT_MANIFEST_SCHEMA = "loopx_shadow_management_manifest_v1";
+export const SHADOW_MANAGEMENT_EXACT_MANIFEST_SCHEMA = "loopx_shadow_management_manifest_v2";
 export const SHADOW_OUTBOX_MANIFEST_SCHEMA = "loopx_shadow_outbox_manifest_v1";
+export const SHADOW_EXACT_OUTBOX_MANIFEST_SCHEMA = "loopx_shadow_outbox_manifest_v2";
 
 export const LEGACY_COORDINATION_WRITER_FENCE_SCHEMA = "loopx_legacy_coordination_writer_fence_v0";
 export const LEGACY_COORDINATION_WRITER_FENCE_ENGAGE_REQUEST_SCHEMA = "loopx_legacy_coordination_writer_fence_engage_request_v0";
@@ -78,7 +89,11 @@ export const DELIVERY_WORKSPACE_SNAPSHOT_REQUEST_SCHEMA = "loopx_delivery_worksp
 export const DELIVERY_WORKSPACE_SNAPSHOT_RESULT_SCHEMA = "loopx_delivery_workspace_result_v0";
 
 export const TASK_LEASE_ACQUIRE_REQUEST_SCHEMA = "loopx_task_lease_acquire_native_v0";
+export const TASK_LEASE_CANONICAL_ACQUIRE_REQUEST_SCHEMA = "loopx_canonical_task_lease_acquire_request_v0";
 export const TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA = "loopx_task_lease_lifecycle_native_v0";
+export const TASK_LEASE_CANONICAL_RENEW_REQUEST_SCHEMA = "loopx_canonical_task_lease_renew_request_v0";
+export const TASK_LEASE_CANONICAL_LIFECYCLE_REQUEST_SCHEMA = "loopx_canonical_task_lease_lifecycle_request_v0";
+export const TASK_LEASE_CANONICAL_CLAIM_TRANSFER_REQUEST_SCHEMA = "loopx_canonical_task_lease_claim_transfer_request_v0";
 
 export const CAPABILITY_HOOK_REGISTRATION_SCHEMA = "loopx_capability_hook_registration_v0";
 export const CAPABILITY_HOOK_INTERACTION_RESULT_SCHEMA = "loopx_interaction_projection_hook_result_v0";
@@ -173,10 +188,13 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
       "reason",
       "completed_at",
       "completion_turn_key",
+      "completion_result",
       "updated_at",
       "superseded_by",
       "completion_validation_required",
       "completion_validation_sha256",
+      "completion_validation_revision",
+      "completion_validation_revision_history",
       "handoff_note"
     ],
     "required_fields": [
@@ -205,6 +223,18 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
       "archive_state"
     ]
   },
+  "todo_priority": {
+    "values": [
+      "P0",
+      "P1",
+      "P2",
+      "P3",
+      "P4"
+    ],
+    "legacy_prefix_pattern": "^\\s*\\[(P[0-4](?:[-\\s][^\\]]*)?)\\]\\s*(.+)$",
+    "legacy_label_pattern": "^(P[0-4])(?:$|[-\\s])",
+    "missing_rank": 50
+  },
   "todo_projection_metadata": {
     "fields": [
       "source_section",
@@ -215,15 +245,17 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
     ]
   },
   "local_authority_protocol": {
-    "mutation_request_schema": LOCAL_COORDINATION_MUTATION_REQUEST_SCHEMA,
-    "mutation_result_schema": LOCAL_COORDINATION_MUTATION_RESULT_SCHEMA,
     "todo_read_request_schema": LOCAL_COORDINATION_TODO_READ_REQUEST_SCHEMA,
     "todo_read_result_schema": LOCAL_COORDINATION_TODO_READ_RESULT_SCHEMA,
     "todo_list_request_schema": LOCAL_COORDINATION_TODO_LIST_REQUEST_SCHEMA,
     "todo_list_result_schema": LOCAL_COORDINATION_TODO_LIST_RESULT_SCHEMA,
+    "todo_snapshot_page_request_schema": LOCAL_COORDINATION_TODO_SNAPSHOT_PAGE_REQUEST_SCHEMA,
+    "todo_snapshot_page_result_schema": LOCAL_COORDINATION_TODO_SNAPSHOT_PAGE_RESULT_SCHEMA,
     "promotion_request_schema": LOCAL_COORDINATION_PROMOTION_REQUEST_SCHEMA,
     "promotion_result_schema": LOCAL_COORDINATION_PROMOTION_RESULT_SCHEMA,
-    "promotion_receipt_schema": LOCAL_COORDINATION_PROMOTION_RECEIPT_SCHEMA
+    "promotion_receipt_schema": LOCAL_COORDINATION_PROMOTION_RECEIPT_SCHEMA,
+    "promotion_review_request_schema": LOCAL_COORDINATION_PROMOTION_REVIEW_REQUEST_SCHEMA,
+    "promotion_review_result_schema": LOCAL_COORDINATION_PROMOTION_REVIEW_RESULT_SCHEMA
   },
   "runtime_shadow_protocol": {
     "commit_request_schema": COORDINATION_RUNTIME_SHADOW_COMMIT_REQUEST_SCHEMA,
@@ -232,6 +264,7 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
     "inspect_request_schema": COORDINATION_RUNTIME_SHADOW_INSPECT_REQUEST_SCHEMA,
     "inspect_result_schema": COORDINATION_RUNTIME_SHADOW_INSPECT_RESULT_SCHEMA,
     "bootstrap_request_schema": COORDINATION_RUNTIME_SHADOW_BOOTSTRAP_REQUEST_SCHEMA,
+    "exact_bootstrap_request_schema": COORDINATION_RUNTIME_SHADOW_EXACT_BOOTSTRAP_REQUEST_SCHEMA,
     "bootstrap_result_schema": COORDINATION_RUNTIME_SHADOW_BOOTSTRAP_RESULT_SCHEMA,
     "rollback_request_schema": COORDINATION_RUNTIME_SHADOW_ROLLBACK_REQUEST_SCHEMA,
     "rollback_result_schema": COORDINATION_RUNTIME_SHADOW_ROLLBACK_RESULT_SCHEMA,
@@ -242,6 +275,7 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
   },
   "local_authority_shadow_protocol": {
     "binding_schema": LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA,
+    "exact_binding_schema": LOCAL_AUTHORITY_SHADOW_EXACT_BINDING_SCHEMA,
     "config_schema": LOCAL_AUTHORITY_SHADOW_CONFIG_SCHEMA,
     "request_schema": LOCAL_AUTHORITY_SHADOW_REQUEST_SCHEMA,
     "projection_schema": LOCAL_AUTHORITY_SHADOW_PROJECTION_SCHEMA,
@@ -252,6 +286,7 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
     "drain_cursor_schema": LOCAL_AUTHORITY_SHADOW_DRAIN_CURSOR_SCHEMA,
     "transaction_projection_schema": LOCAL_AUTHORITY_SHADOW_TRANSACTION_PROJECTION_SCHEMA,
     "commit_entry_request_schema": LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA,
+    "exact_commit_entry_request_schema": LOCAL_AUTHORITY_SHADOW_EXACT_COMMIT_ENTRY_REQUEST_SCHEMA,
     "commit_entry_result_schema": LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_RESULT_SCHEMA,
     "read_request_schema": LOCAL_AUTHORITY_SHADOW_READ_REQUEST_SCHEMA,
     "read_result_schema": LOCAL_AUTHORITY_SHADOW_READ_RESULT_SCHEMA,
@@ -261,8 +296,11 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
   },
   "shadow_management_protocol": {
     "state_schema": SHADOW_MANAGEMENT_STATE_SCHEMA,
+    "exact_state_schema": SHADOW_MANAGEMENT_EXACT_STATE_SCHEMA,
     "manifest_schema": SHADOW_MANAGEMENT_MANIFEST_SCHEMA,
-    "outbox_manifest_schema": SHADOW_OUTBOX_MANIFEST_SCHEMA
+    "exact_manifest_schema": SHADOW_MANAGEMENT_EXACT_MANIFEST_SCHEMA,
+    "outbox_manifest_schema": SHADOW_OUTBOX_MANIFEST_SCHEMA,
+    "exact_outbox_manifest_schema": SHADOW_EXACT_OUTBOX_MANIFEST_SCHEMA
   },
   "legacy_writer_fence_protocol": {
     "fence_schema": LEGACY_COORDINATION_WRITER_FENCE_SCHEMA,
@@ -293,7 +331,11 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
   },
   "task_lease_protocol": {
     "acquire_request_schema": TASK_LEASE_ACQUIRE_REQUEST_SCHEMA,
-    "lifecycle_request_schema": TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA
+    "canonical_acquire_request_schema": TASK_LEASE_CANONICAL_ACQUIRE_REQUEST_SCHEMA,
+    "lifecycle_request_schema": TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA,
+    "canonical_renew_request_schema": TASK_LEASE_CANONICAL_RENEW_REQUEST_SCHEMA,
+    "canonical_lifecycle_request_schema": TASK_LEASE_CANONICAL_LIFECYCLE_REQUEST_SCHEMA,
+    "canonical_claim_transfer_request_schema": TASK_LEASE_CANONICAL_CLAIM_TRANSFER_REQUEST_SCHEMA
   },
   "capability_hook_protocol": {
     "registration_schema": CAPABILITY_HOOK_REGISTRATION_SCHEMA,
@@ -329,5 +371,12 @@ export const COORDINATION_STATE_CONTRACT = deepFreeze({
     "unknown_field_policy": "reject",
     "field_removal_policy": "maintainer_approval_required",
     "markdown_role": "human_workbench_and_compatibility_projection"
+  },
+  "source_transfer_protocol": {
+    "request_schema": COORDINATION_SOURCE_TRANSFER_REQUEST_SCHEMA,
+    "result_schema": COORDINATION_SOURCE_TRANSFER_RESULT_SCHEMA
+  },
+  "source_transfer_limits": {
+    "max_bytes": 16777216
   }
 } as const);

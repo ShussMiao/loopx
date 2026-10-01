@@ -10,18 +10,18 @@ unconditional planning contract — fail-closed.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from ..coordination.local_authority import read_canonical_todo_fields_if_promoted
+from ...history import load_registry
 from ...paths import resolve_runtime_root
 from ...control_plane.todos.active_state_todo_parser import parse_active_state_todos
 from ...control_plane.todos.contract import (
     TODO_TASK_CLASS_ADVANCEMENT,
 )
-from ...control_plane.todos.projection import todo_item_is_actionable_open
+from ...control_plane.todos.todo_semantics import todo_item_is_actionable_open
 from ...project_prompt import render_cli_command_prefix, shell_arg
 from ...registry import registry_goals, resolve_state_file
 
@@ -110,10 +110,12 @@ def _todo_add_command_template(
     runtime_root: str | Path | None,
     goal_id: str,
     agent_id: str | None,
+    registry_path: Path | None = None,
 ) -> str:
     return (
         f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root)} "
-        f"todo add --goal-id "
+        + (f"--registry {shell_arg(str(registry_path))} " if registry_path is not None else "")
+        + "todo add --goal-id "
         f"{shell_arg(str(goal_id or ''))} "
         "--project . "
         "--role agent "
@@ -136,6 +138,7 @@ def todo_authoring_steps(
     runtime_root: str | Path | None,
     goal_id: str,
     agent_id: str | None,
+    registry_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Ordered Todo-authoring steps, conditional on the runnable frontier."""
     add_template = _todo_add_command_template(
@@ -143,6 +146,7 @@ def todo_authoring_steps(
         runtime_root=runtime_root,
         goal_id=goal_id,
         agent_id=agent_id,
+        registry_path=registry_path,
     )
     if not existing_runnable_frontier:
         return [
@@ -219,8 +223,10 @@ def append_todo_delta_render_line(
 
 
 def _read_registry(registry_path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not registry_path.is_file():
+        return None, "unreadable"
     try:
-        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        payload = load_registry(registry_path)
     except (OSError, ValueError):
         return None, "unreadable"
-    return (payload, None) if isinstance(payload, dict) else (None, "not_a_mapping")
+    return payload, None

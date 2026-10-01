@@ -4,27 +4,23 @@ import re
 from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
+# Refs #5136: the text-shape definitions live in one owner now
+# (loopx/public_safe_text.py). This module consumes them for recursive payload
+# validation and public-output policy instead of restating a competing set. The
+# redundant-alias form makes each an explicit re-export (house style under
+# --no-implicit-reexport), so the existing importers of these names from this
+# module are unchanged.
+from ...public_safe_text import (
+    LOCAL_PATH_SURFACE_PATTERN as LOCAL_PATH_SURFACE_PATTERN,
+    PUBLIC_SAFE_LOCAL_PATH_PATTERNS as PUBLIC_SAFE_LOCAL_PATH_PATTERNS,
+    REMOTE_LOCATION_SURFACE_PATTERN as REMOTE_LOCATION_SURFACE_PATTERN,
+    SECRET_LIKE_SURFACE_PATTERN as SECRET_LIKE_SURFACE_PATTERN,
+    find_public_safe_local_path as find_public_safe_local_path,
+)
 
 NormalizeText = Callable[..., str]
 CompactText = Callable[..., Optional[str]]
 DEFAULT_PUBLIC_SAFE_LIST_LIMIT = 4
-LOCAL_PATH_SURFACE_PATTERN = re.compile(
-    r"(?<![:/A-Za-z0-9])(?:"
-    r"/(?:Users|home|Volumes|private|tmp|var|etc|opt|srv|mnt|root|workspace|workspaces)/"
-    r"[^\s`'\"<>]+|"
-    r"[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\s`'\"<>]+"
-    r")",
-    re.IGNORECASE,
-)
-SECRET_LIKE_SURFACE_PATTERN = re.compile(
-    r"(?i)(?:\bbearer\s+[a-z0-9._~+/=-]{16,}|"
-    r"\b(?:access|secret)[_-]?key\s*[=:]\s*[^\s`'\"<>]+|"
-    r"\b(?:ak|sk)\s*[=:]\s*[^\s`'\"<>]+|"
-    r"(?<![a-z0-9_])(?:ak|sk)[-_=:][a-z0-9_=-]{10,}|"
-    r"\bgh[pousr]_[a-z0-9]{20,}\b|"
-    r"\beyj[a-z0-9_-]{10,}\.[a-z0-9_-]{10,}\.[a-z0-9_-]{10,}\b|"
-    r"\btoken\s*[=:]\s*[^\s`'\"<>]{12,})"
-)
 _CREDENTIAL_FIELD_FAMILIES = frozenset(
     {
         "accesskey",
@@ -91,14 +87,19 @@ def validate_public_safe_value(
 ) -> None:
     """Fail closed for private material in a typed public-output payload.
 
-    Field classification is exact after case, separator, and camelCase
-    normalization. Values are then checked recursively so nested maps and lists
-    cannot bypass the same credential and local-path boundary.
+    Mapping field names must be strings. Field classification is exact after
+    case, separator, and camelCase normalization. Values are then checked
+    recursively so nested maps and lists cannot bypass the same credential
+    and local-path boundary.
     """
 
     if isinstance(value, Mapping):
         for key, item in value.items():
-            key_text = str(key)
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"{path} contains a non-string field name ({type(key).__name__})"
+                )
+            key_text = key
             if LOCAL_PATH_SURFACE_PATTERN.search(
                 key_text
             ) or SECRET_LIKE_SURFACE_PATTERN.search(key_text):

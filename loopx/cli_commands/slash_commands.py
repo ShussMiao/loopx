@@ -3,10 +3,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 
-from ..slash_command_install import (
-    install_slash_commands,
-    render_slash_command_install_markdown,
-)
+from ..pi_goal_mode.installation import inspect_pi_installations, render_pi_installation_markdown
+from ..slash_command_install import install_slash_commands, render_slash_command_install_markdown
 from ..slash_commands import build_slash_command_catalog, render_slash_command_catalog_markdown
 
 
@@ -47,6 +45,11 @@ def register_slash_commands_command(
         action="store_true",
         help="Remove LoopX-managed command skill files for supported hosts while preserving user-owned files.",
     )
+    install_group.add_argument(
+        "--inspect",
+        action="store_true",
+        help="Read project and user Pi extension installation state without writing files.",
+    )
     parser.add_argument(
         "--surface",
         action="append",
@@ -68,13 +71,15 @@ def register_slash_commands_command(
             "z-code",
             "agy",
             "antigravity",
+            "kiro",
+            "kiro-cli",
             "pi",
         ],
         help=(
             "Host surface to install. Repeatable. Defaults to static command facades "
-            "for Codex, Claude Code, and OpenCode. `gemini`, `cursor`, `zcode` and "
-            "`agy`, `pi` are opt-in: they write into those hosts' own homes only when "
-            "requested."
+            "for Codex, Claude Code, and OpenCode. `gemini`, `cursor`, `zcode`, "
+            "`agy`, `kiro-cli`, `pi` are opt-in: they write into those hosts' own "
+            "homes only when requested."
         ),
     )
     parser.add_argument(
@@ -121,6 +126,12 @@ def register_slash_commands_command(
         help="Project directory for the Pi goal extension install. Defaults to the current directory.",
     )
     parser.add_argument(
+        "--pi-scope",
+        choices=("project", "user"),
+        default="project",
+        help="Install Pi extension code for one project or the current user. Defaults to project.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what slash-command files would be installed without writing them.",
@@ -135,6 +146,14 @@ def handle_slash_commands_command(
 ) -> int | None:
     if args.command != "slash-commands":
         return None
+    if args.inspect:
+        if args.surface != ["pi"]:
+            raise ValueError("--inspect requires exactly --surface pi")
+        if args.dry_run or args.with_goal_bridge:
+            raise ValueError("--inspect cannot be combined with --dry-run or --with-goal-bridge")
+        payload = inspect_pi_installations(pi_project=args.pi_project)
+        print_payload(payload, output_format(args), render_pi_installation_markdown)
+        return 0 if payload["ok"] else 1
     if args.install or args.uninstall or args.dry_run:
         payload = install_slash_commands(
             execute=bool((args.install or args.uninstall) and not args.dry_run),
@@ -150,6 +169,7 @@ def handle_slash_commands_command(
             cursor_home=args.cursor_home,
             zcode_home=getattr(args, "zcode_home", None),
             pi_project=args.pi_project,
+            pi_scope=args.pi_scope,
         )
         print_payload(payload, output_format(args), render_slash_command_install_markdown)
         return 0 if payload.get("ok") is True else 1

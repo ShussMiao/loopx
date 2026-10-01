@@ -295,7 +295,10 @@ def _atomic_write_text(path: Path, text: str) -> None:
     )
     temporary_path = Path(temporary)
     try:
-        os.fchmod(descriptor, path.stat().st_mode & 0o777)
+        # Windows has no fchmod; the POSIX permission bits of the source file do
+        # not exist there either, so the copy keeps the platform default.
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, path.stat().st_mode & 0o777)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(text)
             stream.flush()

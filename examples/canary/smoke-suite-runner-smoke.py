@@ -135,9 +135,13 @@ def assert_catalog_profile_preview_is_supported() -> None:
         execute=False,
     )
     assert payload["ok"] is True, payload
-    assert payload["selected_check_count"] == 1, payload
-    assert payload["selected_checks"][0]["command"] == "python3 examples/control_plane/control-plane-maintainability-ratchet-smoke.py", payload
-    assert payload["catalog_plan"]["planned_check_count"] == 1, payload
+    assert payload["selected_check_count"] == 2, payload
+    commands = [check["command"] for check in payload["selected_checks"]]
+    assert commands == [
+        "python3 examples/control_plane/control-plane-maintainability-ratchet-smoke.py",
+        "python3 examples/semantic-vocabulary-drift-smoke.py",
+    ], payload
+    assert payload["catalog_plan"]["planned_check_count"] == 2, payload
 
 
 def assert_named_smoke_profile_expands_to_suite_selection() -> None:
@@ -246,11 +250,12 @@ def assert_named_smoke_profile_can_mix_with_catalog_profile() -> None:
     assert payload["ok"] is True, payload
     assert payload["selection_inputs"]["smoke_profiles"] == ["canary-runner"], payload
     assert payload["selection_inputs"]["catalog_profiles"] == ["repo-architecture-budget"], payload
-    assert payload["catalog_plan"]["planned_check_count"] == 1, payload
+    assert payload["catalog_plan"]["planned_check_count"] == 2, payload
     commands = [check["command"] for check in payload["selected_checks"]]
     assert any("examples/canary/" in command for command in commands), payload
     assert all("canary-promotion" not in command for command in commands), payload
     assert any("examples/control_plane/control-plane-maintainability-ratchet-smoke.py" in command for command in commands), payload
+    assert any("examples/semantic-vocabulary-drift-smoke.py" in command for command in commands), payload
 
 
 def assert_cli_json_preview_works() -> None:

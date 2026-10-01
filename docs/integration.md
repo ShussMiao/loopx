@@ -98,25 +98,13 @@ loopx bootstrap \
 
 `loopx connect` is an alias for the same operation. The command is
 safe to rerun: by default it keeps an existing state file and existing registry
-entry. If the goal only needs an additional write boundary after connection,
-prefer the incremental migration path:
-
-An integration provider that already qualified the project bridge can own the
-one-time connection check explicitly:
-
-```bash
-loopx connect \
-  --goal-id project-goal \
-  --no-onboarding-scan \
-  --onboarding-connection-validation provider-prevalidated
-```
-
-The default remains `agent`, which may create a `loopx check` onboarding Todo
-for generic adapters. `provider-prevalidated` records provider ownership in the
-registry and omits that agent Todo; it does not run validation, grant tools, or
-expand the provider's authority. Use it only when the caller has already
-validated the connection. Repository scanning and connection validation remain
-separate controls.
+entry. Connection registers the goal and writes the active state only: it does
+not create first-connect onboarding Todos, owner-decision gates, or host-loop
+opt-in gates. The caller — or the connected domain adapter — writes the first
+delivery Todo it wants, so an autonomously driven project starts from the
+caller's own work queue instead of a generated onboarding queue. If the goal
+only needs an additional write boundary after connection, prefer the
+incremental migration path:
 
 ```bash
 loopx configure-goal \
@@ -493,10 +481,11 @@ loopx refresh-state \
 ```
 
 Use `--delivery-batch-scale` for `test_only`, `single_surface`,
-`multi_surface`, or `implementation`. For agent-facing `refresh-state` calls,
-`single_segment` and `bounded_segment` are accepted as input aliases for
-`single_surface`; the recorded run still stores the canonical `single_surface`
-value. `--delivery-outcome` is a structured enum, not a classification string:
+`multi_surface`, or `implementation`. New `refresh-state` writes require one of
+those canonical values: historical `single_segment` and `bounded_segment`
+records remain readable as `single_surface`, but the legacy names are rejected
+for new writes because a bounded segment does not prove how many surfaces it
+changed. `--delivery-outcome` is a structured enum, not a classification string:
 
 | Value | Meaning |
 | --- | --- |
@@ -584,11 +573,16 @@ editing the run JSON by hand:
 ```bash
 loopx reward \
   --goal-id project-goal \
+  --actor-kind owner \
   --decision continue_route \
   --reward positive \
   --reason-summary "comparable validation improved and the route is worth extending" \
   --follow-up "promote to the next longer-window check"
 ```
+
+Durable reward writes require an explicit `--actor-kind owner` or
+`--actor-kind controller`; `--dry-run` remains available without an actor.
+The selected kind is stored with the run-bound overlay.
 
 By default the command attaches feedback to the latest compact run for the
 goal. Pass `--run-generated-at <timestamp>` to target an older run. The writer
@@ -615,6 +609,7 @@ overlay instead of creating a separate memory store:
 ```bash
 loopx reward \
   --goal-id project-goal \
+  --actor-kind owner \
   --decision route_correction \
   --reward mixed \
   --reason-summary "fix lifecycle counters before adding more benchmark cases" \
@@ -640,6 +635,7 @@ the durable loop in one CLI call:
 ```bash
 loopx reward \
   --goal-id project-goal \
+  --actor-kind owner \
   --decision continue_route \
   --reward positive \
   --reason-summary "comparable validation improved and the route is worth extending" \

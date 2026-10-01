@@ -42,7 +42,9 @@ BUILTIN_IDS = [
     "deep-research",
     "public-safe-outbound",
     "connector-registry",
+    "external-evidence-research",
     "reliability-diagnostics",
+    "progress-review-sentinel",
 ]
 
 
@@ -167,6 +169,27 @@ def test_builtin_catalog_preserves_order_and_marks_provider() -> None:
             "ready": False,
         },
     ]
+
+
+def test_external_evidence_catalog_preserves_receipt_observation_boundary() -> None:
+    capability = build_capability_detail_packet("external-evidence-research")[
+        "capability"
+    ]
+
+    assert capability["implemented_protocols"] == [
+        {
+            "schema_version": "external_evidence_research_v0",
+            "module": "loopx.control_plane.capabilities.external_evidence",
+            "doc": "loopx/capabilities/external_research/README.md",
+        }
+    ]
+    receipt_command = next(
+        command
+        for command in capability["commands"]
+        if command["command"].startswith("loopx external-evidence receipt ")
+    )
+    assert "caller-presented provider receipt" in receipt_command["purpose"]
+    assert "without claiming provider execution" in receipt_command["purpose"]
 
 
 def test_material_lifecycle_catalog_exposes_managed_project_skill() -> None:
@@ -523,9 +546,18 @@ def test_context_provider_factory_dispatches_through_registered_builder() -> Non
 
 def test_cli_rejects_unknown_capability_without_traceback(
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     with pytest.raises(SystemExit) as exc_info:
-        main(["capability", "show", "not-registered"])
+        main(
+            [
+                "--runtime-root",
+                str(tmp_path / "runtime"),
+                "capability",
+                "show",
+                "not-registered",
+            ]
+        )
 
     assert exc_info.value.code == 2
     assert "unknown capability `not-registered`" in capsys.readouterr().err

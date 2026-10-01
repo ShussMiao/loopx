@@ -94,3 +94,57 @@ def test_mixed_legacy_boundary_does_not_skip_next_heading() -> None:
     parsed = parse_active_state_todos(source, item_limit=None)
     assert [item["text"] for item in parsed["user_todos"]["items"]] == ["User task."]
     assert [item["text"] for item in parsed["agent_todos"]["items"]] == ["Agent task."]
+
+
+def test_state_counts_classify_headings_exactly_as_the_region_writer() -> None:
+    """The open counts and the Todo region writer must read one marker set.
+
+    ``loopx/state_projection.py`` carried its own copy of the marker tuples and
+    they had drifted three ways: a bare ``owner`` marker made a prose section
+    named ``Ownership`` count as user Todos, ``codex todo`` was missing although
+    the writer creates it, and there was no archive guard so an archived section
+    counted as live work. The counts feed ``state_projection_gap_warning``, so an
+    inflated agent count suppresses the warning that a Next Action is executable
+    with no agent Todo behind it -- the failure is silence, not a wrong number on
+    a screen.
+    """
+    from loopx.control_plane.goals.active_state_metadata import todo_role_for_heading
+    from loopx.state_projection import summarize_state_todo_open_counts
+
+    state_text = "\n".join([
+        "# Goal state",
+        "",
+        "## Agent Todo",
+        "",
+        "- [ ] [P1] implement the reader metric",
+        "- [ ] [P2] classify the candidate groups",
+        "",
+        "## Agent Todo Archive",
+        "",
+        "- [ ] [P1] archived one",
+        "- [ ] [P2] archived two",
+        "",
+        "## Codex Todo",
+        "",
+        "- [ ] [P1] a heading the region writer creates",
+        "",
+        "## Ownership",
+        "",
+        "- [ ] prose about who owns what, not a Todo",
+        "",
+    ])
+
+    counts = summarize_state_todo_open_counts(state_text)
+    assert counts == {"user": 0, "agent": 3}, (
+        "archived Todos must not count as live, a Codex Todo heading must count, "
+        "and an Ownership prose section must not count as user Todos"
+    )
+
+    for heading, expected in [
+        ("Agent Todo Archive", None),
+        ("Codex Todo", "agent"),
+        ("Ownership", None),
+        ("Agent Todo", "agent"),
+        ("Owner Reading Queue", "user"),
+    ]:
+        assert todo_role_for_heading(heading) == expected, heading

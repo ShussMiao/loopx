@@ -15,13 +15,12 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from ...file_lock import exclusive_file_lock
+from ..coordination.authority_core import HandoffMode
 from ..coordination.coordination_state_contract_generated import (
     LOCAL_AUTHORITY_SHADOW_CONFIG_SCHEMA,
 )
@@ -30,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 TS_READBACK_PROBE = Path("tests") / "control_plane_ts" / "authority_store_readback_probe.ts"
 DEFAULT_REGISTERED_AGENTS: tuple[str, ...] = ("agent-a", "agent-b")
 RUNTIME_ROOT_BINDINGS: tuple[str, ...] = ("registry", "cli_override", "cli_override_divergent")
-HANDOFF_MODES: tuple[str, ...] = ("legacy", "soft_claim", "hard_lease")
+HANDOFF_MODES: tuple[str, ...] = tuple(mode.value for mode in HandoffMode)
 LOCAL_AUTHORITY_SHADOW_CONFIG = {
     "schema_version": LOCAL_AUTHORITY_SHADOW_CONFIG_SCHEMA,
     "mode": "file_one_way",
@@ -94,10 +93,6 @@ class GoalWorkspace:
     def shadow_directory(self) -> Path:
         return self.runtime_root / "authority-shadow" / "file" / self.goal_id
 
-    @property
-    def observation_lock_target(self) -> Path:
-        return self.shadow_directory / "observation"
-
     def cli_prefix(self) -> list[str]:
         prefix = ["--registry", str(self.registry_path)]
         if self.runtime_root_binding in ("cli_override", "cli_override_divergent"):
@@ -129,54 +124,6 @@ class LegacyMigrationSource:
 
     def cli_prefix(self) -> list[str]:
         return ["--registry", str(self.target_registry), "--format", "json"]
-
-
-@dataclass(frozen=True)
-class CandidateDocument:
-    """Stable fields of the single ``authority-store-*.json`` candidate document."""
-
-    path: Path
-    document: JsonObject
-
-    @property
-    def cursor(self) -> str:
-        return str(self.document.get("cursor"))
-
-    @property
-    def store_identity(self) -> str:
-        return str(self.document.get("store_identity"))
-
-    @property
-    def head(self) -> JsonObject:
-        head = self.document.get("head")
-        return dict(head) if isinstance(head, dict) else {}
-
-    @property
-    def operation_ids(self) -> list[str]:
-        committed = self.document.get("committed")
-        if not isinstance(committed, list):
-            return []
-        return [
-            str(entry.get("operation_id"))
-            for entry in committed
-            if isinstance(entry, dict)
-        ]
-
-    @property
-    def todo_ids(self) -> list[str]:
-        return [
-            str(todo.get("todo_id"))
-            for todo in self.head.get("todos") or []
-            if isinstance(todo, dict)
-        ]
-
-    @property
-    def leases(self) -> list[JsonObject]:
-        return [
-            dict(lease)
-            for lease in self.head.get("leases") or []
-            if isinstance(lease, dict)
-        ]
 
 
 @dataclass(frozen=True)
@@ -421,7 +368,7 @@ def run_cli(
         cwd=REPO_ROOT,
         env=cli_env(workspace),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=timeout,
         check=False,
     )
@@ -444,7 +391,7 @@ def spawn_cli(workspace: CliWorkspace, *args: str) -> subprocess.Popen[str]:
         env=cli_env(workspace),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
 
 
@@ -472,33 +419,6 @@ def kill_now(process: subprocess.Popen[str]) -> None:
     process.communicate(timeout=5)
 
 
-@contextmanager
-def hold_observation_lock(workspace: GoalWorkspace) -> Iterator[Path]:
-    """Hold the observer's own lock so a primary commit cannot be observed."""
-
-    with exclusive_file_lock(
-        workspace.observation_lock_target,
-        operation="e2e_window",
-    ) as lock_path:
-        yield lock_path
-
-
-def candidate_store_paths(workspace: GoalWorkspace) -> list[Path]:
-    return sorted(workspace.shadow_directory.glob("authority-store-*.json"))
-
-
-def candidate_document(workspace: GoalWorkspace) -> CandidateDocument:
-    """Return the single candidate document; zero or several is a failure."""
-
-    paths = candidate_store_paths(workspace)
-    if len(paths) != 1:
-        raise AssertionError(f"expected exactly one candidate document, found {len(paths)}")
-    return CandidateDocument(
-        path=paths[0],
-        document=parse_json_object(paths[0].read_text(encoding="utf-8")),
-    )
-
-
 def node_executable() -> str | None:
     return shutil.which("node")
 
@@ -508,6 +428,7 @@ def ts_readback(
     *,
     receipt: str | None = None,
     page_size: int = 2,
+    directory: Path | None = None,
 ) -> JsonObject | None:
     """Read the candidate back through ``FileAuthorityStore``; ``None`` without node."""
 
@@ -520,7 +441,7 @@ def ts_readback(
         "--experimental-strip-types",
         str(REPO_ROOT / TS_READBACK_PROBE),
         "--directory",
-        str(workspace.shadow_directory),
+        str(directory or workspace.shadow_directory),
         "--goal-id",
         workspace.goal_id,
         "--page-size",
@@ -532,7 +453,7 @@ def ts_readback(
         command,
         cwd=REPO_ROOT,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=60,
         check=False,
     )
@@ -591,7 +512,7 @@ def tap_summary(
         cwd=cwd,
         env=dict(env) if env is not None else None,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=timeout,
         check=False,
     )
@@ -599,7 +520,6 @@ def tap_summary(
 
 
 __all__ = [
-    "CandidateDocument",
     "CliCommandError",
     "CliOutputError",
     "CliWorkspace",
@@ -616,11 +536,8 @@ __all__ = [
     "TapSummary",
     "build_goal_workspace",
     "build_legacy_migration_source",
-    "candidate_document",
-    "candidate_store_paths",
     "cli_command",
     "cli_env",
-    "hold_observation_lock",
     "kill_now",
     "node_executable",
     "parse_json_object",

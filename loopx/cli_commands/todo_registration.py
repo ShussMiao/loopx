@@ -5,10 +5,6 @@ from collections.abc import Callable
 
 from ..control_plane.todos.contract import TODO_CONTINUATION_POLICY_VALUES
 from ..todos import ARCHIVE_COMPLETED_DEFAULT_MAX_ACTIVE_DONE
-from ..todo_suggestion_prompt import (
-    ALLOWED_TODO_SUGGESTION_SOURCES,
-    ALLOWED_TODO_SUGGESTION_TRIGGERS,
-)
 from .todo_argument_validation import (
     register_todo_linkage_arguments,
     register_todo_successor_creation_arguments,
@@ -35,13 +31,14 @@ def register_todo_command(
         choices=[
             "add",
             "list",
+            "receipt",
+            "result-read",
             "claim",
             "update",
             "complete",
             "supersede",
             "archive-completed",
-            "suggest",
-            "capture-followups",
+            "plan",
             "project-markdown",
         ],
         default=None,
@@ -49,20 +46,29 @@ def register_todo_command(
             "Use add to append a checkbox todo, claim to soft-claim by registered "
             "agent id, list to read projected todos, update/complete/supersede to transition by todo_id, or "
             "archive-completed to move older completed todos into Completed Work Archive. "
-            "Use suggest to generate an agent-facing candidate todo analysis prompt without writing state. "
-            "Use capture-followups to record a capped public-safe unclaimed follow-up batch."
+            "Use plan with --text and --agent-id for the existing Goal's model planning checkpoint; the caller owns subsequent execution."
         ),
     )
     todo_parser.add_argument("--goal-id", required=True, help="Goal id whose active state should receive the todo.")
     todo_parser.add_argument("--role", choices=["user", "agent"], help="Todo owner. Required for add; optional todo_id search scope for lifecycle commands. Defaults to agent for archive-completed.")
     todo_parser.add_argument("--text", help="Todo text. Required for add; keep it short and public-safe enough for local status.")
-    todo_parser.add_argument(
-        "--follow-up",
-        dest="followups",
-        action="append",
-        help="For capture-followups, append one public-safe agent follow-up todo. Repeat up to the requested batch.",
-    )
+    todo_parser.add_argument("--priority", choices=["P0", "P1", "P2", "P3", "P4"], help="For add/update, declare Todo priority independently of text; omission retains the current value.")
+    todo_parser.add_argument("--clear-priority", action="store_true", help="For update, explicitly remove priority; cannot be combined with --priority.")
     todo_parser.add_argument("--todo-id", help="Structured todo id from status/quota, such as todo_ab12cd34ef56.")
+    todo_parser.add_argument(
+        "--operation-id",
+        help="For canonical todo add, reuse this identity with unchanged intent after an ambiguous response. For todo receipt, read the exact historical operation; a receipt grants no lease.",
+    )
+    todo_parser.add_argument(
+        "--update-operation-id",
+        help=("For promoted text/note, planning, validator revision or User completion update, reuse this operation id after a lost response; "
+              "changed intent is rejected. Planning supports status, evidence, reason, resume conditions and successor links; "
+              "User status=done uses terminal validation and lease release; other leased status changes remain unsupported."),
+    )
+    todo_parser.add_argument(
+        "--update-expected-provider-revision",
+        help="For promoted todo update, require this canonical revision; reuse it with the operation id when recovering a lost response.",
+    )
     todo_parser.add_argument(
         "--claim-operation-id",
         help=(
@@ -75,7 +81,7 @@ def register_todo_command(
     todo_parser.add_argument(
         "--turn-instance-id",
         help=(
-            "For todo complete, bind the lifecycle receipt to the original "
+            "For todo complete/supersede, bind the lifecycle receipt to the original "
             "turn-scoped quota guard and reuse it on retries."
         ),
     )
@@ -99,13 +105,15 @@ def register_todo_command(
     todo_parser.add_argument("--status", choices=["open", "done", "blocked", "deferred"], help="For todo add/update, set the lifecycle status.")
     todo_parser.add_argument("--note", help="Public-safe note to attach to a lifecycle transition.")
     todo_parser.add_argument("--evidence", help="Public-safe evidence pointer or short result for complete/update.")
+    todo_parser.add_argument("--result-file", help="For todo complete, bind a bounded local .json, .md or .txt result to the independently accepted completion.")
     todo_parser.add_argument(
         "--validation-command",
         help=(
             "Caller-approved validation command (no shell) to run before a "
             "todo's completion commits, e.g. 'pytest -q tests/test_x.py'. Set "
-            "on `todo add`; completion runs it independently and blocks on a "
-            "non-zero exit."
+            "on `todo add`, or replace it on a promoted open Todo with `todo "
+            "update` plus operation id, provider revision and agent id; completion "
+            "runs it independently and blocks on a non-zero exit."
         ),
     )
     todo_parser.add_argument(
@@ -118,7 +126,8 @@ def register_todo_command(
             "Trusted JSON string array (argv form, no shell parsing) for the "
             "completion validation command, e.g. '[\"pytest\",\"-q\",\"tests/"
             "test_x.py\"]'. Mutually exclusive with --validation-command; set "
-            "on `todo add`."
+            "on `todo add`, or replace it through the reviewed promoted `todo "
+            "update` path."
         ),
     )
     todo_parser.add_argument(
@@ -127,7 +136,8 @@ def register_todo_command(
         help=(
             "Per-todo timeout for the caller-approved validation command. "
             "Only meaningful with --validation-command or "
-            "--validation-command-json on `todo add`; must be 1-29 so a "
+            "--validation-command-json on `todo add` or validator revision; "
+            "must be 1-29 so a "
             "timed-out validation still produces a typed receipt inside the "
             "30s outer subprocess budget. Defaults to 20."
         ),
@@ -262,7 +272,9 @@ def register_todo_command(
         choices=["approve", "reject", "cancel"],
         help=(
             "For todo complete on a user_gate, record the explicit owner decision. "
-            "Only approve consumes authority and resumes linked work."
+            "For a user_action, only cancel is accepted; it closes the reminder "
+            "without approving or resuming linked work. Only gate approval "
+            "consumes decision authority."
         ),
     )
     todo_parser.add_argument(
@@ -279,7 +291,7 @@ def register_todo_command(
         "--task-lease-idempotency-key",
         help=(
             "For todo claim on promoted hard-lease authority, atomically acquire "
-            "the canonical lease and claim; for complete and supersede, prove the "
+            "the canonical lease and claim; for promoted text/note or planning update, complete and supersede, prove the "
             "execution instance that owns the active lease."
         ),
     )
@@ -288,7 +300,7 @@ def register_todo_command(
         type=int,
         help=(
             "For promoted todo claim, optionally compare-and-set the canonical "
-            "lease version; for complete and supersede, supply the active lease "
+            "lease version; for promoted text/note or planning update, complete and supersede, supply the active lease "
             "version when it is effective."
         ),
     )
@@ -304,7 +316,8 @@ def register_todo_command(
         action="store_true",
         help=(
             "For user todo add/update, explicitly bind the item to the whole goal "
-            "instead of one agent lane."
+            "instead of one agent lane. This scopes continuation, not blocking: "
+            "it does not create a global gate."
         ),
     )
     todo_parser.add_argument(
@@ -337,8 +350,9 @@ def register_todo_command(
         action="store_true",
         help=(
             "For todo add/update on role=user task-class=user_gate, explicitly mark "
-            "that the gate blocks every registered agent. Prefer --blocks-agent or "
-            "--agent-id when only one lane is waiting."
+            "that the gate blocks EVERY registered agent until resolved. This broad "
+            "scope is never inferred from --agent-id, --goal-bound, or missing binding. "
+            "Prefer --blocks-agent or --agent-id when only one lane is waiting."
         ),
     )
     todo_parser.add_argument(
@@ -424,25 +438,17 @@ def register_todo_command(
             "claim/update/complete/supersede, attribute the "
             "lifecycle actor; registered multi-agent goals require it unless an "
             "exact linked user_gate decision_scope supplies the typed owner/controller "
-            "override. For list/suggest, select the project agent lane. Agent todo "
+            "override. For list, select the project agent lane. Agent todo "
             "add intentionally does not accept this option; use --claimed-by to "
             "assign execution, or omit both options to leave the todo unclaimed."
         ),
-    )
-    todo_parser.add_argument(
-        "--from",
-        dest="suggestion_sources",
-        choices=ALLOWED_TODO_SUGGESTION_SOURCES,
-        action="append",
-        help="For todo suggest, include a source lane for agent analysis. Repeat for multiple lanes.",
     )
     todo_parser.add_argument(
         "--limit",
         dest="todo_limit",
         type=int,
         help=(
-            "For todo suggest, maximum candidate count; values above 5 are "
-            "clamped to 5. For todo list, explicit per-section cold-path cap: "
+            "For todo list, explicit per-section cold-path cap: "
             "keep the top N todos of each role section after filtering; must "
             "be an integer >= 1, and the payload discloses the truncation via "
             "explicit_limit."
@@ -457,12 +463,6 @@ def register_todo_command(
             "detail lanes; returns at most two items per role, and --limit can "
             "lower but not expand that bound."
         ),
-    )
-    todo_parser.add_argument(
-        "--trigger",
-        dest="suggestion_trigger",
-        choices=ALLOWED_TODO_SUGGESTION_TRIGGERS,
-        help="For todo suggest, why this candidate queue is being requested.",
     )
     todo_parser.add_argument("--project", help="Project root. Defaults to the registry goal repo.")
     todo_parser.add_argument("--state-file", help="Active goal state path. Defaults to the registry goal state_file.")

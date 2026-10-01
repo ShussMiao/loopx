@@ -1,29 +1,24 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import type {
-  AuthorityStoreCommit,
-  AuthorityStoreCommitResult,
-} from "../../loopx/control_plane/coordination/authority_store.ts";
 import { canonicalAuthoritySha256 } from "../../loopx/control_plane/coordination/authority_store_codec.ts";
 import type { JsonObject } from "../../loopx/control_plane/effect_program.ts";
 import {
-  commitCoordinationProjectionMutation,
   indexCoordinationProjection,
   indexCoordinationProjectionTodos,
+  coordinationTodoReadModel,
+  validateCoordinationTodoReadModel,
   prepareCoordinationProjectionCommit,
   reduceCoordinationProjection,
   TODO_CANONICAL_READ_RECORD_FIELDS,
   TODO_CANONICAL_READ_RECORD_SCHEMA,
 } from "../../loopx/control_plane/coordination/coordination_projection.ts";
 import { FileAuthorityStore } from "../../loopx/control_plane/coordination/file_authority_store.ts";
-import {
-  listLocalCoordinationTodos,
-  LOCAL_COORDINATION_TODO_LIST_REQUEST_SCHEMA,
-} from "../../loopx/control_plane/coordination/local_authority_runtime.ts";
+import {LOCAL_COORDINATION_TODO_LIST_REQUEST_SCHEMA} from "../../loopx/control_plane/coordination/local_authority_runtime.ts";
+import {listLocalCoordinationTodos} from "../../loopx/control_plane/coordination/local_authority_read.ts";
 import {
   TODO_DOMAIN_ITEM_SCHEMA,
   TODO_DOMAIN_READ_RECORD_SCHEMA,
@@ -61,8 +56,14 @@ test("native provider Todo creation and archival need no Markdown address", asyn
     expected_provider_revision: initial.provider_revision,
     mutations: [{ kind: "todo_upsert" as const, todo }],
   };
-  assert.equal((await commitCoordinationProjectionMutation(store, input)).status, "applied");
-  assert.equal((await commitCoordinationProjectionMutation(store, input)).status, "replayed");
+  const seeded = await store.loadAuthority();
+  assert.equal(seeded.status, "loaded");
+  if (seeded.status !== "loaded") return;
+  const create = prepareCoordinationProjectionCommit({
+    ...input,
+    projection: seeded.head,
+  });
+  assert.equal((await store.commitAuthority(create)).status, "applied");
   const head = await store.loadAuthority();
   assert.equal(head.status, "loaded");
   if (head.status !== "loaded") return;
@@ -74,11 +75,13 @@ test("native provider Todo creation and archival need no Markdown address", asyn
   assert.throws(() => reduceCoordinationProjection(head.head, "goal-a", [{
     kind: "todo_upsert", todo: missingArchive,
   }]), /omits existing fields: archive_state/);
-  assert.equal((await commitCoordinationProjectionMutation(store, {
+  const archive = prepareCoordinationProjectionCommit({
     goal_id: "goal-a", operation_id: "archive:domain",
     expected_provider_revision: head.provider_revision,
+    projection: head.head,
     mutations: [{ kind: "todo_upsert", todo: { ...todo, archive_state: "archive" } }],
-  })).status, "applied");
+  });
+  assert.equal((await store.commitAuthority(archive)).status, "applied");
   const reopened = await new FileAuthorityStore(root, "goal-a").loadAuthority();
   assert.equal(reopened.status, "loaded");
   if (reopened.status === "loaded") {
@@ -344,160 +347,181 @@ test("coordination projection commit derives one auditable atomic transaction", 
   ]);
 });
 
-test("provider-first coordination mutation applies, replays, and reads its receipt", async () => {
-  const root = await mkdtemp(join(tmpdir(), "loopx-coordination-mutation-"));
-  const store = new FileAuthorityStore(root, "goal-a");
-  const initial = await store.commitAuthority({
-    expected_provider_revision: null,
-    operation_id: "bootstrap:goal-a",
-    events: [{ schema_version: "bootstrap_v0" }],
-    next_projection: {
-      schema_version: "loopx_coordination_runtime_shadow_projection_v0",
-      goal_id: "goal-a",
-      source_authority: "file_v0",
-      todos: [{ todo_id: "todo_a", status: "open" }],
-      leases: [],
-    },
-    receipts: [],
-  });
-  assert.equal(initial.status, "applied");
-  if (initial.status !== "applied") return;
 
-  const input = {
-    goal_id: "goal-a",
-    operation_id: "claim:goal-a:todo_a:1",
-    expected_provider_revision: initial.provider_revision,
-    mutations: [
-      {
-        kind: "todo_upsert" as const,
-        todo: { todo_id: "todo_a", status: "open", claimed_by: "agent-a" },
-      },
-      {
-        kind: "lease_upsert" as const,
-        lease: { todo_id: "todo_a", owner: "agent-a", lease_epoch: 1 },
-      },
-    ],
-  };
-  const applied = await commitCoordinationProjectionMutation(store, input);
-  assert.equal(applied.status, "applied");
-  const replayed = await commitCoordinationProjectionMutation(store, input);
-  assert.equal(replayed.status, "replayed");
-
-  const head = await store.loadAuthority();
-  assert.equal(head.status, "loaded");
-  if (head.status === "loaded") {
-    assert.equal(
-      (head.head.todos as Array<Record<string, unknown>>)[0]?.claimed_by,
-      "agent-a",
-    );
-    assert.equal((head.head.leases as Array<Record<string, unknown>>)[0]?.owner, "agent-a");
-  }
-});
-
-test("provider-first coordination mutation fences stale revision and operation reuse", async () => {
-  const root = await mkdtemp(join(tmpdir(), "loopx-coordination-mutation-fence-"));
-  const store = new FileAuthorityStore(root, "goal-a");
-  const initial = await store.commitAuthority({
-    expected_provider_revision: null,
-    operation_id: "bootstrap:goal-a",
-    events: [{ schema_version: "bootstrap_v0" }],
-    next_projection: {
-      goal_id: "goal-a",
-      source_authority: "file_v0",
-      todos: [{ todo_id: "todo_a", status: "open" }],
-      leases: [],
-    },
-    receipts: [],
-  });
-  assert.equal(initial.status, "applied");
-  if (initial.status !== "applied") return;
-
-  const stale = await commitCoordinationProjectionMutation(store, {
-    goal_id: "goal-a",
-    operation_id: "claim:stale",
-    expected_provider_revision: "file:stale",
-    mutations: [{
-      kind: "todo_upsert",
-      todo: { todo_id: "todo_a", status: "open", claimed_by: "agent-a" },
-    }],
-  });
-  assert.equal(stale.status, "conflict");
-
-  const applied = await commitCoordinationProjectionMutation(store, {
-    goal_id: "goal-a",
-    operation_id: "claim:reused",
-    expected_provider_revision: initial.provider_revision,
-    mutations: [{
-      kind: "todo_upsert",
-      todo: { todo_id: "todo_a", status: "open", claimed_by: "agent-a" },
-    }],
-  });
-  assert.equal(applied.status, "applied");
-  const mismatch = await commitCoordinationProjectionMutation(store, {
-    goal_id: "goal-a",
-    operation_id: "claim:reused",
-    expected_provider_revision: initial.provider_revision,
-    mutations: [{
-      kind: "todo_upsert",
-      todo: { todo_id: "todo_a", status: "open", claimed_by: "agent-b" },
-    }],
-  });
-  assert.equal(mismatch.status, "failed");
-  if (mismatch.status === "failed") {
-    assert.equal(mismatch.reason_code, "coordination_operation_identity_mismatch");
-  }
-});
-
-test("provider-first coordination mutation recovers a lost applied response", async () => {
-  const root = await mkdtemp(join(tmpdir(), "loopx-coordination-mutation-recover-"));
-  class LostResponseStore extends FileAuthorityStore {
-    override async commitAuthority(
-      commit: AuthorityStoreCommit,
-    ): Promise<AuthorityStoreCommitResult> {
-      const result = await super.commitAuthority(commit);
-      return result.status === "applied"
-        ? {
-          status: "ambiguous",
-          reason_code: "simulated_response_loss",
-          reason: "commit response was lost",
-        }
-        : result;
+// Frozen from the persisted pre-validator-revision contract, not from the
+// implementation under test: future unversioned field changes must fail here.
+const historicalFields = JSON.parse(await readFile(new URL(
+  "../fixtures/coordination/todo-pre-validator-revision-fields.json", import.meta.url,
+), "utf8"));
+for (const native of [false, true]) {
+  test(`historical ${native ? "native" : "canonical"} Todo head survives upgrade and next mutation`, async () => {
+    const fields: string[] = historicalFields.canonical_fields.filter((field: string) =>
+      !native || !historicalFields.projection_metadata_fields.includes(field));
+    const todo: JsonObject = {
+      schema_version: native ? TODO_DOMAIN_ITEM_SCHEMA : "todo_item_v0",
+      todo_id: "todo_upgrade", role: "agent", status: "open", done: false,
+      text: "Read previously accepted work after an upgrade", archive_state: "active",
+      ...(native ? {} : {source_section: "Agent Todo"}),
+    };
+    const schema = native ? TODO_DOMAIN_READ_RECORD_SCHEMA : TODO_CANONICAL_READ_RECORD_SCHEMA;
+    const head = {
+      goal_id: "goal-upgrade", todos: [todo], leases: [],
+      todo_read_model: {schema_version: schema, contract_fields: fields,
+        todo_count: 1, records_sha256: canonicalAuthoritySha256([todo])},
+    };
+    const original = structuredClone(head);
+    assert.deepEqual(validateCoordinationTodoReadModel(head, head.goal_id), head.todo_read_model);
+    assert.deepEqual(head, original, "reading must not rewrite a historical head");
+    for (const invalid of [
+      fields.filter(field => field !== "status"),
+      [...fields, "completion_validation_revision"],
+      [...fields, "unexpected_field"],
+      [...fields].reverse(),
+      [...fields, fields[0]],
+    ]) {
+      assert.throws(() => validateCoordinationTodoReadModel({...head,
+        todo_read_model: {...head.todo_read_model, contract_fields: invalid}}, head.goal_id), /field contract mismatch/);
     }
-  }
-  const store = new LostResponseStore(root, "goal-a");
-  const bootstrap = await FileAuthorityStore.prototype.commitAuthority.call(store, {
-    expected_provider_revision: null,
-    operation_id: "bootstrap:goal-a",
-    events: [{ schema_version: "bootstrap_v0" }],
-    next_projection: {
-      goal_id: "goal-a",
-      source_authority: "file_v0",
-      todos: [{ todo_id: "todo_a", status: "open" }],
-      leases: [],
-    },
-    receipts: [],
+    for (const field of ["completion_validation_revision", "completion_validation_revision_history"]) {
+      const undeclared = {...todo, [field]: field.endsWith("history") ? [] : 1};
+      assert.throws(() => validateCoordinationTodoReadModel({...head, todos: [undeclared],
+        todo_read_model: {...head.todo_read_model, records_sha256: canonicalAuthoritySha256([undeclared])}}, head.goal_id),
+      /exceeds its historical field contract/);
+    }
+    assert.throws(() => validateCoordinationTodoReadModel({...head,
+      todo_read_model: {...head.todo_read_model, records_sha256: "0".repeat(64)}}, head.goal_id), /digest mismatch/);
+    assert.throws(() => validateCoordinationTodoReadModel({...head,
+      todo_read_model: {...head.todo_read_model, todo_count: 2}}, head.goal_id), /count mismatch/);
+    const root = await mkdtemp(join(tmpdir(), "loopx-upgrade-todo-"));
+    const store = new FileAuthorityStore(root, head.goal_id);
+    const initial = await store.commitAuthority({expected_provider_revision: null,
+      operation_id: "historical-head", events: [{schema_version: "bootstrap_v0"}],
+      next_projection: head, receipts: []});
+    assert.equal(initial.status, "applied");
+    if (initial.status !== "applied") return;
+    const request = {schema_version: LOCAL_COORDINATION_TODO_LIST_REQUEST_SCHEMA,
+      runtime_root: root, goal_id: head.goal_id};
+    const createStore = () => new FileAuthorityStore(root, head.goal_id);
+    const listed = await listLocalCoordinationTodos(request, {createStore});
+    assert.equal(listed.status, "loaded");
+    assert.equal(listed.legacy_fallback_used, false);
+    assert.deepEqual(listed.todos, [todo]);
+    const reopened = await createStore().loadAuthority();
+    assert.equal(reopened.status, "loaded");
+    if (reopened.status !== "loaded") return;
+    assert.deepEqual(reopened.head, original);
+    const changed = {...todo, note: "New work after upgrade"};
+    const commit = prepareCoordinationProjectionCommit({goal_id: head.goal_id,
+      operation_id: "next-mutation", expected_provider_revision: initial.provider_revision,
+      projection: reopened.head, mutations: [{kind: "todo_upsert", todo: changed}]});
+    assert.deepEqual(commit.next_projection.todo_read_model, coordinationTodoReadModel([changed], schema));
+    assert.equal((await store.commitAuthority(commit)).status, "applied");
+    const updated = await listLocalCoordinationTodos(request, {createStore});
+    assert.equal(updated.status, "loaded");
+    assert.deepEqual(updated.todos, [changed]);
   });
-  assert.equal(bootstrap.status, "applied");
-  if (bootstrap.status !== "applied") return;
+}
 
-  const recovered = await commitCoordinationProjectionMutation(store, {
-    goal_id: "goal-a",
-    operation_id: "claim:recover",
-    expected_provider_revision: bootstrap.provider_revision,
-    mutations: [{
-      kind: "todo_upsert",
-      todo: { todo_id: "todo_a", status: "open", claimed_by: "agent-a" },
-    }],
+// The release that added the validator revision fields wrote exactly the
+// frozen manifest with those two fields restored; upstream inserted both
+// directly after completion_validation_sha256. Its persisted heads must stay
+// readable once a later release adds another additive field, otherwise an
+// ordinary upgrade loses every Goal's Todo list.
+const previousReleaseFields: string[] = [...historicalFields.canonical_fields];
+previousReleaseFields.splice(
+  previousReleaseFields.indexOf("completion_validation_sha256") + 1, 0,
+  "completion_validation_revision", "completion_validation_revision_history");
+
+for (const native of [false, true]) {
+  test(`Todo head written before a later additive field stays readable (${native ? "native" : "canonical"})`, () => {
+    const fields = previousReleaseFields.filter((field: string) =>
+      !native || !historicalFields.projection_metadata_fields.includes(field));
+    assert.equal(fields.includes("completion_validation_revision"), true);
+    assert.equal(fields.includes("completion_result"), false,
+      "the previous release did not declare the later additive field");
+    const todo: JsonObject = {
+      schema_version: native ? TODO_DOMAIN_ITEM_SCHEMA : "todo_item_v0",
+      todo_id: "todo_previous_release", role: "agent", status: "open", done: false,
+      text: "Read work accepted before the next additive field", archive_state: "active",
+      ...(native ? {} : {source_section: "Agent Todo"}),
+    };
+    const schema = native ? TODO_DOMAIN_READ_RECORD_SCHEMA : TODO_CANONICAL_READ_RECORD_SCHEMA;
+    const head = {
+      goal_id: "goal-previous-release", todos: [todo], leases: [],
+      todo_read_model: {schema_version: schema, contract_fields: fields,
+        todo_count: 1, records_sha256: canonicalAuthoritySha256([todo])},
+    };
+    assert.deepEqual(validateCoordinationTodoReadModel(head, head.goal_id), head.todo_read_model);
+    const withResult = {...todo, completion_result: {
+      schema_version: "loopx_completion_result_v0", sha256: "a".repeat(64),
+      producer_agent_id: "agent-a"}};
+    assert.throws(() => validateCoordinationTodoReadModel({...head, todos: [withResult],
+      todo_read_model: {...head.todo_read_model, records_sha256: canonicalAuthoritySha256([withResult])}},
+    head.goal_id), /exceeds its historical field contract/);
   });
-  assert.equal(recovered.status, "recovered");
-  const replayed = await commitCoordinationProjectionMutation(store, {
-    goal_id: "goal-a",
-    operation_id: "claim:recover",
-    expected_provider_revision: bootstrap.provider_revision,
-    mutations: [{
-      kind: "todo_upsert",
-      todo: { todo_id: "todo_a", status: "open", claimed_by: "agent-a" },
-    }],
+}
+
+for (const native of [false, true]) {
+  test(`Todo carrying a completion result reads under the current contract (${native ? "native" : "canonical"})`, () => {
+    const contract = native ? TODO_DOMAIN_RECORD_CONTRACT.fields : TODO_CANONICAL_READ_RECORD_FIELDS;
+    assert.equal(contract.includes("completion_result"), true);
+    const todo: JsonObject = {
+      schema_version: native ? TODO_DOMAIN_ITEM_SCHEMA : "todo_item_v0",
+      todo_id: "todo_completion_result", role: "agent", status: "done", done: true,
+      text: "Accepted managed report", archive_state: "archive",
+      completion_result: {schema_version: "loopx_completion_result_v0", sha256: "b".repeat(64),
+        producer_agent_id: "agent-a", source_name: "report.md"},
+      ...(native ? {} : {source_section: "Agent Todo"}),
+    };
+    const schema = native ? TODO_DOMAIN_READ_RECORD_SCHEMA : TODO_CANONICAL_READ_RECORD_SCHEMA;
+    const model = coordinationTodoReadModel([todo], schema);
+    assert.equal((model.contract_fields as string[]).includes("completion_result"), true);
+    const head = {goal_id: "goal-completion-result", todos: [todo], leases: [],
+      todo_read_model: model};
+    assert.deepEqual(validateCoordinationTodoReadModel(head, head.goal_id), model);
   });
-  assert.equal(replayed.status, "replayed");
-});
+}
+
+for (const native of [false, true]) {
+  test(`read-model order uses unique Unicode identities without weakening ${native ? "domain" : "canonical"} content validation`, () => {
+    // U+E000 precedes U+10000 in persisted Unicode code-point order, but not
+    // in JavaScript's default UTF-16 sort order. Include an archived dependency.
+    const ids = ["todo_a", "todo_\uE000", "todo_\u{10000}"];
+    const todos: JsonObject[] = ids.map((todo_id, index) => ({
+      schema_version: native ? TODO_DOMAIN_ITEM_SCHEMA : "todo_item_v0",
+      todo_id, role: "agent", status: index === 0 ? "done" : "open", done: index === 0,
+      text: "Preserve the complete retained record", archive_state: index === 0 ? "archive" : "active",
+      completion_result: {nested: [null, false, {label: "original"}]},
+      ...(native ? {} : {source_section: "Agent Todo"}),
+    }));
+    const schema = native ? TODO_DOMAIN_READ_RECORD_SCHEMA : TODO_CANONICAL_READ_RECORD_SCHEMA;
+    const head = {goal_id: "order-goal", todos, leases: [], todo_read_model: coordinationTodoReadModel(todos, schema)};
+    const before = structuredClone(head);
+    assert.deepEqual(validateCoordinationTodoReadModel(head, head.goal_id), head.todo_read_model);
+    assert.deepEqual(head, before);
+    for (const order of [[1, 0, 2], [0, 2, 1], [2, 1, 0]]) {
+      const reordered = order.map(index => todos[index]!);
+      // Even a matching digest cannot legalize a noncanonical record order.
+      assert.throws(() => validateCoordinationTodoReadModel({...head, todos: reordered,
+        todo_read_model: {...head.todo_read_model, records_sha256: canonicalAuthoritySha256(reordered)}}, head.goal_id),
+      /deterministic todo_id order/);
+    }
+    assert.throws(() => validateCoordinationTodoReadModel({...head, todos: [todos[0]!, todos[0]!, todos[2]!]}, head.goal_id),
+      /duplicate todo ids/);
+    const altered = structuredClone(todos);
+    altered[0]!.completion_result = {nested: [null, false, {label: "tampered archive"}]};
+    assert.throws(() => validateCoordinationTodoReadModel({...head, todos: altered}, head.goal_id), /digest mismatch/);
+    for (const invalid of [undefined, Number.NaN, new Date()]) {
+      const malformed = structuredClone(todos);
+      malformed[1]!.completion_result = {invalid} as unknown as JsonObject;
+      assert.throws(() => validateCoordinationTodoReadModel({...head, todos: malformed}, head.goal_id));
+    }
+    const unknownField = todos.map(todo => ({...todo, metadata: {unversioned: true}}));
+    assert.throws(() => validateCoordinationTodoReadModel({...head, todos: unknownField,
+      todo_read_model: {...head.todo_read_model, records_sha256: canonicalAuthoritySha256(unknownField)}}, head.goal_id),
+    /unversioned fields: metadata/);
+    assert.throws(() => validateCoordinationTodoReadModel(head, "foreign-goal"), /goal mismatch/);
+    assert.deepEqual(validateCoordinationTodoReadModel({...head, todos: [],
+      todo_read_model: coordinationTodoReadModel([], schema)}, head.goal_id), coordinationTodoReadModel([], schema));
+  });
+}

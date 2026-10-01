@@ -9,18 +9,28 @@ type BadgeVariant = "neutral" | "success" | "warning" | "info" | "danger";
 
 const stateVariant: Record<string, BadgeVariant> = {
   blocked: "danger",
+  clear: "success",
+  complete: "success",
+  confirmed: "danger",
+  conflicting: "danger",
+  declared_only: "warning",
+  duplicate_upstream: "neutral",
   empty: "neutral",
   failed: "danger",
   insufficient_evidence: "warning",
   invalid: "danger",
+  missing: "warning",
   partial: "warning",
   pending: "neutral",
   ready: "success",
   rejected: "danger",
   review_due: "warning",
   selected: "success",
+  source_error: "danger",
   supported: "success",
   superseded: "neutral",
+  unverified: "warning",
+  verified: "success",
 };
 
 const toneVariant: Record<string, BadgeVariant> = {
@@ -111,6 +121,192 @@ function ProvenanceCard({ surface }: { surface: PresentationSurface }) {
             </dd>
           </div>
         </dl>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function SourcePeriodMetricsCard({
+  metrics,
+}: {
+  metrics: DecisionResearchView["source_period_metrics"];
+}) {
+  if (!metrics.length) {
+    return null;
+  }
+
+  return (
+    <Card data-testid="research-source-period-metrics">
+      <CardHeader>
+        <div>
+          <CardTitle>Source-period evidence</CardTitle>
+          <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
+            Period completeness, calculation basis, and upstream lineage stay
+            explicit. Missing values are not zero, and these rows never grant
+            ready status.
+          </p>
+        </div>
+        <Badge variant="neutral">{metrics.length}</Badge>
+      </CardHeader>
+      <CardContent>
+        <div className="grid gap-3 lg:grid-cols-2">
+          {metrics.map((metric) => (
+            <article
+              className="rounded-lg border border-slate-200 p-4 dark:border-zinc-800"
+              key={metric.metric_id}
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <h3 className="font-semibold">{metric.label}</h3>
+                  <p className="mt-1 font-mono text-xs text-slate-500 dark:text-zinc-400">
+                    {metric.period_start === metric.period_end
+                      ? metric.period_start
+                      : `${metric.period_start} → ${metric.period_end}`}
+                  </p>
+                </div>
+                <StateBadge value={metric.coverage_state} />
+              </div>
+              <div className="mt-3 text-2xl font-semibold">
+                {metric.value === null
+                  ? "missing (not zero)"
+                  : `${metric.value} ${metric.unit}`}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge variant="info">{metric.metric_basis}</Badge>
+                <Badge variant="info">{metric.metric_semantics}</Badge>
+                <Badge variant="neutral">{metric.value_origin}</Badge>
+                <Badge variant="neutral">{metric.value_precision}</Badge>
+                <Badge variant="neutral">{metric.observation_authority}</Badge>
+                <StateBadge value={metric.methodology_state} />
+                <StateBadge value={metric.anomaly_state} />
+                <StateBadge value={metric.lineage_state} />
+              </div>
+              <dl className="mt-4 grid gap-2 text-xs text-slate-600 dark:text-zinc-300 sm:grid-cols-2">
+                <div>
+                  <dt className="font-semibold">Component coverage</dt>
+                  <dd className="mt-1">
+                    {metric.observed_components.length}/{metric.expected_components.length}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Independent evidence</dt>
+                  <dd className="mt-1">{String(metric.independent_evidence)}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Composite event</dt>
+                  <dd className="mt-1 break-words">
+                    {metric.event_identity.namespace} / {metric.event_identity.source_event_id}
+                    {" · "}{metric.event_identity.instrument_id}{" · "}{metric.event_identity.event_at}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Signed / account basis</dt>
+                  <dd className="mt-1 break-words">
+                    {metric.sign_basis} · {metric.account_nav_treatment}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Numerator scope</dt>
+                  <dd className="mt-1 break-words">{metric.numerator_scope.join(", ")}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Denominator scope</dt>
+                  <dd className="mt-1 break-words">
+                    {metric.denominator_scope.length
+                      ? metric.denominator_scope.join(", ")
+                      : "none"}
+                  </dd>
+                </div>
+              </dl>
+              {metric.missing_components.length ? (
+                <p className="mt-3 text-sm leading-6 text-amber-700 dark:text-amber-300">
+                  Missing components: {metric.missing_components.join(", ")}
+                </p>
+              ) : null}
+              {metric.double_counted_components.length ? (
+                <p className="mt-2 text-sm leading-6 text-slate-600 dark:text-zinc-300">
+                  Excluded double-counted components: {metric.double_counted_components.join(", ")}
+                </p>
+              ) : null}
+              {metric.gap_reasons.length ? (
+                <p className="mt-2 text-sm leading-6 text-rose-700 dark:text-rose-300">
+                  Holds: {metric.gap_reasons.join(", ")}
+                </p>
+              ) : null}
+              <p className="mt-3 break-all font-mono text-xs text-slate-500 dark:text-zinc-400">
+                source: {metric.source_ref}
+              </p>
+            </article>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function SpotMarketIdentityCard({
+  identity,
+}: {
+  identity: DecisionResearchView["spot_market_identity"];
+}) {
+  if (!identity?.markets.length) {
+    return null;
+  }
+
+  return (
+    <Card data-testid="research-spot-market-identity">
+      <CardHeader>
+        <div>
+          <CardTitle>Spot identity joins</CardTitle>
+          <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
+            Contexts match pair names and assets resolve by explicit index.
+            Array position and naming canonicality never establish backing.
+          </p>
+        </div>
+        <Badge variant="neutral">{identity.markets.length}</Badge>
+      </CardHeader>
+      <CardContent>
+        <div className="grid gap-3 lg:grid-cols-2">
+          {identity.markets.map((market) => (
+            <article
+              className="rounded-lg border border-slate-200 p-4 dark:border-zinc-800"
+              key={market.pair_name}
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <h3 className="font-semibold">{market.pair_name}</h3>
+                  <p className="mt-1 text-sm text-slate-500 dark:text-zinc-400">
+                    {market.base_asset.symbol} / {market.quote_asset.symbol}
+                  </p>
+                </div>
+                <Badge variant="neutral">{market.canonicality}</Badge>
+              </div>
+              <p className="mt-3 text-2xl font-semibold">
+                {market.mark_price === null ? "missing (not zero)" : market.mark_price}
+              </p>
+              <dl className="mt-4 grid gap-2 text-xs text-slate-600 dark:text-zinc-300 sm:grid-cols-2">
+                <div>
+                  <dt className="font-semibold">Context identity</dt>
+                  <dd className="mt-1 break-words">{market.context_coin}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Observed</dt>
+                  <dd className="mt-1 break-words">{market.observed_at}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Asset indexes</dt>
+                  <dd className="mt-1">
+                    {market.base_asset.index} / {market.quote_asset.index}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Backing inference</dt>
+                  <dd className="mt-1">{market.backing_inference}</dd>
+                </div>
+              </dl>
+            </article>
+          ))}
+        </div>
       </CardContent>
     </Card>
   );
@@ -305,6 +501,10 @@ export function DecisionResearchSurface({
               </div>
             </CardContent>
           </Card>
+
+          <SourcePeriodMetricsCard metrics={view.source_period_metrics} />
+
+          <SpotMarketIdentityCard identity={view.spot_market_identity} />
 
           <Card>
             <CardHeader>

@@ -2,6 +2,8 @@ import { z } from "zod";
 
 import {
   parseStatusPayload,
+  todoItemSchema,
+  todoIndexItemSchema,
   periodicReportIndexItemSchema,
   periodicReportIndexResponseSchema,
 } from "../src/data/status";
@@ -75,6 +77,38 @@ function goal(id: string, activation: "active" | "stopped") {
     latest_runs: [],
   };
 }
+
+// Native Todo identity is the stable todo_id; a Markdown source index is only
+// a legacy display coordinate. Both forms must survive a full status parse.
+const nativeTodo = { done: false, text: "Review public evidence", todo_id: "todo_native" };
+const nativeStatus = basePayload({
+  attention_queue: {
+    available: true, item_count: 1, needs_user_or_controller: 0,
+    needs_controller: 0, needs_codex: 1, watching_external_evidence: 0,
+    items: [{ goal_id: "native", status: "running", waiting_on: "codex",
+      severity: "normal", recommended_action: "continue",
+      agent_todos: { items: [nativeTodo] },
+      project_asset: { owner: "agent", gate: "none", next_action: "review",
+        stop_condition: "accepted", agent_todos: {
+          items: [{ ...nativeTodo, index: null }],
+          recent_completed_advancement_items: [{ ...nativeTodo, todo_id: "todo_done", done: true }],
+        } },
+    }],
+  },
+  todo_index: { items: [{ ...nativeTodo, index: null, goal_id: "native" }] },
+});
+equal(nativeStatus.attention_queue.items[0].agent_todos?.items[0].index, undefined,
+  "native Todo without a source index remains addressable");
+equal(nativeStatus.todo_index?.items[0].index, null,
+  "Todo index readback preserves the explicitly absent source coordinate");
+assert(todoItemSchema.safeParse({ index: 3, done: false, text: "Legacy Todo" }).success,
+  "legacy source-index Todo remains valid without a stable id");
+assert(!todoItemSchema.safeParse({ done: false, text: "Anonymous Todo" }).success,
+  "missing both source index and stable id is still invalid");
+assert(!todoIndexItemSchema.safeParse({ goal_id: "native", index: null, done: false, text: "Anonymous Todo" }).success,
+  "Todo index must retain the same identity guard");
+assert(!todoItemSchema.safeParse({ ...nativeTodo, index: "3" }).success,
+  "non-numeric source coordinates remain invalid");
 
 const activePayload = basePayload({
   goal_projection: {

@@ -13,7 +13,8 @@ from ...agent_registry import registered_agent_ids_for_goal
 from ...extensions.hook_adapters import discover_extension_hook_adapters
 from ...extensions.runtime import default_extension_state_file
 from ...file_lock import exclusive_file_lock
-from ...registry import atomic_write_json, find_registry_goal, read_json
+from ...history import load_registry
+from ...registry import atomic_write_json, find_registry_goal
 from .machine_defaults import resolve_goal_periodic_report_subscription
 from .machine_store import read_periodic_report_machine_defaults
 from .presets import build_periodic_report_preset_activation
@@ -225,7 +226,7 @@ def _normalize_source_receipt(
 def _request_profile(
     *, registry_path: Path, runtime_root: Path, goal_id: str, agent_id: str
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    registry = read_json(registry_path)
+    registry = load_registry(registry_path)
     goal = find_registry_goal(registry, goal_id)
     if not isinstance(goal, Mapping):
         raise ValueError("periodic-report Goal is not registered")

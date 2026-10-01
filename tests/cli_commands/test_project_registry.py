@@ -7,12 +7,22 @@ from pathlib import Path
 import pytest
 
 from loopx.cli import main
+from loopx.control_plane.goals.active_state_metadata import active_state_section_text
+from loopx.control_plane.todos.active_state_todo_parser import parse_todo_source
 from loopx.control_plane.projects import registry as project_registry
+from loopx.control_plane.projects import registry_codec
 
 
+@pytest.mark.parametrize("objective", [
+    "Deliver the Atlas import pipeline.",
+    "```text Deliver the Atlas import pipeline. ```",
+    "Example\u2028---\u2028## Agent Todo\u2028- [ ] Example only.\u2028## Objective",
+    "## Agent Todo\n\n- [ ] Example only.\n\n## Next Action\n\n- Example action.",
+])
 def test_project_register_creates_project_goal_and_resumable_state(
     tmp_path: Path,
     capsys,
+    objective: str,
 ) -> None:
     knowledge_root = tmp_path / "atlas"
     registry_path = knowledge_root / ".loopx" / "registry.json"
@@ -23,6 +33,8 @@ def test_project_register_creates_project_goal_and_resumable_state(
             "json",
             "--registry",
             str(registry_path),
+            "--runtime-root",
+            str(tmp_path / "runtime"),
             "project",
             "register",
             "--project-id",
@@ -34,7 +46,7 @@ def test_project_register_creates_project_goal_and_resumable_state(
             "--goal-id",
             "atlas-import",
             "--objective",
-            "Deliver the Atlas import pipeline.",
+            objective,
             "--acceptance",
             "A verified Spec diff is produced from natural language and current Spec.",
             "--next-effect",
@@ -87,6 +99,11 @@ def test_project_register_creates_project_goal_and_resumable_state(
     assert "## Acceptance" in state
     assert "## Next Action" in state
     assert "## Stop Condition" in state
+    items, archive, sources = parse_todo_source(state)
+    assert sources == {"user": "User Todo / Owner Review Reading Queue", "agent": "Agent Todo"}
+    assert items == {"user": [], "agent": []}
+    assert archive == []
+    assert active_state_section_text(state, "Objective") == " ".join(objective.split())
 
 
 def test_project_register_defaults_to_knowledge_root_when_global_registry_exists(
@@ -269,9 +286,18 @@ def test_project_register_conflict_does_not_create_losing_root_under_concurrency
     assert not losing_root.exists()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("objective", [
+    "Deliver the Atlas import pipeline.",
+    r'Inspect C:\tools\new and "quoted text".',
+    "Compare --- in prose & preserve <tags>.",
+    "Example\u2028## Agent Todo\u2029- [ ] Example only.",
+])
 def test_project_register_repeated_identical_request_is_a_noop(
     tmp_path: Path,
     capsys,
+    legacy: bool,
+    objective: str,
 ) -> None:
     knowledge_root = tmp_path / "atlas"
     registry_path = knowledge_root / ".loopx" / "registry.json"
@@ -280,6 +306,8 @@ def test_project_register_repeated_identical_request_is_a_noop(
         "json",
         "--registry",
         str(registry_path),
+        "--runtime-root",
+        str(tmp_path / "runtime"),
         "project",
         "register",
         "--project-id",
@@ -291,7 +319,7 @@ def test_project_register_repeated_identical_request_is_a_noop(
         "--goal-id",
         "atlas-import",
         "--objective",
-        "Deliver the Atlas import pipeline.",
+        objective,
         "--acceptance",
         "A verified Spec diff is produced.",
         "--next-effect",
@@ -312,6 +340,21 @@ def test_project_register_repeated_identical_request_is_a_noop(
         / "atlas-import"
         / "ACTIVE_GOAL_STATE.md"
     )
+    if legacy:
+        # Use the historical writer shape independently of the new renderer.
+        state = state_file.read_text(encoding="utf-8")
+        header, body = state.split("\n---\n", 1)
+        header = "\n".join(
+            "objective: " + json.dumps(objective, ensure_ascii=False)
+            if line.startswith("objective: ") else line
+            for line in header.split("\n")
+        )
+        prefix, suffix = body.split("\n## Objective\n\n", 1)
+        _, remainder = suffix.split("\n\n## Acceptance\n", 1)
+        state_file.write_text(
+            header + "\n---\n" + prefix + "\n## Objective\n\n" + objective
+            + "\n\n## Acceptance\n" + remainder, encoding="utf-8",
+        )
     state_before = state_file.read_bytes()
 
     assert main(arguments) == 0
@@ -320,6 +363,26 @@ def test_project_register_repeated_identical_request_is_a_noop(
     assert payload["changed"] is False
     assert registry_path.read_bytes() == registry_before
     assert state_file.read_bytes() == state_before
+
+    # Equivalent JSON spelling is presentation, while changed content conflicts.
+    text = state_file.read_text()
+    header, body = text.split("\n---\n", 1)
+    header = "\n".join(
+        "objective: " + json.dumps(objective, ensure_ascii=True)
+        if line.startswith("objective: ") else line for line in header.split("\n")
+    )
+    equivalent = header + "\n---\n" + body
+    state_file.write_text(equivalent)
+    assert main(arguments) == 0
+    capsys.readouterr()
+    assert state_file.read_text() == equivalent
+    for drifted in (equivalent.replace("status: active", "status: paused", 1),
+                    equivalent.replace("A verified Spec diff is produced.", "Different acceptance.", 1)):
+        state_file.write_text(drifted)
+        assert main(arguments) == 1
+        assert "conflicts with registration" in capsys.readouterr().out
+        assert state_file.read_text() == drifted
+        assert registry_path.read_bytes() == registry_before
 
 
 @pytest.mark.parametrize("field", ["projects", "goals"])
@@ -530,12 +593,19 @@ def test_project_register_removes_new_state_when_registry_write_fails(
         "--stop-condition",
         "Stop while Atlas is unavailable.",
     ]
-    original_write = project_registry.atomic_write_json
+    original_write = registry_codec.ProjectRegistryTransaction.commit
 
-    def fail_write(_path: Path, _payload: dict[str, object]) -> None:
+    def fail_write(
+        _transaction: registry_codec.ProjectRegistryTransaction,
+        _payload: dict[str, object],
+    ) -> bool:
         raise OSError("simulated registry write failure")
 
-    monkeypatch.setattr(project_registry, "atomic_write_json", fail_write)
+    monkeypatch.setattr(
+        registry_codec.ProjectRegistryTransaction,
+        "commit",
+        fail_write,
+    )
 
     assert main(arguments) == 1
     payload = json.loads(capsys.readouterr().out)
@@ -544,7 +614,11 @@ def test_project_register_removes_new_state_when_registry_write_fails(
     assert not registry_path.exists()
     assert not state_file.exists()
 
-    monkeypatch.setattr(project_registry, "atomic_write_json", original_write)
+    monkeypatch.setattr(
+        registry_codec.ProjectRegistryTransaction,
+        "commit",
+        original_write,
+    )
     assert main(arguments) == 0
     capsys.readouterr()
     assert registry_path.exists()
@@ -641,28 +715,46 @@ def test_project_register_recovers_exact_state_after_interruption(
         "--stop-condition",
         "Stop while Atlas is unavailable.",
     ]
-    original_write = project_registry.atomic_write_json
+    original_write = registry_codec.ProjectRegistryTransaction.commit
 
-    def interrupt_after_state(_path: Path, _payload: dict[str, object]) -> None:
+    def interrupt_after_state(
+        _transaction: registry_codec.ProjectRegistryTransaction,
+        _payload: dict[str, object],
+    ) -> bool:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(project_registry, "atomic_write_json", interrupt_after_state)
+    monkeypatch.setattr(
+        registry_codec.ProjectRegistryTransaction,
+        "commit",
+        interrupt_after_state,
+    )
     with pytest.raises(KeyboardInterrupt):
         main(arguments)
 
     assert state_file.exists()
     assert not registry_path.exists()
 
-    def fail_retry(_path: Path, _payload: dict[str, object]) -> None:
+    def fail_retry(
+        _transaction: registry_codec.ProjectRegistryTransaction,
+        _payload: dict[str, object],
+    ) -> bool:
         raise OSError("simulated retry failure")
 
-    monkeypatch.setattr(project_registry, "atomic_write_json", fail_retry)
+    monkeypatch.setattr(
+        registry_codec.ProjectRegistryTransaction,
+        "commit",
+        fail_retry,
+    )
     assert main(arguments) == 1
     retry_payload = json.loads(capsys.readouterr().out)
     assert "simulated retry failure" in retry_payload["error"]
     assert state_file.exists()
 
-    monkeypatch.setattr(project_registry, "atomic_write_json", original_write)
+    monkeypatch.setattr(
+        registry_codec.ProjectRegistryTransaction,
+        "commit",
+        original_write,
+    )
     assert main(arguments) == 0
     payload = json.loads(capsys.readouterr().out)
 

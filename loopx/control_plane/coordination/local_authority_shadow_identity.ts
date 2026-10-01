@@ -14,3 +14,8 @@ export function outboxEntryIdentity(
   })).digest("hex");
   return `local-shadow-tx-${digest}`;
 }
+
+export class ShadowLineageError extends Error {
+  readonly reason_code: string;
+  constructor(reasonCode: string) { super(reasonCode); this.reason_code = reasonCode; }
+}

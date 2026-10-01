@@ -1,6 +1,7 @@
 import {
   activeStatusSourceForUrl,
   addSshTunnelStatusSource,
+  bindConfiguredSshHostAliases,
   defaultLocalStatusSourceUrl,
   emptyStatusSourceCatalog,
   loadStatusSourceCatalog,
@@ -51,6 +52,7 @@ equal(projectedStatusSourceForUrl(initial, "/api/status.json", baseHref).readOnl
 equal(projectedStatusSourceForUrl(initial, "http://127.0.0.1:9999/status.json", baseHref).readOnly, true, "an unregistered loopback port does not inherit local authority");
 
 const added = addSshTunnelStatusSource(initial, {
+  hostAlias: "remote-lab",
   label: "Remote lab",
   statusUrl: "http://localhost:8876/status.json",
 }, baseHref);
@@ -58,6 +60,7 @@ assert("catalog" in added, "a valid tunnel source is accepted");
 equal(added.source.kind, "ssh_tunnel", "the source keeps its typed provider kind");
 equal(added.source.readOnly, true, "a tunneled source cannot inherit local write authority");
 equal(added.source.statusUrl, "http://localhost:8876/status.json", "the tunnel URL is canonicalized");
+equal(added.source.hostAlias, "remote-lab", "a configured source retains its remote write routing identity");
 equal(statusSourceForUrl(added.catalog, added.source.statusUrl, baseHref)?.id, added.source.id, "URL lookup preserves source identity");
 
 const publicSource = addSshTunnelStatusSource(initial, {
@@ -87,6 +90,17 @@ stored.sources[0].readOnly = false;
 storage.setItem(statusSourceCatalogStorageKey, JSON.stringify(stored));
 const restored = loadStatusSourceCatalog(storage, baseHref);
 equal(restored.sources[1].readOnly, true, "persisted input cannot downgrade a tunnel to writable");
+equal(restored.sources[1].hostAlias, "remote-lab", "configured routing identity survives catalog reload");
+
+const legacyStorage = new MemoryStorage();
+legacyStorage.setItem(statusSourceCatalogStorageKey, JSON.stringify({
+  schemaVersion: 1,
+  sources: [{ kind: "ssh_tunnel", label: "remote-lab", statusUrl: "http://127.0.0.1:9076/status.json" }],
+}));
+const migrated = bindConfiguredSshHostAliases(loadStatusSourceCatalog(legacyStorage, baseHref), ["remote-lab"]);
+equal(migrated.sources[1].hostAlias, "remote-lab", "an exact configured alias upgrades an older read-only source for remote Goal lifecycle");
+const unbound = bindConfiguredSshHostAliases(loadStatusSourceCatalog(legacyStorage, baseHref), ["other-host"]);
+equal(unbound.sources[1].hostAlias, undefined, "a display label never gains remote write authority without an exact configured alias");
 
 const withoutTunnel = removeStatusSource(restored, restored.sources[1].id);
 equal(withoutTunnel.sources.length, 2, "removing one tunnel preserves the other named source");

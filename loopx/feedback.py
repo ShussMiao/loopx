@@ -12,13 +12,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .history import _chronology_key, load_index, load_registry
+from .control_plane.runtime.time import chronology_key
+from .history import load_index, load_registry
 from .paths import resolve_runtime_root
 from .public_safe_text import (
     PRIVATE_TEXT_PATTERNS as SHARED_PRIVATE_TEXT_PATTERNS,
     find_private_text_match,
 )
 from .registry import registry_goals, resolve_state_file
+from .control_plane.actor_identity import normalize_owner_controller_actor
 
 
 GOAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -214,7 +216,7 @@ def select_run(runs: list[dict[str, Any]], run_generated_at: str | None) -> dict
     return max(
         enumerate(runs),
         key=lambda item: (
-            *_chronology_key(item[1].get("generated_at")),
+            *chronology_key(item[1].get("generated_at")),
             item[0],
         ),
     )[1]
@@ -402,10 +404,12 @@ def append_human_reward(
     goal_id: str,
     run_generated_at: str | None,
     reward: dict[str, Any],
+    actor_kind: str | None = None,
     dry_run: bool = False,
     state_file_override: Path | None = None,
     write_active_state_summary: bool = False,
 ) -> dict[str, Any]:
+    actor = normalize_owner_controller_actor(actor_kind, required=not dry_run)
     validate_goal_id(goal_id)
     registry = load_registry(registry_path)
     runtime_root = resolve_runtime_root(registry, runtime_root_override, registry_path=registry_path)
@@ -432,6 +436,8 @@ def append_human_reward(
         for field in HUMAN_REWARD_FIELDS
         if field in reward
     }
+    if actor is not None:
+        index_record["human_reward"]["actor_kind"] = actor.value
 
     selected_run = {
         "generated_at": selected.get("generated_at"),
@@ -467,7 +473,9 @@ def append_human_reward(
             exclusive_cross_runtime_file_lock(state_file_to_write, operation="reward_summary")
             if state_file_to_write is not None else nullcontext()
         )
-        with state_lock:
+        # Match refresh/history: index first, then the source state lock.
+        from .file_lock import exclusive_run_index_lock
+        with exclusive_run_index_lock(index_path, operation="reward_append"), state_lock:
             if state_file_to_write is not None:
                 original = state_file_to_write.read_text(encoding="utf-8")
                 planned, changed = insert_progress_ledger_entry(
@@ -500,6 +508,7 @@ def append_human_reward(
         "dry_run": dry_run,
         "selected_run": selected_run,
         "human_reward": index_record["human_reward"],
+        "actor_kind": actor.value if actor is not None else None,
         **coordination,
         "active_state_update": active_state_update,
         "index_record": index_record,
@@ -568,6 +577,7 @@ def render_reward_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Reward",
             f"- recorded_at: `{reward.get('recorded_at')}`",
+            f"- actor_kind: `{reward.get('actor_kind')}`",
             f"- decision: `{reward.get('decision')}`",
             f"- reward: `{reward.get('reward')}`",
             f"- reason_summary: {reward.get('reason_summary')}",

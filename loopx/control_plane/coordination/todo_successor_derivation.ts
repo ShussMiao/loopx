@@ -1,4 +1,6 @@
+import {planTodoPriority} from "../todos/priority.ts";
 import type { JsonObject } from "../effect_program.ts";
+import {AGENT_TODO_TASK_CLASSES as AGENT_TASK_CLASSES, USER_TODO_TASK_CLASSES as USER_TASK_CLASSES} from "../todos/authoring_scope.ts";
 import {
   AuthorityStoreProtocolError,
   canonicalAuthorityObject,
@@ -18,12 +20,6 @@ export const TODO_SUCCESSOR_DERIVATION_RESULT_SCHEMA =
 
 const TERMINAL_COMMANDS = ["complete", "supersede"] as const;
 const TODO_ROLES = ["agent", "user"] as const;
-const AGENT_TASK_CLASSES = new Set([
-  "advancement_task",
-  "continuous_monitor",
-  "blocker",
-]);
-const USER_TASK_CLASSES = new Set(["user_action", "user_gate"]);
 const CONTINUATION_POLICIES = new Set([
   "independent_handoff",
   "same_agent_non_delivery",
@@ -112,21 +108,6 @@ function optionalRegisteredAgents(
     }
     return agent;
   });
-}
-
-function priorityPrefix(text: string): string | null {
-  const match = /^\[(P[0-4])\] /iu.exec(text);
-  return match === null ? null : match[1]!.toUpperCase();
-}
-
-function inheritPriority(nextText: string, predecessorText: string): string {
-  const text = compactPythonWhitespace(nextText);
-  if (text.length === 0) {
-    throw new AuthorityStoreProtocolError("successor intent text must not be empty");
-  }
-  if (priorityPrefix(text) !== null) return text;
-  const inherited = priorityPrefix(compactPythonWhitespace(predecessorText));
-  return inherited === null ? text : `[${inherited}] ${text}`;
 }
 
 function normalizeIntent(
@@ -250,7 +231,6 @@ export function deriveCoordinationTodoSuccessorProposals(
   }
   const predecessor = canonicalAuthorityObject(rawInput.predecessor, "predecessor");
   const predecessorId = requireAuthorityStoreId(predecessor.todo_id, "predecessor.todo_id");
-  const predecessorText = optionalString(predecessor.text, "predecessor.text") ?? "";
   const registeredAgents = normalizeRegisteredTodoAgents(rawInput.registered_agents);
   const actor = optionalRegisteredAgent(
     rawInput.actor_agent_id,
@@ -284,7 +264,7 @@ export function deriveCoordinationTodoSuccessorProposals(
   for (const intent of intents) {
     const proposal: JsonObject = {
       role: intent.role,
-      text: inheritPriority(intent.text, predecessorText),
+      text: String(planTodoPriority(predecessor, {text: intent.text}).text),
       task_class: intent.task_class,
     };
     compactOptionalField(proposal, "created_by", actor);

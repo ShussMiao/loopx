@@ -30,6 +30,8 @@ optional metrics stay unknown, never zero.
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, cast
@@ -74,17 +76,63 @@ def read_codex_session_usage(rollout_path: Path) -> dict[str, Any]:
     return _read_codex_session_usage(rollout_path)[0]
 
 
-def _read_codex_session_usage(
-    rollout_path: Path,
-) -> tuple[dict[str, Any], list[tuple[str, str]]]:
-    path = Path(rollout_path).expanduser()
+def _rollout_records(path: Path) -> Iterator[dict[str, Any]]:
+    """Scan the opening byte extent, without sampling or retaining transcripts.
+
+    Accounting needs every record, unlike discovery's bounded head sample.
+    Memory scales with the largest record, not the entire conversation. The
+    opening extent keeps a busy writer from extending this read indefinitely;
+    a later observation sees appended usage under its usual snapshot identity.
+    """
     try:
-        raw_text = path.read_text(encoding="utf-8")
+        with path.open("rb") as stream:
+            remaining = os.fstat(stream.fileno()).st_size
+            line_number = 0
+            pending_corrupt_line: int | None = None
+            while remaining:
+                line = stream.readline(remaining)
+                if not line:
+                    raise CodexSessionUsageError(
+                        f"codex session rollout was truncated during read: {path}"
+                    )
+                remaining -= len(line)
+                line_number += 1
+                if not line.strip():
+                    continue
+                if pending_corrupt_line is not None:
+                    raise CodexSessionUsageError(
+                        f"codex session rollout line {pending_corrupt_line} is corrupt: {path}"
+                    )
+                try:
+                    text = line.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    if remaining == 0 and exc.reason == "unexpected end of data":
+                        # A writer may be partway through a final UTF-8 codepoint.
+                        # Other encoding damage, including a terminated record,
+                        # must never be mistaken for an incomplete append.
+                        continue
+                    raise CodexSessionUsageError(
+                        f"codex session rollout line {line_number} is corrupt: {path}"
+                    ) from exc
+                try:
+                    item = json.loads(text)
+                except json.JSONDecodeError:
+                    # Defer until the next nonblank line: only malformed final
+                    # JSON is tolerated. No later event may hide interior damage.
+                    pending_corrupt_line = line_number
+                    continue
+                if isinstance(item, dict):
+                    yield item
     except OSError as exc:
         raise CodexSessionUsageError(
             f"cannot read codex session rollout: {exc}"
         ) from exc
 
+
+def _read_codex_session_usage(
+    rollout_path: Path,
+) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+    path = Path(rollout_path).expanduser()
     session_id = ""
     session_started_at: datetime | None = None
     model = ""
@@ -92,26 +140,7 @@ def _read_codex_session_usage(
     last_totals_at = ""
     last_totals_model = ""
     trailing_models: list[tuple[str, str]] = []
-    lines = [
-        (number, text)
-        for number, text in enumerate(raw_text.splitlines(), start=1)
-        if text.strip()
-    ]
-    for position, (line_number, line) in enumerate(lines):
-        try:
-            item = json.loads(line.strip())
-        except json.JSONDecodeError as exc:
-            if position == len(lines) - 1:
-                # The Codex CLI appends to the rollout while sessions run; only
-                # a torn final line is concurrent-write noise. A malformed line
-                # with valid events after it means the file itself is damaged,
-                # and parsing on could book a stale cumulative snapshot.
-                continue
-            raise CodexSessionUsageError(
-                f"codex session rollout line {line_number} is corrupt: {path}"
-            ) from exc
-        if not isinstance(item, dict):
-            continue
+    for item in _rollout_records(path):
         kind = str(item.get("type") or "")
         raw_payload = item.get("payload")
         payload = raw_payload if isinstance(raw_payload, dict) else {}
@@ -283,7 +312,7 @@ def session_usage_baseline(
     snapshot_first_booked_at: Any = None
     binding_recorded = False
     seen_rows: set[tuple[str, str, str]] = set()
-    for line_number, line in enumerate(raw.splitlines(), start=1):
+    for line_number, line in enumerate(raw.split("\n"), start=1):
         line = line.strip()
         if not line:
             continue

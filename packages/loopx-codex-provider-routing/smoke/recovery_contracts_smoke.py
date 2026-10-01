@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,9 +17,96 @@ qualify_desktop_patch = contract.qualify_desktop_patch
 qualify_outage_recovery = contract.qualify_outage_recovery
 qualify_quota_recovery = contract.qualify_quota_recovery
 qualify_tool_transport = contract.qualify_tool_transport
+qualify_stream_recovery = importlib.import_module(
+    "loopx_codex_provider_routing.stream_recovery"
+).qualify_stream_recovery
+
+
+def check_stream_recovery() -> None:
+    request = json.loads((PACKAGE_ROOT / "examples/stream-recovery.json").read_text())
+    observation = request["stream_recovery"]
+    assert qualify_stream_recovery(observation)["qualified"] is True
+
+    # More retries cannot repair a deadline that still interrupts each attempt.
+    retries_only = dict(
+        observation, effective_idle_timeout_ms=300000, effective_stream_max_retries=10
+    )
+    result = qualify_stream_recovery(retries_only)
+    assert set(result["failure_codes"]) == {
+        "idle_budget_not_repaired",
+        "stream_retry_budget_expanded",
+    }
+    # Equality leaves a race with the timeout; require headroom over the gap.
+    boundary = dict(observation, effective_idle_timeout_ms=320000)
+    assert qualify_stream_recovery(boundary)["qualified"] is False
+    unexplained = dict(observation, observed_idle_gap_ms=299999)
+    assert qualify_stream_recovery(unexplained)["failure_codes"] == [
+        "idle_timeout_cause_unverified"
+    ]
+    # A 200, synthetic completion or a fresh session cannot prove restoration.
+    for field in (
+        "events_forwarded_incrementally",
+        "same_session",
+        "same_home",
+        "history_preserved",
+        "text_response_completed",
+        "tool_round_trip_completed",
+        "settings_readback_matches",
+    ):
+        failed = qualify_stream_recovery(dict(observation, **{field: False}))
+        assert failed["failure_codes"] == [f"{field}_unverified"]
+    for source in ("adapter", "missing"):
+        failed = qualify_stream_recovery(
+            dict(observation, terminal_event_source=source)
+        )
+        assert failed["failure_codes"] == ["upstream_completion_unverified"]
+
+    for patch in (
+        {"failure_kind": "transport_error"},
+        {"failure_kind": "retry_exhausted"},
+        {"previous_idle_timeout_ms": True},
+        {"effective_idle_timeout_ms": 0},
+        {"effective_stream_max_retries": -1},
+        {"same_home": "true"},
+        {"terminal_event_source": []},
+        {"raw_body": "not permitted"},
+        {"session_id": "not permitted"},
+    ):
+        try:
+            qualify_stream_recovery(dict(observation, **patch))
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError(f"invalid stream observation accepted: {list(patch)}")
+    missing = dict(observation)
+    del missing["same_home"]
+    try:
+        qualify_stream_recovery(missing)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("missing session ownership proof accepted")
+
+    # Exercise the production stdin/stdout entrypoint, including negative evidence.
+    for payload, expected in (
+        (request, True),
+        (dict(request, stream_recovery=retries_only), False),
+    ):
+        run = subprocess.run(
+            [sys.executable, "-m", "loopx_codex_provider_routing.cli"],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=dict(os.environ, PYTHONPATH=str(PACKAGE_ROOT / "src")),
+        )
+        response = json.loads(run.stdout)
+        assert response["ok"] is True
+        assert response["result"]["qualified"] is expected
 
 
 def main() -> int:
+    check_stream_recovery()
     desktop_patch = qualify_desktop_patch(
         {
             "anchor_state": "patched_unique",

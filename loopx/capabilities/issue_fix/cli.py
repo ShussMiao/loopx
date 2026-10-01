@@ -1315,6 +1315,7 @@ def handle_issue_fix_command(
                     raise ValueError("PR lifecycle transition is missing")
                 grouped_monitor_writeback = materialize_issue_fix_grouped_monitors(
                     registry_path=registry_path,
+                    runtime_root=Path(runtime_root_arg).expanduser() if runtime_root_arg else None,
                     goal_id=args.goal_id,
                     project=Path(args.project).expanduser(),
                     ledger_path=ledger_path,

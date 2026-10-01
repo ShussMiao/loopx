@@ -524,7 +524,7 @@ def assert_outcome_floor_projected_blocker_quiet_noop() -> None:
     assert monitor_contract["agent_channel"]["must_attempt"] is True, monitor_contract
     assert monitor_contract["agent_channel"]["quiet_noop_allowed"] is False, monitor_contract
     assert "outcome-floor evidence" in monitor_contract["agent_channel"]["primary_action"], monitor_contract
-    assert "outcome-floor evidence" in monitor_decision["protocol_action_packet"]["summary"], monitor_decision
+    assert "protocol_action_packet" not in monitor_decision, monitor_decision
 
 
 def assert_control_plane_health_self_repair_should_run() -> None:
@@ -1033,8 +1033,8 @@ def assert_heartbeat_recommendation_lifecycle() -> None:
     assert isinstance(reset["reset_token"], str) and len(reset["reset_token"]) == 16, reset
     assert reset["reset_token"] == expected_scheduler_reset_token(scheduler, mapped_decision), reset
     assert reset["host_state_key"] == "scheduler_hint.reset_policy.reset_token", reset
-    assert reset["codex_app_initial_interval_minutes"] == 60, reset
-    assert reset["codex_app_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=60", reset
+    assert reset["app_automation_initial_interval_minutes"] == 60, reset
+    assert reset["app_automation_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=60", reset
     assert len(reset["identity_signature"]) == 12, reset
     assert "identity_snapshot" not in reset, reset
     assert "profile_snapshot" not in reset, reset
@@ -1057,8 +1057,8 @@ def assert_heartbeat_recommendation_lifecycle() -> None:
     assert "heartbeat_recommendation: mode=mapped_noop_if_unchanged notify=DONT_NOTIFY" in mapped_markdown
     assert "heartbeat_stop_if_unchanged: `True`" in mapped_markdown, mapped_markdown
     assert "scheduler_hint: action=backoff_until_fresh_evidence" in mapped_markdown, mapped_markdown
-    assert "codex_app_rrule=FREQ=MINUTELY;INTERVAL=60" in mapped_markdown, mapped_markdown
-    assert "codex_app_progression=[60]" in mapped_markdown, mapped_markdown
+    assert "app_automation_rrule=FREQ=MINUTELY;INTERVAL=60" in mapped_markdown, mapped_markdown
+    assert "app_automation_progression=[60]" in mapped_markdown, mapped_markdown
     assert "scheduler_reset: initial_interval=60" in mapped_markdown, mapped_markdown
     assert "initial_rrule=FREQ=MINUTELY;INTERVAL=60" in mapped_markdown, mapped_markdown
     assert "reset_generation=" in mapped_markdown, mapped_markdown

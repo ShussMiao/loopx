@@ -1,10 +1,11 @@
-import { useId } from "react";
+import { useId, type ReactNode } from "react";
 
 import type { CapabilityConfigurationEditor } from "../../data/chat";
+import { PeriodicReportScheduleField } from "./periodic-report-schedule-field";
 
 type FieldCopy = Record<string, { description?: string; label?: string }>;
 type ConfigurationField = CapabilityConfigurationEditor["fields"][number];
-type FieldValue = boolean | number | string | string[];
+type FieldValue = boolean | number | string | string[] | Record<string, unknown> | null;
 type FieldChange = (key: string, value: FieldValue) => void;
 
 type ConfigurationFieldProps = Readonly<{
@@ -13,23 +14,23 @@ type ConfigurationFieldProps = Readonly<{
   id: string;
   onChange?: FieldChange;
   value: unknown;
+  timezone: string;
 }>;
 
-function FieldDescription({ children }: Readonly<{ children?: string }>) {
-  return children ? <small>{children}</small> : null;
-}
-
-function ConfigurationFieldControl({ copy, field, id, onChange, value }: ConfigurationFieldProps) {
+function ConfigurationFieldControl({ copy, field, id, onChange, value, timezone }: ConfigurationFieldProps) {
   const label = copy[field.key]?.label ?? field.label;
-  const description = copy[field.key]?.description ?? field.description;
   const readOnly = !onChange;
+
+  if (field.input_kind === "periodic_report_schedule") {
+    return <PeriodicReportScheduleField id={id} value={value} timezone={timezone}
+      onChange={onChange ? (schedule) => onChange(field.key, schedule) : undefined} />;
+  }
 
   if (field.input_kind === "boolean") {
     return (
       <label className="is-boolean" htmlFor={id}>
         <span>{label}</span>
-        <input checked={value === true} id={id} onChange={onChange ? (event) => onChange(field.key, event.target.checked) : undefined} readOnly={readOnly} type="checkbox" />
-        <FieldDescription>{description}</FieldDescription>
+        <input checked={value === true} id={id} onChange={onChange ? (event) => onChange(field.key, event.target.checked) : undefined} readOnly={readOnly} role="switch" type="checkbox" />
       </label>
     );
   }
@@ -41,7 +42,6 @@ function ConfigurationFieldControl({ copy, field, id, onChange, value }: Configu
           <option value="" />
           {(field.options ?? []).map((option) => <option key={option} value={option}>{option}</option>)}
         </select>
-        <FieldDescription>{description}</FieldDescription>
       </label>
     );
   }
@@ -50,16 +50,18 @@ function ConfigurationFieldControl({ copy, field, id, onChange, value }: Configu
       <label htmlFor={id}>
         <span>{label}</span>
         <textarea id={id} onChange={onChange ? (event) => onChange(field.key, event.target.value.split(/\r?\n/u).filter(Boolean)) : undefined} readOnly={readOnly} rows={4} value={Array.isArray(value) ? value.join("\n") : ""} />
-        <FieldDescription>{description}</FieldDescription>
       </label>
     );
   }
   const numeric = field.input_kind === "number";
+  const modelSuggestions = field.key === "executor_model"
+    ? ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra"] : [];
   return (
     <label htmlFor={id}>
       <span>{label}</span>
       <input
         id={id}
+        list={modelSuggestions.length ? `${id}-suggestions` : undefined}
         max={field.maximum}
         min={field.minimum}
         onChange={onChange ? (event) => onChange(field.key, numeric ? Number(event.target.value) : event.target.value) : undefined}
@@ -68,7 +70,7 @@ function ConfigurationFieldControl({ copy, field, id, onChange, value }: Configu
         type={numeric ? "number" : "text"}
         value={typeof value === "number" || typeof value === "string" ? value : ""}
       />
-      <FieldDescription>{description}</FieldDescription>
+      {modelSuggestions.length ? <datalist id={`${id}-suggestions`}>{modelSuggestions.map((model) => <option key={model} value={model} />)}</datalist> : null}
     </label>
   );
 }
@@ -77,6 +79,7 @@ type CapabilityConfigurationFieldsProps = Readonly<{
   copy?: FieldCopy;
   disabled?: boolean;
   editor: CapabilityConfigurationEditor;
+  enabledAction?: ReactNode;
   omitKeys?: readonly string[];
   onChange?: FieldChange;
   value: Record<string, unknown>;
@@ -86,6 +89,7 @@ export function CapabilityConfigurationFields({
   copy = {},
   disabled = false,
   editor,
+  enabledAction,
   omitKeys = [],
   onChange,
   value,
@@ -95,16 +99,20 @@ export function CapabilityConfigurationFields({
 
   return (
     <fieldset className="personal-capability-fields" disabled={disabled}>
-      {editor.fields.filter((field) => !omitted.has(field.key)).map((field) => (
-        <ConfigurationFieldControl
+      {editor.fields.filter((field) => !omitted.has(field.key)).map((field) => {
+        const control = <ConfigurationFieldControl
           copy={copy}
           field={field}
           id={`${idPrefix}-${field.key.replace(/[^a-z0-9_-]/gi, "-")}`}
           key={field.key}
           onChange={onChange}
           value={value[field.key]}
-        />
-      ))}
+          timezone={String(value.timezone ?? "UTC")}
+        />;
+        return field.key === "enabled" && field.input_kind === "boolean"
+          ? <div className="personal-capability-enabled-row" key={field.key}>{control}{enabledAction}</div>
+          : control;
+      })}
     </fieldset>
   );
 }

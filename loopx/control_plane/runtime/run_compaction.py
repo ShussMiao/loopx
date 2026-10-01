@@ -5,6 +5,7 @@ from typing import Any, Callable, Optional
 
 HUMAN_REWARD_COMPACT_FIELDS = (
     "recorded_at",
+    "actor_kind",
     "decision",
     "reward",
     "reason_summary",
@@ -93,6 +94,7 @@ RUN_BASE_COMPACT_FIELDS = (
     "progress_scope",
     "todo_id",
     "progress_observation",
+    "blocked_retry",
     "delivery_batch_scale",
     "delivery_outcome",
     "lifecycle_phase",

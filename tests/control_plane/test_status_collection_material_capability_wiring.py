@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -36,11 +37,14 @@ def _context(
             "ok": True,
             "current_registry_is_global": True,
         },
-        collect_history=lambda **_kwargs: {
-            "goal_count": 1,
-            "run_count": 0,
-            "goals": [],
-        },
+        collect_status_history=lambda **_kwargs: SimpleNamespace(
+            status_history={
+                "goal_count": 1,
+                "run_count": 0,
+                "goals": [],
+            },
+            contract_audit=object(),
+        ),
         check_contract=lambda **_kwargs: {
             "ok": True,
             "summary": "ok",

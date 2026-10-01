@@ -83,6 +83,17 @@ qualification.
   bounded account probe before fallback is admitted; only a fresh quota-limited
   probe may create a replacement cooldown.
 
+`qualify_stream_recovery`
+: Qualifies an observed SSE idle-timeout repair using content-free transport
+  and original-session readback. The effective idle deadline must exceed the
+  observed silent gap, retries must not increase, small events must be forwarded
+  incrementally, and completion must come from the upstream. Both text and a
+  tool round trip must finish in the same session and home with history preserved.
+  A larger retry count, HTTP 200, a synthetic terminal event or a fresh test
+  session cannot qualify recovery. This does not establish why the upstream
+  became silent and does not change App configuration. See
+  [the recovery procedure](CONTRACT.md#stream-and-session-recovery).
+
 `qualify_outage_recovery`
 : Orders the end of a provider-wide incident against the stale native cooldown
   and degraded fallback affinity it created. A recovery signal newer than the

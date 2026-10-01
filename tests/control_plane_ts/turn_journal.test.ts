@@ -112,13 +112,17 @@ test("legal terminal replay is projected without effects or private fields", () 
   assert.deepEqual(input, before);
 });
 
-test("journal interpretation preserves the canonical Effect Program slots", () => {
+test("journal replay uses its own decision without a quota action slot", () => {
   const turn = interpretTurnJournalEffect(request());
 
   assert.equal(turn.request.kind, "turn_journal");
   assert.equal(turn.interpretation.route, "turn_journal_replay");
   assert.equal(turn.observation.decision, "replay_legal");
   assert.equal(turn.observation.should_run, false);
+  assert.equal("effective_action" in turn.observation, false);
+  const blocked = interpretTurnJournalEffect({...request(), agent_id: "other-agent"});
+  assert.equal(blocked.observation.decision, "replay_blocked");
+  assert.equal("effective_action" in blocked.observation, false);
   assert.deepEqual(turn.next_effect.cli_actions, []);
   assert.deepEqual(interpretTurnJournal(request()), {
     ok: true,
@@ -153,6 +157,8 @@ test("journal interpretation preserves the canonical Effect Program slots", () =
       checks: [{ kind: "journal_consistency", outcome: "passed" }],
     },
     last_recovery: null,
+    recorded_effects: {host_invoked: true, state_written: true,
+      quota_spent: true, scheduler_acknowledged: null},
     effects: [],
   });
 });
@@ -175,6 +181,87 @@ test("non-terminal replay blocking does not block executor recovery", () => {
     retry_failed: false,
     checks: [{ kind: "journal_consistency", outcome: "passed" }],
   });
+});
+
+test("recorded effects distinguish checkpoint, prepared uncertainty and no attempt", () => {
+  const input = request("in_progress");
+  input.journal.completed_phases = ["host_execute", "typed_result", "validation"];
+  input.journal.effect_attempts = {durable_writeback: {
+    status: "prepared", effect_ref: `${effectId("fixture-goal", "fixture-agent")}#durable_writeback`,
+  }};
+  const result = interpretTurnJournal(input);
+  assert.deepEqual(result.recorded_effects, {
+    host_invoked: true, state_written: null, quota_spent: false,
+    scheduler_acknowledged: false,
+  });
+  assert.equal(result.recovery_decision.reinvoke_host, false);
+
+  input.journal.completed_phases = [];
+  delete input.journal.effect_attempts;
+  assert.equal(interpretTurnJournal(input).recorded_effects.host_invoked, false);
+  input.journal.host_attempt_count = 1;
+  assert.equal(interpretTurnJournal(input).recorded_effects.host_invoked, null);
+});
+
+test("pending spend and foreign lineage cannot certify a quota charge", () => {
+  const input = request("in_progress");
+  input.journal.completed_phases = ["host_execute", "typed_result", "validation", "durable_writeback"];
+  input.journal.effect_attempts = {quota_spend: {
+    status: "prepared", effect_ref: `${effectId("fixture-goal", "fixture-agent")}#quota_spend`,
+  }};
+  assert.deepEqual(interpretTurnJournal(input).recorded_effects, {
+    host_invoked: true, state_written: true, quota_spent: null,
+    scheduler_acknowledged: false,
+  });
+  assert.deepEqual(interpretTurnJournal({...input, agent_id: "another-caller"}).recorded_effects, {
+    host_invoked: null, state_written: null, quota_spent: null,
+    scheduler_acknowledged: null,
+  });
+  input.journal.completed_phases = ["typed_result"];
+  assert.equal(interpretTurnJournal(input).recorded_effects.host_invoked, null);
+});
+
+test("outer-controller completion does not manufacture scheduler acknowledgement", () => {
+  const input = request();
+  input.journal.scheduler = {completed: true, acknowledged: false};
+  assert.equal(interpretTurnJournal(input).recorded_effects.scheduler_acknowledged, false);
+});
+
+test("malformed attempt facts never certify absence of an effect", () => {
+  const input = request("in_progress");
+  input.journal.completed_phases = [];
+  input.journal.host_attempt_count = "1";
+  input.journal.effect_attempts = {durable_writeback: {status: "invalid"}};
+  assert.equal(interpretTurnJournal(input).recorded_effects.host_invoked, null);
+  assert.equal(interpretTurnJournal(input).recorded_effects.state_written, null);
+  input.journal.effect_attempts = [];
+  assert.equal(interpretTurnJournal(input).recorded_effects.quota_spent, null);
+});
+
+test("unknown prepared steps block recovery without false non-execution facts", () => {
+  for (const completedPhases of [[], ["host_execute", "typed_result", "validation"]]) {
+    const input = request("in_progress");
+    input.journal.completed_phases = completedPhases;
+    input.journal.effect_attempts = {unknown_provider_step: {
+      status: "prepared",
+      effect_ref: `${effectId("fixture-goal", "fixture-agent")}#durable_writeback`,
+    }};
+    input.journal.scheduler = {acknowledged: false};
+    const before = structuredClone(input);
+    const result = interpretTurnJournal(input);
+    assert.equal(result.journal_consistent, false);
+    assert.ok(result.violations.includes("prepared_effect_step_unsupported"));
+    assert.equal(result.recovery_decision.action, "blocked");
+    assert.equal(result.recovery_decision.can_continue, false);
+    assert.equal(result.recovery_decision.reinvoke_host, false);
+    assert.equal(result.recovery_decision.resume_from, null);
+    assert.deepEqual(result.recorded_effects, {
+      host_invoked: completedPhases.length ? true : null,
+      state_written: null, quota_spent: null, scheduler_acknowledged: null,
+    });
+    assert.deepEqual(result.effects, []);
+    assert.deepEqual(input, before);
+  }
 });
 
 test("scheduler recovery resumes only scheduler apply", () => {
@@ -369,6 +456,30 @@ test("caller-authored Host retryability fails closed", () => {
   assert.equal(result.recovery_decision.reason, "host_retry_contract_invalid");
 });
 
+test("output budget exhaustion cannot reinvoke the Host", () => {
+  const input = failedHostRetryRequest({ kind: "output_budget_exhausted" });
+  input.journal.host_failure = {
+    schema_version: "loopx_turn_host_failure_v0",
+    kind: "output_budget_exhausted",
+    attempt: 1,
+    retryable: false,
+  };
+
+  const result = interpretTurnJournal(input);
+
+  assert.equal(result.recovery_decision.action, "blocked");
+  assert.equal(result.recovery_decision.reinvoke_host, false);
+  assert.equal(result.recovery_decision.reason, "host_retry_not_available");
+  assert.deepEqual(result.recovery_decision.checks, [
+    { kind: "journal_consistency", outcome: "passed" },
+    {
+      kind: "host_retry_policy",
+      outcome: "failed",
+      reason: "host_retry_not_available",
+    },
+  ]);
+});
+
 test("Host retry metadata with extra fields fails closed", () => {
   let input = failedHostRetryRequest({
     failureFields: {
@@ -392,7 +503,8 @@ test("prepared effects are delegated to the existing provider readback step", ()
   const input = request("in_progress");
   input.journal.completed_phases = ["host_execute", "typed_result", "validation"];
   input.journal.effect_attempts = {
-    durable_writeback: { status: "prepared", effect_ref: "effect:fixture" },
+    durable_writeback: { status: "prepared",
+      effect_ref: `${effectId("fixture-goal", "fixture-agent")}#durable_writeback` },
   };
 
   const result = interpretTurnJournal(input);

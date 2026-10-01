@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,8 @@ from loopx.control_plane.effect_program import (
 from loopx.control_plane.quota import effect_program as quota_effect_program
 from loopx.control_plane.quota import settlement as quota_settlement
 from loopx.control_plane.quota.heartbeat_receipt import (
+    ensure_turn_heartbeat_settlement_receipt,
+    find_heartbeat_receipt,
     heartbeat_receipt_settlement_replan_obligation_id,
     heartbeat_receipt_settlement_todo_id,
 )
@@ -30,6 +33,9 @@ from loopx.control_plane.quota.settlement import (
 from loopx.control_plane.quota.settlement_cli import (
     quota_rollout_replan_obligation_id,
     quota_rollout_todo_id,
+)
+from loopx.control_plane.quota.error_codes import (
+    HeartbeatReceiptIdentityConflictError,
 )
 from loopx.control_plane.quota.turn_envelope import quota_action_signature_document
 from loopx.control_plane.scheduler.execution_context import (
@@ -47,6 +53,46 @@ GOAL_ID = "settlement-goal"
 AGENT_ID = "codex-settlement"
 TODO_ID = "todo_settlement"
 TURN_ID = "turn-settlement-1"
+
+
+@pytest.mark.parametrize("replan", [False, True])
+def test_command_plan_supplies_actor_from_identity(replan):
+    plan = quota_effect_program.build_turn_scoped_cli_settlement_plan(
+        goal_id=GOAL_ID, agent_id=AGENT_ID, command_prefix="loopx",
+        todo_id=None if replan else TODO_ID,
+        replan_obligation_id="replan-0000000000000001" if replan else None,
+        turn_instance_id="turn with spaces", scoped_cli_args="", lifecycle_actor_args="",
+    )
+    for step in plan.as_dict()["ordered_steps"]:
+        if command := step.get("command_template"):
+            argv = shlex.split(command)
+            assert argv.count("--agent-id") == 1
+            assert argv[argv.index("--agent-id") + 1] == AGENT_ID
+            assert argv[argv.index("--turn-instance-id") + 1] == "turn with spaces"
+
+
+@pytest.mark.parametrize("arguments", ["--agent-id other", "--agent-id=other", "--agent-id",
+                                      f"--agent-id {AGENT_ID} --agent-id {AGENT_ID}"])
+@pytest.mark.parametrize("field", ["scoped_cli_args", "lifecycle_actor_args"])
+def test_command_plan_rejects_ambiguous_or_conflicting_actor(arguments, field):
+    with pytest.raises(ValueError, match="actor must match"):
+        quota_effect_program.build_turn_scoped_cli_settlement_plan(
+            goal_id=GOAL_ID, agent_id=AGENT_ID, command_prefix="loopx",
+            todo_id=TODO_ID, replan_obligation_id=None, turn_instance_id=TURN_ID,
+            **{"scoped_cli_args": "", "lifecycle_actor_args": "", field: arguments},
+        )
+
+
+@pytest.mark.parametrize("arguments", [f"--agent-id {AGENT_ID}", f" --agent-id={AGENT_ID}"])
+def test_command_plan_retains_one_matching_actor(arguments):
+    plan = quota_effect_program.build_turn_scoped_cli_settlement_plan(
+        goal_id=GOAL_ID, agent_id=AGENT_ID, command_prefix="loopx",
+        todo_id=TODO_ID, replan_obligation_id=None, turn_instance_id=TURN_ID,
+        scoped_cli_args=arguments, lifecycle_actor_args=arguments,
+    )
+    argv = shlex.split(settlement_step_command(plan.as_dict(), SettlementStepKind.QUOTA_SPEND))
+    assert argv[argv.index("--turn-instance-id") + 1] == TURN_ID
+    assert sum(arg == "--agent-id" or arg.startswith("--agent-id=") for arg in argv) == 1
 
 
 def _receipt(step: SettlementStepKind, marker: str) -> SettlementReceipt:
@@ -200,6 +246,120 @@ def _append_run_index_record(runtime_root: Path, record: dict) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
+def test_turn_guard_upgrades_matching_legacy_receipt_to_explicit_empty_scope(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    identity = SettlementIdentity(GOAL_ID, AGENT_ID, TODO_ID, TURN_ID)
+
+    ensure_turn_heartbeat_settlement_receipt(
+        runtime_root,
+        identity,
+        semantic_replan_guard_scoped=False,
+        semantic_replan_obligation_id=None,
+    )
+    upgraded = ensure_turn_heartbeat_settlement_receipt(
+        runtime_root,
+        identity,
+        semantic_replan_guard_scoped=True,
+        semantic_replan_obligation_id=None,
+    )
+    replayed = ensure_turn_heartbeat_settlement_receipt(
+        runtime_root,
+        identity,
+        semantic_replan_guard_scoped=True,
+        semantic_replan_obligation_id=None,
+    )
+
+    assert upgraded["details"]["semantic_replan_obligation_id"] is None
+    assert replayed == upgraded
+    events = [
+        json.loads(line)
+        for line in rollout_event_log_path(runtime_root, GOAL_ID)
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(events) == 2
+    assert events[1]["causality"] == {
+        "caused_by": events[0]["event_id"],
+        "source_event_id": events[0]["event_id"],
+    }
+
+    readback = read_heartbeat_settlement(
+        runtime_root,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        todo_id=TODO_ID,
+        turn_instance_id=TURN_ID,
+    )
+    assert readback is not None
+    assert readback.semantic_replan_guard == {
+        "schema_version": "semantic_replan_guard_v0",
+        "scope": "turn_guard",
+        "selected_obligation_id": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "torn_record",
+    [
+        b'{"schema_version":"loopx_rollout_event_v0"',
+        b'{"summary":"' + "雪".encode()[:2],
+    ],
+    ids=["ascii", "mid-utf8"],
+)
+def test_turn_guard_remains_readable_after_a_torn_rollout_tail(
+    tmp_path: Path,
+    torn_record: bytes,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    event_path = rollout_event_log_path(runtime_root, GOAL_ID)
+    event_path.parent.mkdir(parents=True)
+    event_path.write_bytes(torn_record)
+    identity = SettlementIdentity(GOAL_ID, AGENT_ID, TODO_ID, TURN_ID)
+
+    written = ensure_turn_heartbeat_settlement_receipt(
+        runtime_root,
+        identity,
+        semantic_replan_guard_scoped=False,
+        semantic_replan_obligation_id=None,
+    )
+
+    readback = find_heartbeat_receipt(
+        runtime_root,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        turn_instance_id=TURN_ID,
+    )
+    assert readback is not None
+    assert readback["event_id"] == written["event_id"]
+
+
+def test_turn_guard_refuses_to_change_an_existing_semantic_selection(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    identity = SettlementIdentity(GOAL_ID, AGENT_ID, TODO_ID, TURN_ID)
+    obligation_id = "replan-0000000000000001"
+    ensure_turn_heartbeat_settlement_receipt(
+        runtime_root,
+        identity,
+        semantic_replan_guard_scoped=True,
+        semantic_replan_obligation_id=obligation_id,
+    )
+
+    with pytest.raises(
+        HeartbeatReceiptIdentityConflictError,
+        match="another semantic replan guard",
+    ):
+        ensure_turn_heartbeat_settlement_receipt(
+            runtime_root,
+            identity,
+            semantic_replan_guard_scoped=True,
+            semantic_replan_obligation_id=None,
+        )
+
+
 def test_quota_settlement_readback_returns_the_complete_typed_chain(
     tmp_path: Path,
 ) -> None:
@@ -273,7 +433,7 @@ def test_quota_settlement_readback_returns_the_complete_typed_chain(
     assert readback.spend_run is not None
 
 
-def test_advancement_completion_requires_the_complete_settlement_chain(
+def test_only_terminal_closeout_requires_the_complete_settlement_chain(
     tmp_path: Path,
 ) -> None:
     runtime_root = tmp_path / "runtime"
@@ -289,18 +449,12 @@ def test_advancement_completion_requires_the_complete_settlement_chain(
     )
     assert incomplete is not None
     error = _completion_settlement_error(
-        {
-            "role": "agent",
-            "task_class": "advancement_task",
-            "action_kind": "implement",
-            "text": "Ship the repository change.",
-        },
         incomplete,
-        no_follow_up=False,
+        no_follow_up=True,
     )
     assert error is not None
     assert error.startswith(
-        "turn-scoped advancement completion requires matching writeback and "
+        "terminal no-follow-up closeout requires matching writeback and "
         "quota spend receipts:"
     )
 
@@ -318,26 +472,13 @@ def test_advancement_completion_requires_the_complete_settlement_chain(
     )
     assert (
         _completion_settlement_error(
-            {
-                "role": "agent",
-                "task_class": "advancement_task",
-                "action_kind": "implement",
-                "text": "Ship the repository change.",
-            },
             settled,
-            no_follow_up=False,
+            no_follow_up=True,
         )
         is None
     )
     assert (
         _completion_settlement_error(
-            {
-                "role": "agent",
-                "task_class": "advancement_task",
-                "action_kind": "research",
-                "continuation_policy": "same_agent_non_delivery",
-                "text": "Analyze the evidence.",
-            },
             incomplete,
             no_follow_up=False,
         )
@@ -557,6 +698,46 @@ def test_codex_app_plan_projects_one_identity_across_settlement_steps() -> None:
     assert plan["host_handoff"]["inside_agent_settlement"] is False
 
 
+def test_cli_validation_projects_ordinary_completion_not_terminal_intent() -> None:
+    plan = build_codex_app_settlement_plan(
+        goal_id=GOAL_ID, agent_id=AGENT_ID, todo_id=TODO_ID,
+        scoped_cli_args="", lifecycle_actor_args="", turn_instance_id_ref=TURN_ID,
+    ).as_dict()
+    validation = plan["ordered_steps"][0]
+    assert validation["command_condition"] == "todo_deliverable_complete"
+    command = settlement_step_command(plan, SettlementStepKind.VALIDATION)
+    assert command is not None
+    argv = shlex.split(command)
+    assert "--no-follow-up" not in argv
+    assert "--next-agent-todo" not in argv
+    assert argv[argv.index("--todo-id") + 1] == TODO_ID
+    assert argv[argv.index("--agent-id") + 1] == AGENT_ID
+    assert argv[argv.index("--turn-instance-id") + 1] == TURN_ID
+
+
+def test_in_flight_validation_never_projects_a_completion_command() -> None:
+    plan = build_codex_app_settlement_plan(
+        goal_id=GOAL_ID, agent_id=AGENT_ID, todo_id=TODO_ID,
+        scoped_cli_args="", lifecycle_actor_args="", turn_instance_id_ref=TURN_ID,
+        delivery_boundary="in_flight_continuation",
+    ).as_dict()
+    assert settlement_step_command(plan, SettlementStepKind.VALIDATION) is None
+    assert "command_condition" not in plan["ordered_steps"][0]
+
+
+def test_native_plan_rerender_reuses_one_runtime_projection_without_shared_mutability() -> None:
+    with patch.object(quota_effect_program, "effect_runtime_result",
+                      wraps=quota_effect_program.effect_runtime_result) as runtime:
+        plan = build_codex_app_settlement_plan(
+            goal_id=GOAL_ID, agent_id=AGENT_ID, todo_id=TODO_ID,
+            scoped_cli_args="", lifecycle_actor_args="", turn_instance_id_ref=TURN_ID,
+        )
+        first = plan.as_dict()
+        first["ordered_steps"][0]["command_template"] = "modified by a consumer"
+        assert plan.as_dict()["ordered_steps"][0]["command_template"] != "modified by a consumer"
+        assert runtime.call_count == 1
+
+
 @pytest.mark.parametrize(
     ("todo_id", "replan_obligation_id"),
     [
@@ -579,7 +760,16 @@ def test_codex_app_plan_rejects_ambiguous_settlement_binding(
         )
 
 
-def test_standard_codex_app_actions_use_typed_settlement_before_turn_driver() -> None:
+@pytest.mark.parametrize(
+    "profile",
+    (
+        SchedulerRuntimeProfile.CODEX_APP_HEARTBEAT,
+        SchedulerRuntimeProfile.TRAE_APP,
+    ),
+)
+def test_standard_app_actions_use_typed_settlement_before_turn_driver(
+    profile: SchedulerRuntimeProfile,
+) -> None:
     todo_id = "todo_123456789abc"
     actions = interaction_next_cli_actions(
         {
@@ -589,7 +779,7 @@ def test_standard_codex_app_actions_use_typed_settlement_before_turn_driver() ->
         },
         mode="bounded_delivery",
         scheduler_execution_context=scheduler_execution_context_for_runtime_profile(
-            SchedulerRuntimeProfile.CODEX_APP_HEARTBEAT
+            profile
         ),
     )
 
@@ -631,7 +821,7 @@ def test_codex_app_actions_preserve_a_concrete_admitted_turn_identity() -> None:
         SchedulerRuntimeProfile.CODEX_CLI_VISIBLE,
     ),
 )
-def test_unbound_native_goal_actions_preserve_visible_goal_spend_attribution(
+def test_unbound_native_goal_actions_require_host_identity_before_settlement(
     profile: SchedulerRuntimeProfile,
 ) -> None:
     todo_id = "todo_visible_goal"
@@ -647,14 +837,12 @@ def test_unbound_native_goal_actions_preserve_visible_goal_spend_attribution(
         ),
     )
 
-    assert len(actions) == 2
-    assert actions[0].startswith("loopx refresh-state")
-    assert actions[1] == (
-        f"loopx quota spend-slot --goal-id {GOAL_ID} --slots 1 "
-        f"--source visible-goal --execute --agent-id {AGENT_ID}"
-    )
-    assert all("--todo-id" not in command for command in actions)
-    assert all("--turn-instance-id" not in command for command in actions)
+    assert len(actions) == 1
+    assert "quota should-run" in actions[0]
+    assert "--turn-instance-id" in actions[0]
+    assert "--begin-turn" not in actions[0]
+    assert "spend-slot" not in actions[0]
+    assert "refresh-state" not in actions[0]
 
 
 def test_unbound_codex_app_ssh_goal_requires_a_guided_turn_before_delivery() -> None:
@@ -677,7 +865,14 @@ def test_unbound_codex_app_ssh_goal_requires_a_guided_turn_before_delivery() -> 
     assert "spend-slot" not in actions[0]
 
 
-def test_unbound_codex_app_ssh_goal_requires_a_guided_turn_before_replan() -> None:
+@pytest.mark.parametrize(
+    "profile", (
+        SchedulerRuntimeProfile.CODEX_APP_SSH_VISIBLE,
+        SchedulerRuntimeProfile.CODEX_CLI_VISIBLE,
+        SchedulerRuntimeProfile.ARK_MANAGED_AGENT_GOAL,
+    ),
+)
+def test_unbound_native_goal_requires_identity_before_replan(profile) -> None:
     actions = interaction_next_cli_actions(
         {
             "goal_id": GOAL_ID,
@@ -698,19 +893,30 @@ def test_unbound_codex_app_ssh_goal_requires_a_guided_turn_before_replan() -> No
         },
         mode="autonomous_replan",
         scheduler_execution_context=scheduler_execution_context_for_runtime_profile(
-            SchedulerRuntimeProfile.CODEX_APP_SSH_VISIBLE
+            profile
         ),
     )
 
     assert len(actions) == 1
     assert actions[0].startswith("loopx --format json quota should-run")
-    assert "--runtime-profile codex_app_ssh_goal" in actions[0]
-    assert actions[0].endswith("--begin-turn")
+    assert f"--runtime-profile {profile.value}" in actions[0]
+    if profile is SchedulerRuntimeProfile.CODEX_APP_SSH_VISIBLE:
+        assert actions[0].endswith("--begin-turn")
+    else:
+        assert "--turn-instance-id" in actions[0]
+        assert "--begin-turn" not in actions[0]
     assert "refresh-state" not in actions[0]
     assert "spend-slot" not in actions[0]
 
 
-def test_turn_bound_codex_app_ssh_goal_preserves_visible_goal_settlement() -> None:
+@pytest.mark.parametrize(
+    "profile", (
+        SchedulerRuntimeProfile.CODEX_APP_SSH_VISIBLE,
+        SchedulerRuntimeProfile.CODEX_CLI_VISIBLE,
+        SchedulerRuntimeProfile.ARK_MANAGED_AGENT_GOAL,
+    ),
+)
+def test_turn_bound_native_goal_preserves_visible_goal_settlement(profile) -> None:
     turn_instance_id = "guided-start:native-visible-goal"
 
     actions = interaction_next_cli_actions(
@@ -721,7 +927,7 @@ def test_turn_bound_codex_app_ssh_goal_preserves_visible_goal_settlement() -> No
         },
         mode="bounded_delivery",
         scheduler_execution_context=scheduler_execution_context_for_runtime_profile(
-            SchedulerRuntimeProfile.CODEX_APP_SSH_VISIBLE
+            profile
         ),
         turn_instance_id=turn_instance_id,
     )
@@ -731,6 +937,53 @@ def test_turn_bound_codex_app_ssh_goal_preserves_visible_goal_settlement() -> No
     assert actions[1].startswith("loopx quota spend-slot")
     assert "--source visible-goal" in actions[1]
     for command in actions:
+        assert f"--todo-id {TODO_ID}" in command
+        assert f"--turn-instance-id {turn_instance_id}" in command
+
+
+@pytest.mark.parametrize(
+    "profile",
+    (
+        SchedulerRuntimeProfile.CLAUDE_CODE_VISIBLE,
+        SchedulerRuntimeProfile.KIRO_CLI_VISIBLE,
+    ),
+)
+def test_interactive_visible_goal_reenters_before_exposing_bound_settlement(
+    profile: SchedulerRuntimeProfile,
+) -> None:
+    payload = {
+        "goal_id": GOAL_ID,
+        "agent_identity": {"agent_id": AGENT_ID},
+        "selected_todo": {"todo_id": TODO_ID},
+    }
+    context = scheduler_execution_context_for_runtime_profile(profile)
+
+    unbound = interaction_next_cli_actions(
+        payload,
+        mode="bounded_delivery",
+        scheduler_execution_context=context,
+    )
+
+    assert len(unbound) == 1
+    assert unbound[0].startswith("loopx --format json quota should-run")
+    assert f"--runtime-profile {profile.value}" in unbound[0]
+    assert "--turn-instance-id" in unbound[0]
+    assert "refresh-state" not in unbound[0]
+    assert "spend-slot" not in unbound[0]
+
+    turn_instance_id = f"{profile.value}-visible-goal-turn-1"
+    bound = interaction_next_cli_actions(
+        payload,
+        mode="bounded_delivery",
+        scheduler_execution_context=context,
+        turn_instance_id=turn_instance_id,
+    )
+
+    assert len(bound) == 2
+    assert bound[0].startswith("loopx refresh-state")
+    assert bound[1].startswith("loopx quota spend-slot")
+    assert "--source visible-goal" in bound[1]
+    for command in bound:
         assert f"--todo-id {TODO_ID}" in command
         assert f"--turn-instance-id {turn_instance_id}" in command
 

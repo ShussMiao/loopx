@@ -7,6 +7,7 @@ from typing import Any
 
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
 from .contract import normalize_todo_id_list
+from ..content_digest import BARE_SHA256_PATTERN
 
 
 TODO_COMPLETION_TRANSACTION_REQUEST_SCHEMA = "loopx_todo_completion_transaction_v0"
@@ -31,6 +32,7 @@ _SOURCE_FIELDS = (
     "completion_continuation",
     "completion_turn_key",
     "successor_todo_ids",
+    "task_repository",
     "validation_command",
     "validation_command_argv",
     "validation_label",
@@ -283,6 +285,16 @@ def _valid_receipt(value: Any) -> bool:
         and value.get("stdout_captured") is False
         and value.get("stderr_captured") is False
         and value.get("local_path_captured") is False
+        and (
+            value.get("validation_declaration_sha256") is None
+            or (
+                isinstance(value.get("validation_declaration_sha256"), str)
+                and BARE_SHA256_PATTERN.fullmatch(
+                    value.get("validation_declaration_sha256")
+                )
+                is not None
+            )
+        )
     )
 
 
@@ -382,6 +394,20 @@ def _valid_execute_validation_result(result: Mapping[str, Any]) -> bool:
                 isinstance(effect.get("validation_timeout_seconds"), int)
                 and not isinstance(effect.get("validation_timeout_seconds"), bool)
                 and 1 <= int(effect["validation_timeout_seconds"]) <= 29
+            )
+        )
+        and (
+            effect.get("task_repository") is None
+            or isinstance(effect.get("task_repository"), str)
+        )
+        and (
+            effect.get("validation_declaration_sha256") is None
+            or (
+                isinstance(effect.get("validation_declaration_sha256"), str)
+                and BARE_SHA256_PATTERN.fullmatch(
+                    effect.get("validation_declaration_sha256")
+                )
+                is not None
             )
         )
     )

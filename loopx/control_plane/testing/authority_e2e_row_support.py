@@ -20,36 +20,6 @@ AGENT_A = "agent-a"
 AGENT_B = "agent-b"
 
 
-PRIMARY_VISIBILITY_TIMEOUT_SECONDS = 15.0
-
-
-COMMITTED_OBSERVATION_OUTCOMES = frozenset({"captured", "replayed", "ambiguous_reconciled"})
-
-
-LOCAL_SHADOW_SUMMARY_ENABLED = {
-    "enabled": True,
-    "mode": "file_one_way",
-    "status": "enabled",
-}
-
-
-DEFAULT_OFF_PARITY_FIELDS: tuple[str, ...] = (
-    "ok",
-    "added",
-    "already_exists",
-    "metadata_updated",
-    "status_changed",
-    "role",
-    "status",
-    "task_class",
-    "action_kind",
-    "continuation_policy",
-)
-
-
-MIGRATION_SEED_SCHEMA = "loopx_state_migration_shadow_seed_evidence_v0"
-
-
 class RowAssertionError(AssertionError):
     """A row invariant failed; the message is written to be public-safe."""
 
@@ -87,34 +57,6 @@ def expect(condition: bool, message: str) -> None:
 def sha256_hex(value: str | bytes) -> str:
     payload = value.encode("utf-8") if isinstance(value, str) else value
     return hashlib.sha256(payload).hexdigest()
-
-
-def shadow_evidence(payload: Mapping[str, object], *, label: str) -> JsonObject:
-    evidence = payload.get("authority_shadow")
-    expect(isinstance(evidence, dict), f"{label} must carry authority_shadow evidence")
-    assert isinstance(evidence, dict)
-    return {str(key): value for key, value in evidence.items()}
-
-
-def committed_observation(payload: Mapping[str, object], *, label: str) -> JsonObject:
-    evidence = shadow_evidence(payload, label=label)
-    expect(
-        evidence.get("outcome") in COMMITTED_OBSERVATION_OUTCOMES,
-        f"{label} observation outcome must be captured, replayed, or ambiguous_reconciled",
-    )
-    expect(
-        evidence.get("primary_writeback_preserved") is True,
-        f"{label} must preserve the primary writeback",
-    )
-    expect(
-        evidence.get("provider_to_local_writes") is False,
-        f"{label} must never write from provider to local state",
-    )
-    expect(
-        evidence.get("candidate_read_for_decision") is False,
-        f"{label} must never read the candidate for a decision",
-    )
-    return evidence
 
 
 def add_todo(workspace: GoalWorkspace, text: str) -> JsonObject:
@@ -157,10 +99,6 @@ def acquire_lease(
     )
 
 
-def configure_shadow(workspace: GoalWorkspace, *flags: str) -> JsonObject:
-    return run_cli(workspace, "configure-goal", "--goal-id", workspace.goal_id, *flags)
-
-
 def lease_version(payload: Mapping[str, object], *, label: str) -> str:
     lease = payload.get("lease")
     expect(isinstance(lease, dict), f"{label} must return a lease record")
@@ -171,22 +109,14 @@ def lease_version(payload: Mapping[str, object], *, label: str) -> str:
 __all__ = [
     "AGENT_A",
     "AGENT_B",
-    "COMMITTED_OBSERVATION_OUTCOMES",
-    "DEFAULT_OFF_PARITY_FIELDS",
-    "LOCAL_SHADOW_SUMMARY_ENABLED",
-    "MIGRATION_SEED_SCHEMA",
-    "PRIMARY_VISIBILITY_TIMEOUT_SECONDS",
     "RowAssertionError",
     "RowContext",
     "RowOutcome",
     "acquire_lease",
     "add_todo",
-    "committed_observation",
-    "configure_shadow",
     "expect",
     "lease_version",
     "passed",
-    "shadow_evidence",
     "sha256_hex",
     "unverified",
 ]

@@ -7,6 +7,7 @@ import {
   requireNonEmptyString as requiredString,
   requireStringLiteral,
 } from "./runtime_decode.ts";
+import { ENVELOPED_SHA256_PATTERN } from "./content_digest.ts";
 
 export const EXTERNAL_EFFECT_RECEIPT_SCHEMA_VERSION =
   "loopx_external_effect_receipt_v0";
@@ -69,6 +70,13 @@ const MONITOR_COMPLETE_FIELDS = new Set([
   "monitor_key",
   "evidence",
 ]);
+// Provider results may propose monitor transitions only. A team plan
+// (`steward_team_plan_preview`) is deliberately not admitted: no provider
+// emits one, and admitting it would let an external provider create lane
+// Todos. That needs its own contract (a proposal schema without monitor
+// fields, lane action limits, how a refused plan reads in the lifecycle
+// receipt). The Python settlement owner keeps the route and already requires
+// the state basis the journal binds for an operation declaring the kind.
 const TRANSITION_PROPOSAL_KINDS = [
   "continuous_monitor_upsert",
   "continuous_monitor_complete",
@@ -179,7 +187,7 @@ function canonicalDigest(value: unknown): string {
 
 function requiredCanonicalDigest(value: unknown, label: string): string {
   const digest = requiredString(value, label);
-  if (!/^sha256:[0-9a-f]{64}$/.test(digest)) {
+  if (!ENVELOPED_SHA256_PATTERN.test(digest)) {
     throw new EffectRuntimeRequestError(`${label} is invalid`);
   }
   return digest;

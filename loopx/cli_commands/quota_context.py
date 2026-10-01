@@ -5,27 +5,32 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..control_plane.coordination.legacy_writer_fence import (
-    require_legacy_coordination_write_allowed,
+from ..control_plane.scheduler.provider_monitor_poll import (
+    require_monitor_poll_source_available,
 )
 from ..control_plane.quota.error_codes import QuotaCommandValidationError
 from ..control_plane.runtime.status_projection_cache import (
+    cached_goal_run_index_is_current,
     load_status_projection_cache,
     resolve_status_projection_cache_runtime_root,
     write_status_projection_cache,
 )
 from ..control_plane.scheduler.execution_context import (
     GUIDED_START_TURN_RUNTIME_PROFILES,
+    HostSurface,
     SchedulerExecutionContextResolution,
     SchedulerRuntimeProfile,
     scheduler_execution_context_for_runtime_profile,
     scheduler_runtime_profile_for_execution_context,
+    resolve_scheduler_execution_context,
+)
+from ..control_plane.scheduler.state import (
+    APP_AUTOMATION_STATEFUL_BACKOFF_STATE_KEY,
 )
 from ..status import AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK, collect_status
 from ..turn_identity import mint_turn_instance_id, normalize_turn_instance_id
 from .quota_request import (
-    QUOTA_MONITOR_POLL_DETAIL_SECTIONS,
-    QUOTA_SHOULD_RUN_DETAIL_SECTIONS,
+    QUOTA_COMMAND_DETAIL_SECTIONS,
     quota_detail_sections_from_args,
     validate_quota_command_request,
 )
@@ -39,6 +44,9 @@ QUOTA_SCHEDULER_COMMANDS = frozenset(
         "scheduler-fail-current",
         "spend-slot",
     }
+)
+QUOTA_SCHEDULER_FOLLOWUP_COMMANDS = frozenset(
+    {"scheduler-ack", "scheduler-ack-current", "scheduler-fail-current"}
 )
 
 
@@ -64,9 +72,16 @@ def _scheduler_execution_context_from_args(
         args.scheduler_owner,
         args.execution_mode,
     )
-    if args.codex_app and (args.runtime_profile or any(explicit_scheduler_fields)):
+    codex_app = bool(getattr(args, "codex_app", False))
+    trae_app = bool(getattr(args, "trae_app", False))
+    app_alias_count = int(codex_app) + int(trae_app)
+    if app_alias_count > 1:
         raise QuotaCommandValidationError(
-            "--codex-app cannot be combined with --runtime-profile, "
+            "--codex-app and --trae_app are mutually exclusive"
+        )
+    if app_alias_count and (args.runtime_profile or any(explicit_scheduler_fields)):
+        raise QuotaCommandValidationError(
+            "app runtime aliases cannot be combined with --runtime-profile, "
             "--host-surface, --scheduler-owner, or --execution-mode"
         )
     if args.runtime_profile and any(explicit_scheduler_fields):
@@ -76,7 +91,9 @@ def _scheduler_execution_context_from_args(
         )
     runtime_profile = (
         SchedulerRuntimeProfile.CODEX_APP_HEARTBEAT.value
-        if args.codex_app
+        if codex_app
+        else SchedulerRuntimeProfile.TRAE_APP.value
+        if trae_app
         else args.runtime_profile
     )
     if runtime_profile:
@@ -106,17 +123,13 @@ def validate_quota_command_context_request(
             "--turn-envelope is only valid with `quota should-run`"
         )
     requested_details = set(getattr(args, "include_details", None) or ())
-    if requested_details and command not in {"should-run", "monitor-poll"}:
+    if requested_details and command not in QUOTA_COMMAND_DETAIL_SECTIONS:
         raise QuotaCommandValidationError(
-            "--include-detail is only valid with `quota should-run` or "
-            "`quota monitor-poll`"
+            "--include-detail is only valid with `quota status`, `quota plan`, "
+            "`quota should-run` or `quota monitor-poll`"
         )
-    if requested_details and "all" not in requested_details:
-        allowed_details = set(
-            QUOTA_MONITOR_POLL_DETAIL_SECTIONS
-            if command == "monitor-poll"
-            else QUOTA_SHOULD_RUN_DETAIL_SECTIONS
-        )
+    if requested_details:
+        allowed_details = {*QUOTA_COMMAND_DETAIL_SECTIONS[command], "all"}
         unsupported_details = sorted(requested_details - allowed_details)
         if unsupported_details:
             raise QuotaCommandValidationError(
@@ -172,13 +185,65 @@ def validate_quota_command_context_request(
         if command in QUOTA_SCHEDULER_COMMANDS
         else None
     )
+    resolved_scheduler_context = resolve_scheduler_execution_context(scheduler_context)
+    neutral_rrule = str(
+        getattr(args, "app_automation_current_rrule", None) or ""
+    ).strip()
+    legacy_codex_rrule = str(
+        getattr(args, "codex_app_current_rrule", None) or ""
+    ).strip()
+    if neutral_rrule and legacy_codex_rrule and neutral_rrule != legacy_codex_rrule:
+        raise QuotaCommandValidationError(
+            "--app-automation-current-rrule and --codex-app-current-rrule disagree"
+        )
+    if (
+        legacy_codex_rrule
+        and resolved_scheduler_context.ok
+        and resolved_scheduler_context.context is not None
+        and resolved_scheduler_context.context.host_surface is HostSurface.TRAE_APP
+    ):
+        raise QuotaCommandValidationError(
+            "Trae App uses --app-automation-current-rrule, not the Codex compatibility alias"
+        )
+    args.app_automation_current_rrule = neutral_rrule or legacy_codex_rrule or None
+    if command in QUOTA_SCHEDULER_FOLLOWUP_COMMANDS:
+        selected_surface = (
+            resolved_scheduler_context.context.host_surface.value
+            if resolved_scheduler_context.ok
+            and resolved_scheduler_context.context is not None
+            and resolved_scheduler_context.context.app_automation_applicable
+            else "codex_app"
+        )
+        supplied_surface = str(getattr(args, "surface", None) or "").strip()
+        if supplied_surface and supplied_surface != selected_surface:
+            raise QuotaCommandValidationError(
+                f"--surface {supplied_surface} does not match selected App runtime {selected_surface}"
+            )
+        args.surface = selected_surface
+        supplied_state_key = str(
+            getattr(args, "state_key", None) or ""
+        ).strip()
+        default_state_key = (
+            APP_AUTOMATION_STATEFUL_BACKOFF_STATE_KEY
+            if selected_surface == HostSurface.TRAE_APP.value
+            else None
+        )
+        if (
+            selected_surface == HostSurface.TRAE_APP.value
+            and supplied_state_key
+            and supplied_state_key != APP_AUTOMATION_STATEFUL_BACKOFF_STATE_KEY
+        ):
+            raise QuotaCommandValidationError(
+                "Trae App scheduler follow-up requires the app_automation state key"
+            )
+        args.state_key = supplied_state_key or default_state_key
     validate_quota_command_request(args)
     if begin_turn:
         profile = scheduler_runtime_profile_for_execution_context(scheduler_context)
         if profile not in GUIDED_START_TURN_RUNTIME_PROFILES:
             raise QuotaCommandValidationError(
-                "--begin-turn requires runtime-profile codex_app_heartbeat "
-                "or codex_app_ssh_goal; every other host starts its turn by "
+                "--begin-turn requires runtime-profile codex_app_heartbeat, "
+                "trae_app, or codex_app_ssh_goal; every other host starts its turn by "
                 "passing its own --turn-instance-id"
             )
     if (
@@ -225,13 +290,14 @@ def prepare_quota_command_context(
         runtime_root_override=runtime_root_arg,
     )
     if command == "monitor-poll" and args.execute and (args.todo_id or args.target_key):
-        # This command still uses the legacy Todo writer. Preserve its typed
-        # rejection before collecting a promoted read model (which may itself
-        # be unavailable). The writer repeats the check under its mutation lock.
-        require_legacy_coordination_write_allowed(
+        # Canonical availability precedes unrelated status/quota preparation.
+        # The eventual transaction repeats its fence check under the writer lock.
+        require_monitor_poll_source_available(
             runtime_root=runtime_root, goal_id=args.goal_id,
         )
-    status_goal_id = args.goal_id if command not in {"status", "plan"} else None
+    # Observation commands use the same scoped collector/cache as execution
+    # commands. Only an omitted selector requests the whole registry.
+    status_goal_id = args.goal_id
     projection_cache_ttl_seconds = int(
         getattr(args, "projection_cache_ttl_seconds", 120)
     )
@@ -250,7 +316,19 @@ def prepare_quota_command_context(
             goal_id=status_goal_id,
             max_age_seconds=projection_cache_ttl_seconds,
             available_capabilities=args.available_capabilities,
+            agent_lane_id=args.agent_id,
         )
+        if (
+            status_payload is not None
+            and command in QUOTA_SCHEDULER_COMMANDS
+            and status_goal_id
+            and not cached_goal_run_index_is_current(
+                status_payload, runtime_root=runtime_root, goal_id=status_goal_id,
+            )
+        ):
+            status_payload = None
+            cache_metadata["hit"] = False
+            cache_metadata["miss_reason"] = "run_index_changed"
     if status_payload is None:
         collector = status_collector or collect_status
         status_payload = collector(
@@ -260,6 +338,7 @@ def prepare_quota_command_context(
             limit=status_limit,
             goal_id=status_goal_id,
             available_capabilities=args.available_capabilities,
+            agent_lane_id=args.agent_id,
         )
         if bool(getattr(args, "write_projection_cache", False)):
             cache_metadata = write_status_projection_cache(
@@ -272,6 +351,7 @@ def prepare_quota_command_context(
                 payload=status_payload,
                 max_age_seconds=projection_cache_ttl_seconds,
                 available_capabilities=args.available_capabilities,
+                agent_lane_id=args.agent_id,
             )
     elif isinstance(status_payload.get("projection_cache"), dict):
         cache_metadata = dict(status_payload["projection_cache"])

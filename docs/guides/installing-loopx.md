@@ -24,21 +24,32 @@ development and qualification surface, not a second implicit package channel.
 The archive snapshot remains a recovery path rather than a competing default.
 
 LoopX's Effect Program core runs in a managed, idle-exiting TypeScript runtime
-and requires Node.js 22.6 or later. LoopX starts and reuses that local runtime
-automatically; users do not run a daemon manually. The runtime binds only to
-loopback, authenticates requests with a user-private token, rotates when the
-packaged Effect core changes, and exits after an idle period. `loopx doctor`
+and requires Node.js 22.22.3 or later; Node.js 24 LTS is the recommended primary
+runtime. LoopX starts and reuses that local runtime automatically; users do not
+run a daemon manually. The runtime binds only to loopback, authenticates
+requests with a user-private token, rotates when the packaged Effect core
+changes, and exits after an idle period. `loopx doctor`
 reports it as `ready`, `missing`, `unsupported`, or `probe_failed`; a missing
 or stale runtime fails closed instead of falling back to a second Python rule
 engine. The same doctor projection exposes `runtime_lifecycle.state` as
 `running`, `stopped`, or `unavailable`, plus a public-safe `diagnostic_code`;
 the App can render this projection without inventing a second health model.
 `stopped` is healthy and means the idle-exited runtime will restart on the next
-control-plane request. Validate Node before installing or upgrading LoopX:
+control-plane request. Validate Node before installing or upgrading LoopX.
+Upgrading from an older Node 22 installation requires restarting the managed
+runtime with `loopx doctor --restart-runtime` after the new Node is on `PATH`.
+SQLite remains opt-in and checks the actual embedded SQLite version before
+opening authority state.
+
+The CI and release lanes use Node.js 24 LTS. Node.js 26 remains a non-blocking
+forward-compatibility probe and is not a supported-version promise. After the
+Node.js 22 maintenance window ends, a separate policy change will raise the
+minimum to Node.js 24.12 or newer and remove no-longer-needed experimental
+flags.
 
 ```bash
 node --version
-# v22.6.0 or newer
+# v22.22.3 or newer
 ```
 
 Use `loopx doctor --deep` after installation to start the managed runtime and
@@ -73,7 +84,7 @@ trusted checkout can install the native PowerShell launcher without Bash,
 POSIX symlinks, or WSL:
 
 ```powershell
-git clone https://github.com/huangruiteng/loopx.git "$HOME/loopx"
+git clone https://github.com/loopx-project/loopx.git "$HOME/loopx"
 Set-Location "$HOME/loopx"
 pwsh -NoLogo -NoProfile -File .\scripts\install-windows.ps1 `
   -Python (Get-Command python).Source `
@@ -128,6 +139,89 @@ surfaces remain explicit; inspect `loopx slash-commands --help` before enabling
 one. Host integration changes command discovery only. It does not grant LoopX
 permission to write a repository, contact external systems, or bypass a user
 gate.
+
+Every host skill root exposes only canonical `loopx-*` skills. Install and
+uninstall retire older LoopX-managed `loop-global-*` skill files; unmarked
+user-owned files are preserved and reported. This prevents cross-host imports
+from republishing a deprecated facade beside its canonical outcome.
+
+**Invocation migration:** on Claude Code and Kiro, the skill is also the slash
+command, so use `/loopx-global-summary`, `/loopx-global-gates`,
+`/loopx-global-todos` and `/loopx-global-risks` instead of `/loop-global-*`.
+Other skill-backed hosts likewise expose only the canonical names. OpenCode
+alone retains independently installed `commands/loop-global-*.md` when legacy
+aliases are enabled. `--no-legacy-aliases` omits those command files from new
+installs; it does not retire existing native command files. The command catalog
+still describes aliases, but a catalog row does not install a host invocation.
+Goal execution and write authority are unchanged.
+
+Both workflow and command installation reconcile managed duplicates between
+`CODEX_HOME/skills` (default `~/.codex/skills`) and `~/.agents/skills`.
+The selected installation root wins only when a replacement exists; a command
+facade cannot replace a rich workflow. Modified receipts, user-owned metadata,
+extra files, sole copies, and skill symlinks are preserved and reported under
+`skill_reconciliation` or `codex_skill_reconciliation`. A custom Codex profile
+does not authorize cleaning another profile. The fixed installer permits
+`LOOPX_SKILL_DEDUPE_OTHER_ROOT=0` for intentionally separate host roots.
+
+To inspect and repair command discovery for the current Codex profile:
+
+```bash
+loopx --format json slash-commands --surface codex --dry-run
+loopx --format json slash-commands --surface codex --install
+```
+
+Read the reconciliation result and resolve preserved conflicts explicitly.
+
+If duplicates return after successful reconciliation, inspect the host's
+external-agent import history. Importing Claude Code skills can recreate
+LoopX command facades in the shared `.agents/skills` root after installation,
+including legacy aliases. Exclude LoopX from subsequent imports when its
+Codex skills are already installed, then rerun the repair above. LoopX's
+installer does not control a host's later import jobs or import settings.
+Generated Codex entries include `agents/openai.yaml` with the `LoopX` display
+name and explicit-invocation policy; `workflow-skills --install` also repairs
+missing managed entry metadata while preserving user-owned metadata.
+
+A running session may retain its original skill catalog; reload the host or
+open a new task before checking discovery again. Installation cannot rewrite
+instructions already loaded into a conversation.
+
+## Skill Discovery Scope
+
+Default workflow installation keeps `loopx-project`, `loopx-self-repair`,
+`loopx-pr-review`, `loopx-pr-program`, `loopx-doc-registry`, and `loopx-benchmark`
+globally visible in the selected host profile, alongside the generated
+`loopx` entry. These are reusable LoopX instructions: connection and repair
+must work before project setup, PR workflows can span repositories, and
+document/benchmark workflows retain their existing connected-project or
+LoopX-task triggers. Visibility does not activate a capability or authorize
+state changes, external publication, or benchmark jobs.
+
+The `loopx-global-summary`, `loopx-global-gates`, `loopx-global-todos`, and
+`loopx-global-risks` command skills also belong in the global host root. Install
+and inspect them through `loopx slash-commands --surface codex --install` and
+`loopx slash-commands --surface codex --dry-run`. They inspect the registry
+visible to the current user; discovery never expands account or project access.
+They remain optional command facades, separate from default workflow delivery.
+
+`loopx-material` and `loopx-change-quality` remain project-only by default.
+The release's `.loopx-skill-scope` marker declares `global` or `project`;
+both declared scopes support an explicit managed project copy:
+
+```bash
+loopx project-skill install --project . --skill loopx-self-repair --surface codex
+loopx project-skill install --project . --skill loopx-self-repair --surface codex --execute
+loopx project-skill status --project . --skill loopx-self-repair --surface codex
+loopx project-skill uninstall --project . --skill loopx-self-repair --surface codex --execute
+```
+
+Use a project copy only for an intentional override or isolated host. It leaves
+global copies untouched and retains project connection, ownership, digest,
+and containment checks. Missing or unknown source markers still fail closed.
+See [Project Skill Delivery](../../loopx/capabilities/project_skill_delivery/README.md)
+for lifecycle details. `loopx doctor` continues to require the complete default
+workflow set; a lone generated entry does not replace missing rich workflows.
 
 ## Upgrade And Repair
 
@@ -212,6 +306,22 @@ not necessarily active in an installed release. Archive maintainers may use
 the tagged package channel and wait for the corresponding release instead of
 trying to switch an installed distribution to `main`.
 
+For an archive snapshot, `update check` and `update plan` resolve a selected
+moving GitHub ref to its current commit before saying that no update is needed.
+Matching package versions and a recent install timestamp do not establish
+source equality. If the ref lookup is unavailable, the plan reports activation
+as unqualified; retry online or select a trusted full commit SHA. A custom
+archive URL is likewise not proven by the GitHub repo/ref alone.
+An injected `--installed-doctor-json` snapshot is diagnostic input, not a live
+remote-ref check: it can qualify an immutable SHA but cannot claim a moving ref
+is currently installed.
+
+An install taken from a pinned full commit SHA needs no separate lineage
+lookup: `loopx update check --ref <40-hex-commit>` compares that commit with the
+installed manifest source commit and reports `runtime_active` when they match,
+so the readback you would use to confirm your own pinned install stays
+actionable.
+
 For an installation owned by another Python package manager, `update plan`
 reports that owner and its command; LoopX fails closed instead of guessing a
 pip mutation. For a live source checkout, it reports the contributor installer
@@ -241,7 +351,7 @@ Python package environment is unavailable or the CLI is too damaged to run its
 own repair path:
 
 ```bash
-curl -fsSL https://huangruiteng.github.io/loopx/install.sh | bash
+curl -fsSL https://loopx-project.github.io/loopx/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 loopx doctor
 ```

@@ -14,6 +14,7 @@ from pathlib import Path
 import select
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -30,6 +31,7 @@ from loopx.control_plane.coordination.shadow_management import (
     shadow_management_state_path,
 )
 from loopx.control_plane.effect_runtime import effect_runtime_result
+from loopx.control_plane.todos import provider_update
 
 REPO = Path(__file__).resolve().parents[2]
 GOAL, TODO = "goal-update", "todo_update_probe"
@@ -88,7 +90,7 @@ NODE = r"""
 import fs from 'node:fs';
 import {syncBuiltinESMExports} from 'node:module';
 import {once} from 'node:events';
-import {join} from 'node:path';
+import {dirname, join} from 'node:path';
 const input = JSON.parse(process.argv[1]);
 const base = new URL(input.module_base);
 const {FileAuthorityStore} = await import(new URL('file_authority_store.ts', base));
@@ -109,7 +111,16 @@ if (input.mode.endsWith('_wait')) {
   syncBuiltinESMExports();
 }
 let result;
-if (input.mode === 'inspect') {
+if (input.mode === 'hold_writer_lock') {
+  const {withFileMutationLock} = await import(new URL('../effect_runtime_io.ts', base));
+  const lockPath = management.shadowMaintenanceLockPath(input.request.runtime_root, input.request.goal_id);
+  await fs.promises.mkdir(dirname(lockPath), {recursive:true});
+  result = await withFileMutationLock(lockPath, async () => {
+    process.stdout.write('BARRIER lock-held\n');
+    await new Promise(resolve => setTimeout(resolve, 14_000));
+    return {status:'released'};
+  });
+} else if (input.mode === 'inspect') {
   result = {head:await store.loadAuthority(), receipt:input.operation_id ? await store.readReceipt(input.operation_id) : null,
     document_path:store.path};
 } else if (input.mode.startsWith('update')) {
@@ -226,6 +237,50 @@ def test_native_update_preserves_complete_records_and_exact_receipts(workspace: 
         assert replay["status"] == "replayed"
         assert replay["original_receipt"] == receipt
         assert inspect(workspace)["head"] == after["head"]
+
+
+@pytest.mark.parametrize("workspace", ["native"], indirect=True)
+def test_canonical_update_rpc_budget_covers_the_writer_lock_and_receipt(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[float] = []
+    original = provider_update.effect_runtime_result
+
+    def timed_call(method: str, request: dict, **kwargs: object) -> object:
+        assert method == "coordination.local_authority.todo_update"
+        observed.append(float(kwargs["timeout"]))
+        return original(method, request, **kwargs)
+
+    monkeypatch.setattr(provider_update, "effect_runtime_result", timed_call)
+    result = provider_update.update_canonical_todo_if_promoted(
+        registry_path=workspace.registry, runtime_root=workspace.runtime,
+        goal_id=GOAL, todo_id=TODO, actor_agent_id="agent-a", role="agent",
+        text="Updated with the bounded canonical writer budget", note=None,
+        dry_run=False, operation_id="budgeted-update",
+    )
+    assert result is not None and result["status"] == "applied", result
+    assert observed and all(timeout > 35 for timeout in observed)
+    receipt = inspect(workspace, "budgeted-update")["receipt"]
+    assert receipt["status"] == "found"
+
+
+@pytest.mark.parametrize("workspace", ["native"], indirect=True)
+def test_cli_update_waits_past_default_rpc_budget_for_real_writer_lock(workspace: Workspace) -> None:
+    holder = start(node_command("hold_writer_lock", workspace.request()))
+    try:
+        expect_barrier(holder, "lock-held")
+        started = time.monotonic()
+        result = subprocess.run(workspace.command(), cwd=REPO,
+                                capture_output=True, text=True, timeout=30)
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stdout + result.stderr
+        payload = json.loads(result.stdout)
+        assert elapsed > 10, elapsed
+        assert payload["status"] == "applied", payload
+        receipt = payload["original_receipt"]
+        assert inspect(workspace, receipt["operation_id"])["receipt"]["status"] == "found"
+    finally:
+        stop(holder)
 
 
 @pytest.mark.parametrize("transport", ["cli", "rpc"])

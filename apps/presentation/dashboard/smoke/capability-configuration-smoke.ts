@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { projectEditableCapabilityConfiguration } from "../src/data/capability-configuration.js";
+import { parseEditableCapabilityJson, projectEditableCapabilityConfiguration } from "../src/data/capability-configuration.js";
 
 const periodicReportEditor = {
   fields: [
@@ -8,6 +8,7 @@ const periodicReportEditor = {
     { key: "profile_preset" },
     { key: "route_ref" },
     { key: "timezone" },
+    { key: "schedule", nullable: true },
   ],
 };
 
@@ -58,4 +59,27 @@ assert.deepEqual(
   "typed editors must replace non-editable null projections with capability defaults",
 );
 
-console.log("capability configuration projection smoke: ok");
+
+assert.deepEqual(parseEditableCapabilityJson(periodicReportEditor, '{"enabled":false,"timezone":"UTC"}'), { enabled: false, timezone: "UTC" });
+for (const invalid of ['{', 'null', '[]', 'true', '{"schema_version":"injected"}', '{"enabled":true,"status":"active"}', '{"__proto__":{}}']) {
+  assert.equal(parseEditableCapabilityJson(periodicReportEditor, invalid), null, `reject invalid or unregistered JSON fields: ${invalid}`);
+}
+
+console.log("capability configuration projection and JSON boundary smoke: ok");
+
+const schedule = { schema_version: "periodic_report_schedule_v0", schedule_id: "weekly",
+  rrule: "FREQ=WEEKLY;BYDAY=FR;BYHOUR=18;BYMINUTE=0", timezone: "Asia/Shanghai" };
+assert.deepEqual(projectEditableCapabilityConfiguration(periodicReportEditor, { schedule }), { schedule });
+assert.deepEqual(parseEditableCapabilityJson(periodicReportEditor, JSON.stringify({ schedule })), { schedule });
+assert.deepEqual(projectEditableCapabilityConfiguration(periodicReportEditor, { schedule: null }, { schedule }), { schedule: null },
+  "explicit nullable clear must not restore the inherited schedule on editor mode changes");
+
+assert.deepEqual(
+  projectEditableCapabilityConfiguration(
+    { fields: [{ key: "wait_for_ci" }, { key: "review_priority" }] },
+    { wait_for_ci: false, review_priority: "other-developers-first", schema_version: "pull_request_review_goal_configuration_v0" },
+    { wait_for_ci: true },
+  ),
+  { wait_for_ci: false, review_priority: "other-developers-first" },
+  "an explicit Goal CI opt-out must survive default projection and omit envelope fields",
+);

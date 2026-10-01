@@ -18,6 +18,7 @@ from .resume_condition import (
     TODO_RESUME_KIND_CAPACITY_AVAILABLE as TODO_RESUME_KIND_CAPACITY_AVAILABLE,
     TODO_RESUME_KIND_MONITOR_CHANGED as TODO_RESUME_KIND_MONITOR_CHANGED,
     TODO_RESUME_KIND_PR_MERGED as TODO_RESUME_KIND_PR_MERGED,
+    TODO_RESUME_KIND_RESUME_AT as TODO_RESUME_KIND_RESUME_AT,
     TODO_RESUME_KIND_TODO_DONE as TODO_RESUME_KIND_TODO_DONE,
     TODO_RESUME_KIND_VALUES as TODO_RESUME_KIND_VALUES,
     normalize_supported_todo_resume_when as normalize_supported_todo_resume_when,
@@ -1115,7 +1116,9 @@ _TODO_METADATA_FIELD_SCHEMA = (
         _TodoMetadataField(
             key,
             _nonempty_metadata_text,
-            write_normalizer=_truthy_value,
+            write_normalizer=normalize_todo_generation
+            if key == "material_change_generation"
+            else _truthy_value,
         )
         for key in TODO_MONITOR_METADATA_FIELDS
     ),

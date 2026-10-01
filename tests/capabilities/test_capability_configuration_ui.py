@@ -7,7 +7,44 @@ from loopx.capabilities.configuration_ui import (
     capability_configuration_editor,
     resolve_capability_configuration,
 )
-from loopx.configuration_catalog import build_goal_configuration_catalog
+from loopx.capabilities.machine_configuration.builtins import (
+    build_builtin_machine_configuration_registry,
+)
+from loopx.configuration_catalog import (
+    build_configuration_capability_descriptors,
+    build_goal_configuration_catalog,
+)
+
+
+def test_machine_catalog_only_uses_dashboard_supported_editor_kinds() -> None:
+    """A Goal-only descriptor must not make the whole machine page unreadable."""
+
+    catalog = build_capability_configuration_catalog(
+        machine_namespaces=build_builtin_machine_configuration_registry().public_catalog()[
+            "namespaces"
+        ],
+        goal_features=build_configuration_capability_descriptors(),
+    )
+    supported = {
+        "boolean",
+        "number",
+        "select",
+        "string_list",
+        "text",
+        "periodic_report_schedule",
+    }
+    fields = {
+        (capability["capability_id"], field["key"]): field
+        for capability in catalog["capabilities"]
+        for field in capability["configuration_editor"]["fields"]
+    }
+    assert fields[("progress_review", "drift_threshold")]["input_kind"] == "number"
+    unsupported = {
+        key: field["input_kind"]
+        for key, field in fields.items()
+        if field["input_kind"] not in supported
+    }
+    assert unsupported == {}
 
 
 def test_periodic_report_editor_is_shared_across_machine_and_goal_scopes() -> None:
@@ -21,7 +58,126 @@ def test_periodic_report_editor_is_shared_across_machine_and_goal_scopes() -> No
         "profile_preset",
         "route_ref",
         "timezone",
+        "schedule",
     ]
+
+
+def test_pull_request_review_editor_supports_machine_and_goal_ci_policy() -> None:
+    editor = capability_configuration_editor("pull_request_review")
+
+    assert editor["schema_version"] == "capability_configuration_editor_v0"
+    assert editor["editable"] is True
+    assert editor["supported_scopes"] == ["machine", "goal"]
+    assert editor["writable_scopes"] == ["machine", "goal"]
+    assert editor["fields"][0]["key"] == "wait_for_ci"
+    assert editor["fields"][0]["input_kind"] == "boolean"
+    assert editor["fields"][1:] == [
+        {
+            "key": "review_priority",
+            "label": "Review priority",
+            "description": (
+                "Default ranks actionable PRs whose author differs from the "
+                "authenticated reviewer before the reviewer's own PRs."
+            ),
+            "input_kind": "select",
+            "required": True,
+            "options": ["other-developers-first", "owner-first"],
+        }
+    ]
+
+
+def test_reward_memory_editor_writes_binding_without_returning_private_path() -> None:
+    editor = capability_configuration_editor("reward_memory")
+
+    assert editor["editable"] is True
+    assert editor["writable_scopes"] == ["goal"]
+    assert [field["key"] for field in editor["fields"]] == [
+        "config_path",
+        "enabled_agents",
+    ]
+    catalog = build_capability_configuration_catalog(
+        goal_features=[
+            {
+                "feature_id": "reward_memory",
+                "display_name": "Reward Memory",
+                "current": {
+                    "enabled": True,
+                    "config_pointer_registered": True,
+                    "binding_revision": "sha256:opaque",
+                    "enabled_agents": ["researcher"],
+                },
+            }
+        ]
+    )
+    current = catalog["capabilities"][0]["current"]
+    assert current["config_pointer_registered"] is True
+    assert "config_path" not in current
+
+
+def test_steward_executor_editor_is_machine_only_and_typed() -> None:
+    """The steward's executor is a machine setting no Goal can override."""
+
+    editor = capability_configuration_editor("steward_executor")
+
+    assert editor["editable"] is True
+    assert editor["supported_scopes"] == ["machine"]
+    assert editor["writable_scopes"] == ["machine"]
+    fields = {field["key"]: field for field in editor["fields"]}
+    # The form offers exactly the choices the owning namespace accepts, so a
+    # submission cannot name an executor the channel has no contract for.
+    assert fields["executor_endpoint"]["input_kind"] == "select"
+    assert fields["executor_endpoint"]["options"] == ["codex", "dsh"]
+    assert fields["executor_endpoint"]["required"] is True
+    assert fields["selection_policy"]["options"] == [
+        "preferred",
+        "pinned",
+        "flexible",
+    ]
+    assert fields["eligible_endpoints"]["input_kind"] == "string_list"
+    assert fields["executor_model"]["input_kind"] == "text"
+    assert fields["executor_model"]["nullable"] is True
+    assert fields["executor_reasoning_effort"]["input_kind"] == "select"
+    assert fields["executor_reasoning_effort"]["nullable"] is True
+    assert "high" in fields["executor_reasoning_effort"]["options"]
+    with pytest.raises(ValueError, match="does not support Goal configuration"):
+        resolve_capability_configuration(
+            "steward_executor",
+            goal_override={
+                "schema_version": "steward_executor_machine_defaults_v0",
+                "executor_endpoint": "dsh",
+            },
+        )
+    catalog = build_capability_configuration_catalog(
+        machine_namespaces=[
+            {
+                "namespace": "steward_executor",
+                "title": "Steward executor",
+                "current": {
+                    "schema_version": "steward_executor_machine_defaults_v0",
+                    "executor_endpoint": "dsh",
+                    "executor_model": "deepseek-v4-flash",
+                    "executor_reasoning_effort": "high",
+                },
+                "configuration_template": {
+                    "schema_version": "steward_executor_machine_defaults_v1",
+                    "selection_policy": "preferred",
+                    "executor_endpoint": "codex",
+                    "eligible_endpoints": [],
+                    "executor_model": None,
+                    "executor_reasoning_effort": None,
+                },
+            }
+        ]
+    )
+    capability = catalog["capabilities"][0]
+    assert capability["available_scopes"] == ["machine"]
+    # The configured machine value is the effective value, and it is reported as
+    # an inherited machine default rather than as a capability default.
+    assert capability["effective_configuration"]["source"] == "machine_default"
+    assert capability["effective_configuration"]["inherited"] is True
+    assert capability["effective_configuration"]["configuration"] == (
+        capability["machine_current"]
+    )
 
 
 def test_catalog_merges_machine_and_goal_descriptors_without_losing_scope() -> None:
@@ -108,12 +264,25 @@ def test_goal_configuration_uses_the_shared_capability_catalog() -> None:
     assert {item["capability_id"] for item in shared["capabilities"]} == {
         item["feature_id"] for item in catalog["features"]
     }
-    assert all(item["available_scopes"] == ["goal"] for item in shared["capabilities"])
+    scopes = {
+        item["capability_id"]: item["available_scopes"]
+        for item in shared["capabilities"]
+    }
+    assert scopes["todo_replan_cadence"] == ["goal"]
+    assert scopes["change_quality_qualification"] == ["goal"]
+    assert all(
+        item["available_scopes"] == ["goal"] for item in shared["capabilities"]
+    )
     multi_subagent = next(
         item
         for item in shared["capabilities"]
         if item["capability_id"] == "multi_subagent"
     )
+    assert multi_subagent["context_contribution"] == {
+        "supported_phases": ["before_plan", "before_delegate", "after_delegate_result"],
+        "target": "coordinator", "activation": "with_capability", "receipt_required": True,
+    }
+    assert "context_contribution" not in multi_subagent["current"]
     assert multi_subagent["default"] == {
         "enabled": False,
         "max_children": 3,
@@ -183,3 +352,43 @@ def test_resolution_rejects_values_for_unsupported_scopes() -> None:
             "periodic_report",
             goal_override=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "scopes"),
+    [
+        ("manager_runtime", ["machine"]),
+        ("steward_executor", ["machine"]),
+        ("periodic_report", ["machine", "goal"]),
+        ("change_quality_qualification", ["machine", "goal"]),
+        ("pull_request_review", ["machine", "goal"]),
+        ("todo_replan_cadence", ["machine", "goal"]),
+        ("multi_subagent", ["goal"]),
+        ("peer_task_coordination", ["goal"]),
+        ("explore_harness", ["goal"]),
+        ("explore_graph", ["goal"]),
+        ("progress_review", ["goal"]),
+        ("reward_memory", ["goal"]),
+        ("lark_kanban_heartbeat_sync", ["goal"]),
+        ("lark_event_inbox", ["goal"]),
+        ("coordination_runtime_shadow", ["goal"]),
+        ("local_authority_shadow", ["goal"]),
+    ],
+)
+def test_capability_scope_matches_product_ownership(capability_id, scopes) -> None:
+    """Host authority, reusable defaults and Goal bindings stay distinct."""
+
+    catalog = build_capability_configuration_catalog(
+        machine_namespaces=build_builtin_machine_configuration_registry().public_catalog()[
+            "namespaces"
+        ],
+        goal_features=build_configuration_capability_descriptors(),
+    )
+    descriptor = next(c for c in catalog["capabilities"] if c["capability_id"] == capability_id)
+    assert descriptor["available_scopes"] == scopes
+    assert descriptor["configuration_editor"]["supported_scopes"] == scopes
+    assert set(descriptor["configuration_editor"]["writable_scopes"]) <= set(scopes)
+    for scope, keyword in (("machine", "machine_default"), ("goal", "goal_override")):
+        if scope not in scopes:
+            with pytest.raises(ValueError, match="does not support"):
+                resolve_capability_configuration(capability_id, **{keyword: {}})

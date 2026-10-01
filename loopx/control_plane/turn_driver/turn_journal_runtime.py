@@ -26,6 +26,7 @@ _PROJECTION_KEYS = {
     "journal_consistent",
     "recovery_decision",
     "last_recovery",
+    "recorded_effects",
     "effects",
 }
 _BOOLEAN_PROJECTION_KEYS = {
@@ -145,6 +146,12 @@ def interpret_turn_journal_projection(
         or not all(isinstance(violation, str) for violation in payload["violations"])
         or not _validate_recovery_decision(payload.get("recovery_decision"))
         or not _validate_recovery_audit(payload.get("last_recovery"))
+        or not isinstance(payload.get("recorded_effects"), dict)
+        or set(payload["recorded_effects"]) != {
+            "host_invoked", "state_written", "quota_spent", "scheduler_acknowledged",
+        }
+        or any(value is not None and not isinstance(value, bool)
+               for value in payload["recorded_effects"].values())
     ):
         raise RuntimeError(
             "TypeScript Turn-journal inspection projection type mismatch"
@@ -159,16 +166,20 @@ def write_turn_journal(
     journal: Mapping[str, Any],
     *,
     expected_effect_id: str | None = None,
+    source_admission: Mapping[str, Any] | None = None,
 ) -> dict[str, object]:
     """Commit a Turn-journal transition through the TS semantic owner."""
 
+    request: dict[str, Any] = {
+        "path": path,
+        "journal": dict(journal),
+        "expected_effect_id": expected_effect_id,
+    }
+    if source_admission is not None:
+        request["source_admission"] = dict(source_admission)
     payload = effect_runtime_result(
         "turn_journal.write",
-        {
-            "path": path,
-            "journal": dict(journal),
-            "expected_effect_id": expected_effect_id,
-        },
+        request,
         retry_safe=True,
     )
     if (

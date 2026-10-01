@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from ...capabilities.periodic_report.cli import render_periodic_report_markdown
+from ...history import load_registry
 from ...paths import resolve_runtime_root
-from ...registry import read_json
 from ..runtime import default_extension_state_file, resolve_extension_activation
 from . import (
     LARK_EXTENSION_ID,
@@ -92,7 +92,7 @@ def _resolved_goal_channel_runtime_root(
 ) -> tuple[Path, Path]:
     resolved_registry = registry_path.expanduser().resolve()
     runtime_root = resolve_runtime_root(
-        read_json(resolved_registry),
+        load_registry(resolved_registry),
         runtime_root_arg,
         registry_path=resolved_registry,
     )

@@ -1,6 +1,7 @@
 # RFC：Obelisk Session Evidence Provider v0
 
-- 状态：集成提案草案
+- 状态：已接受
+- 替代 / 关闭：无
 - 日期：2026-09-01
 - 跟踪 Issue：[#3792](https://github.com/huangruiteng/loopx/issues/3792)
 - 决策边界：LoopX 是否以及如何把历史 Agent Session 作为 Replan 与 Turn Admission 的有界证据
@@ -99,6 +100,10 @@ LoopX 不得把 Obelisk 代码 Vendor、静态链接、翻译或复制进 Core�
 Obelisk Hit 是历史观察，不是 `reward_memory_active_record_v0`，不得伪装成已审阅 Reward
 Memory。未来如果 Decision Context 或 Explore 出现第二个真实 Caller，应在其拥有独立
 Admission Policy 后复用 Provider-neutral Historical Evidence Contract，而不是提前抽象。
+
+### 3.2 跨 session 续接 caller
+
+[强能力管家/语义交接 RFC §5.7](capable-manager-semantic-handoff-v0.zh-CN.md#57-会话与产品连续性) 提议明确的 `resume_or_handoff_gap` 恢复 caller：先恢复当前工作和已有主动续接 brief（包括适用时的 [Stage A](cross-session-memory-substrate-v0.zh-CN.md) 上下文），再只查询缺失的决策证据。这是拟议集成，不代表 caller 已交付或本 provider 晋级。同 Agent 更换 session 可满足初始 scope；另一接收者不能从 handoff 继承来源 Agent 的 archive 检索权。有权限的来源摘录可随 brief 传递，不同时授予 archive 搜索。下文 provider 阶段、默认关闭、scope、私有结果/公开回执边界及验收要求不变。基础续接必须在没有 Obelisk 时成立。
 
 ## 4. Admission Policy
 

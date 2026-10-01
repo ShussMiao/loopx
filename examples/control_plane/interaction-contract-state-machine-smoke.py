@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canary the interaction/protocol state machine across major quota modes."""
+"""Canary the structured interaction state machine across major quota modes."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from loopx.control_plane.work_items.execution_obligation import (  # noqa: E402
 )
 from loopx.control_plane.work_items.interaction_contract import (  # noqa: E402
     build_interaction_contract,
-    build_protocol_action_packet,
     user_channel_action_required,
 )
 from loopx.control_plane.work_items.work_lane import build_work_lane_contract  # noqa: E402
@@ -195,7 +194,6 @@ def finalize(payload: dict[str, Any]) -> dict[str, Any]:
         ],
         scheduler_execution_context=APP_SCHEDULER_CONTEXT,
     )
-    payload["protocol_action_packet"] = build_protocol_action_packet(payload)
     return payload
 
 
@@ -276,7 +274,7 @@ def _assert_cross_layer_case(
     must_attempt: bool = True,
     quiet: bool = False,
     spend: bool = True,
-    summary_fragments: tuple[str, ...] = (),
+    action_fragment: str | None = None,
     cli_fragments: tuple[str, ...] = (),
 ) -> None:
     contract = payload["interaction_contract"]
@@ -297,9 +295,9 @@ def _assert_cross_layer_case(
         name,
         scheduler_hint,
     )
-    summary = payload["protocol_action_packet"]["summary"]
-    for fragment in summary_fragments:
-        assert fragment in summary, (name, summary)
+    assert "protocol_action_packet" not in payload, (name, payload)
+    if action_fragment is not None:
+        assert action_fragment in contract["agent_channel"]["primary_action"], (name, contract)
     cli_actions = " ".join(contract["cli_channel"]["next_cli_actions"])
     for fragment in cli_fragments:
         assert fragment in cli_actions, (name, cli_actions)
@@ -319,7 +317,6 @@ def assert_cross_layer_state_machine_matrix() -> None:
         lane="advancement_task",
         obligation="advance_one_bounded_segment",
         interaction="bounded_delivery",
-        summary_fragments=("lane=advancement_task", "scheduler=run_now"),
     )
     _assert_cross_layer_case(
         "due monitor preemption",
@@ -327,7 +324,7 @@ def assert_cross_layer_state_machine_matrix() -> None:
         lane="continuous_monitor",
         obligation="attempt_due_monitor",
         interaction="bounded_delivery",
-        summary_fragments=("lane=continuous_monitor", "todo_due_monitor"),
+        action_fragment="todo_due_monitor",
     )
     _assert_cross_layer_case(
         "monitor schedule gap repair",
@@ -335,10 +332,7 @@ def assert_cross_layer_state_machine_matrix() -> None:
         lane="advancement_task",
         obligation="repair_monitor_schedule_metadata",
         interaction="bounded_delivery",
-        summary_fragments=(
-            "lane=advancement_task",
-            "repair the selected continuous_monitor todo",
-        ),
+        action_fragment="repair the selected continuous_monitor todo",
     )
     _assert_cross_layer_case(
         "monitor quiet wait",
@@ -358,10 +352,6 @@ def assert_cross_layer_state_machine_matrix() -> None:
         must_attempt=False,
         quiet=True,
         spend=False,
-        summary_fragments=(
-            "lane=continuous_monitor",
-            "scheduler=backoff_until_material_transition",
-        ),
     )
     _assert_cross_layer_case(
         "agent scope wait",
@@ -379,13 +369,11 @@ def assert_cross_layer_state_machine_matrix() -> None:
         must_attempt=False,
         quiet=True,
         spend=False,
-        summary_fragments=("scheduler=backoff_until_reassigned",),
     )
     _assert_cross_layer_case(
         "successor replan",
         _successor_replan_payload(),
         interaction=AgentScopeFrontierAction.SUCCESSOR_REPLAN_REQUIRED.value,
-        summary_fragments=("scheduler=run_now",),
         cli_fragments=("todo_deferred_successor",),
     )
 
@@ -405,10 +393,9 @@ def assert_bounded_delivery_bundle() -> None:
     assert contract["agent_channel"]["quiet_noop_allowed"] is False, contract
     assert contract["cli_channel"]["spend_after_validation"] is True, contract
     assert payload["scheduler_hint"]["action"] == "run_now", payload
-    summary = payload["protocol_action_packet"]["summary"]
-    assert "actor=agent" in summary, summary
-    assert "lane=advancement_task" in summary, summary
-    assert "scheduler=run_now" in summary, summary
+    assert contract["user_channel"]["action_required"] is False, contract
+    assert payload["work_lane_contract"]["lane"] == "advancement_task", payload
+    assert "protocol_action_packet" not in payload, payload
 
 
 def assert_user_notice_can_coexist_with_bounded_delivery() -> None:
@@ -474,10 +461,7 @@ def assert_user_action_is_non_blocking_notice() -> None:
     ], contract
     assert contract["agent_channel"]["must_attempt"] is True, contract
     assert contract["agent_channel"]["delivery_allowed"] is True, contract
-    summary = payload["protocol_action_packet"]["summary"]
-    assert "actor=agent" in summary, summary
-    assert "user_action_required=false" in summary, summary
-    assert "user_action_pending=true" in summary, summary
+    assert "protocol_action_packet" not in payload, payload
 
 
 def assert_gate_cooldown_suppresses_non_blocking_notice() -> None:
@@ -612,20 +596,16 @@ def assert_required_reads_are_mirrored_into_execution_channels() -> None:
         work_lane=advancement_lane(),
         heartbeat_mode="steering_audit_then_one_step",
     )
-    payload["required_reads"] = [
+    expected = [
         {
             "kind": "agent_scoped_evidence_log",
             "command": "  loopx evidence-log --goal-id interaction-state-machine-goal  ",
         }
     ]
+    # Reads are mirrored losslessly; the transport does not rewrite commands.
+    payload["required_reads"] = expected
     payload = finalize(payload)
     contract = payload["interaction_contract"]
-    expected = [
-        {
-            "kind": "agent_scoped_evidence_log",
-            "command": "loopx evidence-log --goal-id interaction-state-machine-goal",
-        }
-    ]
     assert contract["agent_channel"]["required_reads"] == expected, contract
     assert contract["cli_channel"]["required_reads"] == expected, contract
     assert "required_reads" not in contract["user_channel"], contract

@@ -1,16 +1,36 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile, writeFile, rename, unlink } from "node:fs/promises";
+import { readFile, writeFile, rename, symlink, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import type { JsonObject } from "../../loopx/control_plane/effect_program.ts";
-import { commitLocalAuthorityShadowEntry, readLocalAuthorityShadow } from "../../loopx/control_plane/coordination/local_authority_shadow.ts";
+import {
+  commitLocalAuthorityShadowEntry,
+  localAuthorityShadowPartitionDigest,
+  readLocalAuthorityShadow,
+} from "../../loopx/control_plane/coordination/local_authority_shadow.ts";
 import { outboxEntryIdentity, beginLeaseOutboxEntry } from "../../loopx/control_plane/coordination/local_authority_shadow_outbox.ts";
+import {
+  drainShadowOutbox,
+  SHADOW_DRAIN_SCHEMA,
+  SHADOW_EXACT_DRAIN_SCHEMA,
+} from "../../loopx/control_plane/coordination/shadow_drain.ts";
+import { requireShadowCaptureBinding } from "../../loopx/control_plane/coordination/shadow_management.ts";
 import * as schemas from "../../loopx/control_plane/coordination/coordination_state_contract.generated.ts";
 import { fixture, pendingEntry, settleFiles, todo, sha } from "./shadow_file_fixture.ts";
+import { resolveTestPython } from "../../scripts/test-python.mjs";
 
 const execFileAsync = promisify(execFile);
+const PYTHON = resolveTestPython();
+const GOAL_A = {
+  goal_id: "goal-a",
+  goal_instance_id: "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+};
+const GOAL_B = {
+  goal_id: "goal-a",
+  goal_instance_id: "ginst_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+};
 
 test("one primary entry commits exactly once after a complete baseline", async (t) => {
   const f = await fixture(t);
@@ -34,6 +54,47 @@ test("one primary entry commits exactly once after a complete baseline", async (
   assert.equal(replay.outcome, "replayed"); assert.equal(replay.cursor, "2");
   const history = await f.store.scanCommitted(null, 10);
   assert.equal(history.status, "page"); if (history.status === "page") assert.equal(history.transactions.length, 2);
+});
+
+test("exact drain rejects stale and legacy callers before advancing Goal A", async (t) => {
+  const f = await fixture(t, GOAL_A);
+  await pendingEntry(f, 1, {handoff_mode: "hard_lease", todos: [todo()]});
+  const before = await f.store.loadAuthority();
+  const base = {
+    runtime_root: f.root,
+    goal_id: "goal-a",
+    python_executable: PYTHON,
+    config_enabled: true,
+    max_entries: 10,
+    budget_seconds: 10,
+    lock_timeout_seconds: 2,
+  };
+
+  const stale = await drainShadowOutbox({
+    ...base,
+    schema_version: SHADOW_EXACT_DRAIN_SCHEMA,
+    goal_ref: GOAL_B,
+  });
+  assert.equal(stale.outcome, "stopped");
+  assert.equal(stale.reason_code, "stale_goal_instance");
+  assert.equal(stale.pending_after, 1);
+  assert.deepEqual(await f.store.loadAuthority(), before);
+
+  const legacy = await drainShadowOutbox({
+    ...base,
+    schema_version: SHADOW_DRAIN_SCHEMA,
+  });
+  assert.equal(legacy.outcome, "stopped");
+  assert.equal(legacy.reason_code, "legacy_goal_binding");
+  assert.deepEqual(await f.store.loadAuthority(), before);
+
+  const current = await drainShadowOutbox({
+    ...base,
+    schema_version: SHADOW_EXACT_DRAIN_SCHEMA,
+    goal_ref: GOAL_A,
+  });
+  assert.equal(current.outcome, "drained");
+  assert.equal(current.delivered, 1);
 });
 
 test("receipt replay rejects every changed identity field even after pending cleanup", async (t) => {
@@ -135,10 +196,88 @@ test("a lease writer with a missing cursor obtains its next sequence from proved
   await unlink(join(directory, "drain-cursor.json"));
   const capture = await beginLeaseOutboxEntry({ runtime_root: f.root, goal_id: "goal-a",
     lease_directory: join(f.root, "goals", "goal-a", "task-leases"), write_class: "task_lease_renew",
-    operation_id: null, previous_lease: lease, planned_lease: { ...lease, version: 2 } });
+    operation_id: null, previous_lease: lease, planned_lease: { ...lease, version: 2 },
+    active_todo_ids: null });
   assert.equal(capture.failure, null);
   assert.equal(capture.seq, 2);
   await assert.rejects(readFile(join(directory, "drain-cursor.json")), { code: "ENOENT" });
+});
+
+test("exact lease capture rejects a recreated Goal and an unstamped caller", async (t) => {
+  const f = await fixture(t, GOAL_A);
+  const lease = {
+    schema_version: "task_lease_v0",
+    goal_id: "goal-a",
+    todo_id: "todo_one",
+    owner: "agent-a",
+    version: 1,
+    lease_epoch: 1,
+    status: "active",
+    updated_at: "2026-09-06T00:00:00Z",
+  };
+  const input = {
+    runtime_root: f.root,
+    goal_id: "goal-a",
+    lease_directory: join(f.root, "goals", "goal-a", "task-leases"),
+    write_class: "task_lease_acquire",
+    operation_id: null,
+    previous_lease: null,
+    planned_lease: lease,
+    active_todo_ids: null,
+  };
+  const stale = await beginLeaseOutboxEntry({...input, goal_ref: GOAL_B});
+  assert.equal(stale.failure?.reason_code, "stale_goal_instance");
+  assert.equal(stale.failure?.error_class, "ShadowManagementError");
+  const unstamped = await beginLeaseOutboxEntry(input);
+  assert.equal(unstamped.failure?.reason_code, "goal_instance_id_missing");
+  assert.equal(unstamped.failure?.error_class, "ShadowManagementError");
+  const current = await beginLeaseOutboxEntry({...input, goal_ref: GOAL_A});
+  assert.equal(current.failure, null);
+  assert.equal(current.seq, 1);
+});
+
+test("a lease writer uses the active binding digest through a runtime-root alias", async (t) => {
+  const f = await fixture(t);
+  const alias = `${f.root}-alias`;
+  t.after(() => unlink(alias));
+  await symlink(f.root, alias, process.platform === "win32" ? "junction" : "dir");
+  const planned = { schema_version: "task_lease_v0", goal_id: "goal-a", todo_id: "todo_one",
+    owner: "agent-a", version: 1, lease_epoch: 1, status: "active", updated_at: "2026-09-06T00:00:00Z" };
+  const capture = await beginLeaseOutboxEntry({ runtime_root: alias, goal_id: "goal-a",
+    lease_directory: join(alias, "goals", "goal-a", "task-leases"), write_class: "task_lease_acquire",
+    operation_id: null, previous_lease: null, planned_lease: planned, active_todo_ids: null });
+  assert.equal(capture.failure, null);
+  const prepared = JSON.parse(await readFile(join(alias, "authority-shadow", "outbox", "goal-a", "leases",
+    `0000000001-${capture.entry_id}.prepared.json`), "utf8"));
+  assert.equal(prepared.source_root_digest, (await requireShadowCaptureBinding(alias, "goal-a")).source_root_digest);
+});
+
+test("lease capture omits a lease whose Todo left the current graph", async (t) => {
+  const f = await fixture(t);
+  const leaseDirectory = join(f.root, "goals", "goal-a", "task-leases");
+  const archivedLease = { schema_version: "task_lease_v0", goal_id: "goal-a", todo_id: "todo_gone",
+    owner: "agent-a", version: 1, lease_epoch: 1, status: "released", updated_at: "2026-09-06T00:00:00Z" };
+  await writeFile(join(leaseDirectory, "todo_gone.json"), JSON.stringify(archivedLease));
+  const planned = { schema_version: "task_lease_v0", goal_id: "goal-a", todo_id: "todo_one",
+    owner: "agent-a", version: 1, lease_epoch: 1, status: "active", updated_at: "2026-09-06T00:00:00Z" };
+  // `todo_gone` is absent from the graph: the capture must not project it.
+  const filtered = await beginLeaseOutboxEntry({ runtime_root: f.root, goal_id: "goal-a",
+    lease_directory: leaseDirectory, write_class: "task_lease_acquire", operation_id: "op-1",
+    previous_lease: null, planned_lease: planned, active_todo_ids: ["todo_one"] });
+  assert.equal(filtered.failure, null);
+  const prepared = JSON.parse(await readFile(
+    join(f.root, "authority-shadow", "outbox", "goal-a", "leases",
+      `0000000001-${filtered.entry_id}.prepared.json`), "utf8"));
+  assert.deepEqual(prepared.projection.leases.map((item: JsonObject) => item.file_stem), ["todo_one"]);
+  // A graph that still contains the Todo retains it: the rule drops orphans only.
+  const retained = await beginLeaseOutboxEntry({ runtime_root: f.root, goal_id: "goal-a",
+    lease_directory: leaseDirectory, write_class: "task_lease_acquire", operation_id: "op-2",
+    previous_lease: null, planned_lease: planned, active_todo_ids: ["todo_one", "todo_gone"] });
+  assert.equal(retained.failure, null);
+  const second = JSON.parse(await readFile(
+    join(f.root, "authority-shadow", "outbox", "goal-a", "leases",
+      `0000000002-${retained.entry_id}.prepared.json`), "utf8"));
+  assert.deepEqual(second.projection.leases.map((item: JsonObject) => item.file_stem), ["todo_gone", "todo_one"]);
 });
 
 for (const [marker, resolution, expected] of [
@@ -178,6 +317,34 @@ test("a missing primary mutation cannot hide behind continuous sequence numbers 
   assert.equal((await f.store.loadAuthority() as { cursor: string }).cursor, "1");
 });
 
+test("Todo continuity ignores only a changed resume evaluation observation clock", async (t) => {
+  const f = await fixture(t);
+  const original = todo();
+  original.resume_condition = {
+    evaluated_at: "2026-09-20T00:00:00Z",
+    satisfied: false,
+    availability_reason: "resume_condition_pending",
+  };
+  const first = await pendingEntry(f, 1, { handoff_mode: "hard_lease", todos: [original] });
+  const delivered = await commitLocalAuthorityShadowEntry(first);
+  assert.equal(delivered.outcome, "delivered");
+  await settleFiles(f, first, delivered);
+
+  const reread = structuredClone(original);
+  (reread.resume_condition as JsonObject).evaluated_at = "2026-09-21T00:00:00Z";
+  const next = structuredClone(reread);
+  next.text = "Durable Todo mutation after another read";
+  const second = await pendingEntry(
+    f,
+    2,
+    { handoff_mode: "hard_lease", todos: [next] },
+    {
+      previousPartitionProjection: { handoff_mode: "hard_lease", todos: [reread] },
+    },
+  );
+  assert.equal((await commitLocalAuthorityShadowEntry(second)).outcome, "delivered");
+});
+
 test("prose bytes may change only while the canonical previous partition remains proved", async (t) => {
   const f = await fixture(t);
   await writeFile(f.statePath, `${await readFile(f.statePath, "utf8")}\n## Notes\nProse only.\n`);
@@ -188,9 +355,34 @@ test("prose bytes may change only while the canonical previous partition remains
 test("Python and TypeScript entry identity include the same root and lineage", async () => {
   const source = sha("source"); const root = sha("root");
   const script = "from loopx.control_plane.coordination.local_authority_shadow_outbox import entry_identity\nprint(entry_identity(goal_id='goal-a',partition='leases',seq=7,source_ref='" + source + "',capture_lineage_id='lineage-a',source_root_digest='" + root + "'))";
-  const result = await execFileAsync(process.env.LOOPX_TEST_PYTHON ?? "python3", ["-c", script],
+  const result = await execFileAsync(PYTHON, ["-c", script],
     { cwd: join(import.meta.dirname, "..", "..") });
   assert.equal(result.stdout.trim(), outboxEntryIdentity("goal-a", "leases", 7, source, "lineage-a", root));
   assert.notEqual(outboxEntryIdentity("goal-a", "leases", 7, source, "lineage-a", root),
     outboxEntryIdentity("goal-a", "leases", 7, source, "lineage-b", root));
+});
+
+test("Python and TypeScript share the stable Todo partition digest", async () => {
+  const projection = {
+    handoff_mode: "hard_lease",
+    todos: [{
+      ...todo(),
+      resume_condition: {
+        evaluated_at: "2026-09-21T00:00:00Z",
+        satisfied: false,
+        availability_reason: "resume_condition_pending",
+      },
+    }],
+  };
+  const script = [
+    "import json, sys",
+    "from loopx.control_plane.coordination.local_authority_shadow_projection import partition_digest",
+    "print(partition_digest(json.loads(sys.argv[1])))",
+  ].join("\n");
+  const result = await execFileAsync(
+    PYTHON,
+    ["-c", script, JSON.stringify(projection)],
+    { cwd: join(import.meta.dirname, "..", "..") },
+  );
+  assert.equal(result.stdout.trim(), localAuthorityShadowPartitionDigest("todos", projection));
 });

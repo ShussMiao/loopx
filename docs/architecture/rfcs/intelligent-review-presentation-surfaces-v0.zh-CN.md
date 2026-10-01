@@ -1,6 +1,7 @@
 # RFC：智能化审阅与动态展示面 v0
 
-- 状态：Draft，等待 Maintainer 审阅
+- 状态：已接受
+- 替代 / 关闭：无
 - 提案人：LoopX Maintainers
 - 日期：2026-09-01
 - 范围：定义一个 provider-neutral 的 typed interaction projection，用于筛选、展示、审阅和反馈控制面的重要变化，并为卡片、对比、图、报告、Dashboard 与持续演进的文档提供有界 presentation plan；不新增 source store、authority grant、provider effect、通知调度器、万能 renderer，也不要求必须依赖模型
@@ -52,6 +53,15 @@ LoopX 优化的是一个联合目标：
 ```
 
 最小化 attention 不等于最小化信息，也不等于删除人的判断。它意味着最大化每次打扰、每块可见界面的决策价值：
+
+每个可见元素至少满足 **高价值信息、非常必要的交互、富有表现力的视觉呈现** 之一。
+按整个视口评估，不能只看单个组件。开发及 PR 证据流程以
+[Earn The User's Attention](../../development/design.md#earn-the-users-attention) 为准。
+有界落地覆盖 Goal 对话、管家首页、概览、任务、成果与设置：一步打开执行详情；
+首页按有内容的分组分配空间，摘要只展示新增运行结果；紧凑呈现进展与用量；
+看板保留原结构，上方只留简短对话回执；成果来源在原详情中查看；配置影响仍与
+原有预览／应用流程一起直接呈现。失败与不确定性保持可见。此展示切片不代表
+共享 interaction compiler 或跨渠道 projection 已完成。
 
 - 日常、可逆、可验证的工作应安静进行或直接完成；
 - 重要进展应清晰可见，但不应伪装成需要决策；
@@ -542,6 +552,28 @@ type PresentationArtifactPlan = {
 
 Adaptive policy 必须 inspectable、resettable，其输出携带 reason codes，并始终保留 deterministic fallback。
 
+### 8.7 团队实时工作区
+
+[团队实时工作区 v0](live-team-workspace-v0.zh-CN.md) 描述 S5/R2 投研旅程：
+指挥台与空间工作室同列表、语义缩放和历史回放共用 typed 事实。有目的的动态
+是产品目标；注册、执行、返回、独立验收与请求方采用保持分离。保留来源 / 版本
+谱系和不确定性，不能由装饰动态推断活动或由共识人数推断置信度。这是已接受的设计展示切片，不是已交付的团队流，也不新增调度权限。其 L1–L3 计划与 V1–V7 验收
+展开本 RFC Stage 3 的展示旅程，不关闭本文跨渠道或受治理 settlement 验收。
+
+### 8.8 可复用的对话工作界面
+
+管家 Chat、Goal Chat、直接 Agent 对话及其前端/飞书投影，共用一种交互方式。简单事实问题直接回答并给来源；复杂调查给出先行结论、可读 Markdown 报告、证据链接、判断和有界的不确定性。回答结构适应任务，不强制四段模板。保存完整答复；现有工件 owner 支持时提供可独立打开的报告引用。仅以受控安全子集渲染模型 Markdown，不把答复中的 HTML 当可执行内容。渠道长度限制可以调整密度，不能无声删掉结论或证据入口。只有附件不能结清答复义务。
+
+把宿主真实事件投影成紧凑的当前阶段和可展开历史：已接受、排队、开始、工具/公开进度、等待、中断、失败、完成。最终答复优先；完成的日常过程收起，拒绝、无结果、接收方失联保持可见。分别保留来源消息、已准入 Turn、当前续接 owner、事件游标和最终结果身份。重连及重放不能启动第二次模型 Turn、重复事件或丢失最终结果；adapter 未发出的工具活动不能臆造。
+
+停止和修正绑定当前 session 与 Turn，旧控件不能影响后来的 Turn。停止读回区分真实中断、已经结束、不支持或拒绝。忙时修正要么作为本轮原生 steering 接收，要么带可恢复入口回执明确排入后续回合；完成竞态与丢失 ACK 不能使它无声消失。停止对话 Turn 不隐式影响被委派 worker 的 Todo/lease 或待回传义务。前端与飞书以各自展示密度验收同一身份、中断、重放及受众隔离用例。此共用合同复用 Chat/session、工件和展示 owner，不新增第二套对话存储或调度器。
+
+**以注意力为中心回传。** 原对话区分用户请求的成果、日常进展、需要主人决定的事项：成果正常返回，未变化的进展合并进摘要，重要决定给出具体对象、建议、证据和不处理的影响。保留深入证据及负责人对话的直接入口；在负责人处形成的纠偏，通过同一请求关系将相关决定/工作变化带回管家，不复制整段私人对话。来源覆盖和未完成工作保持可见；空目录或已保存但投递失败的答案都不算成功交付。
+
+创建与首次发送同样属于共用界面：切换页面或刷新后保留消息及 pending/failed 状态，提供安全重试/读回，区分 Goal 已创建、Agent 已接入、工作已开始。乐观清空输入框不等于请求已接收。[Golden-query 集](../../product/use-cases/steward/golden-queries.md)在打包前端及每个对外承诺的渠道检查这些入口和完整对话；中间过程展示不为报告特化。
+
+Botmux 是交互参考：[实时卡片](https://github.com/deepcoldy/botmux/blob/982e2c9f16e4f45ae2581967bc1a35a286e7bfa2/docs-site/docs/zh/cards.md)优先保留最终答复、折叠真实过程；[会话模型](https://github.com/deepcoldy/botmux/blob/982e2c9f16e4f45ae2581967bc1a35a286e7bfa2/docs-site/docs/zh/session-model.md)区分对话权与操作权；[Codex 纠偏研究](https://github.com/deepcoldy/botmux/blob/982e2c9f16e4f45ae2581967bc1a35a286e7bfa2/docs/design/2026-05-28-codex-type-ahead-steer-design.md)记录忙时消息会合并或分开回复。停止能力因后端而异。这些公开来源指导竞态和展示验收，不能替代 LoopX adapter 的真实资格，也不要求把 Botmux 装到已有飞书 token 上。
+
 ## 9. 覆盖长程工作的完整生命周期
 
 | 阶段 | 智能化界面的职责 |
@@ -657,7 +689,49 @@ Durable report 与 living document 还必须携带 artifact identity、source li
 - 保持当前 backend 与 renderer；
 - 发布 protocol 与聚焦测试。
 
+当前有界实现位于
+`loopx/control_plane/presentation/action_review_plan.ts`。
+`compileActionReviewPlan` 从已通过 Chat transport schema 的 proposal 编译内部
+`action_review_plan_v0` union；它不是新的公开 wire contract 或合法动作目录。
+Goal 列表的暂停入口消费 `direct`，现有动作抽屉消费解释与可执行状态。
+恢复与删除仍需 review；不完整、未知权限或 stale 的生命周期提案停止直接执行，
+提供重新检查入口。共享 Chat transport schema 要求每条 validation evidence
+均为非空白字符串，保留原文本；无效或混合证据数组拒绝解析并显示执行失败，
+不会触发 apply。编译器复用同一 schema 校验直接调用的输入；仅生命周期直接
+执行额外要求数组非空，其他动作原有的空数组审阅路径保持兼容。
+后端 preview/apply、fingerprint 与 reducer 不变。
+
+Human-confirmed Goal Channel operation 链路交付后，它的 Dashboard 与 Lark
+展示成为这条 seam 的第二个真实消费者。同一个 compiler 现在为 confirmation、
+pending 与 result 状态生成内部 `operation_review_frame_v0`。Dashboard 直接导入
+pure reducer；每次 Lark 卡片渲染只通过 managed TypeScript runtime 请求一次
+frame，随后仅负责 Card 2.0 的 provider-specific 渲染与 transport。Canonical
+lifecycle、authorization、claim、outcome 与 delivery receipt 仍由 Python Chat
+action store 持有。这不会新增 Lark 入口，也不会把 effect authority 移入
+presentation code。
+
+本切片同时修正失败读回的展示：`applied` 但无 `projection_verified: true`
+不能显示已完成，直接操作也会打开异常详情并回滚乐观显示。其他动作保留原有
+reviewed 路径；远端 SSH 生命周期入口仍使用其自身的绑定与读回契约。CLI、Lark
+没有新增入口。验证入口为 Dashboard 的 `smoke:action-review-plan`、
+`smoke:personal-workspace` 与 `smoke:personal-workspace-packaged`。
+
+
+生命周期 preview/apply 返回值会核对请求的 Goal、操作与 proposal 身份。
+其他动作暂缓后即使保留历史 gate，仍保持原有重试入口。失败展示使用 Chat
+错误码和提案状态，不再按错误文案推测 stale 状态。
+
 ### Stage 2：Attention 与 Disclosure Plan
+
+当前 Dashboard 切片：从「需要你」进入事项详情，可查看已有 Todo 投影中的原因、证据、
+目标 Todo/Agent、声明的决策范围和替代关系。只有明确的 `user_gate` 显示为需要决定；
+其他事项不从文案推断阅读或授权含义。已选详情随当前来源更新；来源已无该事项时显示
+不可用；来源读取中或失败时保留的历史事项同样不能视为当前有效，也不再提供决定
+操作。来源与 Goal 的失效状态不会传播到其他健康来源或 Goal。仅当同一来源、同一 Goal 中有明确的
+`superseded_by` 目标时提供跳转。阅读不会关闭 gate。现有普通事项仍沿用受控预览。
+
+此切片尚未实现跨渠道披露编译器、已读回执、授权分类或自动去重，属于 Stage 2 的部分
+交付。CLI 和 Lark 契约保持不变。
 
 - 编译 material attention-queue deltas；
 - 分离 selection、delivery、interaction 与 density；
@@ -673,6 +747,23 @@ Durable report 与 living document 还必须携带 artifact identity、source li
 - 为不同 layout 与 locale 添加 semantic parity fixtures。
 
 ### Stage 4：Replan、Acceptance 与 Settlement Review
+
+本地 Goal「概览」中的交付与依据区域通过一次按需 Chat 读取，组合已有的有界
+`task_graph_projection_v0` 与 `goal_acceptance_observation_projection_v0`。
+支持关系图/列表、搜索、直接关联筛选、当前来源跳转和 Markdown 快照导出。
+覆盖范围、缺失前序、未展开 Gate 及尚未评估的验收保持可见。工作区变化后，
+须刷新才能继续来源跳转或导出；读取失败、来源或 Goal 不匹配不能显示为空成功。
+成果继续由原成果页展示，不作为验收证据导出。
+概览、任务、对话、成果作为 Goal 的直接导航，配置直接进入既有设置编辑器。
+同一 Goal/来源内保留各页筛选、已完成历史与滚动位置；交付区域直接呈现在概览，
+不作为看板/列表的第三种布局，也不经过嵌套设置弹窗。
+
+这是 S5/G2 的有界可见性切片，不代表 G2 资格通过或通用交互编译器完成。
+复用原有 graph、acceptance 和 preview/apply owner，不新增任务、租约、权限或
+验收写入者。CLI 回读继续使用相同投影，Lark Goal Channel 保持现状；跨渠道复盘
+展示及受治理的修订/结算交互，仍由本 tracker 的领域后继承担。验证入口：
+`tests/test_delivery_review.py`、Dashboard `smoke:delivery-review`，以及中英文、
+桌面/窄屏真实打包页面交互。
 
 - 为 material replan delta、acceptance gap 和 effect repair state 增加 domain adapters；
 - 每个 domain reducer 继续保持 authoritative；
@@ -737,6 +828,8 @@ Attention cost 与 outcome quality 必须同时度量：
 - Agent throughput、acceptance quality 与 safety outcomes；
 - model-advice override、hallucination、over-escalation 与 dangerous suppression rate。
 
+[Golden-query evaluation](../../product/use-cases/steward/golden-queries.md)用成对基线/候选任务及逐入口结果落实这些指标。计量可避免的找人、补背景、重复、催办、搬运；必要授权、主动改目标和自愿学习分开报告。保留失败/放弃样本及未知成本/覆盖，不能靠沉默、短回答或少消息刷高分。真实案例在取得独立证据前均未验收。
+
 减少点击但降低 accepted outcome quality 是回归，不是成功。
 
 ## 15. Failure 与 Fallback Rules
@@ -776,7 +869,7 @@ Attention cost 与 outcome quality 必须同时度量：
 
 ## 18. RFC 验收条件
 
-当 Maintainers 对以下内容达成一致时，本 RFC 才可离开 Draft：
+RFC 合入即接受设计依据。实现资格仍覆盖以下内容：
 
 1. projection-only authority boundary；
 2. 封闭的 interaction modes 与优先级；

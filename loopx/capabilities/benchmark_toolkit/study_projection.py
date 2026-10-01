@@ -6,7 +6,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import statistics
 import tempfile
 from collections.abc import Iterable, Mapping
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ...file_lock import exclusive_file_lock
+from ...control_plane.content_digest import BARE_SHA256_PATTERN
 from .experiment_board import (
     BENCHMARK_EXPERIMENT_BOARD_ROW_SCHEMA_VERSION,
     benchmark_experiment_board_row_key,
@@ -22,6 +22,10 @@ from .experiment_board import (
     build_benchmark_experiment_board,
     normalize_benchmark_experiment_board_row,
     preview_benchmark_experiment_board_upsert,
+)
+from .experiment_identity import (
+    ARM_ROLES,
+    experiment_token_text as _token,
 )
 from .four_arm_contract import BENCHMARK_FOUR_ARM_CONTRACT_SCHEMA_VERSION
 from .runtime_observation import (
@@ -40,9 +44,6 @@ BENCHMARK_CASE_INSIGHT_PROJECTION_SCHEMA_VERSION = (
 )
 BENCHMARK_STUDY_DASHBOARD_SCHEMA_VERSION = "benchmark_study_dashboard_v0"
 
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,127}$")
-_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_ARM_ROLES = {"baseline", "control", "treatment", "explore"}
 _METRIC_ROLES = {"primary", "guardrail", "supporting"}
 _RECORD_KINDS = {
     "study_manifest",
@@ -61,13 +62,6 @@ def _reject_unknown_fields(
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValueError(f"{field} contains unsupported fields: {', '.join(unknown)}")
-
-
-def _token(value: Any, *, field: str) -> str:
-    text = str(value or "").strip()
-    if not _TOKEN_RE.fullmatch(text):
-        raise ValueError(f"{field} must be a compact public-safe token")
-    return text
 
 
 def _optional_token(value: Any, *, field: str) -> str | None:
@@ -230,7 +224,7 @@ def normalize_benchmark_study_manifest(
         )
         arm_id = _token(raw_arm.get("arm_id"), field="arm.arm_id")
         arm_role = _token(raw_arm.get("arm_role"), field="arm.arm_role")
-        if arm_role not in _ARM_ROLES:
+        if arm_role not in ARM_ROLES:
             raise ValueError("arm.arm_role is unsupported")
         raw_assignments = raw_arm.get("factor_assignments")
         if not isinstance(raw_assignments, Mapping):
@@ -579,7 +573,7 @@ def normalize_benchmark_upload_envelope(
     if payload.get("record_id") != rebuilt["record_id"]:
         raise ValueError("benchmark upload record_id does not match envelope identity")
     digest = str(payload.get("payload_digest") or "")
-    if not _DIGEST_RE.fullmatch(digest) or digest != rebuilt["payload_digest"]:
+    if not BARE_SHA256_PATTERN.fullmatch(digest) or digest != rebuilt["payload_digest"]:
         raise ValueError("benchmark upload payload digest mismatch")
     return rebuilt
 
@@ -588,7 +582,7 @@ def _read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
-    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for index, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
         if not line.strip():
             continue
         try:

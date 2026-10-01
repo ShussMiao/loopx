@@ -103,8 +103,7 @@ capability_gate
 work_lane_contract
 vision_continuation_audit
 user_todo_summary / agent_todo_summary
-protocol_action_packet
-compatibility fields
+compatibility fields (historical protocol_action_packet is read-only)
 ```
 
 其中最稳定的执行入口是：
@@ -611,7 +610,7 @@ workspace guard 在这里覆盖 capability/self-repair，是因为任何会写 r
 
 ### 4. `terminal_no_followup` 必须由完整 closure 推导
 
-`loopx/control_plane/goals/goal_frontier.py` 把 terminal 拆成两次验证。
+`loopx/control_plane/goals/goal_frontier/terminal.py` 把 terminal 拆成两次验证。
 
 第一次验证 user/agent todo source：
 

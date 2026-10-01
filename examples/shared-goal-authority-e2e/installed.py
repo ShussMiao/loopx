@@ -122,6 +122,7 @@ resources = {}
 for relative in ['control_plane/coordination/runtime_shadow.ts', 'control_plane/coordination/shadow_management.ts',
     'control_plane/coordination/file_authority_store.ts', 'control_plane/coordination/local_authority_shadow_identity.ts',
     'control_plane/coordination/legacy_writer_lock_paths.ts',
+    'control_plane/runtime/receipt_log_snapshot.ts',
     'control_plane/work_items/task_lease_acquire.ts',
     'control_plane/coordination/coordination_state_contract_v0.json',
     'control_plane/coordination/coordination_state_contract.generated.ts']:
@@ -143,7 +144,7 @@ print(json.dumps({'executable': sys.executable, 'package': str(package),
 
         self.cli("console_project_bootstrap", "bootstrap", "--project", str(self.project),
             "--goal-id", GOAL, "--objective", "Qualify installed authority transactions.",
-            "--no-onboarding-scan", "--onboarding-connection-validation", "provider-prevalidated", "--no-global-sync")
+            "--no-global-sync")
         # Set configuration only, before shadow bootstrap creates the real binding.
         registry = json.loads(self.registry.read_text())
         goal = next(item for item in registry["goals"] if item["id"] == GOAL)

@@ -1,10 +1,11 @@
+export {ShadowLineageError} from "./local_authority_shadow_identity.ts";
+import {currentGraphTodoIds} from "./source_projection.ts";
+import {verifyPendingEntryFiles, withMarkerlessSourceProof} from "./shadow_entry_evidence.ts";
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
 import type { JsonObject } from "../effect_program.ts";
 import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
-import { withFileMutationLock } from "../effect_runtime_io.ts";
 import {
   requireInteger,
   requireJsonObject,
@@ -20,15 +21,20 @@ import type {
 } from "./authority_store.ts";
 import { authorityUnicodeCompare, canonicalAuthorityBytes, canonicalAuthoritySha256 } from "./authority_store_codec.ts";
 import {
-  TODO_CANONICAL_READ_RECORD_FIELDS,
+  coordinationTodoReadModel,
   validateCoordinationTodoReadModel,
 } from "./coordination_projection.ts";
 import { FileAuthorityStore } from "./file_authority_store.ts";
-import { requireShadowCaptureBinding, withShadowMaintenanceLock, readShadowBootstrapSourcePath } from "./shadow_management.ts";
-import { outboxEntryIdentity, OUTBOX_ENTRY_FILE_PATTERN } from "./local_authority_shadow_identity.ts";
-import { legacyCoordinationTodoLockPath, taskLeaseLockPath } from "./legacy_writer_lock_paths.ts";
+import { parseExactGoalRef } from "../goals/goal_instance_identity.ts";
 import {
-  LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA,
+  requireShadowBindingGoalRef,
+  requireShadowCaptureBinding,
+  shadowBindingGoalRef,
+  type WireGoalRef,
+  withShadowMaintenanceLock,
+} from "./shadow_management.ts";
+import { outboxEntryIdentity, ShadowLineageError } from "./local_authority_shadow_identity.ts";
+import {
   LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_RESULT_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_EVENT_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_EVIDENCE_SCHEMA,
@@ -39,9 +45,8 @@ import {
   LOCAL_AUTHORITY_SHADOW_REQUEST_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_TRANSACTION_PROJECTION_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_TRANSACTION_RECEIPT_SCHEMA,
-  LOCAL_AUTHORITY_SHADOW_OUTBOX_ENTRY_SCHEMA,
-  LOCAL_AUTHORITY_SHADOW_OUTBOX_COMMIT_SCHEMA,
 } from "./coordination_state_contract.generated.ts";
+import { ENVELOPED_SHA256_PATTERN } from "../content_digest.ts";
 
 export {
   LOCAL_AUTHORITY_SHADOW_EVIDENCE_SCHEMA,
@@ -50,323 +55,21 @@ export {
   LOCAL_AUTHORITY_SHADOW_REQUEST_SCHEMA,
 };
 
-const REQUEST_FIELDS = new Set([
-  "schema_version",
-  "mode",
-  "runtime_root",
-  "goal_id",
-  "observation_id",
-  "observation_trigger",
-  "source_digest",
-  "source_projection",
-]);
-export type LocalAuthorityShadowOutcome =
-  | "captured"
-  | "replayed"
-  | "ambiguous_reconciled"
-  | "ambiguous_unproved"
-  | "unavailable"
-  | "failed"
-  | "protocol_mismatch"
-  | "conflict_retry_required";
-
-export interface LocalAuthorityShadowEvidence extends JsonObject {
-  schema_version: typeof LOCAL_AUTHORITY_SHADOW_EVIDENCE_SCHEMA;
-  outcome: LocalAuthorityShadowOutcome;
-  reason_code: string | null;
-  goal_id: string;
-  observation_id: string;
-  source_digest: string;
-  capture_kind: "post_commit_snapshot";
-  source_transaction_correlated: false;
-  durable_source_outbox: false;
-  source_candidate_compared: false;
-  parity_verdict: "not_evaluated";
-  primary_authority: "legacy_local";
-  candidate_provider: "file";
-  candidate_read_for_decision: false;
-  provider_to_local_writes: false;
-  primary_writeback_preserved: true;
-  store_identity: string | null;
-  provider_revision: string | null;
-  cursor: string | null;
-}
-
-interface LocalAuthorityShadowRequest {
-  mode: "file_one_way";
-  runtime_root: string;
-  goal_id: string;
-  observation_id: string;
-  observation_trigger: string;
-  source_digest: string;
-  source_projection: JsonObject;
+/** Compatibility tombstone for older clients: never open or mint a store. */
+export async function recordLocalAuthorityShadow(_value: unknown): Promise<never> {
+  throw new EffectRuntimeRequestError(
+    "Post-commit observation is retired; configure runtime shadow and explicitly bootstrap its source lineage.",
+    "local_authority_shadow_retired",
+  );
 }
 
 export interface LocalAuthorityShadowDependencies {
   openStore?: (directory: string, goalId: string) => AuthorityStore;
 }
 
-function decodeRequest(value: unknown): LocalAuthorityShadowRequest {
-  const request = requireJsonObject(value, "local authority shadow request");
-  const unexpected = Object.keys(request).filter((field) => !REQUEST_FIELDS.has(field));
-  if (unexpected.length > 0) {
-    const listed = [...unexpected].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
-    throw new EffectRuntimeRequestError(
-      `Local authority shadow request has unsupported fields: ${listed.join(", ")}`,
-    );
-  }
-  if (request.schema_version !== LOCAL_AUTHORITY_SHADOW_REQUEST_SCHEMA) {
-    throw new EffectRuntimeRequestError("Local authority shadow request schema mismatch");
-  }
-  if (request.mode !== "file_one_way") {
-    throw new EffectRuntimeRequestError("Local authority shadow mode must be file_one_way");
-  }
-  const goalId = requireNonEmptyString(request.goal_id, "goal_id");
-  if (goalId === "." || goalId === ".." || goalId.includes("/") || goalId.includes("\\")) {
-    throw new EffectRuntimeRequestError(
-      "Local authority shadow goal id must be a single path segment",
-    );
-  }
-  const projection = requireJsonObject(request.source_projection, "source_projection");
-  if (
-    projection.schema_version !== LOCAL_AUTHORITY_SHADOW_PROJECTION_SCHEMA ||
-    projection.goal_id !== goalId
-  ) {
-    throw new EffectRuntimeRequestError(
-      "Local authority shadow projection schema or goal identity mismatch",
-    );
-  }
-  const sourceDigest = requireNonEmptyString(request.source_digest, "source_digest");
-  if (!/^sha256:[a-f0-9]{64}$/u.test(sourceDigest)) {
-    throw new EffectRuntimeRequestError("source_digest must be sha256:<64 lowercase hex>");
-  }
-  return {
-    mode: "file_one_way",
-    runtime_root: requireNonEmptyString(request.runtime_root, "runtime_root"),
-    goal_id: goalId,
-    observation_id: requireNonEmptyString(request.observation_id, "observation_id"),
-    observation_trigger: requireNonEmptyString(
-      request.observation_trigger,
-      "observation_trigger",
-    ),
-    source_digest: sourceDigest,
-    source_projection: structuredClone(projection),
-  };
-}
-
-function evidence(
-  request: LocalAuthorityShadowRequest,
-  outcome: LocalAuthorityShadowOutcome,
-  options: {
-    reasonCode?: string | null;
-    storeIdentity?: string | null;
-    providerRevision?: string | null;
-    cursor?: string | null;
-  } = {},
-): LocalAuthorityShadowEvidence {
-  return {
-    schema_version: LOCAL_AUTHORITY_SHADOW_EVIDENCE_SCHEMA,
-    outcome,
-    reason_code: options.reasonCode ?? null,
-    goal_id: request.goal_id,
-    observation_id: request.observation_id,
-    source_digest: request.source_digest,
-    capture_kind: "post_commit_snapshot",
-    source_transaction_correlated: false,
-    durable_source_outbox: false,
-    source_candidate_compared: false,
-    parity_verdict: "not_evaluated",
-    primary_authority: "legacy_local",
-    candidate_provider: "file",
-    candidate_read_for_decision: false,
-    provider_to_local_writes: false,
-    primary_writeback_preserved: true,
-    store_identity: options.storeIdentity ?? null,
-    provider_revision: options.providerRevision ?? null,
-    cursor: options.cursor ?? null,
-  };
-}
-
-function readFailureEvidence(
-  request: LocalAuthorityShadowRequest,
-  result: Extract<AuthorityStoreLoadResult, { status: "unavailable" | "failed" }>,
-  storeIdentity: string | null,
-): LocalAuthorityShadowEvidence {
-  return evidence(request, result.status, {
-    reasonCode: result.reason_code,
-    storeIdentity,
-  });
-}
-
-function receiptMatches(
-  request: LocalAuthorityShadowRequest,
-  result: Extract<AuthorityStoreReceiptResult, { status: "found" }>,
-): boolean {
-  return result.receipts.some((raw) => {
-    const receipt = raw as Record<string, unknown>;
-    return receipt.schema_version === LOCAL_AUTHORITY_SHADOW_OBSERVATION_RECEIPT_SCHEMA &&
-      receipt.observation_id === request.observation_id &&
-      receipt.source_digest === request.source_digest &&
-      receipt.primary_authority === "legacy_local" &&
-      receipt.provider_to_local_writes === false;
-  });
-}
-
-async function reconcileReceipt(
-  store: AuthorityStore,
-  request: LocalAuthorityShadowRequest,
-  storeIdentity: string,
-  reconciledOutcome: "replayed" | "ambiguous_reconciled",
-): Promise<LocalAuthorityShadowEvidence> {
-  const result = await store.readReceipt(request.observation_id);
-  if (result.status === "found" && receiptMatches(request, result)) {
-    return evidence(request, reconciledOutcome, {
-      storeIdentity,
-      providerRevision: result.provider_revision,
-      cursor: result.cursor,
-    });
-  }
-  if (result.status === "unavailable") {
-    return evidence(request, "unavailable", {
-      reasonCode: result.reason_code,
-      storeIdentity,
-    });
-  }
-  if (result.status === "failed") {
-    return evidence(request, "failed", {
-      reasonCode: result.reason_code,
-      storeIdentity,
-    });
-  }
-  return evidence(
-    request,
-    reconciledOutcome === "ambiguous_reconciled"
-      ? "ambiguous_unproved"
-      : "protocol_mismatch",
-    {
-      reasonCode: result.status === "missing"
-        ? "observation_receipt_missing"
-        : "observation_receipt_mismatch",
-      storeIdentity,
-    },
-  );
-}
-
-/**
- * Record a post-commit observation in a candidate AuthorityStore.
- *
- * The legacy local writers remain the only decision authority. This function
- * receives a completed source projection and has no route back to those files.
- */
-export async function recordLocalAuthorityShadow(
-  value: unknown,
-  dependencies: LocalAuthorityShadowDependencies = {},
-): Promise<LocalAuthorityShadowEvidence> {
-  const request = decodeRequest(value);
-  let store: AuthorityStore;
-  try {
-    const providerDirectory = join(
-      request.runtime_root,
-      "authority-shadow",
-      "file",
-      request.goal_id,
-    );
-    store = (dependencies.openStore ?? ((directory, goalId) =>
-      new FileAuthorityStore(directory, goalId)))(
-        providerDirectory,
-        request.goal_id,
-      );
-  } catch {
-    return evidence(request, "unavailable", {
-      reasonCode: "provider_construction_failed",
-    });
-  }
-
-  try {
-    const identity = await store.storeIdentity();
-    if (identity.status !== "available") {
-      return evidence(request, identity.status, { reasonCode: identity.reason_code });
-    }
-    const storeIdentity = identity.store_identity;
-    const receipt = {
-      schema_version: LOCAL_AUTHORITY_SHADOW_OBSERVATION_RECEIPT_SCHEMA,
-      observation_id: request.observation_id,
-      source_digest: request.source_digest,
-      observation_trigger: request.observation_trigger,
-      source_transaction_correlated: false,
-      parity_verdict: "not_evaluated",
-      primary_authority: "legacy_local",
-      candidate_read_for_decision: false,
-      provider_to_local_writes: false,
-    };
-    const event = {
-      schema_version: "loopx_local_authority_shadow_event_v0",
-      kind: "post_commit_snapshot_captured",
-      observation_id: request.observation_id,
-      observation_trigger: request.observation_trigger,
-      source_digest: request.source_digest,
-    };
-
-    const loaded = await store.loadAuthority();
-    if (loaded.status === "unavailable" || loaded.status === "failed") {
-      return readFailureEvidence(request, loaded, storeIdentity);
-    }
-    const committed = await store.commitAuthority({
-      expected_provider_revision:
-        loaded.status === "loaded" ? loaded.provider_revision : null,
-      operation_id: request.observation_id,
-      events: [event],
-      next_projection: request.source_projection,
-      receipts: [receipt],
-    });
-    if (committed.status === "applied") {
-      return evidence(request, "captured", {
-        storeIdentity,
-        providerRevision: committed.provider_revision,
-        cursor: committed.cursor,
-      });
-    }
-    if (committed.status === "ambiguous") {
-      return await reconcileReceipt(
-        store,
-        request,
-        storeIdentity,
-        "ambiguous_reconciled",
-      );
-    }
-    if (committed.status === "failed") {
-      return evidence(request, "failed", {
-        reasonCode: committed.reason_code,
-        storeIdentity,
-      });
-    }
-    if (committed.conflict_kind === "operation_id_exists") {
-      return await reconcileReceipt(store, request, storeIdentity, "replayed");
-    }
-    return evidence(request, "conflict_retry_required", {
-      reasonCode: "provider_revision_mismatch",
-      storeIdentity,
-      providerRevision: committed.current_provider_revision,
-      cursor: committed.current_cursor,
-    });
-  } catch {
-    return evidence(request, "unavailable", {
-      reasonCode: "provider_call_failed",
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Transaction-bound entries (Stage 2C second half).
-//
-// A drained outbox entry becomes exactly one candidate transaction whose
-// operation_id is the entry id, so a receipt names the primary transaction it
-// records instead of a post-commit snapshot that may include other writers.
-// ---------------------------------------------------------------------------
-
+// Transaction-bound entries are the only writable shadow lineage.
 export const LOCAL_AUTHORITY_SHADOW_PROJECTION_SCHEMA_V1 =
   LOCAL_AUTHORITY_SHADOW_TRANSACTION_PROJECTION_SCHEMA;
-export { LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA };
 export { LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_RESULT_SCHEMA };
 export { LOCAL_AUTHORITY_SHADOW_READ_REQUEST_SCHEMA };
 export { LOCAL_AUTHORITY_SHADOW_READ_RESULT_SCHEMA };
@@ -385,12 +88,12 @@ const NO_OP_RESOLUTIONS = new Set<string>(["abandoned", "unproved"]);
 const SOURCE_KINDS = ["markdown_active_state", "state_event_log", "task_lease_record"] as const;
 const WRITER_RUNTIMES = ["python", "typescript"] as const;
 const COMMIT_ENTRY_REQUEST_FIELDS = new Set([
-  "schema_version",
   "runtime_root",
   "goal_id",
   "entry",
   "partition_projection",
   "partition_digest",
+  "goal_ref",
 ]);
 const ENTRY_FIELDS = new Set([
   "prepared_sha256", "committed_sha256",
@@ -406,6 +109,7 @@ const ENTRY_FIELDS = new Set([
   "resolution",
 ]);
 const READ_REQUEST_FIELDS = new Set([
+  "read_model",
   "receipt_operation_id",
   "schema_version",
   "runtime_root",
@@ -415,7 +119,7 @@ const READ_REQUEST_FIELDS = new Set([
   "scan_limit",
 ]);
 const ENTRY_ID_PATTERN = /^local-shadow-tx-[0-9a-f]{64}$/u;
-const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+const DIGEST_PATTERN = ENVELOPED_SHA256_PATTERN;
 const MAX_SCAN_LIMIT = 10000;
 const REVISION_RETRY_ATTEMPTS = 3;
 
@@ -461,9 +165,10 @@ interface ShadowEntry {
   resolution: ShadowEntryResolution;
 }
 
-interface CommitEntryRequest {
+export interface CommitEntryRequest {
   runtime_root: string;
   goal_id: string;
+  goal_ref: JsonObject | null;
   entry: ShadowEntry;
   partition_projection: JsonObject | null;
   partition_digest: string | null;
@@ -485,6 +190,7 @@ export interface LocalAuthorityShadowCommitEntryResult extends JsonObject {
 }
 
 interface ReadRequest {
+  read_model: "full" | "proof";
   receipt_operation_id: string | null;
   runtime_root: string;
   goal_id: string;
@@ -608,11 +314,6 @@ function decodeCommitEntryRequest(value: unknown): CommitEntryRequest {
     COMMIT_ENTRY_REQUEST_FIELDS,
     "Local authority shadow commit entry request",
   );
-  if (request.schema_version !== LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA) {
-    throw new EffectRuntimeRequestError(
-      "Local authority shadow commit entry request schema mismatch",
-    );
-  }
   const entry = decodeEntry(request.entry);
   const projection = decodePartitionProjection(request.partition_projection, entry.partition);
   const digest = optionalDigest(request.partition_digest, "partition_digest");
@@ -627,9 +328,22 @@ function decodeCommitEntryRequest(value: unknown): CommitEntryRequest {
       `entry resolution ${entry.resolution} requires partition_projection and partition_digest`,
     );
   }
+  const goalId = requireGoalId(request.goal_id);
+  let goalRef: JsonObject | null = null;
+  if (request.goal_ref !== null && request.goal_ref !== undefined) {
+    const parsed = parseExactGoalRef(request.goal_ref);
+    if (parsed.kind !== "parsed" || parsed.value.goalId.value !== goalId) {
+      throw new EffectRuntimeRequestError("goal_ref must be an exact reference for goal_id");
+    }
+    goalRef = {
+      goal_id: parsed.value.goalId.value,
+      goal_instance_id: parsed.value.goalInstanceId.value,
+    };
+  }
   return {
     runtime_root: requireNonEmptyString(request.runtime_root, "runtime_root"),
-    goal_id: requireGoalId(request.goal_id),
+    goal_id: goalId,
+    goal_ref: goalRef,
     entry,
     partition_projection: projection,
     partition_digest: digest,
@@ -647,6 +361,9 @@ function decodeReadRequest(value: unknown): ReadRequest {
     throw new EffectRuntimeRequestError(`scan_limit must be between 0 and ${MAX_SCAN_LIMIT}`);
   }
   return {
+    read_model: request.read_model === undefined || request.read_model === "full" ? "full"
+      : request.read_model === "proof" ? "proof"
+      : (() => {throw new EffectRuntimeRequestError("read_model must be full or proof");})(),
     receipt_operation_id: optionalString(request.receipt_operation_id, "receipt_operation_id"),
     runtime_root: requireNonEmptyString(request.runtime_root, "runtime_root"),
     goal_id: requireGoalId(request.goal_id),
@@ -664,11 +381,58 @@ function decodeReadRequest(value: unknown): ReadRequest {
   };
 }
 
+/**
+ * Remove query-clock observations from one Todo before authority comparison.
+ *
+ * `resume_condition.evaluated_at` records when a reader evaluated an otherwise
+ * durable resume condition.  Re-reading unchanged source therefore changes
+ * that timestamp without changing the Todo decision.  The evaluated outcome
+ * and every other resume fact remain in the authority identity, so an actual
+ * readiness transition still produces drift until the writer captures it.
+ */
+function todoAuthorityIdentityView(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const todo = structuredClone(value as JsonObject);
+  const condition = todo.resume_condition;
+  if (condition !== null && typeof condition === "object" && !Array.isArray(condition)) {
+    const stableCondition = { ...(condition as JsonObject) };
+    delete stableCondition.evaluated_at;
+    todo.resume_condition = stableCondition;
+  }
+  return todo;
+}
+
+function authorityIdentityTodos(value: unknown): unknown {
+  return Array.isArray(value) ? value.map(todoAuthorityIdentityView) : value;
+}
+
+function partitionAuthorityIdentityView(partition: ShadowPartition, projection: JsonObject): JsonObject {
+  if (partition !== "todos") return projection;
+  return { ...projection, todos: authorityIdentityTodos(projection.todos) };
+}
+
+/**
+ * Stable identity for one source partition.
+ *
+ * Prepared outbox bytes and the supplied projection are still compared in
+ * full. This semantic digest excludes only the query-clock observation that
+ * cannot prove a source mutation, so writer continuity and final parity use
+ * the same identity boundary.
+ */
+export function localAuthorityShadowPartitionDigest(
+  partition: ShadowPartition,
+  projection: JsonObject,
+): string {
+  return `sha256:${createHash("sha256").update(
+    canonicalAuthorityBytes(partitionAuthorityIdentityView(partition, projection)),
+  ).digest("hex")}`;
+}
+
 /** Digest of the fields parity compares; must match Python `head_digest`. */
 export function localAuthorityShadowHeadDigest(head: JsonObject): string {
   const view = {
     handoff_mode: head.handoff_mode ?? null,
-    todos: head.todos ?? null,
+    todos: authorityIdentityTodos(head.todos ?? null),
     leases: head.leases ?? null,
   };
   return `sha256:${createHash("sha256").update(canonicalAuthorityBytes(view)).digest("hex")}`;
@@ -686,15 +450,6 @@ function partitionsOf(head: JsonObject | null): JsonObject {
     }
   }
   return partitions;
-}
-
-function todoReadModel(todos: readonly JsonObject[]): JsonObject {
-  return {
-    schema_version: "loopx_todo_canonical_read_record_v0",
-    todo_count: todos.length,
-    records_sha256: createHash("sha256").update(canonicalAuthorityBytes(todos)).digest("hex"),
-    contract_fields: [...TODO_CANONICAL_READ_RECORD_FIELDS],
-  };
 }
 
 /**
@@ -720,6 +475,13 @@ export function composeLocalAuthorityShadowHead(
     if (entry.partition === "todos") {
       handoffMode = String(projection.handoff_mode);
       todos = structuredClone(projection.todos as JsonObject[]);
+      // The Todo partition carries the published Todo read records, including
+      // archived rows retained for audit. The candidate head, like the source
+      // projection, keeps live lease edges only for Todos that are still in the
+      // current graph (`archive_state === "active"`); a retained archived row
+      // must not re-admit the lease its archive just orphaned.
+      const graphTodoIds = currentGraphTodoIds(todos);
+      leases = leases.filter((lease) => graphTodoIds.has(String(lease.todo_id)));
     } else {
       leases = structuredClone(projection.leases as JsonObject[]);
     }
@@ -732,7 +494,10 @@ export function composeLocalAuthorityShadowHead(
     handoff_mode: handoffMode,
     todos,
     leases,
-    todo_read_model: todoReadModel(todos),
+    todo_read_model: coordinationTodoReadModel(
+      todos,
+      "loopx_todo_canonical_read_record_v0",
+    ),
     partitions,
     ...(base.capture_profile === undefined ? {} : {
       capture_profile: base.capture_profile,
@@ -899,11 +664,7 @@ export interface ShadowLineageBinding {
   store_identity: string;
   bootstrap_operation_id: string;
   bootstrap_provider_revision: string;
-}
-
-export class ShadowLineageError extends Error {
-  readonly reason_code: string;
-  constructor(reasonCode: string) { super(reasonCode); this.reason_code = reasonCode; }
+  goal_ref?: WireGoalRef;
 }
 
 function requireLineage(condition: unknown, reason: string): asserts condition {
@@ -919,15 +680,25 @@ function sourceReference(entry: ShadowEntry, digest: string | null): string {
 
 function validateEntryIdentity(request: CommitEntryRequest, binding: ShadowLineageBinding): void {
   const { entry } = request;
+  if (request.goal_ref === null) {
+    requireLineage(shadowBindingGoalRef(binding) === null, "legacy_goal_binding");
+  } else {
+    requireShadowBindingGoalRef(binding, request.goal_ref, request.goal_id);
+  }
   requireLineage(entry.capture_lineage_id === binding.capture_lineage_id, "stale_generation");
-  const rootDigest = `sha256:${createHash("sha256").update(resolve(request.runtime_root)).digest("hex")}`;
-  requireLineage(entry.source_root_digest === binding.source_root_digest && rootDigest === binding.source_root_digest,
-    "source_root_mismatch");
+  // requireShadowCaptureBinding has already proved that this binding belongs
+  // to the requested physical runtime root. Keep accepting the binding's
+  // immutable digest so an in-flight lineage created by a pre-canonical-path
+  // release can drain safely after upgrade.
+  requireLineage(entry.source_root_digest === binding.source_root_digest, "source_root_mismatch");
   requireLineage(entry.entry_id === outboxEntryIdentity(request.goal_id, entry.partition, entry.seq,
     sourceReference(entry, request.partition_digest), entry.capture_lineage_id, entry.source_root_digest),
   "entry_identity_mismatch");
   if (request.partition_projection !== null) {
-    requireLineage(request.partition_digest === `sha256:${canonicalAuthoritySha256(request.partition_projection)}`,
+    requireLineage(request.partition_digest === localAuthorityShadowPartitionDigest(
+      entry.partition,
+      request.partition_projection,
+    ),
       "partition_digest_mismatch");
   }
   requireLineage(entry.source.kind !== "state_event_log", "event_log_writer_not_bound");
@@ -941,101 +712,14 @@ function partitionProjection(head: JsonObject, partition: ShadowPartition): Json
 }
 
 function validateSourceContinuity(request: CommitEntryRequest, previous: JsonObject): void {
-  const digest = `sha256:${canonicalAuthoritySha256(partitionProjection(previous, request.entry.partition))}`;
+  const digest = localAuthorityShadowPartitionDigest(
+    request.entry.partition,
+    partitionProjection(previous, request.entry.partition),
+  );
   requireLineage(request.entry.source.previous_partition_digest === digest, "source_partition_continuity_unproved");
   if (!NO_OP_RESOLUTIONS.has(request.entry.resolution)) {
     requireLineage(request.partition_digest !== digest, "partition_unchanged");
   }
-}
-
-async function verifyPendingEntryFiles(request: CommitEntryRequest): Promise<void> {
-  const entry = request.entry;
-  const directory = join(request.runtime_root, "authority-shadow", "outbox", request.goal_id, entry.partition);
-  const stem = `${String(entry.seq).padStart(10, "0")}-${entry.entry_id}`;
-  const bytes = await readFile(join(directory, `${stem}.prepared.json`));
-  requireLineage(`sha256:${createHash("sha256").update(bytes).digest("hex")}` === entry.prepared_sha256,
-    "outbox_prepared_bytes_mismatch");
-  const prepared = requireJsonObject(JSON.parse(bytes.toString("utf8")), "prepared entry");
-  requireLineage(prepared.schema_version === LOCAL_AUTHORITY_SHADOW_OUTBOX_ENTRY_SCHEMA &&
-    prepared.goal_id === request.goal_id && prepared.entry_id === entry.entry_id && prepared.seq === entry.seq &&
-    prepared.partition === entry.partition && prepared.capture_lineage_id === entry.capture_lineage_id &&
-    prepared.source_root_digest === entry.source_root_digest && prepared.prepared_at === entry.prepared_at &&
-    canonicalAuthorityBytes(prepared.writer).equals(canonicalAuthorityBytes(entry.writer)), "outbox_prepared_identity_mismatch");
-  const source = { ...requireJsonObject(prepared.source, "prepared source") };
-  delete source.previous_lease;
-  requireLineage(canonicalAuthorityBytes(source).equals(canonicalAuthorityBytes(entry.source)), "outbox_prepared_source_mismatch");
-  if (request.partition_projection !== null) {
-    let projection = requireJsonObject(prepared.projection, "prepared projection");
-    if (entry.partition === "leases") {
-      requireLineage(Array.isArray(projection.leases), "outbox_prepared_projection_mismatch");
-      const leases = (projection.leases as JsonObject[]).map((value) => {
-        const record = requireJsonObject(value.record, "prepared lease record");
-        requireLineage(record.goal_id === request.goal_id && record.todo_id === value.file_stem, "source_lease_identity_mismatch");
-        return record;
-      });
-      projection = { leases };
-    }
-    requireLineage(canonicalAuthorityBytes(projection).equals(canonicalAuthorityBytes(request.partition_projection)),
-      "outbox_prepared_projection_mismatch");
-  }
-  let markerBytes: Buffer | null = null;
-  try { markerBytes = await readFile(join(directory, `${stem}.committed.json`)); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  requireLineage((markerBytes === null ? null : `sha256:${createHash("sha256").update(markerBytes).digest("hex")}`) === entry.committed_sha256,
-    "outbox_committed_bytes_mismatch");
-  if (markerBytes !== null) {
-    requireLineage(entry.resolution === "committed", "outbox_resolution_marker_mismatch");
-    const marker = requireJsonObject(JSON.parse(markerBytes.toString("utf8")), "committed marker");
-    rejectUnexpectedFields(marker, new Set(["schema_version", "entry_id", "capture_lineage_id", "committed_at"]), "committed marker");
-    requireLineage(marker.schema_version === LOCAL_AUTHORITY_SHADOW_OUTBOX_COMMIT_SCHEMA && marker.entry_id === entry.entry_id &&
-      marker.capture_lineage_id === entry.capture_lineage_id && marker.committed_at === entry.committed_at, "outbox_committed_identity_mismatch");
-  } else {
-    requireLineage(entry.committed_at === null && entry.resolution !== "committed", "outbox_committed_marker_missing");
-  }
-}
-
-/** Resolve markerless evidence again under the actual primary lock, and keep
- * that lock through the candidate commit. A caller's earlier observation can
- * have become stale while it crossed the Python/TypeScript process boundary.
- */
-async function withMarkerlessSourceProof<T>(
-  request: CommitEntryRequest,
-  binding: Awaited<ReturnType<typeof requireShadowCaptureBinding>>,
-  operation: () => Promise<T>,
-): Promise<T> {
-  if (request.entry.committed_sha256 !== null) return await operation();
-  const entry = request.entry;
-  const proveAndCommit = async (sourcePath: string): Promise<T> => {
-    await verifyPendingEntryFiles(request);
-    const directory = join(request.runtime_root, "authority-shadow", "outbox", request.goal_id, entry.partition);
-    for (const item of await readdir(directory, { withFileTypes: true })) {
-      requireLineage(item.isFile() && !item.isSymbolicLink(), "source_transaction_unproved");
-      if (item.name === "drain-cursor.json") continue;
-      const match = OUTBOX_ENTRY_FILE_PATTERN.exec(item.name);
-      requireLineage(match !== null && Number(match[1]) <= entry.seq &&
-        (Number(match[1]) !== entry.seq || match[2] === entry.entry_id), "source_transaction_unproved");
-    }
-    let source: Buffer | null = null;
-    try { source = await readFile(sourcePath); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    const digest = source === null ? null : `sha256:${createHash("sha256").update(source).digest("hex")}`;
-    const expected = entry.resolution === "abandoned" ? entry.source.previous_bytes_digest : entry.source.bytes_digest;
-    requireLineage((entry.resolution === "abandoned" || entry.resolution === "committed_proven_by_readback") &&
-      digest === expected, "source_transaction_unproved");
-    return await operation();
-  };
-  if (entry.partition === "todos") {
-    const statePath = await readShadowBootstrapSourcePath(request.runtime_root, request.goal_id, binding);
-    return await withFileMutationLock(legacyCoordinationTodoLockPath(request.runtime_root, request.goal_id), () =>
-      withFileMutationLock(statePath, () => proveAndCommit(statePath)));
-  }
-  const todoId = entry.source.lease?.todo_id;
-  requireLineage(typeof todoId === "string" && /^[A-Za-z0-9_.-]+$/.test(todoId) && todoId !== "." && todoId !== "..",
-    "source_transaction_unproved");
-  const leasePath = join(request.runtime_root, "goals", request.goal_id, "task-leases", `${todoId}.json`);
-  return await withFileMutationLock(taskLeaseLockPath(request), () => proveAndCommit(leasePath));
 }
 
 export interface ValidatedShadowLineage {
@@ -1052,8 +736,14 @@ export interface ValidatedShadowLineage {
  */
 export async function readProvenShadowSequence(
   runtimeRoot: string, goalId: string, partition: ShadowPartition, expectedLineageId: string,
+  expectedGoalRef: unknown = null,
 ): Promise<number> {
   const binding = await requireShadowCaptureBinding(runtimeRoot, goalId);
+  if (expectedGoalRef === null) {
+    requireLineage(shadowBindingGoalRef(binding) === null, "legacy_goal_binding");
+  } else {
+    requireShadowBindingGoalRef(binding, expectedGoalRef, goalId);
+  }
   requireLineage(binding.capture_lineage_id === expectedLineageId, "stale_generation");
   const store = new FileAuthorityStore(join(runtimeRoot, "authority-shadow", "file-v0"), goalId, { existingOnly: true });
   const lineage = await loadValidatedShadowLineage(store, runtimeRoot, goalId, binding);
@@ -1125,6 +815,7 @@ export async function loadValidatedShadowLineage(
       : { leases: transaction.projection.leases };
     const request: CommitEntryRequest = {
       runtime_root: runtimeRoot, goal_id: goalId,
+      goal_ref: shadowBindingGoalRef(binding),
       entry: decodeEntry({
         capture_lineage_id: receipt.capture_lineage_id,
         prepared_sha256: receipt.prepared_sha256, committed_sha256: receipt.committed_sha256,
@@ -1271,8 +962,19 @@ export async function commitLocalAuthorityShadowEntry(
   value: unknown,
   dependencies: LocalAuthorityShadowDependencies = {},
 ): Promise<LocalAuthorityShadowCommitEntryResult> {
+  return await commitShadowEntryTransaction(value, dependencies, "assert_recorded");
+}
+
+/** Internal transaction runner. The delivery owner supplies only a request read
+ * from witnessed outbox bytes; existing resolved callers retain assertion-only
+ * semantics. No resolution policy is accepted from the RPC caller. */
+export async function commitShadowEntryTransaction(
+  value: unknown,
+  dependencies: LocalAuthorityShadowDependencies,
+  resolutionPolicy: "assert_recorded" | "derive_from_source",
+): Promise<LocalAuthorityShadowCommitEntryResult> {
   const request = decodeCommitEntryRequest(value);
-  const noOp = NO_OP_RESOLUTIONS.has(request.entry.resolution);
+  const plannedProjection = request.partition_projection, plannedDigest = request.partition_digest;
   try {
     return await withShadowMaintenanceLock(request.runtime_root, request.goal_id, async () => {
       const binding = await requireShadowCaptureBinding(request.runtime_root, request.goal_id);
@@ -1284,18 +986,39 @@ export async function commitLocalAuthorityShadowEntry(
         const lineage = await loadValidatedShadowLineage(store, request.runtime_root, request.goal_id, active);
         const existing = await store.readReceipt(request.entry.entry_id);
         if (existing.status === "found") {
-          return await reconcileTransactionReceipt(store, request, binding.store_identity, "replayed");
+          if (resolutionPolicy === "derive_from_source") {
+            request.partition_projection = plannedProjection; request.partition_digest = plannedDigest;
+            const receipt = existing.receipts[0];
+            requireLineage(existing.receipts.length === 1 &&
+              receipt.prepared_sha256 === request.entry.prepared_sha256 &&
+              receipt.committed_sha256 === request.entry.committed_sha256,
+              "outbox_receipt_mismatch");
+            request.entry.resolution = requireStringLiteral(receipt.resolution, ENTRY_RESOLUTIONS, "receipt.resolution");
+            if (NO_OP_RESOLUTIONS.has(request.entry.resolution)) {
+              request.partition_projection = null; request.partition_digest = null;
+            }
+          }
+          const replay = await reconcileTransactionReceipt(store, request, binding.store_identity, "replayed");
+          return resolutionPolicy === "derive_from_source"
+            ? {...replay, resolution: request.entry.resolution, partition_digest: request.partition_digest} : replay;
         }
         requireLineage(existing.status === "missing", "shadow_receipt_unavailable");
         requireLineage(lineage.transactions.length < 10000, "shadow_qualification_history_too_large");
+        if (resolutionPolicy === "derive_from_source") {
+          request.partition_projection = plannedProjection; request.partition_digest = plannedDigest;
+        }
         const attempt = await withMarkerlessSourceProof(request, active, async () => {
           await verifyPendingEntryFiles(request);
           requireLineage(request.entry.seq === lineage.last_sequences[request.entry.partition] + 1,
             "partition_sequence_mismatch");
           validateSourceContinuity(request, lineage.head.head);
-          return await attemptCommitEntry(store, request, binding.store_identity, noOp);
-        });
-        if (attempt.kind === "final") return attempt.result;
+          return await attemptCommitEntry(store, request, binding.store_identity, NO_OP_RESOLUTIONS.has(request.entry.resolution));
+        }, resolutionPolicy);
+        if (attempt.kind === "final") {
+          return resolutionPolicy === "derive_from_source"
+            ? {...attempt.result, resolution: request.entry.resolution, partition_digest: request.partition_digest}
+            : attempt.result;
+        }
       }
       return commitEntryResult(request, "conflict_retry_required", { reasonCode: "provider_revision_mismatch" });
     });
@@ -1327,12 +1050,13 @@ function loadedReadResult(
   base: JsonObject,
   storeIdentity: string,
   loaded: Extract<AuthorityStoreLoadResult, { status: "loaded" | "missing" }>,
+  includeHead: boolean,
 ): JsonObject {
   const result: JsonObject = { ...base, status: loaded.status, store_identity: storeIdentity };
   if (loaded.status === "loaded") {
     result.provider_revision = loaded.provider_revision;
     result.cursor = loaded.cursor;
-    result.head = structuredClone(loaded.head);
+    result.head = includeHead ? structuredClone(loaded.head) : null;
     result.head_digest = localAuthorityShadowHeadDigest(loaded.head);
     result.partitions = partitionsOf(loaded.head);
   }
@@ -1407,7 +1131,7 @@ export async function readLocalAuthorityShadow(
         store_identity: identity.store_identity,
       };
     }
-    const result = loadedReadResult(base, identity.store_identity, loaded);
+    const result = loadedReadResult(base, identity.store_identity, loaded, request.read_model === "full");
     if (request.store_kind === "runtime_shadow" && loaded.status === "loaded" && loaded.head.capture_profile !== "file_outbox_v1") {
       result.eligible = false;
       result.reason_code = "legacy_lineage_ineligible";
@@ -1421,13 +1145,16 @@ export async function readLocalAuthorityShadow(
         bootstrap_provider_revision: binding.bootstrap_provider_revision,
         last_sequences: lineage.last_sequences,
         last_applied_sequences: lineage.last_applied_sequences,
-        transactions: structuredClone(lineage.transactions.filter((transaction) =>
+        transactions: lineage.transactions.filter((transaction) =>
           request.scan_after_cursor === null || Number(transaction.cursor) > Number(request.scan_after_cursor)
-        ).slice(0, request.scan_limit)) as unknown as JsonObject[],
-        receipt: receipt === null ? null : structuredClone(receipt) as unknown as JsonObject,
+        ).slice(0, request.scan_limit).map(transaction => request.read_model === "proof"
+          ? scanTransactionView(transaction) : structuredClone(transaction) as unknown as JsonObject),
+        receipt: receipt === null ? null : request.read_model === "proof"
+          ? scanTransactionView(receipt) : structuredClone(receipt) as unknown as JsonObject,
       };
     }
-    return request.scan_limit > 0 ? await appendScanPage(store, request, result) : result;
+    return request.read_model === "full" && request.scan_limit > 0
+      ? await appendScanPage(store, request, result) : result;
   } catch (error) {
     const raw = error as { reason_code?: string; code?: string };
     return { ...base, status: "failed", reason_code: raw.reason_code ?? raw.code ?? "provider_call_failed" };

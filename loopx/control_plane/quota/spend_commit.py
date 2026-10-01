@@ -32,6 +32,7 @@ def _quota_spend_commit_request(
     generated_at: str,
     execute: bool,
     runtime_root: Path | None,
+    expected_index_digest: str | None,
 ) -> dict[str, Any]:
     # Import lazily because runtime loads history, whose quota compatibility
     # surface re-exports this module during package initialization.
@@ -44,19 +45,13 @@ def _quota_spend_commit_request(
     goal_id = validate_goal_id_path_segment(
         str(preview.get("goal_id") or "").strip()
     )
-    index_path = (
-        runtime_root / "goals" / goal_id / "runs" / "index.jsonl"
-        if runtime_root is not None
-        else None
-    )
     resolved_agent_id = (
         normalize_todo_claimed_by(preview.get("agent_id"))
         or quota_decision_agent_id(before)
     )
-    request_preview = {
-        **dict(preview),
-        "after_recommended_action": after.get("recommended_action"),
-    }
+    request_preview = dict(preview)
+    request_preview.pop("expected_index_digest", None)
+    request_preview["after_recommended_action"] = after.get("recommended_action")
     return {
         "schema_version": QUOTA_SPEND_COMMIT_REQUEST_SCHEMA,
         "runtime_root": str(runtime_root) if runtime_root is not None else None,
@@ -64,11 +59,7 @@ def _quota_spend_commit_request(
         "source": source,
         "generated_at": generated_at,
         "execute": execute,
-        "expected_index_digest": (
-            quota_spend_index_digest(index_path)
-            if index_path is not None
-            else None
-        ),
+        "expected_index_digest": expected_index_digest,
         "preview": request_preview,
         "before": compact_quota_decision(before),
         "after": compact_quota_decision(after),
@@ -83,6 +74,7 @@ def _quota_spend_commit_result(
     generated_at: str | None,
     execute: bool,
     runtime_root: Path | None,
+    expected_index_digest: str | None,
 ) -> Mapping[str, Any]:
     params = _quota_spend_commit_request(
         preview,
@@ -90,6 +82,7 @@ def _quota_spend_commit_result(
         generated_at=generated_at or now_local_iso(),
         execute=execute,
         runtime_root=runtime_root,
+        expected_index_digest=expected_index_digest,
     )
     try:
         result = effect_runtime_result("quota.spend.commit", params)
@@ -165,6 +158,7 @@ def build_quota_slot_spend_event(
         generated_at=generated_at,
         execute=False,
         runtime_root=None,
+        expected_index_digest=None,
     )
     record = result.get("record")
     if not isinstance(record, Mapping):
@@ -194,6 +188,13 @@ def record_quota_slot_spend_from_preview(
     if not raw_runtime_root:
         raise ValueError("status payload does not include runtime_root")
     runtime_root = Path(str(raw_runtime_root)).expanduser()
+    if execute and "expected_index_digest" not in preview:
+        raise ValueError("quota spend preview does not include its index basis")
+    expected_index_digest = preview.get("expected_index_digest")
+    if expected_index_digest is not None and not isinstance(
+        expected_index_digest, str
+    ):
+        raise ValueError("quota spend preview index basis must be a string or null")
     if execute:
         index_path = runtime_root / "goals" / safe_goal_id / "runs" / "index.jsonl"
         # Legacy Python run writers use this kernel lock. Hold it across the
@@ -206,6 +207,7 @@ def record_quota_slot_spend_from_preview(
                 generated_at=None,
                 execute=True,
                 runtime_root=runtime_root,
+                expected_index_digest=expected_index_digest,
             )
     else:
         result = _quota_spend_commit_result(
@@ -214,6 +216,7 @@ def record_quota_slot_spend_from_preview(
             generated_at=None,
             execute=False,
             runtime_root=runtime_root,
+            expected_index_digest=expected_index_digest,
         )
     payload = result.get("payload")
     if not isinstance(payload, Mapping):

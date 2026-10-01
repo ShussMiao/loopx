@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 from pathlib import Path
 from typing import Any
 
-from ...file_lock import exclusive_file_lock
+from ..projects.registry_codec import project_registry_transaction
+from ...configuration_transaction import configuration_payload_revision
+from ...file_lock import exclusive_cross_runtime_file_lock
 from ...global_registry import sync_project_registry_to_global
 from ...history import load_registry
-from ...registry import atomic_write_json, registry_goals
+from ...registry import registry_goals
 from ...registry_writability import probe_registry_write_path
+from ..actor_identity import normalize_owner_controller_actor
 from ..runtime.time import now_local_iso
 from .activation import (
     GoalActivationState,
@@ -17,11 +22,15 @@ from .activation import (
     goal_activation_state,
     normalize_goal_activation_state,
 )
+from ..content_digest import BARE_SHA256_PATTERN
 from .configure_goal_service import resolve_configure_goal_sync_target
 
 
 GOAL_ACTIVATION_TRANSITION_SCHEMA_VERSION = "loopx_goal_activation_transition_v1"
 GOAL_ACTIVATION_READBACK_SCHEMA_VERSION = "loopx_goal_activation_readback_v1"
+GOAL_ACTIVATION_SOURCE_FINGERPRINT_SCHEMA_VERSION = (
+    "loopx_goal_activation_source_fingerprint_v1"
+)
 GOAL_ACTIVATION_AUTHORITY_ROUTE_SCHEMA_VERSION = (
     "loopx_goal_activation_authority_route_v1"
 )
@@ -65,6 +74,41 @@ def _same_path(left: Path, right: Path) -> bool:
         return left.expanduser().resolve() == right.expanduser().resolve()
     except OSError:
         return str(left.expanduser()) == str(right.expanduser())
+
+
+def _goal_activation_source_identity(source_registry: Path) -> str:
+    return configuration_payload_revision(
+        {"source_registry": str(source_registry.expanduser().resolve())}
+    ).removeprefix("sha256:")
+
+
+def _projected_source_identity(
+    target_registry: Path,
+    *,
+    goal_id: str,
+) -> str | None:
+    target_goal = _goal_or_none(load_registry(target_registry), goal_id)
+    if target_goal is None:
+        return None
+    source_ref = str(target_goal.get("source_registry") or "").strip()
+    if not source_ref:
+        return None
+    return _goal_activation_source_identity(Path(source_ref))
+
+
+def goal_activation_source_fingerprint(
+    *,
+    goal_id: str,
+    source_registry: Path,
+    source_bytes: bytes,
+) -> str:
+    identity = {
+        "schema_version": GOAL_ACTIVATION_SOURCE_FINGERPRINT_SCHEMA_VERSION,
+        "goal_id": goal_id,
+        "source_identity": _goal_activation_source_identity(source_registry),
+        "source_content_sha256": hashlib.sha256(source_bytes).hexdigest(),
+    }
+    return configuration_payload_revision(identity).removeprefix("sha256:")
 
 
 def _goal(payload: dict[str, Any], goal_id: str) -> dict[str, Any]:
@@ -207,6 +251,8 @@ def set_goal_activation_state(
     state: GoalActivationState | str,
     reason: str | None = None,
     runtime_root_override: str | None = None,
+    expected_state_fingerprint: str | None = None,
+    actor_kind: str | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview or apply one reversible Goal activation transition."""
@@ -214,6 +260,7 @@ def set_goal_activation_state(
     normalized_goal_id = str(goal_id or "").strip()
     if not normalized_goal_id:
         raise ValueError("goal id is required")
+    actor = normalize_owner_controller_actor(actor_kind, required=execute)
     target_state = normalize_goal_activation_state(state)
     authority_route = _source_and_target(
         registry_path=registry_path,
@@ -224,19 +271,42 @@ def set_goal_activation_state(
     source_registry = authority_route.source_registry
     target_registry = authority_route.target_registry
     sync_runtime_root = authority_route.sync_runtime_root
+    registries_are_distinct = not _same_path(source_registry, target_registry)
+    source_identity = _goal_activation_source_identity(source_registry)
+    target_source_identity = (
+        _projected_source_identity(
+            target_registry,
+            goal_id=normalized_goal_id,
+        )
+        if registries_are_distinct
+        else source_identity
+    )
+    source_bytes = source_registry.read_bytes()
     source_goal = _goal(load_registry(source_registry), normalized_goal_id)
+    normalized_fingerprint = str(expected_state_fingerprint or "").strip() or None
+    if normalized_fingerprint is not None and not BARE_SHA256_PATTERN.fullmatch(
+        normalized_fingerprint
+    ):
+        raise ValueError("expected state fingerprint must be a SHA-256 digest")
+    observed_fingerprint = goal_activation_source_fingerprint(
+        goal_id=normalized_goal_id,
+        source_registry=source_registry,
+        source_bytes=source_bytes,
+    )
     before_state = goal_activation_state(source_goal)
     changed = before_state is not target_state
+    actor_label = actor.value if actor is not None else "owner"
     default_reason = (
-        "Stopped by owner"
+        f"Stopped by {actor_label}"
         if target_state is GoalActivationState.STOPPED
-        else "Resumed by owner"
+        else f"Resumed by {actor_label}"
     )
     reason_text = " ".join(str(reason or default_reason).split()).strip()
     proposed_activation = build_goal_activation(
         state=target_state,
         updated_at=now_local_iso(),
         reason=reason_text,
+        actor_kind=actor.value if actor is not None else None,
     )
     payload: dict[str, Any] = {
         "ok": True,
@@ -250,15 +320,34 @@ def set_goal_activation_state(
         "written": False,
         "partial_write": False,
         "source_registry": str(source_registry),
+        "source_identity": source_identity,
+        "source_fingerprint_schema_version": (
+            GOAL_ACTIVATION_SOURCE_FINGERPRINT_SCHEMA_VERSION
+        ),
         "target_global_registry": str(target_registry),
         "authority_route": authority_route.public_summary(),
+        "expected_state_fingerprint": normalized_fingerprint,
+        "observed_state_fingerprint": observed_fingerprint,
         "activation": proposed_activation,
+        "actor_kind": actor.value if actor is not None else None,
         "readback": {
             "schema_version": GOAL_ACTIVATION_READBACK_SCHEMA_VERSION,
             "status": "not_executed" if changed else "not_required",
             "verified": not changed,
         },
     }
+    if (
+        normalized_fingerprint is not None
+        and observed_fingerprint != normalized_fingerprint
+    ):
+        payload.update(
+            {
+                "ok": False,
+                "error_kind": "goal_action_stale",
+                "error": "Goal state changed after action projection; refresh actions and retry",
+            }
+        )
+        return payload
     if not execute:
         return payload
 
@@ -270,7 +359,6 @@ def set_goal_activation_state(
             "Repair the Goal source registry route before resuming this Goal."
         )
 
-    registries_are_distinct = not _same_path(source_registry, target_registry)
     if registries_are_distinct:
         writability = probe_registry_write_path(target_registry, create_parent=True)
         payload["global_registry_writability"] = writability
@@ -288,12 +376,72 @@ def set_goal_activation_state(
             )
             return payload
 
-    if changed:
-        with exclusive_file_lock(
-            source_registry,
-            operation="set_goal_activation_state",
-        ):
-            source_payload = load_registry(source_registry)
+    sync_payload: dict[str, Any] | None = None
+    with project_registry_transaction(
+        source_registry,
+        operation="set_goal_activation_state",
+    ) as transaction:
+        target_lock = (
+            exclusive_cross_runtime_file_lock(
+                target_registry,
+                operation="set_goal_activation_state",
+            )
+            if registries_are_distinct
+            else nullcontext()
+        )
+        with target_lock:
+            if registries_are_distinct:
+                locked_target_source_identity = _projected_source_identity(
+                    target_registry,
+                    goal_id=normalized_goal_id,
+                )
+                route_changed = locked_target_source_identity != target_source_identity
+                route_conflicts = locked_target_source_identity not in {
+                    None,
+                    source_identity,
+                }
+                if route_changed or route_conflicts:
+                    route_fingerprint = configuration_payload_revision(
+                        {
+                            "source_fingerprint": observed_fingerprint,
+                            "target_source_identity": locked_target_source_identity,
+                        }
+                    ).removeprefix("sha256:")
+                    payload.update(
+                        {
+                            "ok": False,
+                            "error_kind": "goal_action_stale",
+                            "error": (
+                                "Goal source route changed after action projection; "
+                                "refresh actions and retry"
+                            ),
+                            "observed_state_fingerprint": route_fingerprint,
+                        }
+                    )
+                    return payload
+
+            source_payload = transaction.payload_copy()
+            locked_fingerprint = goal_activation_source_fingerprint(
+                goal_id=normalized_goal_id,
+                source_registry=source_registry,
+                source_bytes=source_registry.read_bytes(),
+            )
+            if (
+                normalized_fingerprint is not None
+                and locked_fingerprint != normalized_fingerprint
+            ):
+                payload.update(
+                    {
+                        "ok": False,
+                        "error_kind": "goal_action_stale",
+                        "error": (
+                            "Goal state changed after action projection; "
+                            "refresh actions and retry"
+                        ),
+                        "observed_state_fingerprint": locked_fingerprint,
+                    }
+                )
+                return payload
             locked_goal = _goal(source_payload, normalized_goal_id)
             locked_state = goal_activation_state(locked_goal)
             if locked_state is not before_state:
@@ -302,41 +450,43 @@ def set_goal_activation_state(
                         "ok": False,
                         "error_kind": "goal_activation_state_changed",
                         "error": (
-                            "goal activation changed after preview; regenerate the transition"
+                            "goal activation changed after preview; "
+                            "regenerate the transition"
                         ),
                         "observed_state": locked_state.value,
                     }
                 )
                 return payload
-            locked_goal.pop("activation_state", None)
-            locked_goal["activation"] = proposed_activation
-            atomic_write_json(source_registry, source_payload, preserve_mode=True)
-            payload["written"] = True
+            if changed:
+                locked_goal.pop("activation_state", None)
+                locked_goal["activation"] = proposed_activation
+                transaction.commit(source_payload)
+                payload["written"] = True
 
-    sync_payload: dict[str, Any] | None = None
-    if registries_are_distinct:
-        sync_payload = sync_project_registry_to_global(
-            registry_path=source_registry,
-            runtime_root_override=sync_runtime_root,
-            goal_id=normalized_goal_id,
-            dry_run=False,
-        )
-        payload["global_sync"] = sync_payload
+            if registries_are_distinct:
+                sync_payload = sync_project_registry_to_global(
+                    registry_path=source_registry,
+                    runtime_root_override=sync_runtime_root,
+                    goal_id=normalized_goal_id,
+                    dry_run=False,
+                    _global_registry_lock_held=True,
+                )
+                payload["global_sync"] = sync_payload
 
-    readback = (
-        {
-            "schema_version": GOAL_ACTIVATION_READBACK_SCHEMA_VERSION,
-            "status": "not_run",
-            "verified": False,
-        }
-        if sync_payload is not None and not sync_payload.get("ok")
-        else _readback(
-            source_registry=source_registry,
-            target_registry=target_registry,
-            goal_id=normalized_goal_id,
-            expected_state=target_state,
-        )
-    )
+            readback = (
+                {
+                    "schema_version": GOAL_ACTIVATION_READBACK_SCHEMA_VERSION,
+                    "status": "not_run",
+                    "verified": False,
+                }
+                if sync_payload is not None and not sync_payload.get("ok")
+                else _readback(
+                    source_registry=source_registry,
+                    target_registry=target_registry,
+                    goal_id=normalized_goal_id,
+                    expected_state=target_state,
+                )
+            )
     payload["readback"] = readback
     sync_ok = sync_payload is None or bool(sync_payload.get("ok"))
     payload["ok"] = bool(sync_ok and readback.get("verified"))

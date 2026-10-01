@@ -42,7 +42,7 @@ def _default_command_runner(
         command,
         cwd=str(cwd),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=timeout,
     )
 

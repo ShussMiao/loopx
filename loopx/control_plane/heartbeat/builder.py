@@ -45,6 +45,8 @@ from .host import (
 from .rules import (
     DEFAULT_MATERIAL_QUEUE_RULE,
     DEFAULT_PERMISSION_RULE,
+    REWARD_MEMORY_OUTCOME_COMPACT_RULE,
+    REWARD_MEMORY_OUTCOME_RULE,
 )
 from .task_body import (
     bind_exact_turn_settlement_task_body,
@@ -71,12 +73,12 @@ from ...project_prompt import (
 )
 
 FINE_GRAINED_TURN_RULE = (
-    "Fine-grained planning contract: each Todo must be one small verifiable checkpoint; "
-    "if broader, split before delivery. The turn budget is one coherent decision slice "
+    "Fine-grained planning contract: each Todo must be an independently verifiable checkpoint; "
+    "split independent decisions before delivery. Work follows one coherent direction "
     "and may complete one or more causally related Agent advancement Todos. After each "
     "completion inspect fresh evidence before creating or claiming a successor; continue "
     "only while the direction remains unchanged. Validate and durably complete each Todo, "
-    "then perform accountable refresh and spend to settle the turn once after the slice. "
+    "then perform accountable refresh and spend to settle the turn once after the work. "
     "A direction change or bounded-chain review must use the existing replan obligation/"
     "ACK path before further delivery. Protocol/setup and capability re-entry steps are "
     "inline non-advancement work: never create Todos or settle a turn for them alone."
@@ -105,6 +107,26 @@ def _select_task_body_renderer(
     if compact:
         return render_compact_heartbeat_task_body
     return render_heartbeat_task_body
+
+
+def _reward_memory_rule_kwargs(
+    *,
+    full: bool,
+    reward_memory_enabled: bool,
+    native_goal_host: bool,
+    ark_managed_agent_goal: bool,
+) -> dict[str, str]:
+    if native_goal_host or ark_managed_agent_goal:
+        return {}
+    if not reward_memory_enabled:
+        return {"reward_memory_rule": ""}
+    return {
+        "reward_memory_rule": (
+            REWARD_MEMORY_OUTCOME_RULE
+            if full
+            else REWARD_MEMORY_OUTCOME_COMPACT_RULE
+        )
+    }
 
 
 def _heartbeat_regeneration_commands(
@@ -266,6 +288,7 @@ def build_heartbeat_prompt(
     visible_goal_host: str | None = None,
     turn_granularity: str | None = None,
     turn_instance_id: str | None = None,
+    reward_memory_enabled: bool = True,
 ) -> dict[str, Any]:
     if not (full or compact or brief or thin):
         thin = True
@@ -324,12 +347,15 @@ def build_heartbeat_prompt(
         scheduler_execution_context=scheduler_execution_context,
     )
     explicit_agent_scopes = normalize_agent_scopes(agent_scopes)
-    profile_agent_scopes = agent_profile_scopes(agent_profile)
-    normalized_agent_scopes = explicit_agent_scopes or profile_agent_scopes
+    if explicit_agent_scopes:
+        normalized_agent_scopes = explicit_agent_scopes
+        agent_scope_source = "argument"
+    else:
+        normalized_agent_scopes = agent_profile_scopes(agent_profile)
+        agent_scope_source = "agent_profile_v1" if normalized_agent_scopes else None
     if traex_visible_goal:
         for scope in normalized_agent_scopes:
             validate_visible_goal_policy_rule(field="agent_scope", value=scope)
-    agent_scope_source = "argument" if explicit_agent_scopes else "agent_profile_v1" if profile_agent_scopes else None
     if normalized_agent_scopes and not normalized_agent_id:
         raise ValueError("--agent-scope requires --agent-id so claimed_by uses a registered agent")
     normalized_registered_agents = normalize_registered_agents(registered_agents)
@@ -414,6 +440,12 @@ def build_heartbeat_prompt(
         brief=brief,
         compact=compact,
     )
+    reward_memory_rule_kwargs = _reward_memory_rule_kwargs(
+        full=full,
+        reward_memory_enabled=reward_memory_enabled,
+        native_goal_host=native_goal_host,
+        ark_managed_agent_goal=ark_managed_agent_goal,
+    )
     task_body = task_body_renderer(
         goal_id=goal_id,
         active_state=active_state_text,
@@ -433,6 +465,7 @@ def build_heartbeat_prompt(
         compact_prompt_command=str(commands["compact_prompt_command"]),
         brief_prompt_command=str(commands["brief_prompt_command"]),
         thin_prompt_command=str(commands["thin_prompt_command"]),
+        **reward_memory_rule_kwargs,
     )
     task_body = bind_exact_turn_settlement_task_body(
         task_body,
@@ -472,6 +505,7 @@ def build_heartbeat_prompt(
         "agent_profile": agent_profile_prompt_projection(agent_profile),
         "registered_agents": normalized_registered_agents,
         "runtime_profile": runtime_profile,
+        "reward_memory_enabled": reward_memory_enabled,
         "scheduler_execution_context": scheduler_execution_context,
         **(
             {"visible_goal_host": visible_goal_host}

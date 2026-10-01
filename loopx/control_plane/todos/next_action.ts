@@ -1,3 +1,4 @@
+import {readTodoPriority, todoPriorityRank as priorityRank, type TodoPriority} from "./priority.ts";
 import type { JsonObject } from "../effect_program.ts";
 import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
 import {
@@ -17,15 +18,13 @@ const TODO_ID_PATTERN = /^todo_[a-z0-9_-]{3,64}$/;
 const NEXT_ACTION_BINDING_PATTERN =
   /^\s*<!--\s*loopx:next-action\s+schema=([A-Za-z0-9_-]+)\s+todo_id=(todo_[A-Za-z0-9_-]+)\s*-->\s*$/;
 const TODO_STATUSES = new Set(["open", "done", "blocked", "deferred"]);
-const TODO_PRIORITY_PATTERN = /^P([0-4])/;
-const TODO_MISSING_PRIORITY_RANK = 50;
 const CONTROL_TASK_CLASSES = new Set([
   "continuous_monitor",
   "user_gate",
   "blocker",
 ]);
 
-export type TodoPriority = `P${0 | 1 | 2 | 3 | 4}${string}`;
+export type {TodoPriority} from "./priority.ts";
 
 export interface TodoNextActionSnapshot {
   todo_id: string;
@@ -87,11 +86,10 @@ function nullableTodoPriority(
   label: string,
 ): TodoPriority | null {
   if (value === null) return null;
-  const priority = requiredString(value, label).trim().toUpperCase();
-  if (!TODO_PRIORITY_PATTERN.test(priority)) {
-    throw new EffectRuntimeRequestError(`${label} must start with P0, P1, P2, P3, or P4`);
-  }
-  return priority as TodoPriority;
+  // Snapshot input is a read compatibility boundary, unlike new priority intent.
+  const priority = readTodoPriority({priority: requiredString(value, label)});
+  if (priority === null) throw new EffectRuntimeRequestError(`${label} must be a supported Todo priority`);
+  return priority;
 }
 
 function normalizedTodoId(value: unknown, label: string): string {
@@ -329,11 +327,6 @@ function bindNextAction(
     matched: true,
     lines: updated,
   };
-}
-
-function priorityRank(priority: TodoPriority | null): number {
-  const match = priority ? TODO_PRIORITY_PATTERN.exec(priority) : null;
-  return match ? Number(match[1]) : TODO_MISSING_PRIORITY_RANK;
 }
 
 function nextOpenAgentTodo(

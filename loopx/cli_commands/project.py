@@ -10,6 +10,7 @@ from pathlib import Path
 from ..control_plane.projects.registry import (
     PROJECT_KINDS,
     bind_session,
+    recreate_goal,
     register_project_goal,
     resolve_project,
     unbind_session,
@@ -44,6 +45,11 @@ def register_project_commands(
     register_parser.add_argument("--stop-condition", required=True)
     register_parser.add_argument("--repository", action="append", default=[])
     register_parser.add_argument("--external-locator", action="append", default=[])
+    register_parser.add_argument(
+        "--goal-instance-profile",
+        choices=("source_session_v1",),
+    )
+    register_parser.add_argument("--operation-id")
 
     bind_parser = project_sub.add_parser(
         "bind-session",
@@ -52,6 +58,8 @@ def register_project_commands(
     add_subcommand_format(bind_parser)
     bind_parser.add_argument("--session-id", required=True)
     bind_parser.add_argument("--goal-id", required=True)
+    bind_parser.add_argument("--goal-instance-id")
+    bind_parser.add_argument("--operation-id")
 
     unbind_parser = project_sub.add_parser(
         "unbind-session",
@@ -60,6 +68,18 @@ def register_project_commands(
     add_subcommand_format(unbind_parser)
     unbind_parser.add_argument("--session-id", required=True)
     unbind_parser.add_argument("--goal-id", required=True)
+    unbind_parser.add_argument("--goal-instance-id")
+    unbind_parser.add_argument("--operation-id")
+
+    recreate_parser = project_sub.add_parser(
+        "recreate-goal",
+        help="Retire one exact Goal instance and publish its reserved successor.",
+    )
+    add_subcommand_format(recreate_parser)
+    recreate_parser.add_argument("--goal-id", required=True)
+    recreate_parser.add_argument("--goal-instance-id", required=True)
+    recreate_parser.add_argument("--operation-id", required=True)
+    recreate_parser.add_argument("--execute", action="store_true")
 
     resolve_parser = project_sub.add_parser(
         "resolve",
@@ -68,6 +88,8 @@ def register_project_commands(
     add_subcommand_format(resolve_parser)
     resolve_parser.add_argument("--project-id")
     resolve_parser.add_argument("--session-id")
+    resolve_parser.add_argument("--goal-id")
+    resolve_parser.add_argument("--goal-instance-id")
     resolve_parser.add_argument("--repository")
     resolve_parser.add_argument("--external-locator")
 
@@ -120,26 +142,42 @@ def handle_project_command(
                 stop_condition=args.stop_condition,
                 repository_bindings=args.repository,
                 external_locator_bindings=args.external_locator,
+                goal_instance_profile=args.goal_instance_profile,
+                operation_id=args.operation_id,
             )
         elif args.project_command == "bind-session":
             payload = bind_session(
                 registry_path=registry_path,
                 session_id=args.session_id,
                 goal_id=args.goal_id,
+                goal_instance_id=args.goal_instance_id,
+                operation_id=args.operation_id,
             )
         elif args.project_command == "unbind-session":
             payload = unbind_session(
                 registry_path=registry_path,
                 session_id=args.session_id,
                 goal_id=args.goal_id,
+                goal_instance_id=args.goal_instance_id,
+                operation_id=args.operation_id,
             )
-        else:
+        elif args.project_command == "resolve":
             payload = resolve_project(
                 registry_path=registry_path,
                 explicit_project_id=args.project_id,
                 session_id=args.session_id,
                 repository=args.repository,
                 external_locator=args.external_locator,
+                goal_id=args.goal_id,
+                goal_instance_id=args.goal_instance_id,
+            )
+        else:
+            payload = recreate_goal(
+                registry_path=registry_path,
+                goal_id=args.goal_id,
+                goal_instance_id=args.goal_instance_id,
+                operation_id=args.operation_id,
+                execute=args.execute,
             )
     except (OSError, TypeError, ValueError, LegacyCoordinationWriterFenced, ShadowManagementError) as exc:
         payload = {

@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .control_plane.goals.active_state_metadata import todo_role_for_heading
+from .control_plane.status.active_state_projection import SECTION_HEADING_PATTERN
 from .control_plane.todos.contract import (
     TODO_TASK_PATTERN,
     build_todo_id,
@@ -42,25 +44,8 @@ ACTIVE_STATE_STRUCTURED_PROJECTION_SCHEMA_VERSION = "active_state_structured_pro
 ACTIVE_STATE_PROJECTION_DIAGNOSTICS_SCHEMA_VERSION = "active_state_projection_diagnostics_v0"
 TODO_ITEM_SCHEMA_VERSION = "todo_item_v0"
 
-SECTION_HEADING_PATTERN = re.compile(r"^##+\s+(.+?)\s*$")
 BULLET_PATTERN = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$")
 PRIORITY_PATTERN = re.compile(r"^\[(P[0-4])\]\s+(.+)$", re.IGNORECASE)
-USER_TODO_HEADER_MARKERS = (
-    "user todo",
-    "owner review",
-    "owner todo",
-    "user action",
-    "用户",
-    "人工",
-    "owner",
-)
-AGENT_TODO_HEADER_MARKERS = (
-    "agent todo",
-    "agent backlog",
-    "agent action",
-    "项目 agent",
-    "agent 待办",
-)
 NEXT_ACTION_EXECUTABLE_PATTERN = re.compile(
     r"(?i)\b(?:run|repair|fix|implement|add|update|write|record|validate|"
     r"rerun|debug|inspect|analy[sz]e|sync|refresh|test|benchmark|trace|"
@@ -355,12 +340,17 @@ def is_user_wait_text(value: Any) -> bool:
 
 
 def _role_for_heading(heading: str) -> str | None:
-    normalized = heading.strip().lower()
-    if any(marker in normalized for marker in USER_TODO_HEADER_MARKERS):
-        return "user"
-    if any(marker in normalized for marker in AGENT_TODO_HEADER_MARKERS):
-        return "agent"
-    return None
+    """Classify a state heading exactly as the Todo region writer does.
+
+    This module used to carry its own copy of the marker tuples. The copies had
+    drifted: they matched bare ``owner``, so a prose section named ``Ownership``
+    counted as user Todos; they missed ``codex todo``, which the writer creates;
+    and they had no archive guard, so ``Agent Todo Archive`` counted as live
+    agent Todos. The open counts feed ``state_projection_gap_warning``, where an
+    inflated agent count suppresses the very warning that says a Next Action is
+    executable with no agent Todo behind it.
+    """
+    return todo_role_for_heading(heading)
 
 
 def _open_count(summary: dict[str, Any] | None) -> int:

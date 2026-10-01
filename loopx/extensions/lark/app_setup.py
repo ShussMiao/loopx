@@ -50,7 +50,7 @@ def _default_process_factory(args: list[str], env: dict[str, str]) -> SetupProce
         env=env,
         stderr=subprocess.STDOUT,
         stdout=subprocess.PIPE,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
 
 

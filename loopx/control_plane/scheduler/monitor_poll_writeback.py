@@ -1,114 +1,15 @@
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Any
 
 from ..todos.contract import (
     TODO_TASK_CLASS_ADVANCEMENT,
-    TODO_TASK_CLASS_MONITOR,
     TODO_TASK_CLASS_USER_GATE,
-    normalize_required_capabilities,
-    normalize_todo_action_kind,
-    normalize_todo_continuation_policy,
     normalize_todo_id,
-    normalize_todo_task_repository,
-    resolve_next_user_task_class,
-    resolve_todo_continuation_policy,
 )
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
 from ..todos.monitor_metadata import MonitorPollObservation
-from .monitor_todo import monitor_todo_task_class
-
-
-def require_monitor_successor_route(
-    *,
-    next_agent_todo: str | None,
-    next_action_kind: str | None,
-    next_task_repository: str | None,
-    next_required_capabilities: list[str] | None,
-    next_continuation_policy: str | None,
-    next_target_key: str | None,
-) -> None:
-    route_fields = {
-        "--next-action-kind": next_action_kind,
-        "--next-task-repository": next_task_repository,
-        "--next-continuation-policy": next_continuation_policy,
-        "--next-target-key": next_target_key,
-    }
-    if not next_agent_todo:
-        if any(route_fields.values()) or next_required_capabilities:
-            raise ValueError("monitor successor routing options require --next-agent-todo")
-        return
-    if not str(next_action_kind or "").strip():
-        raise ValueError(
-            "`quota monitor-poll --next-agent-todo` requires explicit successor "
-            "action semantics via --next-action-kind"
-        )
-
-
-def _derived_monitor_successor_target_key(*, todo_id: str, result_hash: str) -> str:
-    digest = hashlib.sha256(result_hash.encode("utf-8")).hexdigest()[:16]
-    return f"monitor-successor:{todo_id}:{digest}"
-
-
-def _resolve_monitor_successor_route(
-    *,
-    next_agent_todo: str | None,
-    next_action_kind: str | None,
-    next_task_repository: str | None,
-    next_required_capabilities: list[str] | None,
-    next_continuation_policy: str | None,
-    next_target_key: str | None,
-    source_task_repository: str | None,
-    todo_id: str,
-    result_hash: str,
-) -> dict[str, Any]:
-    if not next_agent_todo:
-        return {}
-    action_kind = normalize_todo_action_kind(next_action_kind)
-    if not action_kind:
-        raise ValueError(
-            "--next-action-kind must be a public-safe token: lowercase letters, "
-            "digits, '_' or '-'"
-        )
-    task_repository = normalize_todo_task_repository(next_task_repository)
-    if next_task_repository and not task_repository:
-        raise ValueError(
-            "--next-task-repository must be a credential-free Git remote or "
-            "canonical git:<host>/<path> identity"
-        )
-    if source_task_repository and not task_repository:
-        raise ValueError(
-            "repository-bound monitor successors require explicit "
-            "--next-task-repository so same-repository and cross-repository "
-            "routing cannot be confused"
-        )
-    required_capabilities = normalize_required_capabilities(
-        next_required_capabilities
-    )
-    if next_required_capabilities and not required_capabilities:
-        raise ValueError(
-            "--next-required-capability must contain public-safe capability tokens"
-        )
-    if next_continuation_policy and not normalize_todo_continuation_policy(
-        next_continuation_policy
-    ):
-        raise ValueError(
-            "--next-continuation-policy must be a supported todo continuation policy"
-        )
-    return {
-        "action_kind": action_kind,
-        "task_repository": task_repository,
-        "required_capabilities": required_capabilities,
-        "continuation_policy": resolve_todo_continuation_policy(
-            next_continuation_policy
-        ).value,
-        "target_key": str(next_target_key or "").strip()
-        or _derived_monitor_successor_target_key(
-            todo_id=todo_id,
-            result_hash=result_hash,
-        ),
-    }
 
 
 def resolve_monitor_todo_item(
@@ -132,43 +33,16 @@ def resolve_monitor_todo_item(
         runtime_root_arg=str(runtime_root) if runtime_root is not None else None,
     )
     items = payload.get("todos") if isinstance(payload.get("todos"), list) else []
-    if normalized_todo_id:
-        matches = [
-            item
-            for item in items
-            if isinstance(item, dict)
-            and normalize_todo_id(item.get("todo_id")) == normalized_todo_id
-        ]
-        if not matches:
-            raise ValueError(f"monitor todo_id {normalized_todo_id!r} was not found")
-        if len(matches) > 1:
-            raise ValueError(f"monitor todo_id {normalized_todo_id!r} matched multiple todos")
-        item = matches[0]
-        item_target_key = str(item.get("target_key") or "").strip()
-        if safe_target_key and item_target_key and safe_target_key != item_target_key:
-            raise ValueError(
-                f"monitor todo_id {normalized_todo_id!r} resolves target_key "
-                f"{item_target_key!r}, not {safe_target_key!r}"
-            )
-        if monitor_todo_task_class(item) != TODO_TASK_CLASS_MONITOR:
-            raise ValueError("monitor-poll todo writeback target must be task_class=continuous_monitor")
-        return item
-
-    matches: list[dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if safe_target_key and str(item.get("target_key") or "").strip() == safe_target_key:
-            matches.append(item)
-    if not matches:
-        target = normalized_todo_id or safe_target_key
-        raise ValueError(f"monitor todo target {target!r} was not found")
-    if len(matches) > 1:
-        raise ValueError(f"monitor target_key {safe_target_key!r} matched multiple todos; pass --todo-id")
-    item = matches[0]
-    if monitor_todo_task_class(item) != TODO_TASK_CLASS_MONITOR:
-        raise ValueError("monitor-poll todo writeback target must be task_class=continuous_monitor")
-    return item
+    try:
+        result = effect_runtime_result("scheduler.monitor_target.select", {
+            "schema_version": "loopx_monitor_target_request_v0", "items": items,
+            "todo_id": normalized_todo_id, "target_key": safe_target_key or None,
+        })
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from exc
+    if not isinstance(result, dict) or result.get("schema_version") != "loopx_monitor_target_result_v0":
+        raise TypeError("TypeScript Monitor target selection shape mismatch")
+    return result["todo"]
 
 
 def write_monitor_poll_todo_state(
@@ -196,6 +70,9 @@ def write_monitor_poll_todo_state(
     next_user_task_class: str | None = None,
     next_claimed_by: str | None = None,
     agent_id: str | None = None,
+    task_lease_idempotency_key: str | None = None,
+    task_lease_expected_version: int | None = None,
+    gate_scope_guard: bool = False,
 ) -> dict[str, Any] | None:
     """Apply one monitor poll observation as a complete Todo writeback.
 
@@ -212,8 +89,34 @@ def write_monitor_poll_todo_state(
         require_legacy_coordination_write_allowed,
     )
 
+    lease_proof = ({"idempotency_key": task_lease_idempotency_key,
+                    "expected_version": task_lease_expected_version}
+                   if task_lease_idempotency_key is not None or task_lease_expected_version is not None else None)
     if not todo_id and not target_key:
+        if lease_proof is not None:
+            raise ValueError("lease proof requires a Monitor target")
         return None
+    from .provider_monitor_poll import poll_canonical_monitor_if_promoted
+
+    canonical = poll_canonical_monitor_if_promoted(
+        registry_path=registry_path, runtime_root=runtime_root, goal_id=goal_id,
+        execute=execute, monitor_effect_id=monitor_effect_id, agent_id=agent_id,
+        lease_proof=lease_proof, gate_scope_guard=gate_scope_guard,
+        observation={"todo_id": todo_id, "target_key": target_key,
+            "result_hash": result_hash, "material_change": material_change,
+            "generated_at": generated_at, "cadence": cadence,
+            "next_due_at": next_due_at, "reason_summary": reason_summary},
+        intent={"next_agent_todo": next_agent_todo, "next_action_kind": next_action_kind,
+            "next_task_repository": next_task_repository,
+            "next_required_capabilities": next_required_capabilities or [],
+            "next_continuation_policy": next_continuation_policy,
+            "next_target_key": next_target_key, "next_claimed_by": next_claimed_by,
+            "next_user_todo": next_user_todo, "next_user_task_class": next_user_task_class},
+    )
+    if canonical is not None:
+        return canonical
+    if lease_proof is not None:
+        raise ValueError("Monitor lease proof requires promoted canonical authority; no legacy write attempted")
     if execute:
         require_legacy_coordination_write_allowed(
             runtime_root=runtime_root,
@@ -222,18 +125,6 @@ def write_monitor_poll_todo_state(
     safe_result_hash = str(result_hash or "").strip()
     if not safe_result_hash:
         raise ValueError("monitor todo writeback requires --result-hash")
-    effective_next_user_task_class = resolve_next_user_task_class(
-        next_user_todo,
-        next_user_task_class,
-    )
-    require_monitor_successor_route(
-        next_agent_todo=next_agent_todo,
-        next_action_kind=next_action_kind,
-        next_task_repository=next_task_repository,
-        next_required_capabilities=next_required_capabilities,
-        next_continuation_policy=next_continuation_policy,
-        next_target_key=next_target_key,
-    )
     item = resolve_monitor_todo_item(
         registry_path=registry_path,
         goal_id=goal_id,
@@ -244,18 +135,32 @@ def write_monitor_poll_todo_state(
     resolved_todo_id = normalize_todo_id(item.get("todo_id"))
     if not resolved_todo_id:
         raise ValueError("resolved monitor todo has no stable todo_id")
-    successor_route = _resolve_monitor_successor_route(
-        next_agent_todo=next_agent_todo,
-        next_action_kind=next_action_kind,
-        next_task_repository=next_task_repository,
-        next_required_capabilities=next_required_capabilities,
-        next_continuation_policy=next_continuation_policy,
-        next_target_key=next_target_key,
-        source_task_repository=str(item.get("task_repository") or "").strip()
-        or None,
-        todo_id=resolved_todo_id,
-        result_hash=safe_result_hash,
-    )
+    # The typed plan validates the complete successor intent before the first
+    # write. Source lookup and actual effects remain in this adapter.
+    try:
+        plan = effect_runtime_result("scheduler.monitor_successor.plan", {
+            "schema_version": "loopx_monitor_successor_plan_request_v0",
+            "todo_id": resolved_todo_id, "result_hash": safe_result_hash,
+            "source_task_repository": item.get("task_repository"),
+            "intent": {
+                "material_change": material_change,
+                "next_agent_todo": next_agent_todo, "next_action_kind": next_action_kind,
+                "next_task_repository": next_task_repository,
+                "next_required_capabilities": next_required_capabilities or [],
+                "next_continuation_policy": next_continuation_policy,
+                "next_target_key": next_target_key, "next_claimed_by": next_claimed_by,
+                "next_user_todo": next_user_todo, "next_user_task_class": next_user_task_class,
+            },
+        })
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from exc
+    if not isinstance(plan, dict) or plan.get("schema_version") != "loopx_monitor_successor_plan_result_v0":
+        raise TypeError("TypeScript monitor successor plan shape mismatch")
+    successor_route = plan["agent_route"]
+    intent = plan["intent"]
+    next_agent_todo = intent["next_agent_todo"]
+    next_user_todo = intent["next_user_todo"]
+    effective_next_user_task_class = intent["next_user_task_class"]
     safe_target_key = str(target_key or "").strip()
     update_result = update_goal_todo(
         registry_path=registry_path,
@@ -274,6 +179,7 @@ def write_monitor_poll_todo_state(
             next_due_at=next_due_at,
         ),
         enforce_monitor_boundedness=False,
+        monitor_gate_scope_guard=gate_scope_guard,
         agent_id=agent_id,
         dry_run=not execute,
     )
@@ -301,7 +207,7 @@ def write_monitor_poll_todo_state(
                 task_repository=successor_route["task_repository"],
                 continuation_policy=successor_route["continuation_policy"],
                 required_capabilities=successor_route["required_capabilities"],
-                claimed_by=next_claimed_by,
+                claimed_by=successor_route["claimed_by"],
                 unblocks_todo_id=resolved_todo_id,
                 monitor_metadata={"target_key": successor_route["target_key"]},
                 dry_run=not execute,

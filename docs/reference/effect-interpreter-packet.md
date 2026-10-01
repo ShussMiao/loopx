@@ -26,6 +26,28 @@ decision or turn-settlement logic; they give refactor and test code one
 stable abstraction for reading the effect program shape across packet
 families.
 
+The action slot depends on the packet family:
+
+| Observation | Verdict | `effective_action` |
+| --- | --- | --- |
+| Quota should-run | Quota decision | Existing decision/frontier action string |
+| Turn result | `decision` carries `result_kind` | Always JSON `null` / Python `None` |
+| Journal replay | `replay_legal` or `replay_blocked` | Omitted from the internal replay observation |
+
+Turn-result readers must use `decision` for the result verdict. The result lens
+ignores a host-supplied action; it cannot create a quota decision. The TS result
+type fixes its action to null, while the generic quota type retains its default
+string action. This changes the transient result projection, not persisted
+host results, receipts, or journal plans. See the
+[semantic vocabulary RFC](../architecture/rfcs/semantic-vocabulary-convergence-v0.md#m1-action-domains-and-compatibility)
+for the versioned frontier migration and its compatibility boundary.
+
+动作槽位按 packet family 区分：quota 保留决策/前沿动作字符串；Turn result 的
+判决从 `decision` 读取，`effective_action` 固定为 `null`（Python 为 `None`）；
+journal replay 使用自己的判决，不再输出动作字段。host 提供的 action 不会被
+解释为 quota 决策。这只改变瞬时结果投射，不重写落盘的 host result、receipt
+或 journal plan。
+
 ## Turn Journal Lens
 
 `interpret_turn_journal` reads an existing fenced Turn journal and returns an
@@ -124,7 +146,17 @@ The decision is returned as:
 | `effective_action` | Machine-visible effective action |
 | `recommended_action` | Next concrete action text |
 | `action_portfolio` | Primary plus bounded typed fallbacks, when present |
-| `protocol_action_packet.summary` | Compact actor-facing summary |
+| `protocol_action_packet.summary` | Optional historical actor-facing summary; no action authority |
+
+For a source without `protocol_action_packet`, the quota lens exposes
+`protocol_summary=null`; typed interaction, lane, and scheduler contracts still
+supply obligations and next effects. Historical v0 and opaque summaries remain
+readable observations and cannot override those contracts. The
+[PR-05 migration](protocols/protocol-action-packet-decision-v0.md)
+defines packet-free new quota/live/paused/recovery output from the first release
+containing #4794. It names the supported bundled consumers, retained v0 format
+lifetime and tested v1.1.0 rollback baseline; unknown external clients are not
+automatically covered.
 
 `EffectTurn.observation.action_portfolio` is the canonical TypeScript-owned
 observation of this field. Python supplies only scope/capability-admitted todo
@@ -142,8 +174,8 @@ The observation points back into the loop:
 | `execution_mode` | Execution strategy (`serial` / `parallel` / `interleaved`) for an ordered effect program |
 | `scheduler_hint.action` | Scheduler around decision |
 | `scheduler_hint.cadence_class` | Cadence for the next host wake |
-| `scheduler_hint.codex_app.ack_hint.cli_args` | Host ACK effect |
-| `scheduler_hint.codex_app.failure_hint.cli_args` | Host failure effect |
+| `scheduler_hint.app_automation.ack_hint.cli_args` | Host ACK effect |
+| `scheduler_hint.app_automation.failure_hint.cli_args` | Host failure effect |
 
 `EffectTurn.next_effect` is the code lens for this slot. It keeps the
 data-encoded handler visible: the host invokes the CLI actions and settles

@@ -4,6 +4,7 @@ from typing import Any
 
 from ...control_plane import control_plane_policy_summary
 from ...control_plane.quota.states import QUOTA_STATE_ORDER
+from ...control_plane.projection_envelope_facts import render_projection_envelope_markdown
 from ...control_plane.runtime.decision_freshness import (
     DECISION_FRESHNESS_WARNING_ITEM_LIMIT,
 )
@@ -192,6 +193,14 @@ def render_quota_markdown(payload: dict[str, Any]) -> str:
         f"- goals: `{payload.get('goal_count')}`",
         f"- runs: `{payload.get('run_count')}`",
     ]
+    if payload.get("goal_filter"):
+        lines.append(f"- goal_filter: `{markdown_scalar(payload['goal_filter'])}` (counts and ranking cover this Goal only)")
+    if payload.get("reason"):
+        lines.append(f"- reason: {markdown_scalar(payload['reason'])}")
+    if payload.get("recommended_action"):
+        lines.append(f"- action: {markdown_scalar(payload['recommended_action'])}")
+    if payload.get("status_projection_envelope"):
+        lines.extend(render_projection_envelope_markdown(payload["status_projection_envelope"]))
     summary = as_dict(payload.get("summary"))
     states = as_dict(summary.get("states"))
     state_text = ", ".join(f"{state}={states.get(state, 0)}" for state in QUOTA_STATE_ORDER)
@@ -204,7 +213,8 @@ def render_quota_markdown(payload: dict[str, Any]) -> str:
     lines.append(f"- states: {state_text}")
 
     next_turn = as_dict(payload.get("next_automatic_turn"))
-    lines.extend(["", "## Next Automatic Turn"])
+    next_title = "Next Automatic Turn Within Selected Goal" if payload.get("goal_filter") else "Next Automatic Turn"
+    lines.extend(["", f"## {next_title}"])
     if next_turn:
         quota = as_dict(next_turn.get("quota"))
         lines.append(
@@ -485,8 +495,13 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
                     f"resume_when={vision_wait_state.get('resume_when')} "
                     f"automatic_resume={vision_wait_state.get('automatic_resume')}"
                 )
-    task_orchestration = as_dict(payload.get("task_orchestration_contract"))
-    if task_orchestration:
+    orchestration = as_dict(payload.get("task_orchestration_contract"))
+    for label, task_orchestration in (
+        ("task_orchestration", orchestration),
+        ("peer_activation_diagnostic", as_dict(orchestration.get("peer_activation_diagnostic"))),
+    ):
+        if not task_orchestration:
+            continue
         lanes = as_list(task_orchestration.get("eligible_child_lanes"))
         if not lanes:
             lanes = as_list(task_orchestration.get("eligible_peer_lanes"))
@@ -494,13 +509,26 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
         if not blocked_lanes:
             blocked_lanes = as_list(task_orchestration.get("blocked_peer_lanes"))
         lines.append(
-            "- task_orchestration: "
+            f"- {label}: "
             f"mode={task_orchestration.get('mode')} "
             f"activation_required={task_orchestration.get('activation_required')} "
-            f"lanes={len(lanes)} "
-            f"blocked_lanes={len(blocked_lanes)} "
+            f"lanes={task_orchestration.get('eligible_peer_count', len(lanes))} "
+            f"blocked_lanes={task_orchestration.get('blocked_peer_count', len(blocked_lanes))} "
             f"writeback_owner={task_orchestration.get('writeback_owner')}"
         )
+        fields = " ".join(
+            f"{key}={markdown_scalar(task_orchestration[key])}"
+            for key in ("execution_scope", "execution_state", "task_selection", "activation_allowed")
+            if key in task_orchestration
+        )
+        if fields:
+            lines.append(f"- {label}_admission: {fields}")
+        reasons = sorted({str(reason) for row in blocked_lanes if isinstance(row, dict)
+                          for reason in as_list(row.get("reason_codes"))})
+        if reasons:
+            lines.append(f"- {label}_blockers: {', '.join(reasons)}")
+        if task_orchestration.get("read_required") is True:
+            lines.append(f"- {label}_required_detail: {task_orchestration.get('detail_ref')}")
     replan_decision = as_dict(payload.get("autonomous_replan_decision"))
     if replan_decision:
         lines.append(
@@ -664,6 +692,15 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
             f"trigger_count={replan_obligation.get('trigger_count')} "
             f"triggers={','.join(trigger_kinds)}"
         )
+        for trigger in as_list(replan_obligation.get("triggers")):
+            if not isinstance(trigger, dict) or not trigger.get("reason_code"):
+                continue
+            lines.append(f"  - reason_code: {trigger['reason_code']}")
+            checks = as_dict(trigger.get("component_checks"))
+            lines.append("  - component_checks: " + ", ".join(
+                f"{key}={'pass' if passed else 'fail'}" for key, passed in checks.items()
+            ))
+            lines.append(f"  - resolution: {trigger.get('resolution_hint')}")
     required_reads = as_list(payload.get("required_reads"))
     for read in required_reads[:3]:
         if not isinstance(read, dict):
@@ -873,7 +910,9 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
             lines.append(f"- automation_pause_policy: {automation_liveness.get('pause_policy')}")
     scheduler_hint = as_dict(payload.get("scheduler_hint"))
     if scheduler_hint:
-        codex_app = as_dict(scheduler_hint.get("codex_app"))
+        app_automation = as_dict(
+            scheduler_hint.get("app_automation") or scheduler_hint.get("codex_app")
+        )
         unchanged_poll = as_dict(scheduler_hint.get("unchanged_poll"))
         limits = as_dict(unchanged_poll.get("limits"))
         codex_cli_tui = as_dict(scheduler_hint.get("codex_cli_tui"))
@@ -892,10 +931,10 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
             "- scheduler_hint: "
             f"action={scheduler_hint.get('action')} "
             f"cadence={scheduler_hint.get('cadence_class')} "
-            f"codex_app_minutes={codex_app.get('recommended_interval_minutes')} "
-            f"codex_app_rrule={codex_app.get('recommended_rrule')} "
-            f"codex_app_apply_needed={(codex_app.get('stateful_backoff') or {}).get('apply_needed') if isinstance(codex_app.get('stateful_backoff'), dict) else None} "
-            f"codex_app_progression={codex_app.get('example_progression_minutes')} "
+            f"app_automation_minutes={app_automation.get('recommended_interval_minutes')} "
+            f"app_automation_rrule={app_automation.get('recommended_rrule')} "
+            f"app_automation_apply_needed={(app_automation.get('stateful_backoff') or {}).get('apply_needed') if isinstance(app_automation.get('stateful_backoff'), dict) else None} "
+            f"app_automation_progression={app_automation.get('example_progression_minutes')} "
             f"cli_unchanged_limit={cli_unchanged_limit} "
             f"claude_unchanged_limit={claude_unchanged_limit}"
         )
@@ -904,8 +943,8 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
         if reset_policy := as_dict(scheduler_hint.get("reset_policy")):
             lines.append(
                 "- scheduler_reset: "
-                f"initial_interval={reset_policy.get('codex_app_initial_interval_minutes')} "
-                f"initial_rrule={reset_policy.get('codex_app_initial_rrule')} "
+                f"initial_interval={reset_policy.get('app_automation_initial_interval_minutes')} "
+                f"initial_rrule={reset_policy.get('app_automation_initial_rrule')} "
                 f"reset_generation={reset_policy.get('reset_token')} "
                 f"identity_signature={reset_policy.get('identity_signature')}"
             )

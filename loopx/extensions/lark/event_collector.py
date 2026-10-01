@@ -18,6 +18,7 @@ from .event_inbox import (
     inspect_lark_event_inbox,
     load_lark_event_inbox_config,
 )
+from .identity_shapes import LARK_CHAT_ID_PATTERN
 
 CONFIG_SCHEMA_VERSION_V0 = "lark_event_collector_config_v0"
 CONFIG_SCHEMA_VERSION = "lark_event_collector_config_v1"
@@ -29,13 +30,13 @@ PLAN_SCHEMA_VERSION = "lark_event_collector_plan_v0"
 STATUS_SCHEMA_VERSION = "lark_event_collector_status_v0"
 INSTALL_SCHEMA_VERSION = "lark_event_collector_install_v0"
 SERVICE_RE = re.compile(r"^loopx-[a-z0-9][a-z0-9._-]{1,73}$")
-CHAT_RE = re.compile(r"^oc_[A-Za-z0-9_-]+$")
 TIMEOUT_RE = re.compile(r"^[1-9][0-9]*(?:s|m|h)$")
 SUPPORTED_SUPERVISORS = {"launchd", "systemd"}
 SUPPORTED_EVENT_KEY = "im.message.receive_v1"
 MAX_ROUTE_COUNT = 50
 TURN_START_SYNC_MAX_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
 TURN_START_SYNC_MAX_OVERLAP_SECONDS = 5 * 60
+OPERATION_CALLBACK_EVENT_KEY = "card.action.trigger"
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -130,6 +131,37 @@ def load_lark_event_collector_config(
     )
     turn_start_sync_overlap = raw_turn_start_sync.get("overlap_seconds", 5)
     turn_start_sync_page_size = raw_turn_start_sync.get("page_size", 50)
+    raw_operation_callbacks = payload.get("operation_callbacks")
+    if raw_operation_callbacks is not None and not isinstance(
+        raw_operation_callbacks, Mapping
+    ):
+        raise TypeError("collector operation_callbacks must be an object")
+    raw_operation_callbacks = (
+        raw_operation_callbacks if isinstance(raw_operation_callbacks, Mapping) else {}
+    )
+    unknown_operation_callback_fields = set(raw_operation_callbacks) - {"enabled", "managed_turn_wake"}
+    if unknown_operation_callback_fields:
+        raise ValueError("collector operation_callbacks contains unsupported fields")
+    operation_callbacks_enabled = raw_operation_callbacks.get("enabled") is True
+    if operation_callbacks_enabled and schema_version == CONFIG_SCHEMA_VERSION_V0:
+        raise ValueError("collector operation_callbacks requires config v1")
+    managed_turn_wake = None
+    raw_wake = raw_operation_callbacks.get("managed_turn_wake")
+    if raw_wake is not None:
+        fields = {"registry_path", "goal_id", "requester_agent_id", "execution_config", "binding_id"}
+        if not isinstance(raw_wake, Mapping) or set(raw_wake) != fields:
+            raise ValueError("collector managed_turn_wake requires one explicit operator binding")
+        if not operation_callbacks_enabled:
+            raise ValueError("collector managed_turn_wake requires enabled operation callbacks")
+        if any(not isinstance(raw_wake[key], str) or not raw_wake[key]
+               or len(raw_wake[key]) > 4096 or any(ord(c) < 32 for c in raw_wake[key]) for key in fields):
+            raise ValueError("collector managed_turn_wake requires bounded string fields")
+        registry_path = Path(raw_wake["registry_path"]).expanduser()
+        if not registry_path.is_absolute():
+            raise ValueError("collector managed_turn_wake registry_path must be absolute")
+        config_ref, _ = _relative_project_path(root, raw_wake["execution_config"], "wake execution_config")
+        managed_turn_wake = {**dict(raw_wake), "registry_path": str(registry_path),
+                             "project": str(root), "execution_config": config_ref}
     for label, value, lower, upper in (
         (
             "initial_lookback_seconds",
@@ -199,7 +231,7 @@ def load_lark_event_collector_config(
                 "public-safe token"
             )
         chat_id = str(raw_route.get("chat_id") or "").strip()
-        if not CHAT_RE.fullmatch(chat_id):
+        if not LARK_CHAT_ID_PATTERN.fullmatch(chat_id):
             raise ValueError(
                 f"collector route {index + 1} chat_id must be a Lark oc_ chat id"
             )
@@ -307,6 +339,11 @@ def load_lark_event_collector_config(
             "overlap_seconds": turn_start_sync_overlap,
             "page_size": turn_start_sync_page_size,
         },
+        "operation_callbacks": {
+            "enabled": operation_callbacks_enabled,
+            "event_key": OPERATION_CALLBACK_EVENT_KEY,
+            "managed_turn_wake": managed_turn_wake,
+        },
         "routes": routes,
     }
 
@@ -324,6 +361,7 @@ def _jq_projection(chat_ids: str | Sequence[str]) -> str:
         "event_id:(.event_id // .message_id // .id),"
         "message_id:(.message_id // .id),"
         "create_time:.create_time,content:.content,"
+        "parent_id:.parent_id,root_id:.root_id,"
         "attachment_count:(.attachment_count // 0),"
         "sender_type:(.sender_type // .sender.sender_type),"
         "sender_id:(.sender_id // .sender.id // .sender.sender_id),"
@@ -421,6 +459,9 @@ def _plan(
     runtime_root: str | Path | None = None,
 ) -> tuple[dict[str, Any], list[str], bytes]:
     executable = shutil.which(str(config["lark_cli_bin"]))
+    operation_runtime_missing = bool(
+        config["operation_callbacks"]["enabled"] and runtime_root is None
+    )
     argv = _collector_argv(
         config,
         executable or str(config["lark_cli_bin"]),
@@ -429,10 +470,16 @@ def _plan(
     service_payload = _service_payload(config, argv)
     return (
         {
-            "ok": True,
+            "ok": not operation_runtime_missing,
             "schema_version": PLAN_SCHEMA_VERSION,
             "enabled": config["enabled"],
-            "status": "install_ready" if executable else "dependency_missing",
+            "status": (
+                "pinned_runtime_required"
+                if operation_runtime_missing
+                else "install_ready"
+                if executable
+                else "dependency_missing"
+            ),
             "service_name": config["service_name"],
             "supervisor": config["supervisor"],
             "event_key": config["event_key"],
@@ -446,9 +493,19 @@ def _plan(
             ),
             "route_count": len(config["routes"]),
             "multi_chat_routing": len(config["routes"]) > 1,
+            "operation_callbacks_enabled": config["operation_callbacks"]["enabled"],
+            "operation_callback_managed_wake_configured": config["operation_callbacks"]["managed_turn_wake"] is not None,
+            "operation_callback_event_key": (
+                config["operation_callbacks"]["event_key"]
+                if config["operation_callbacks"]["enabled"]
+                else None
+            ),
+            "operation_callback_console_configuration_preflighted": False,
             "lark_cli_available": executable is not None,
             "install_hint": (
-                None
+                "Pass the pinned LoopX runtime root for operation callbacks."
+                if operation_runtime_missing
+                else None
                 if executable
                 else "Install and configure lark-cli, then rerun the collector plan."
             ),
@@ -498,6 +555,8 @@ def install_lark_event_collector(
     plan, _, _ = _plan(config, runtime_root=runtime_root)
     if not config["enabled"]:
         raise ValueError("cannot install a disabled lark collector")
+    if plan["ok"] is not True:
+        return {**plan, "schema_version": INSTALL_SCHEMA_VERSION, "execute": execute}
     if not plan["lark_cli_available"]:
         return {**plan, "schema_version": INSTALL_SCHEMA_VERSION, "execute": execute}
     executable = shutil.which(str(config["lark_cli_bin"]))
@@ -615,6 +674,45 @@ def inspect_lark_event_collector(
         config["supervisor"] != "launchd" or "state = running" in observed.stdout
     )
     installed = service_path.is_file()
+    callback_status_path = (
+        Path(config["project"])
+        / ".loopx"
+        / "runtime"
+        / "lark-collector"
+        / "operation-callback-status.json"
+    )
+    callback_status: Mapping[str, Any] = {}
+    try:
+        raw_callback_status = json.loads(
+            callback_status_path.read_text(encoding="utf-8")
+        )
+        if isinstance(raw_callback_status, Mapping):
+            callback_status = raw_callback_status
+    except (OSError, json.JSONDecodeError):
+        pass
+    callbacks_enabled = config["operation_callbacks"]["enabled"] is True
+    callback_listener_active = bool(
+        callbacks_enabled
+        and active
+        and callback_status.get("listener_active") is True
+    )
+    callback_listener_ready = bool(
+        callback_listener_active
+        and callback_status.get("listener_ready") is True
+    )
+    callback_delivery_verified = bool(
+        callbacks_enabled
+        and callback_status.get("callback_delivery_verified") is True
+    )
+    callback_qualification_state = (
+        "disabled"
+        if not callbacks_enabled
+        else "callback_qualified"
+        if callback_delivery_verified
+        else "listener_ready_unqualified"
+        if callback_listener_ready
+        else "listener_unready"
+    )
     healthy = bool(
         config["enabled"]
         and plan["lark_cli_available"]
@@ -646,6 +744,28 @@ def inspect_lark_event_collector(
         "all_routes_real_event_evidence_present": (
             routes_with_event_evidence == len(config["routes"])
         ),
+        "operation_callbacks_enabled": callbacks_enabled,
+        "operation_callback_managed_wake_configured": config["operation_callbacks"]["managed_turn_wake"] is not None,
+        "operation_callback_listener_active": callback_listener_active,
+        "operation_callback_listener_ready": callback_listener_ready,
+        "operation_callback_delivery_verified": callback_delivery_verified,
+        "operation_callback_qualification_state": callback_qualification_state,
+        "operation_callback_verified_count": int(
+            callback_status.get("verified_callback_count") or 0
+        ),
+        "operation_callback_last_evidence_at": callback_status.get(
+            "last_verified_callback_at"
+        ),
+        "operation_callback_last_failure_code": callback_status.get(
+            "last_failure_code"
+        ),
+        "operation_callback_last_failure_stage": callback_status.get(
+            "last_failure_stage"
+        ),
+        "operation_callback_last_failure_event_shape": callback_status.get(
+            "last_failure_event_shape"
+        ),
+        "operation_callback_console_configuration_preflighted": False,
         "thread_complete": all(
             route["inbox"]["thread_complete"] for route in config["routes"]
         ),

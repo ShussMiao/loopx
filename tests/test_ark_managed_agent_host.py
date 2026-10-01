@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 from pathlib import Path
 
@@ -72,23 +73,14 @@ def test_goal_prompt_is_one_transport_independent_activation() -> None:
     assert "Goal runtime owns continuation and inner iterations" in normalized
     assert "goal loop, not automation" in normalized
     assert "invoke LoopX Turn" in normalized
-    assert "a segment is progress, not a new Goal boundary" in normalized
-    assert (
-        "Reuse this Goal until terminal"
-    ) in normalized
-    assert "do not create a successor host Goal merely to continue" in normalized
-    assert (
-        "Normal turns use CLI `interaction_contract`; use `loopx-project` for "
-        "lifecycle/registry and `loopx-self-repair` for runtime/projection drift."
-        in normalized
-    )
-    assert "take highest-priority unblocked in-scope todo" in normalized
-    assert "claims/leases and blocker-push/recovery obligations" in normalized
-    assert (
-        "Before dependencies, persist changed scope/acceptance/non-goal evidence "
-        "and next todo"
-    ) in normalized
-    assert "refresh the accountable progress record before spending" in normalized
+    assert "Progress is not a new Goal boundary" in normalized
+    assert "do not create a new host Goal merely to continue" in normalized
+    assert "current `interaction_contract`" in normalized
+    assert "selection_command" in normalized
+    assert "settlement_plan.ordered_steps" in normalized
+    assert "terminal no-follow-up" in normalized
+    assert local_development["progress_refresh_state_command"] not in local_development["task_body"]
+    assert local_development["quota_spend_command"] not in local_development["task_body"]
 
 
 def test_goal_prompt_projects_goal_only_host_contract() -> None:
@@ -155,9 +147,9 @@ def test_host_activation_submits_one_goal_without_turn_or_automation() -> None:
         "runtime_capability_reentry_v0" in step and "do not rewrite task_body" in step
         for step in packet["activation_steps"]
     )
-    assert packet["commands"]["heartbeat_prompt"].endswith(
-        "--runtime-profile ark_managed_agent_goal"
-    )
+    prompt_args = shlex.split(packet["commands"]["heartbeat_prompt"])
+    assert prompt_args[prompt_args.index("--runtime-profile") + 1] == "ark_managed_agent_goal"
+    assert prompt_args.count("--bootstrap") == 1
     assert "automation_update" not in str(packet)
     assert "loopx turn run-once" not in str(packet).lower()
 
@@ -177,7 +169,7 @@ def test_host_requires_host_managed_loopx_skill_delivery(monkeypatch) -> None:
     assert contract["install_script"] == "scripts/install-local.sh"
     assert (
         contract["no_clone_install_command"] == "curl -fsSL "
-        "https://huangruiteng.github.io/loopx/install.sh"
+        "https://loopx-project.github.io/loopx/install.sh"
         " | env LOOPX_SKILLS_DIR=./.agents/skills "
         "LOOPX_ENTRY_HOST_SURFACE=ark-managed-agent "
         "LOOPX_INSTALL_SLASH_COMMANDS=0 bash"
@@ -331,6 +323,12 @@ def test_retire_duplicate_managed_skills_removes_only_loopx_managed_copies(
     agents_skills = tmp_path / ".agents" / "skills"
     _materialize_workflow_skills(codex_skills)
     _materialize_workflow_skills(agents_skills)
+    canonical_facade = codex_skills / "loopx-global-gates" / "SKILL.md"
+    canonical_facade.parent.mkdir(parents=True)
+    canonical_facade.write_text(
+        "<!-- loopx-managed-slash-command:v1 command=/loopx-global-gates -->\n",
+        encoding="utf-8",
+    )
     facade = agents_skills / "loopx-global-gates" / "SKILL.md"
     facade.parent.mkdir(parents=True)
     facade.write_text(

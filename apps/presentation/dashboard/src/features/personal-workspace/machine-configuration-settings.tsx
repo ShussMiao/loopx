@@ -1,5 +1,6 @@
+import { UsageStatisticsSettings } from "./usage-statistics-settings";
 import { useEffect, useMemo, useState } from "react";
-import { Check, Code2, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, Code2, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 
 import {
   applyMachineConfiguration,
@@ -17,8 +18,9 @@ import {
 } from "../../data/chat";
 import { projectEditableCapabilityConfiguration } from "../../data/capability-configuration";
 import { CapabilityConfigurationFields } from "./capability-configuration-fields";
+import { withReportScheduleTimezone } from "./periodic-report-schedule-field";
 import { localizeCapability, localizedCapabilityFieldCopy } from "./capability-localization";
-import { canEditCapability, CapabilityCatalogNavigation, CapabilityConfigurationSummary, CapabilityDetailHeader, CapabilityEditorStatus, CapabilityEffectiveSource } from "./capability-workbench";
+import { canEditCapability, CapabilityCatalogNavigation, CapabilityConfigurationSummary, CapabilityDetailHeader, CapabilityEditorStatus, orderCapabilitiesForPresentation } from "./capability-workbench";
 import { useWorkspaceI18n } from "./i18n";
 
 type CapabilityDescriptor = CapabilityConfigurationCatalog["capabilities"][number];
@@ -43,11 +45,19 @@ function completeMachineConfiguration(
   current: Record<string, unknown> | undefined,
   draft: Record<string, unknown>,
 ) {
-  return {
+  const complete = {
     ...configurationObject(capability.default),
     ...configurationObject(current),
     ...draft,
   };
+  // The guided steward editor owns the v1 selection-policy fields. Opening an
+  // installed v0 preference in that form is an explicit migration preview;
+  // JSON mode can still submit the legacy shape unchanged when needed.
+  if (capability.capability_id === "steward_executor"
+    && (Object.hasOwn(draft, "selection_policy") || Object.hasOwn(draft, "eligible_endpoints"))) {
+    complete.schema_version = configurationObject(capability.default).schema_version;
+  }
+  return complete;
 }
 
 function validGuidedDraft(capability: CapabilityDescriptor, value: Record<string, unknown>) {
@@ -59,6 +69,18 @@ function validGuidedDraft(capability: CapabilityDescriptor, value: Record<string
     return Boolean(String(value.profile_preset ?? "").trim()
       && String(value.route_ref ?? "").trim()
       && String(value.timezone ?? "").trim());
+  }
+  if (capability.capability_id === "steward_executor") {
+    const policy = String(value.selection_policy ?? "preferred");
+    const primary = String(value.executor_endpoint ?? "");
+    const eligible = Array.isArray(value.eligible_endpoints)
+      ? value.eligible_endpoints.map((item) => String(item))
+      : [];
+    if (policy === "flexible") {
+      return eligible.length > 0 && eligible.includes(primary)
+        && new Set(eligible).size === eligible.length;
+    }
+    return eligible.length === 0;
   }
   return true;
 }
@@ -80,7 +102,7 @@ function shortRevision(value: string | undefined) {
   return value.replace(/^sha256:/, "").slice(0, 12);
 }
 
-export function MachineConfigurationSettings() {
+export function MachineConfigurationSettings({ section, onChanged }: { section: "steward" | "other"; onChanged?: () => void }) {
   const { locale, t } = useWorkspaceI18n();
   const [inspection, setInspection] = useState<MachineConfigurationInspection | null>(null);
   const [selectedCapabilityId, setSelectedCapabilityId] = useState("");
@@ -95,10 +117,22 @@ export function MachineConfigurationSettings() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const capabilities = inspection?.capability_catalog.capabilities ?? [];
+  const capabilities = useMemo(() => orderCapabilitiesForPresentation(
+    (inspection?.capability_catalog.capabilities ?? []).filter((capability) =>
+      capability.available_scopes.includes("machine")
+      && (section === "steward"
+        ? capability.capability_id === "steward_executor" || capability.capability_id === "manager_runtime"
+        : capability.capability_id !== "steward_executor" && capability.capability_id !== "manager_runtime")),
+    locale,
+  ), [inspection, locale, section]);
+  const invalidNamespace = inspection?.invalid_namespaces[0];
   const selectedRaw = capabilities.find(
     (capability) => capability.capability_id === selectedCapabilityId,
-  ) ?? capabilities[0];
+  ) ?? (invalidNamespace ? capabilities.find(
+    (capability) => capability.machine_namespace === invalidNamespace,
+  ) : undefined) ?? (section === "steward"
+    ? capabilities.find((capability) => capability.capability_id === "steward_executor")
+    : undefined) ?? capabilities.find((capability) => canEditCapability(capability, "machine")) ?? capabilities[0];
   const selected = selectedRaw ? localizeCapability(selectedRaw, locale) : undefined;
   const selectedCurrent = currentConfiguration(inspection, selected);
   const configured = Boolean(selected?.machine_namespace && selectedCurrent);
@@ -119,15 +153,25 @@ export function MachineConfigurationSettings() {
     setInspection(await fetchMachineConfiguration());
   }
 
+  async function retryLoad() {
+    if (busy) return;
+    setBusy("load");
+    setError(null);
+    try {
+      await reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("machine.loadError"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   useEffect(() => {
     let active = true;
     fetchMachineConfiguration()
       .then((next) => {
         if (!active) return;
         setInspection(next);
-        setSelectedCapabilityId(next.capability_catalog.capabilities.find(
-          (capability) => capability.available_scopes.includes("machine"),
-        )?.capability_id ?? "");
       })
       .catch((cause: unknown) => {
         if (active) setError(cause instanceof Error ? cause.message : t("machine.loadError"));
@@ -155,8 +199,9 @@ export function MachineConfigurationSettings() {
     setRollbackPlan(null);
   }, [inspection, selectedCapabilityId, locale]);
 
-  function changeDraft(key: string, value: boolean | number | string | string[]) {
-    setDraft((current) => ({ ...current, [key]: value }));
+  function changeDraft(key: string, value: unknown) {
+    setDraft((current) => selected?.capability_id === "periodic_report"
+      ? withReportScheduleTimezone(current, key, value) : { ...current, [key]: value });
     setPreview(null);
     setPreviewOperation("upsert");
     setError(null);
@@ -234,6 +279,7 @@ export function MachineConfigurationSettings() {
       setNotice(result.status === "applied"
         ? t(operation === "remove" ? "machine.removed" : "machine.applied")
         : t("machine.unchanged"));
+      onChanged?.();
     } catch (cause) {
       setPreview(null);
       setPreviewOperation("upsert");
@@ -267,6 +313,7 @@ export function MachineConfigurationSettings() {
       setPreview(null);
       await reload();
       setNotice(t("machine.rolledBack"));
+      onChanged?.();
     } catch (cause) {
       setRollbackPlan(null);
       setError(cause instanceof Error ? cause.message : t("machine.rollbackError"));
@@ -278,48 +325,113 @@ export function MachineConfigurationSettings() {
   if (busy === "load") {
     return <div className="personal-machine-loading" role="status">{t("common.loading")}</div>;
   }
+  if (!inspection) {
+    return <section className="personal-capability-error" role="alert">
+      <AlertTriangle aria-hidden size={18} />
+      <span><strong>{t("machine.loadError")}</strong><small>{error}</small></span>
+      <button onClick={() => void retryLoad()} type="button"><RefreshCw aria-hidden size={15} />{t("capabilities.retry")}</button>
+    </section>;
+  }
   if (!selected) {
     return <p className="personal-capability-empty">{t("machine.capabilityEmpty")}</p>;
   }
 
   return (
     <section className="personal-capability-settings" data-revision={inspection?.revision}>
-      <div className="personal-capability-scope-note">
-        <ShieldCheck aria-hidden size={17} />
-        <p><strong>{t("machine.liveDefault")}</strong>{t("machine.liveDefaultDescription")}</p>
+      <div>
+        {section === "steward" ? <details className="personal-capability-scope-note">
+          <summary><ShieldCheck aria-hidden size={17} />{t("machine.liveDefault")}</summary>
+          <p>{t("machine.liveDefaultDescription")}</p>
+        </details> : null}
+        {section === "other" ? <UsageStatisticsSettings /> : null}
       </div>
 
-      <div className="personal-capability-layout">
-        <CapabilityCatalogNavigation capabilities={capabilities} locale={locale} onSelect={setSelectedCapabilityId} scope="machine" selectedCapabilityId={selected.capability_id} t={t} />
+      {/* The catalog workbench is the only flexible block on this surface. It
+          lives in one body element so the surface keeps exactly two grid rows
+          however many notices the editor needs. */}
+      <div className="personal-capability-body">
+        {inspection?.status === "invalid" ? (
+          <section className="personal-machine-error" data-testid="machine-invalid-repair" role="alert">
+            <strong>{t("machine.invalidStoredConfiguration")}</strong>
+            <p>{t("machine.invalidStoredConfigurationDescription")}</p>
+          </section>
+        ) : null}
 
-        <article className="personal-capability-detail">
-          <CapabilityDetailHeader capability={selectedRaw} locale={locale} />
+        <div className="personal-capability-layout">
+        <CapabilityCatalogNavigation capabilities={capabilities} locale={locale} onSelect={setSelectedCapabilityId} scope="machine" selectedCapabilityId={selected.capability_id} showScope={false} t={t} />
 
-          {selected.available_scopes.includes("machine") ? <CapabilityEffectiveSource
-            source={configured ? "machine_default" : "capability_default"} t={t}
-          /> : null}
+        <article aria-label={selected.display_name} className="personal-capability-detail" tabIndex={0}>
+          <CapabilityDetailHeader capability={selectedRaw} locale={locale}
+            source={selected.available_scopes.includes("machine") ? configured ? "machine_default" : "capability_default" : undefined} />
           <CapabilityEditorStatus available={editorAvailable} t={t} description={!selected.available_scopes.includes("machine") ? t("machine.goalOnly")
               : t("machine.editorUnavailableDescription")} />
+
+          {selected.capability_id === "goal_storage" ? (
+            <section className="personal-capability-behavior-note">
+              <ShieldCheck aria-hidden size={18} />
+              <div><strong>{locale === "zh-CN" ? "仅影响此后创建的 Goal" : "Future Goals only"}</strong><p>{locale === "zh-CN"
+                ? "创建时固定选择，审核晋升后生效。已有 Goal 不变；迁移需单独备份、停止写入并结算租约。"
+                : "Fixed at creation and used after reviewed promotion. Existing Goals are unchanged; migration requires a separate backup, stopped writers and settled leases."}</p></div>
+            </section>
+          ) : null}
 
           {selected.capability_id === "periodic_report" ? (
             <section className="personal-capability-behavior-note">
               <ShieldCheck aria-hidden size={18} />
-              <div><strong>{t("machine.periodicReportActivation")}</strong><p>{t("machine.periodicReportActivationDescription")}</p></div>
+              <div><strong>{selectedCurrent?.schedule
+                ? (locale === "zh-CN" ? "日历与阶段汇报" : "Calendar and stage reports")
+                : t("machine.periodicReportActivation")}</strong><p>{selectedCurrent?.schedule
+                ? selectedCurrent.enabled === true
+                  ? (locale === "zh-CN" ? "已配置日历计划，由现有唤醒检查；是否送达请核对报告回执。" : "A calendar schedule is configured and checked by existing wakes. Verify delivery in the report receipt.")
+                  : (locale === "zh-CN" ? "日历计划已保存；启用此能力后才会检查和投递。" : "The schedule is saved; enable this capability to check and deliver reports.")
+                : t("machine.periodicReportActivationDescription")}</p></div>
             </section>
           ) : null}
 
-          {editorAvailable ? <><div className="personal-capability-editor-mode">
-            <span>{t("machine.editorMode")}</span>
-            <div role="group" aria-label={t("machine.editorMode")}>
-              <button aria-pressed={editorMode === "guided"} disabled={!editorAvailable} onClick={() => changeMode("guided")} type="button">{t("machine.visualEditor")}</button>
-              <button aria-pressed={editorMode === "json"} onClick={() => changeMode("json")} type="button"><Code2 aria-hidden size={14} />{t("machine.jsonEditor")}</button>
-            </div>
-          </div>
+          {selected.capability_id === "change_quality_qualification" ? (
+            <section className="personal-capability-behavior-note">
+              <ShieldCheck aria-hidden size={18} />
+              <div><strong>{t("machine.changeQualityActivation")}</strong><p>{t("machine.changeQualityActivationDescription")}</p></div>
+            </section>
+          ) : null}
+
+          {selected.capability_id === "todo_replan_cadence" ? (
+            <section className="personal-capability-behavior-note">
+              <ShieldCheck aria-hidden size={18} />
+              <div><strong>{t("machine.replanCadenceActivation")}</strong><p>{t("machine.replanCadenceActivationDescription")}</p></div>
+            </section>
+          ) : null}
+
+          {selected.capability_id === "steward_executor" ? (
+            <section className="personal-capability-behavior-note">
+              <ShieldCheck aria-hidden size={18} />
+              <div><strong>{locale === "zh-CN" ? "管家模型与思考深度" : "Steward model and reasoning"}</strong><p>{locale === "zh-CN"
+                ? "这里设置本机管家新会话的默认模型和思考深度。已有会话可能继续使用原来的分配；配置成功不代表正在运行的会话已切换。"
+                : "Choose the model and reasoning effort for new steward sessions on this machine. Existing sessions may retain their earlier allocation; saving a default does not switch a running session."}</p></div>
+            </section>
+          ) : null}
+
+          {selected.capability_id === "pull_request_review" ? (
+            <section className="personal-capability-behavior-note">
+              <ShieldCheck aria-hidden size={18} />
+              <div><strong>{locale === "zh-CN" ? "只改变队列排序" : "Queue ordering only"}</strong><p>{locale === "zh-CN"
+                ? "默认先审阅其他开发者的 PR；选择 owner-first 才会优先当前已认证审阅者自己的 PR。此配置不会发布 review、写 Todo、push 或 merge。"
+                : "The default reviews other developers' PRs first; choose owner-first only when the authenticated reviewer's own PRs should lead. This setting never posts a review, writes Todos, pushes, or merges."}</p></div>
+            </section>
+          ) : null}
+
+          {editorAvailable ? <>{editorMode === "json" || !selected.configuration_editor.fields.some((field) => field.key === "enabled" && field.input_kind === "boolean") ? <div className="personal-capability-editor-mode">
+            <button onClick={() => changeMode(editorMode === "guided" ? "json" : "guided")} type="button">
+              <Code2 aria-hidden size={14} />{t(editorMode === "guided" ? "machine.editJson" : "machine.backToForm")}
+            </button>
+          </div> : null}
 
           {editorMode === "guided" ? (
             <section className="personal-capability-field-summary">
-              <strong>{t("capabilities.fields")}</strong>
-              <CapabilityConfigurationFields copy={localizedCapabilityFieldCopy(locale)} disabled={Boolean(busy)} editor={selected.configuration_editor} onChange={changeDraft} value={draft} />
+              <CapabilityConfigurationFields copy={localizedCapabilityFieldCopy(locale)} disabled={Boolean(busy)} editor={selected.configuration_editor}
+                omitKeys={selected.capability_id === "steward_executor" && draft.selection_policy !== "flexible" ? ["eligible_endpoints"] : []}
+                onChange={changeDraft} value={draft}
+                enabledAction={<button className="personal-capability-edit-json" onClick={() => changeMode("json")} type="button"><Code2 aria-hidden size={14} />{t("machine.editJson")}</button>} />
               {!editorValid ? <p className="personal-machine-validation" role="alert">{t("machine.requiredFields")}</p> : null}
             </section>
           ) : (
@@ -366,6 +478,7 @@ export function MachineConfigurationSettings() {
             t={t}
           /> : null}
         </article>
+        </div>
       </div>
     </section>
   );

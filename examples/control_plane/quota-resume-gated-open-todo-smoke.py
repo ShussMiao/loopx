@@ -267,8 +267,13 @@ def assert_ready_deferred_p0_preempts_open_p1_for_successor_replan() -> None:
         "top_ready_todo_id"
     ] == READY_DEFERRED_ID, quota_payload
 
-    for item in agent_todos["deferred_items"]:
-        item["priority"] = "P1"
+    # The bounded display lane and the lossless candidate lane are two
+    # projections of the same canonical Todo, and the explicit candidate lane
+    # owns the row when both carry it. Move the priority in every projection so
+    # the fixture still models one real Todo instead of two different ones.
+    for lane in ("deferred_items", "deferred_resume_candidates"):
+        for item in agent_todos.get(lane, []):
+            item["priority"] = "P1"
     equal_priority = build_quota_should_run(
         status_payload(agent_todos, next_action=FALLBACK_ACTION),
         goal_id=GOAL_ID,

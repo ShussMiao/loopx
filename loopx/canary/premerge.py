@@ -397,7 +397,7 @@ def _run_gate_check(
         completed = subprocess.run(
             argv,
             cwd=repo_root,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=max(1.0, timeout_seconds),
@@ -502,6 +502,55 @@ def _diff_hygiene_checks(
     return checks
 
 
+def _module_ceiling_colocation_check(
+    *,
+    changed_files: list[str],
+    base_ref: str,
+    execute: bool,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, Any] | None:
+    python_files = [
+        str(path) for path in changed_files
+        if str(path).startswith("loopx/")
+        and str(path).endswith(".py")
+        and (repo_root / str(path)).is_file()
+    ]
+    if not python_files:
+        return None
+    base = (base_ref or "origin/main").strip() or "origin/main"
+    if not execute:
+        return {
+            "id": "module_ceiling_colocation",
+            "kind": "direct_import",
+            "command": "python3 examples/control_plane/control-plane-maintainability-ratchet-smoke.py",
+            "reason": "module growth that crossed its reviewed ceiling must settle in the same diff",
+            "status": "ready",
+            "ok": True,
+        }
+    from loopx.canary.maintainability_ratchet import diff_scoped_module_ceiling_violations
+
+    violations = diff_scoped_module_ceiling_violations(
+        repo_root, python_files, base_ref=base
+    )
+    ok = not violations
+    check: dict[str, Any] = {
+        "id": "module_ceiling_colocation",
+        "kind": "direct_import",
+        "command": "python3 examples/control_plane/control-plane-maintainability-ratchet-smoke.py",
+        "reason": "module growth that crossed its reviewed ceiling must settle in the same diff",
+        "status": "passed" if ok else "failed",
+        "ok": ok,
+    }
+    if violations:
+        check["detail"] = [
+            f"{item['path']}: grew {item['base_lines']} -> {item['head_lines']} lines "
+            f"past its inherited ceiling {item['base_ceiling']}; settle the ceiling in "
+            f"this diff (loopx/canary/module_metric_baseline.json)"
+            for item in violations
+        ]
+    return check
+
+
 def _py_compile_check(
     *,
     python_files: list[str],
@@ -551,10 +600,20 @@ def _gate_status(
         status = "preview_only"
     else:
         status = "passed"
+    self_merge_validation_passed = status == "passed" and not manual_holds
     return {
         "status": status,
         "merge_gate_passed": status == "passed",
-        "self_merge_allowed": status == "passed" and not manual_holds,
+        # This gate owns validation, not repository merge authority.  Keep the
+        # historical field fail-closed so a green canary cannot be mistaken for
+        # permission to bypass a repository's independent-maintainer policy.
+        "self_merge_allowed": False,
+        "self_merge_validation_passed": self_merge_validation_passed,
+        "self_merge_authority": {
+            "granted": False,
+            "reason": "repository_policy_required",
+            "next_gate": "apply repository policy and exact-head merge readiness",
+        },
         "direct_failure_count": len(direct_failures),
         "run_failure_count": len(run_failures),
         "manual_hold_count": len(manual_holds),
@@ -673,6 +732,7 @@ def apply_change_quality_verification(
                 "status": f"quality_{status}",
                 "merge_gate_passed": False,
                 "self_merge_allowed": False,
+                "self_merge_validation_passed": False,
             }
         )
         summary["failure_count"] = int(summary.get("failure_count") or 0) + 1
@@ -754,7 +814,9 @@ def _tier_limits(tier: str) -> dict[str, int | bool]:
         return {"catalog_limit": 3, "profile_limit": 0, "deep": False}
     if normalized == "deep":
         return {"catalog_limit": 0, "profile_limit": 0, "deep": True}
-    return {"catalog_limit": 9, "profile_limit": 8, "deep": False}
+    # Reserve the added vocabulary check without displacing the existing
+    # state-machine and heartbeat/quota checks in the standard catalog slice.
+    return {"catalog_limit": 10, "profile_limit": 8, "deep": False}
 
 
 def build_premerge_validation_gate(
@@ -802,6 +864,15 @@ def build_premerge_validation_gate(
     )
     if py_compile is not None:
         direct_checks.append(py_compile)
+
+    module_colocation = _module_ceiling_colocation_check(
+        changed_files=files,
+        base_ref=base_ref,
+        execute=execute,
+        repo_root=target_repo_root,
+    )
+    if module_colocation is not None:
+        direct_checks.append(module_colocation)
 
     if files:
         catalog_progress = _section_progress_callback(
@@ -968,8 +1039,9 @@ def build_premerge_validation_gate(
             "Pre-merge validation is a risk-based gate: it runs diff hygiene, "
             "changed Python compile checks, catalog-selected canaries, risk-profile "
             "smokes, and public/private boundary checks. It reports manual holds for "
-            "benchmark-sensitive or reviewer-gated surfaces instead of treating local "
-            "smoke success as self-merge permission."
+            "benchmark-sensitive or reviewer-gated surfaces. Passing validation is "
+            "not merge authority: repository policy and exact-head merge readiness "
+            "remain separate mandatory gates."
         ),
     }
     if progress_callback and execute:
@@ -1035,6 +1107,10 @@ def render_premerge_validation_gate_markdown(payload: dict[str, Any]) -> str:
         f"- ok: `{str(payload.get('ok')).lower()}`",
         f"- merge_gate_passed: `{str(gate.get('merge_gate_passed')).lower()}`",
         f"- self_merge_allowed: `{str(gate.get('self_merge_allowed')).lower()}`",
+        f"- self_merge_validation_passed: "
+        f"`{str(gate.get('self_merge_validation_passed')).lower()}`",
+        f"- self_merge_authority: "
+        f"`{str((gate.get('self_merge_authority') or {}).get('reason') or '')}`",
         f"- tier: `{payload.get('tier')}`",
         f"- dry_run: `{str(payload.get('dry_run')).lower()}`",
         f"- changed_files: `{classification.get('changed_file_count')}`",

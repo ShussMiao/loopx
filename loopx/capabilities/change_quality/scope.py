@@ -14,10 +14,16 @@ def _git(
     *args: str,
     text: bool = False,
 ) -> subprocess.CompletedProcess[Any]:
+    # git emits UTF-8 regardless of the host locale. Pin the codec only in
+    # text mode: a non-None encoding would silently flip bytes-mode callers
+    # into text mode because CPython treats any of text/encoding/errors as
+    # text-mode requests.
     return subprocess.run(
         ["git", "-C", str(repo_root), *args],
         check=False,
         text=text,
+        encoding="utf-8" if text else None,
+        errors="replace" if text else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )

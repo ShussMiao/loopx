@@ -34,6 +34,10 @@ public_safe_boundary = cast(
 		"public_safe_boundary",
 	),
 )
+load_registry = cast(
+	Callable[[Path], dict[str, Any]],
+	getattr(import_module("loopx.history"), "load_registry"),
+)
 redact_public_text = cast(
 	Callable[..., str],
 	getattr(
@@ -391,10 +395,10 @@ def _collect_stale_host_poll_risks(
 
 	risks: list[dict[str, Any]] = []
 	try:
-		registry_payload = json.loads(registry_path.read_text(encoding="utf-8"))
+		registry_payload = load_registry(registry_path)
 	except FileNotFoundError:
 		return risks
-	except (OSError, json.JSONDecodeError) as exc:
+	except (OSError, ValueError) as exc:
 		warnings.append(
 			_warning(
 				"host_poll_registry_unreadable",

@@ -57,27 +57,21 @@ basis under Stage 1's downgraded naming.
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from ...agent_registry import registered_agent_ids_for_goal
-from ...event_sourced_state import now_utc_iso
+from ..runtime.time import now_utc_iso
 from ...file_lock import exclusive_file_lock
-from ...history import load_index
-from ...registry import resolve_state_file
+from ...history import load_index, load_registry
 from ...runtime import validate_goal_id_path_segment
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..runtime.time import chronology_key
 from ..status.autonomous_replan_projection import (
     autonomous_replan_obligation_from_runs,
 )
-from ..todos.contract import (
-    normalize_todo_bound_agent,
-    normalize_todo_claimed_by,
-    normalize_todo_id,
-)
-from ..todos.projection import todo_item_is_actionable_open
+from ..todos.contract import normalize_todo_claimed_by
 from ..work_items.autonomous_replan_obligation import (
     ensure_replan_novelty_policy,
     run_history_agent_id,
@@ -87,11 +81,12 @@ from .goal_frontier import (
     autonomous_replan_is_required,
     autonomous_replan_scope_decision,
 )
+from ..content_digest import ENVELOPED_SHA256_PATTERN
+from .shared_goal_work_source import read_shared_goal_work_source
 from .shared_goal_alignment import (
     DEFAULT_REGISTRY_RELATIVE_PATH,
-    _parsed_active_state,
     _registered_goal,
-    project_shared_goal_alignment,
+    _project_shared_goal_alignment,
 )
 
 GOAL_AMENDMENT_PROPOSAL_EFFECT_METHOD = "goal.amendment_proposal.admit"
@@ -115,7 +110,6 @@ GOAL_AMENDMENT_PROPOSAL_ADMISSION_FACTS = (
 )
 AMENDMENT_PROPOSAL_JOURNAL_DIRNAME = "amendment-proposals"
 AMENDMENT_PROPOSAL_JOURNAL_BASENAME = "journal.jsonl"
-_SHA256_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def amendment_proposal_journal_path(
@@ -201,15 +195,11 @@ def admit_goal_amendment_proposal(
         else project / DEFAULT_REGISTRY_RELATIVE_PATH
     )
     try:
-        registry_payload = json.loads(
-            effective_registry_path.read_text(encoding="utf-8")
-        )
+        registry_payload = load_registry(effective_registry_path)
     except (OSError, ValueError):
         raise ValueError(
             f"goal registry is unreadable: {effective_registry_path}"
         ) from None
-    if not isinstance(registry_payload, dict):
-        raise TypeError("goal registry must contain a JSON object")
 
     effective_runtime_root = (
         runtime_root
@@ -223,10 +213,9 @@ def admit_goal_amendment_proposal(
         )
 
     goal = _registered_goal(registry_payload, goal_id=proposal_goal_id)
-    state_path = resolve_state_file(project, goal.get("state_file"))
-    if state_path is None:
-        raise ValueError(f"goal state file is missing for {proposal_goal_id}")
-    state_text = state_path.read_text(encoding="utf-8")
+    work_source = read_shared_goal_work_source(goal=goal, project=project,
+        runtime_root=effective_runtime_root)
+    state_text = work_source.state_text
 
     # Causal authority is derived, never submitted: the open obligation
     # inventory comes from the same run-history projection the quota/status
@@ -244,13 +233,14 @@ def admit_goal_amendment_proposal(
     # and unregistered proposers, and derives the source basis (state event
     # log append sequence, or markdown fallback) the proposal's base binds
     # against — both its sequence and its digest.
-    alignment = project_shared_goal_alignment(
+    alignment = _project_shared_goal_alignment(
         goal_id=proposal_goal_id,
         agent_id=proposer_agent_id,
         project=project,
         registry_path=effective_registry_path,
         runtime_root=effective_runtime_root,
         status_item=derived_status_item,
+        work_source=work_source,
     )
     source_basis = alignment.get("source_basis")
     if not isinstance(source_basis, Mapping):
@@ -266,18 +256,13 @@ def admit_goal_amendment_proposal(
         registered_agents=registered_agent_ids_for_goal(goal),
         status_item=derived_status_item,
     )
-    goal_todo_inventory = _goal_todo_inventory(
-        state_text=state_text,
-        goal=goal,
-        state_path=state_path,
-    )
-
     request = {
         "schema_version": GOAL_AMENDMENT_PROPOSAL_REQUEST_SCHEMA_VERSION,
         "proposal": dict(proposal),
         "derived_basis": derived_basis,
         "open_replan_obligations": open_replan_obligations,
-        "goal_todo_inventory": goal_todo_inventory,
+        "work_items": work_source.items,
+        "observed_at": work_source.observed_at,
     }
     try:
         admission = effect_runtime_result(
@@ -330,7 +315,7 @@ def _derive_open_replan_obligation_inventory(
         for _, run in sorted(
             enumerate(runs),
             key=lambda item: (
-                str(item[1].get("generated_at") or ""),
+                *chronology_key(item[1].get("generated_at")),
                 item[0],
             ),
             reverse=True,
@@ -427,46 +412,6 @@ def _open_replan_obligation_inventory(
     return list(inventory.values())
 
 
-def _goal_todo_inventory(
-    *,
-    state_text: str,
-    goal: Mapping[str, Any],
-    state_path: Path,
-) -> list[dict[str, Any]]:
-    """Derive the goal's actionable open Todos as typed facts.
-
-    ``claimed_by``/``bound_agent`` are diagnostic companions only:
-    admission checks existence, openness, and goal membership — shared
-    amendments legitimately affect peer-claimed work, and lease
-    disposition belongs to the Stage 3 commit step (RFC §5 step 4).
-    """
-
-    _, items = _parsed_active_state(
-        state_text,
-        goal=dict(goal),
-        state_path=state_path,
-    )
-    inventory: list[dict[str, Any]] = []
-    seen_todo_ids: set[str] = set()
-    for todo_item in items:
-        if not todo_item_is_actionable_open(todo_item):
-            continue
-        todo_id = normalize_todo_id(todo_item.get("todo_id"))
-        if not todo_id or todo_id in seen_todo_ids:
-            continue
-        seen_todo_ids.add(todo_id)
-        inventory.append(
-            {
-                "todo_id": todo_id,
-                "status": "open",
-                "task_class": (str(todo_item.get("task_class") or "").strip() or None),
-                "claimed_by": normalize_todo_claimed_by(todo_item.get("claimed_by")),
-                "bound_agent": normalize_todo_bound_agent(todo_item.get("bound_agent")),
-            }
-        )
-    return inventory
-
-
 def _check_admission_shape(
     admission: object,
     *,
@@ -495,7 +440,7 @@ def _check_admission_shape(
         != str(proposal.get("proposal_id") or "").strip().lower()
         or admission.get("base_revision_basis")
         != str(proposal.get("base_revision_basis") or "").strip()
-        or not _SHA256_DIGEST_PATTERN.fullmatch(
+        or not ENVELOPED_SHA256_PATTERN.fullmatch(
             str(admission.get("proposal_digest") or "")
         )
     ):

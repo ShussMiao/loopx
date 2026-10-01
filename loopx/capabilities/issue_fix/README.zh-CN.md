@@ -407,6 +407,11 @@ scope、public-safe 且幂等的 `pr_merge` rollout event。Todo resume 投影�
 后续一次 `status` / `quota should-run` 就能把已匹配的 todo 当作普通 runnable work
 选中。相同 merged observation 重放时复用稳定 event id，不会制造第二次 transition。
 
+如果 GitHub 对改名仓库返回重定向，lifecycle reconciliation 以 provider 返回的 PR URL
+作为 canonical repository identity，并把请求时的旧仓库记为显式 alias source ref。
+alias 只对同一次观察到的 PR number 有效；resume evaluation 仍保持 repository-qualified，
+不会误匹配其他仓库中的同号 PR。
+
 这是一条事件驱动链，而不是 webhook 与业务代码硬耦合：
 
 ```text
@@ -921,6 +926,27 @@ review、maintainer correction、mergeability、stale branch 和 terminal status
 发布、review request、merge 与读取私有材料继续作为 explicit gate。每次 material
 transition 必须生成 `runnable_successor`、具体 blocker 或结构化 no-follow-up；
 unchanged poll 保持安静且不消耗 delivery quota。
+
+`--execute-transition` 为每个非空的「仓库／状态」分组维护一个 Monitor。成员变化
+推进观察 generation；空组结束；完成后的新非空观察重新开启同一个未归档 Todo。
+创建时通过显式 `priority=P2` 传入优先级，不再把正文当前缀参数使用。
+
+`hard_lease` 模式的观察／结束先领取 60 秒 execution lease，之后只释放这次执行。
+Agent ID 相同也不能借用另一轮的 lease。原样重试可以恢复自己的活动领取；观察
+提交后进程退出，重试清理残留 lease 而不重复业务写入。到期或已释放的旧执行需要
+重新领取；再激活本身不授予执行权。已有 `--runtime-root` 参数贯穿读取、租约、
+写入和显示恢复，不新增 provider 或 capability 启用方式。
+
+缺失 ledger、损坏的分组声明、重复活动 target、旧的空组观察都会报错，不能当作
+「工作已全部结束」。恢复 ledger 或解决重复项后重试，不回退旧存储。各桶独立提交，
+后面的桶失败不会回滚前面的桶；用同一 registry/runtime root 执行
+`loopx todo list --goal-id GOAL` 读回，再重试原观察。`write_performed` 只表示 Todo
+业务写入；无变化重试仍可能清理 lease 和恢复当前显示。显示 pending 可通过
+`loopx todo project-markdown` 重试，不回滚已提交业务。
+
+不传 `--execute-transition` 即只检查而不对账 Todo。回滚实现时保留 canonical
+state、writer fence 和 receipt，恢复兼容代码，不能复活旧 Markdown authority。
+该过程不授予发布、合并、新 capability 或私有材料访问权限。
 
 持久化 PR lifecycle 时应传入 `--issue-ref`。这个显式、public-safe 的关联让 outcome
 read model 可以把 PR 精确连接到 issue，而不用从分支名、标题或正文中猜测。

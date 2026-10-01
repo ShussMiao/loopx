@@ -5,7 +5,11 @@ import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
 import { jsonObject, requireJsonObject } from "../runtime_decode.ts";
 import { normalizeDeliveryWorkspaceSnapshot } from "../agents/delivery_workspace.ts";
 
+import { decodeExternalDelivery, type ExternalDeliveryRequest } from "./refresh_external_delivery.ts";
+
 export interface RefreshRetryRequest {
+  checkpoint_read_context_id?: string | null;
+  external_delivery?: ExternalDeliveryRequest | null;
   vision: JsonObject | null;
   unchanged_reason: string | null;
   merge_patch: boolean;
@@ -34,6 +38,8 @@ export function decodeRefreshRetry(value: unknown): RefreshRetryRequest | null {
     return value;
   };
   return {
+    checkpoint_read_context_id: input.checkpoint_read_context_id == null ? null : nullableString("checkpoint_read_context_id"),
+    external_delivery: decodeExternalDelivery(input.external_delivery),
     vision: input.vision === null ? null : requireJsonObject(input.vision, "refresh_retry.vision"),
     unchanged_reason: nullableString("unchanged_reason"),
     merge_patch: input.merge_patch === true,
@@ -56,6 +62,11 @@ function canonical(value: unknown): string {
 
 type Decision = "append" | "replay" | "repair_receipt" | "supplement_checkpoint" | "supplement_workspace" | "reject";
 
+export function isMaterialMonitorPoll(run: JsonObject | null): boolean {
+  if (run?.classification !== "quota_monitor_poll") return false;
+  return run.material_change === true;
+}
+
 export function refreshRecovery(
   request: RefreshRetryRequest,
   prior: JsonObject | null,
@@ -68,6 +79,7 @@ export function refreshRecovery(
     vision: request.vision,
     unchanged_reason: request.unchanged_reason,
     merge_patch: request.merge_patch,
+    ...(request.checkpoint_read_context_id ? {checkpoint_read_context_id: request.checkpoint_read_context_id} : {}),
   })).digest("hex") : null;
   const mutationDigest = createHash("sha256").update(canonical(request.mutation)).digest("hex");
   const changesMutation = Object.values(request.mutation).some((value) =>
@@ -76,6 +88,7 @@ export function refreshRecovery(
     schema_version: "refresh_recovery_v0",
     decision, reason, vision_request_digest: digest,
     mutation_digest: mutationDigest,
+    ...(request.checkpoint_read_context_id ? {checkpoint_read_context_id: request.checkpoint_read_context_id} : {}),
     original_generated_at: jsonObject(prior?.refresh_recovery)?.original_generated_at
       ?? prior?.generated_at ?? null,
   });
@@ -97,8 +110,8 @@ export function refreshRecovery(
   // A material poll is not a completed refresh: its receipt-bound first
   // workspace supplement may author next-action/vision through normal refresh
   // validation. Once appended, the recovery digests restore strict replay.
-  const firstMonitorCloseout = missingWorkspace && prior.classification === "quota_monitor_poll" &&
-    prior.material_change === true && prior.refresh_recovery == null && checkpoint === null;
+  const firstMonitorCloseout = missingWorkspace && isMaterialMonitorPoll(prior) &&
+    prior.refresh_recovery == null && checkpoint === null;
   if (firstMonitorCloseout) {
     const unrelatedMutation = Object.entries(request.mutation).some(([key, value]) =>
       key !== "next_action" && value !== null && value !== false &&

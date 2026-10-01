@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .capabilities.configuration_ui import build_capability_configuration_catalog
+from .control_plane.agent_context import agent_context_descriptor
 from .control_plane.goals.goal_vision_policy import completed_todo_replan_threshold
 
 DEFAULT_MULTI_SUBAGENT_MAX_CHILDREN = 2
@@ -48,6 +49,7 @@ def build_goal_configuration_catalog(
     feature_summary: Mapping[str, Any],
     default_multi_subagent_max_children: int,
     explore_harness_profiles: Sequence[str],
+    machine_inheritable_goal_overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the on-demand configuration read model for optional features."""
 
@@ -86,12 +88,18 @@ def build_goal_configuration_catalog(
         if isinstance(feature_summary.get("change_quality_qualification"), Mapping)
         else {}
     )
+    progress_review = (
+        feature_summary.get("progress_review")
+        if isinstance(feature_summary.get("progress_review"), Mapping)
+        else {}
+    )
     inspect_command = _configure_command(goal_id)
     multi_enable_args = (
         "--multi-subagent-feature",
         "enabled",
         "--max-children",
         str(default_multi_subagent_max_children),
+        "--align-codex-subagent-capacity",
     )
     peer_coordination = (
         feature_summary.get("peer_task_coordination")
@@ -103,6 +111,11 @@ def build_goal_configuration_catalog(
         if isinstance(feature_summary.get("local_authority_shadow"), Mapping)
         else {}
     )
+    coordination_runtime_shadow = (
+        feature_summary.get("coordination_runtime_shadow")
+        if isinstance(feature_summary.get("coordination_runtime_shadow"), Mapping)
+        else {}
+    )
     graph_enable_args = ("--explore-graph-enabled",)
     harness_enable_args = (
         "--explore-harness-enabled",
@@ -110,7 +123,7 @@ def build_goal_configuration_catalog(
         "generic",
     )
 
-    catalog = {
+    catalog: dict[str, Any] = {
         "schema_version": "loopx_goal_configuration_catalog_v0",
         "scope": "default_off_optional_capabilities",
         "all_settings_help_command": "loopx configure-goal --help",
@@ -154,72 +167,99 @@ def build_goal_configuration_catalog(
                         goal_id, "--execution-replan-after-todos", "3", execute=True
                     ),
                     "preview_disable": _configure_command(
-                        goal_id, "--execution-replan-after-todos", "5"
+                        goal_id, "--clear-execution-replan-after-todos"
                     ),
                     "apply_disable": _configure_command(
-                        goal_id, "--execution-replan-after-todos", "5", execute=True
+                        goal_id, "--clear-execution-replan-after-todos", execute=True
                     ),
                     "verify": [inspect_command],
                 },
                 "documentation": {
                     "path": "docs/quota-allocation.md#completed-todo-review-cadence",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "docs/quota-allocation.md#completed-todo-review-cadence"
                     ),
                 },
             },
             {
                 "feature_id": "local_authority_shadow",
-                "display_name": "Local post-commit authority observation",
-                "availability": "experimental_opt_in",
+                "display_name": "Retired post-commit authority observation",
+                "availability": "retired",
                 "default": {"enabled": False},
                 "current": {
                     "enabled": local_authority_shadow.get("enabled") is True,
                     "mode": local_authority_shadow.get("mode"),
                     "status": local_authority_shadow.get("status", "disabled"),
                 },
-                "consider_when": (
-                    "A Goal needs to exercise the first Stage 2C observation "
-                    "plumbing while legacy local writers remain authoritative."
-                ),
-                "effect": (
-                    "Captures a best-effort post-commit snapshot of Todo and "
-                    "task-lease state through the FileAuthorityStore contract."
-                ),
-                "does_not": [
-                    "read the candidate for lifecycle decisions",
-                    "write candidate state back into Markdown or task-lease files",
-                    "promote shared authority or fence legacy writers",
-                    "bind the snapshot to the exact primary transaction",
-                    "guarantee delivery through a durable outbox",
-                    "compare source and candidate or issue a parity verdict",
-                ],
+                "consider_when": "Clear retained observation configuration before an explicit runtime-shadow bootstrap.",
+                "effect": "No new observations are written. Retained data stays read-only and cannot qualify promotion.",
+                "does_not": ["enable or bootstrap runtime shadow", "delete retained observations", "grant promotion evidence"],
                 "commands": {
-                    "preview_enable": _configure_command(
-                        goal_id, "--local-authority-shadow-file"
-                    ),
-                    "apply_enable": _configure_command(
-                        goal_id, "--local-authority-shadow-file", execute=True
-                    ),
-                    "preview_disable": _configure_command(
-                        goal_id, "--clear-local-authority-shadow"
-                    ),
-                    "apply_disable": _configure_command(
-                        goal_id, "--clear-local-authority-shadow", execute=True
-                    ),
+                    "preview_disable": _configure_command(goal_id, "--clear-local-authority-shadow"),
+                    "apply_disable": _configure_command(goal_id, "--clear-local-authority-shadow", execute=True),
                     "verify": [inspect_command],
                 },
                 "documentation": {
                     "path": "docs/architecture/rfcs/shared-goal-authority-state-provider-v0.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
+                        "docs/architecture/rfcs/shared-goal-authority-state-provider-v0.md"
+                    ),
+                },
+            },
+            {
+                "feature_id": "coordination_runtime_shadow",
+                "display_name": "Transaction-bound coordination shadow",
+                "availability": "experimental_opt_in",
+                "default": {"enabled": False},
+                "current": {
+                    "enabled": coordination_runtime_shadow.get("enabled") is True,
+                    "provider": coordination_runtime_shadow.get("provider"),
+                    "status": coordination_runtime_shadow.get("status", "configuration_absent"),
+                },
+                "consider_when": (
+                    "A legacy Goal is being qualified for an explicit reviewed "
+                    "cutover to canonical local authority."
+                ),
+                "effect": (
+                    "Captures transaction-bound Todo and task-lease mutations in "
+                    "the file-v0 shadow used by parity qualification."
+                ),
+                "does_not": [
+                    "promote the Goal or fence legacy writers",
+                    "start a managed worker",
+                    "make the shadow authoritative for lifecycle decisions",
+                ],
+                "commands": {
+                    "preview_enable": _configure_command(
+                        goal_id, "--coordination-runtime-shadow-file"
+                    ),
+                    "apply_enable": _configure_command(
+                        goal_id, "--coordination-runtime-shadow-file", execute=True
+                    ),
+                    "preview_disable": _configure_command(
+                        goal_id, "--clear-coordination-runtime-shadow"
+                    ),
+                    "apply_disable": _configure_command(
+                        goal_id, "--clear-coordination-runtime-shadow", execute=True
+                    ),
+                    "verify": [
+                        inspect_command,
+                        f"loopx --format json coordination-shadow inspect --goal-id {goal_id}",
+                    ],
+                },
+                "documentation": {
+                    "path": "docs/architecture/rfcs/shared-goal-authority-state-provider-v0.md",
+                    "url": (
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "docs/architecture/rfcs/shared-goal-authority-state-provider-v0.md"
                     ),
                 },
             },
             {
                 "feature_id": "multi_subagent",
+                "context_contribution": agent_context_descriptor(),
                 "display_name": "Adaptive child capacity",
                 "availability": "supported_opt_in",
                 "default": {
@@ -231,6 +271,11 @@ def build_goal_configuration_catalog(
                     "enabled": feature_summary.get("multi_subagent") == "enabled",
                     "max_children": orchestration.get("max_children"),
                     "allowed_domains": list(orchestration.get("allowed_domains") or []),
+                    **(
+                        dict(orchestration["model_config"])
+                        if "model_config" in orchestration
+                        else {}
+                    ),
                 },
                 "required_inputs": {},
                 "consider_when": (
@@ -239,6 +284,8 @@ def build_goal_configuration_catalog(
                 ),
                 "effect": (
                     "Sets the hard capacity boundary for adaptive child orchestration. "
+                    "The preview also reads Codex host capacity; the one-click apply may "
+                    "raise that host limit without lowering an existing higher value. "
                     "Optional --allowed-domain values narrow eligible Todo lanes; without "
                     "them, the task coordinator still decides whether, what, and how to "
                     "parallelize within every other admission boundary."
@@ -269,7 +316,7 @@ def build_goal_configuration_catalog(
                 "documentation": {
                     "path": "docs/integrations/codex-subagent-orchestration.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "docs/integrations/codex-subagent-orchestration.md"
                     ),
                 },
@@ -330,9 +377,84 @@ def build_goal_configuration_catalog(
                 "documentation": {
                     "path": "docs/integrations/codex-subagent-orchestration.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "docs/integrations/codex-subagent-orchestration.md"
                     ),
+                },
+            },
+            {
+                "feature_id": "progress_review",
+                "display_name": "Progress-review sentinel",
+                "availability": "supported_opt_in",
+                "default": {
+                    "mode": "off",
+                    "signal": "noul",
+                    "drift_threshold": 2,
+                    "contract_revision": None,
+                },
+                "current": {
+                    "mode": str(progress_review.get("mode") or "off"),
+                    "signal": str(progress_review.get("signal") or "noul"),
+                    "drift_threshold": int(progress_review.get("drift_threshold") or 2),
+                    "contract_revision": progress_review.get("contract_revision") or None,
+                },
+                "consider_when": (
+                    "Long-running work keeps declaring advancement while the typed "
+                    "repeat fuse stays quiet, and an external bounded reviewer of "
+                    "scoped file deltas is installed for the goal."
+                ),
+                "effect": (
+                    "shadow records typed drift receipts per refresh; assist lets "
+                    "consecutive completed drift receipts bound to the pinned goal "
+                    "contract revision raise the existing autonomous replan "
+                    "obligation, which the Agent must acknowledge."
+                ),
+                "does_not": [
+                    "call a model from the control plane or read raw file deltas",
+                    "replace the Agent's typed progress_observation",
+                    "pause turns, open user gates, or settle Goal acceptance",
+                    "count unknown, abstained, failed or missing receipts as drift",
+                ],
+                "commands": {
+                    "preview_enable": _configure_command(
+                        goal_id, "--progress-review-mode", "shadow"
+                    ),
+                    "apply_enable": _configure_command(
+                        goal_id, "--progress-review-mode", "shadow", execute=True
+                    ),
+                    "preview_assist": _configure_command(
+                        goal_id,
+                        "--progress-review-mode",
+                        "assist",
+                        "--progress-review-drift-threshold",
+                        "2",
+                    ),
+                    "apply_assist": _configure_command(
+                        goal_id,
+                        "--progress-review-mode",
+                        "assist",
+                        "--progress-review-drift-threshold",
+                        "2",
+                        execute=True,
+                    ),
+                    "preview_pin": _configure_command(
+                        goal_id,
+                        "--progress-review-contract-revision",
+                        "<basis-sha256>",
+                    ),
+                    "preview_disable": _configure_command(
+                        goal_id, "--clear-progress-review-configuration"
+                    ),
+                    "apply_disable": _configure_command(
+                        goal_id, "--clear-progress-review-configuration", execute=True
+                    ),
+                    "verify": [
+                        inspect_command,
+                        "loopx capability show progress-review-sentinel --format json",
+                    ],
+                },
+                "documentation": {
+                    "path": "loopx/capabilities/progress_review/README.md",
                 },
             },
             {
@@ -379,7 +501,7 @@ def build_goal_configuration_catalog(
                 "documentation": {
                     "path": "loopx/capabilities/explore/README.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "loopx/capabilities/explore/README.md"
                     ),
                 },
@@ -432,10 +554,19 @@ def build_goal_configuration_catalog(
                 "documentation": {
                     "path": "loopx/capabilities/explore/README.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "loopx/capabilities/explore/README.md"
                     ),
                 },
+            },
+            {
+                "feature_id": "pull_request_review",
+                "display_name": "Pull-request review",
+                "availability": "supported",
+                "default": {"wait_for_ci": True, "review_priority": "other-developers-first"},
+                "current": feature_summary.get("pull_request_review") or {},
+                "effect": "Choose CI waiting and review priority for this Goal; clear the complete override to restore machine defaults.",
+                "documentation": {"path": "loopx/capabilities/pr_review_queue/README.md"},
             },
             {
                 "feature_id": "change_quality_qualification",
@@ -515,7 +646,7 @@ def build_goal_configuration_catalog(
                 "documentation": {
                     "path": "loopx/capabilities/change_quality/README.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "loopx/capabilities/change_quality/README.md"
                     ),
                 },
@@ -526,13 +657,34 @@ def build_goal_configuration_catalog(
                 "availability": "experimental_opt_in",
                 "default": {"enabled": False},
                 "current": {
+                    "binding_status": reward_memory.get("binding_status"),
+                    "effective_available": reward_memory.get("effective_available")
+                    is True,
+                    "desired_automation": dict(
+                        reward_memory.get("desired_automation") or {}
+                    ),
+                    "recorded_verified_agents": list(
+                        reward_memory.get("recorded_verified_agents") or []
+                    ),
                     "enabled": reward_memory.get("enabled") is True,
                     "experimental": reward_memory.get("experimental") is True,
                     "config_pointer_registered": reward_memory.get(
                         "config_pointer_registered"
                     )
                     is True,
+                    "binding_revision": str(
+                        reward_memory.get("binding_revision") or ""
+                    ),
                     "enabled_agents": list(reward_memory.get("enabled_agents") or []),
+                    "enablement_verified_agents": list(
+                        reward_memory.get("enablement_verified_agents") or []
+                    ),
+                    "automatic_ingest": reward_memory.get("automatic_ingest"),
+                    "automatic_recall": reward_memory.get("automatic_recall"),
+                    "automation_intent": dict(
+                        reward_memory.get("automation_intent") or {}
+                    ),
+                    "host_coverage": list(reward_memory.get("host_coverage") or []),
                 },
                 "required_inputs": {
                     "ignored-reward-memory-config": (
@@ -540,8 +692,8 @@ def build_goal_configuration_catalog(
                         "config under .loopx/config/."
                     ),
                     "agent-id": (
-                        "Replace the placeholder with one registered agent lane. "
-                        "Repeat --reward-memory-agent for another explicit lane."
+                        "Replace the placeholder with one registered Agent lane. "
+                        "A private config binds exactly one Goal-scoped Agent."
                     ),
                 },
                 "consider_when": (
@@ -555,7 +707,7 @@ def build_goal_configuration_catalog(
                 "does_not": [
                     "make any provider a global LoopX feature or dependency",
                     "install, authenticate, or configure the selected provider",
-                    "enable every agent, automatically ingest feedback, or automatically recall",
+                    "enable every agent or treat an unvalidated Turn summary as evidence",
                     "bypass scope, authority, freshness, conflict, or exact-readback guards",
                 ],
                 "commands": {
@@ -598,7 +750,7 @@ def build_goal_configuration_catalog(
                 "documentation": {
                     "path": "loopx/capabilities/reward_memory/README.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "loopx/capabilities/reward_memory/README.md"
                     ),
                 },
@@ -669,7 +821,7 @@ def build_goal_configuration_catalog(
                 "documentation": {
                     "path": "loopx/extensions/lark/docs/lark-event-inbox.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "loopx/extensions/lark/docs/lark-event-inbox.md"
                     ),
                 },
@@ -726,7 +878,7 @@ def build_goal_configuration_catalog(
                 "documentation": {
                     "path": "docs/integrations/lark-kanban-control-plane-adapter.md",
                     "url": (
-                        "https://github.com/huangruiteng/loopx/blob/main/"
+                        "https://github.com/loopx-project/loopx/blob/main/"
                         "docs/integrations/lark-kanban-control-plane-adapter.md"
                     ),
                 },
@@ -761,6 +913,20 @@ def build_goal_configuration_catalog(
             "documentation": {},
         }
     )
+    overrides = machine_inheritable_goal_overrides or {}
+    for feature in catalog["features"]:
+        feature_id = str(feature.get("feature_id") or "")
+        if feature_id not in {
+            "todo_replan_cadence",
+            "change_quality_qualification",
+            "pull_request_review",
+        }:
+            continue
+        explicit = overrides.get(feature_id)
+        if isinstance(explicit, Mapping):
+            feature["current"] = dict(explicit)
+        else:
+            feature.pop("current", None)
     catalog["capability_catalog"] = build_capability_configuration_catalog(
         goal_features=catalog["features"],
         explore_harness_profiles=explore_harness_profiles,

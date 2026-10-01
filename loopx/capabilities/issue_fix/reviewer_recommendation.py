@@ -69,7 +69,7 @@ def _run_git(repo_path: Path, args: Sequence[str]) -> str:
     result = subprocess.run(
         ["git", *args],
         cwd=repo_path,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=20,
@@ -625,7 +625,13 @@ def _apply_reviewer_sources_for_path(
 
 def _derive_changed_files(repo_path: Path, base_ref: str) -> list[str]:
     output = _run_git(repo_path, ["diff", "--name-only", f"{base_ref}...HEAD"])
-    return _normalise_changed_files(output.splitlines())
+    # `git diff --name-only` frames one pathname per LF. Under the default
+    # `core.quotePath=true` a non-ASCII pathname arrives octal-escaped, but a
+    # repository may set `core.quotePath=false`, and a pathname carrying
+    # U+0085/U+2028/U+2029 is then emitted raw. `str.splitlines()` treats those
+    # as record boundaries and would tear one path into two, so frame on LF and
+    # drop the empty trailing record instead.
+    return _normalise_changed_files([line for line in output.split("\n") if line])
 
 
 def _collect_history(
@@ -647,7 +653,12 @@ def _collect_history(
         ],
     )
     rows: list[tuple[str, str]] = []
-    for line in output.splitlines():
+    # `git log --format=` writes one record per LF and substitutes `%aN`/`%aE`
+    # verbatim, so a name may contain U+0085, U+2028, U+2029 or the ASCII
+    # separators U+000B/U+000C/U+001C-U+001E. `str.splitlines()` treats every
+    # one of those as a line break and would tear one record into fragments,
+    # which the `if not separator: continue` guard below would then swallow.
+    for line in output.split("\n"):
         name, separator, email = line.partition("\x1f")
         if not separator:
             continue

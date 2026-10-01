@@ -12,6 +12,7 @@ import {
   startViteDashboardServer,
   waitForHttp,
 } from "./dashboard-browser-smoke-support.mjs";
+import { resolveTestPython } from "../scripts/test-python.mjs";
 
 const require = createRequire(import.meta.url);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -50,8 +51,8 @@ async function openDrawer(page, name) {
     await page.getByRole("dialog", { name: /Goal navigation|Goal 导航/ }).waitFor({ state: "visible" });
   }
   await page.getByRole("button", { name: new RegExp(name, "i") }).first().click();
-  await page.locator(".personal-goal-tools-trigger").click();
-  await page.locator(".personal-goal-tools-menu button").first().click();
+  await page.getByRole("button", { name: /^(Overview|概览)$/, exact: true }).click();
+  await page.getByRole("button", { name: /^(Goal information|Goal 信息)$/, exact: true }).click();
   await page.locator(".personal-context-drawer").waitFor({ state: "visible" });
   return page.locator(".personal-context-drawer").innerText();
 }
@@ -70,7 +71,7 @@ async function main() {
   await mkdir(outputDir, { recursive: true });
   const { chromium } = loadPlaywright();
   const server = packaged
-    ? spawn(process.env.LOOPX_PYTHON_BIN || "python3", ["-m", "http.server", String(port), "--bind", "127.0.0.1", "--directory", resolve(repoRoot, "loopx/web")], { stdio: "ignore" })
+    ? spawn(resolveTestPython(), ["-m", "http.server", String(port), "--bind", "127.0.0.1", "--directory", resolve(repoRoot, "loopx/web")], { stdio: "ignore" })
     : startViteDashboardServer({ dashboardDir, port });
   let browser;
   try {
@@ -94,7 +95,7 @@ async function main() {
     requireText(await openDrawer(page, "Usage unknown"), ["Not measured"], "unknown measurement");
     await page.locator(".personal-drawer-close").click();
     requireText(await openDrawer(page, "Usage zero"), ["0 / 0", "$0.00 / $0.00", "0ms / 0ms"], "measured zero");
-    requireText(await page.locator(".personal-channel-title").innerText(), ["0 tokens", "$0.00", "0ms"], "zero header");
+    rejectText(await page.locator(".personal-channel-title").innerText(), ["0 tokens", "$0.00", "0ms"], "usage belongs in overview and details, not repeated in the header");
     await page.locator(".personal-drawer-close").click();
     const partial = await openDrawer(page, "Usage partial");
     requireText(partial, ["1.5k / 3.0k", "Not measured"], "partial measurement");

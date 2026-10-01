@@ -88,7 +88,7 @@ def project_delivery_response(
 ) -> dict[str, Any]:
     """Select a canonical source row; TS alone decides its supervision meaning."""
     from ..todos.summary_item import todo_planning_source_items
-    from ..todos.projection import todo_summary_claim_scope_agent_id
+    from ..todos.todo_semantics import todo_summary_claim_scope_agent_id
 
     source = next((item for item in todo_planning_source_items(summary, include_terminal=True)
                    if item.get("todo_id") == run.get("todo_id")), None) if summary else None
@@ -103,6 +103,8 @@ def project_delivery_response(
             "kind", "target", "target_todo_id", "target_status", "target_task_class", "target_archive_state",
             "baseline_generation", "material_change_generation", "provider_required", "provider", "capability",
             "pr_repo", "pr_number", "repository_binding_state", "repository_binding_source",
+            "scheduled_for", "evaluated_at", "clock_provider", "generation_fence", "material_change",
+            "resume_receipt",
         ) if key in condition}
     result = effect_runtime_result("work_item.delivery_response.project", {
         "run": _run_facts(run), "todo": todo,

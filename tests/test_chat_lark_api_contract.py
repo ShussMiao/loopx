@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 import loopx.chat_server as chat_server
 from loopx.chat_server import (
     CHAT_GOAL_CONTEXTS_PATH,
@@ -400,8 +402,9 @@ def test_lark_connections_include_app_reply_health(
     assert responses[0]["connections"][0]["last_event_reason"] == "topic_mismatch"
 
 
+@pytest.mark.parametrize("editing", [False, True])
 def test_connect_refreshes_the_app_level_event_consumer(
-    monkeypatch: Any, tmp_path: Path
+    monkeypatch: Any, tmp_path: Path, editing: bool
 ) -> None:
     import loopx.chat_lark_api as api
 
@@ -425,7 +428,7 @@ def test_connect_refreshes_the_app_level_event_consumer(
         )
 
         def _read_json(self) -> dict[str, Any]:
-            return {
+            body = {
                 "goal_id": "goal-alpha",
                 "app_ref": "mew",
                 "chat_id": "oc_public_fixture",
@@ -437,6 +440,12 @@ def test_connect_refreshes_the_app_level_event_consumer(
                 "reply_mode": "topic_reply",
                 "execute": True,
             }
+
+            if editing:
+                for field in ("app_ref", "chat_id", "chat_name"):
+                    body.pop(field)
+                body["connection_id"] = "lark_existing"
+            return body
 
         def _goal_channel_context(self, _goal_id: str):
             return ({"goals": [{"id": "goal-alpha"}]}, tmp_path / "goal-channel.json")
@@ -455,6 +464,7 @@ def test_connect_refreshes_the_app_level_event_consumer(
 
     Handler()._lark_connect()
 
+    assert connect_calls[0]["connection_id"] == ("lark_existing" if editing else None)
     assert refreshed == [True]
     assert connect_calls[0]["agent_id"] == "agent-alpha"
     assert connect_calls[0]["capture_scope"] == "addressed_only"
@@ -651,3 +661,177 @@ def test_session_ingress_resolves_the_exact_goal_agent_session(
     ]
     assert connect_calls[0]["session_id"] == "session-alpha"
     assert connect_calls[0]["ingress_mode"] == "session_queue"
+
+
+def test_manager_route_reconciliation_opens_before_atomic_binding_swap(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import loopx.chat_lark_api as api
+
+    project = tmp_path / "project"
+    project.mkdir()
+    source_registry = project / ".loopx" / "registry.json"
+    source_registry.parent.mkdir()
+    source_registry.write_text("{}\n")
+    registry = {"goals": [{"id": "goal-alpha", "repo": str(project)}]}
+    binding = {
+        "goal_id": "goal-alpha",
+        "connection_id": "lark-manager",
+        "agent_id": "loopx-manager",
+        "session_id": "old-session",
+        "enabled": True,
+        "target_ref": "manager-target",
+        "routing": {"conversation_kind": "manager"},
+        "connector": {"session_ref": "old-session"},
+    }
+    calls: list[str] = []
+    monkeypatch.setattr(api, "load_registry", lambda _path: registry)
+    monkeypatch.setattr(
+        api,
+        "resolve_goal_source_runtime_route",
+        lambda **_kwargs: {"source_registry": str(source_registry)},
+    )
+    monkeypatch.setattr(api, "resolve_runtime_root", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(api, "read_goal_channel_binding", lambda _path: {})
+    monkeypatch.setattr(
+        api, "binding_for_goal", lambda *_args, **_kwargs: dict(binding)
+    )
+    monkeypatch.setattr(
+        api,
+        "read_goal_channel_targets",
+        lambda _path: {
+            "targets": {
+                "manager-target": {
+                    "name": "manager-target",
+                    "enabled": True,
+                    "identity": {"sender_profile": "mew"},
+                    "channel": {"chat_id": "oc_public_fixture"},
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "manager_connection_executor_endpoint",
+        lambda _root: ("dsh", "machine_configuration"),
+    )
+
+    def open_session(**_kwargs: Any):
+        calls.append("open")
+        return {"session_id": "new-session"}, True
+
+    def rebind(**_kwargs: Any):
+        calls.append("rebind")
+        return {
+            **binding,
+            "session_id": "new-session",
+            "routing": {
+                "conversation_kind": "manager",
+                "executor_endpoint_id": "dsh",
+            },
+            "connector": {"session_ref": "new-session"},
+        }
+
+    monkeypatch.setattr(api, "open_manager_session", open_session)
+    monkeypatch.setattr(api, "rebind_lark_manager_session", rebind)
+    controller = SimpleNamespace(
+        store=SimpleNamespace(
+            load_session=lambda session_id: {
+                "session_id": session_id,
+                "agent_id": "codex" if session_id == "old-session" else "dsh",
+                "channel_id": api.manager_channel(
+                    provider="lark", audience="mew\0oc_public_fixture"
+                ),
+                "status": "ready",
+            }
+        )
+    )
+    reconciled = api.reconcile_lark_manager_route(
+        route={
+            "goal_id": "goal-alpha",
+            "connection_id": "lark-manager",
+            "conversation_kind": "manager",
+            "session_id": "old-session",
+        },
+        registry_path=tmp_path / "registry.json",
+        runtime_root_override=None,
+        runtime_controller=controller,
+    )
+    assert calls == ["open", "rebind"]
+    assert reconciled["session_id"] == "new-session"
+    assert reconciled["executor_endpoint_id"] == "dsh"
+    assert reconciled["connector"]["session_ref"] == "new-session"
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_manager_connection_opens_audience_session_only_on_execute(
+    monkeypatch: Any, tmp_path: Path, execute: bool
+) -> None:
+    import loopx.chat_lark_api as api
+    from loopx.chat_manager import manager_channel
+
+    calls: list[dict[str, Any]] = []
+    opened: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        api,
+        "connect_lark_goal_topic",
+        lambda **kwargs: calls.append(kwargs) or {"ok": True, "status": "connected"},
+    )
+
+    class Handler(LarkChatRequestMixin):
+        path = "/api/chat/lark/connections"
+        server = SimpleNamespace(
+            chat_store=SimpleNamespace(latest_session=lambda **kwargs: None),
+            runtime_controller=SimpleNamespace(
+                open_session=lambda **kwargs: (
+                    opened.append(kwargs) or {"session_id": "manager-session"},
+                    False,
+                )
+            ),
+            lark_goal_topic_runtime=SimpleNamespace(refresh=lambda: None),
+        )
+
+        def _require_lark_cli(self):
+            return "fake-lark"
+
+        def _read_json(self):
+            return {
+                "goal_id": "goal-alpha",
+                "app_ref": "mew",
+                "chat_id": "oc_public_fixture",
+                "chat_name": "Product",
+                "conversation_kind": "manager",
+                "turn_trigger": "human_messages",
+                "execute": execute,
+            }
+
+        def _goal_channel_context(self, _goal_id):
+            return {
+                "goals": [{"id": "goal-alpha", "repo": str(tmp_path)}]
+            }, tmp_path / "binding.json"
+
+        def _goal_channel_target_path(self):
+            return tmp_path / "targets.json"
+
+        def _lark_runner(self):
+            return lambda *_args: {"returncode": 0, "stdout": "{}", "stderr": ""}
+
+        def _send_json(self, payload, *, status=200):
+            assert payload["ok"]
+
+        def _send_error(self, message, **kwargs):
+            raise AssertionError(message)
+
+    Handler()._lark_connect()
+    assert calls[0]["conversation_kind"] == "manager"
+    assert calls[0]["turn_trigger"] == "human_messages"
+    assert calls[0]["ingress_mode"] == "session_queue"
+    assert calls[0]["session_id"] == ("manager-session" if execute else None)
+    assert len(opened) == int(execute)
+    if execute:
+        assert opened[0]["agent_goal_id"] == "loopx-manager"
+        assert opened[0]["agent_id"] == "codex"
+        assert opened[0]["channel_id"] == manager_channel(
+            provider="lark", audience="mew\0oc_public_fixture"
+        )
+        assert opened[0]["channel_id"] != "manager"

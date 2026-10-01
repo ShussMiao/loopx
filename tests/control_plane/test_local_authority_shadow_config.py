@@ -45,61 +45,30 @@ def _registry(tmp_path: Path) -> Path:
     return registry
 
 
-def test_configure_goal_enables_and_clears_closed_file_shadow_config(
-    tmp_path: Path,
-) -> None:
+@pytest.mark.parametrize("execute", [False, True])
+def test_retired_enable_rejects_without_rewriting_registry(tmp_path: Path, execute: bool) -> None:
     registry = _registry(tmp_path)
+    before = registry.read_bytes()
+    with pytest.raises(ValueError, match="local_authority_shadow_retired"):
+        configure_goal(registry_path=registry, goal_id=GOAL_ID,
+                       local_authority_shadow_file=True, execute=execute)
+    assert registry.read_bytes() == before
 
-    preview = configure_goal(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        local_authority_shadow_file=True,
-        execute=False,
-    )
 
-    assert preview["changed_fields"] == ["local_authority_shadow"]
-    assert preview["before"]["local_authority_shadow"] == {
-        "enabled": False,
-        "mode": None,
-        "status": "disabled",
-    }
-    assert preview["after"]["local_authority_shadow"] == {
-        "enabled": True,
-        "mode": "file_one_way",
-        "status": "enabled",
-    }
-
-    applied = configure_goal(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        local_authority_shadow_file=True,
-        execute=True,
-    )
-    assert applied["written"] is True
-    goal = json.loads(registry.read_text(encoding="utf-8"))["goals"][0]
-    assert goal["coordination"]["authority_shadow"] == {
-        "schema_version": "loopx_local_authority_shadow_config_v0",
-        "mode": "file_one_way",
-    }
-    assert goal["coordination"]["agent_model"] == "peer_v1"
-
-    repeated = configure_goal(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        local_authority_shadow_file=True,
-        execute=True,
-    )
-    assert repeated["written"] is False
-
-    cleared = configure_goal(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        clear_local_authority_shadow=True,
-        execute=True,
-    )
-    assert cleared["changed_fields"] == ["local_authority_shadow"]
-    goal = json.loads(registry.read_text(encoding="utf-8"))["goals"][0]
+def test_clear_retired_setting_preserves_runtime_config_and_peer_registration(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    data = json.loads(registry.read_text())
+    data["goals"][0]["coordination"]["authority_shadow"] = {
+        "schema_version": "loopx_local_authority_shadow_config_v0", "mode": "file_one_way"}
+    registry.write_text(json.dumps(data))
+    result = configure_goal(registry_path=registry, goal_id=GOAL_ID,
+        clear_local_authority_shadow=True, coordination_runtime_shadow_file=True, execute=True)
+    assert result["before"]["local_authority_shadow"]["status"] == "retired"
+    assert result["before"]["local_authority_shadow"]["enabled"] is False
+    assert result["after"]["local_authority_shadow"]["status"] == "disabled"
+    goal = json.loads(registry.read_text())["goals"][0]
     assert "authority_shadow" not in goal["coordination"]
+    assert goal["coordination"]["runtime_shadow"]["enabled"] is True
     assert goal["coordination"]["registered_agents"] == ["agent-a", "agent-b"]
 
 
@@ -116,70 +85,90 @@ def test_configure_goal_rejects_enable_and_clear_in_one_operation(
         )
 
 
-def test_configure_goal_cli_exposes_default_off_shadow_boundary(
+def test_configure_goal_exposes_transaction_bound_runtime_shadow_separately(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     registry = _registry(tmp_path)
 
-    exit_code = main(
-        [
-            "--registry",
-            str(registry),
-            "--runtime-root",
-            str(tmp_path / "runtime"),
-            "--format",
-            "json",
-            "configure-goal",
-            "--goal-id",
-            GOAL_ID,
-            "--local-authority-shadow-file",
-        ]
+    preview = configure_goal(
+        registry_path=registry,
+        goal_id=GOAL_ID,
+        coordination_runtime_shadow_file=True,
+        execute=False,
     )
+    assert preview["changed_fields"] == ["coordination_runtime_shadow"]
+    assert preview["before"]["coordination_runtime_shadow"] == {
+        "enabled": False,
+        "provider": None,
+        "status": "configuration_absent",
+    }
+    assert preview["after"]["coordination_runtime_shadow"] == {
+        "enabled": True,
+        "provider": "file_v0",
+        "status": "enabled",
+    }
+    assert preview["after"]["local_authority_shadow"]["enabled"] is False
 
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["dry_run"] is True
-    assert payload["written"] is False
-    assert payload["after"]["local_authority_shadow"]["enabled"] is True
+    applied = configure_goal(
+        registry_path=registry,
+        goal_id=GOAL_ID,
+        coordination_runtime_shadow_file=True,
+        execute=True,
+    )
+    assert applied["written"] is True
+    goal = json.loads(registry.read_text(encoding="utf-8"))["goals"][0]
+    assert goal["coordination"]["runtime_shadow"] == {
+        "enabled": True,
+        "schema_version": "loopx_coordination_runtime_shadow_config_v0",
+        "provider": "file_v0",
+    }
+    assert "authority_shadow" not in goal["coordination"]
+
     feature = next(
         item
-        for item in payload["configuration_catalog"]["features"]
-        if item["feature_id"] == "local_authority_shadow"
+        for item in applied["configuration_catalog"]["features"]
+        if item["feature_id"] == "coordination_runtime_shadow"
     )
-    assert feature["display_name"] == "Local post-commit authority observation"
-    assert feature["availability"] == "experimental_opt_in"
-    assert "parity" not in feature["consider_when"].lower()
-    assert "post-commit snapshot" in feature["effect"]
-    assert feature["does_not"] == [
-        "read the candidate for lifecycle decisions",
-        "write candidate state back into Markdown or task-lease files",
-        "promote shared authority or fence legacy writers",
-        "bind the snapshot to the exact primary transaction",
-        "guarantee delivery through a durable outbox",
-        "compare source and candidate or issue a parity verdict",
-    ]
-    assert feature["commands"]["apply_disable"].endswith(
-        "--clear-local-authority-shadow --execute"
+    assert feature["current"]["enabled"] is True
+    assert feature["commands"]["apply_enable"].endswith(
+        "--coordination-runtime-shadow-file --execute"
     )
-    assert "authority_shadow" not in json.loads(
-        registry.read_text(encoding="utf-8")
-    )["goals"][0]["coordination"]
+
+    cleared = configure_goal(
+        registry_path=registry,
+        goal_id=GOAL_ID,
+        clear_coordination_runtime_shadow=True,
+        execute=True,
+    )
+    assert cleared["changed_fields"] == ["coordination_runtime_shadow"]
+    goal = json.loads(registry.read_text(encoding="utf-8"))["goals"][0]
+    assert "runtime_shadow" not in goal["coordination"]
 
 
-def test_rfc_disambiguates_historical_and_current_stage_numbering() -> None:
-    english = (
-        REPO_ROOT
-        / "docs/architecture/rfcs/shared-goal-authority-state-provider-v0.md"
-    ).read_text(encoding="utf-8")
-    chinese = (
-        REPO_ROOT
-        / "docs/architecture/rfcs/shared-goal-authority-state-provider-v0.zh-CN.md"
-    ).read_text(encoding="utf-8")
+def test_cli_rejects_retired_activation_and_exposes_no_enable_action(tmp_path: Path, capsys) -> None:
+    registry = _registry(tmp_path)
+    before = registry.read_bytes()
+    code = main(["--registry", str(registry), "--format", "json", "configure-goal",
+                 "--goal-id", GOAL_ID, "--local-authority-shadow-file"])
+    assert code != 0
+    assert "local_authority_shadow_retired" in capsys.readouterr().out
+    assert registry.read_bytes() == before
+    result = configure_goal(registry_path=registry, goal_id=GOAL_ID)
+    feature = next(row for row in result["configuration_catalog"]["features"]
+                   if row["feature_id"] == "local_authority_shadow")
+    assert feature["availability"] == "retired"
+    assert "apply_enable" not in feature["commands"]
+    assert "--clear-local-authority-shadow" in feature["commands"]["apply_disable"]
+    from loopx.capabilities.configuration_ui import capability_configuration_editor
+    assert capability_configuration_editor("local_authority_shadow")["writable_scopes"] == []
 
-    assert "historical #3669 implementation sequence" in english
-    assert "part of the Stage 0 reference foundation" in english
-    assert "not the Stage 3 remote-shadow phase in Section 11" in english
-    assert "#3669 历史实施序列" in chinese
-    assert "属于 Stage 0 reference foundation" in chinese
-    assert "不是第 11 节的 Stage 3 远端 shadow 阶段" in chinese
+
+@pytest.mark.parametrize("raw", [None, {}, {"mode": "other"}])
+def test_malformed_retained_config_can_be_cleared_without_activation(tmp_path: Path, raw) -> None:
+    registry = _registry(tmp_path)
+    data = json.loads(registry.read_text())
+    data["goals"][0]["coordination"]["authority_shadow"] = raw
+    registry.write_text(json.dumps(data))
+    result = configure_goal(registry_path=registry, goal_id=GOAL_ID, clear_local_authority_shadow=True, execute=True)
+    assert result["before"]["local_authority_shadow"]["status"] == "invalid"
+    assert result["after"]["local_authority_shadow"]["status"] == "disabled"

@@ -400,3 +400,14 @@ test("runtime decoder rejects malformed authority input before transition", () =
     /request schema mismatch/,
   );
 });
+
+
+test("historical decorated priority snapshots remain readable", () => {
+  const startup = todo("todo_startup", {priority: "P2"});
+  const request = reconcileRequest(["## Next Action", "", `- ${startup.text}`,
+    `<!-- loopx:next-action schema=${NEXT_ACTION_BINDING_SCHEMA} todo_id=${startup.todo_id} -->`, ""], [startup]);
+  request.agent_todos = [startup, {...todo("todo_task"), priority: "P1-review"}];
+  const result = transitionTodoNextAction(request);
+  assert.equal(result.outcome, "reprioritized");
+  assert.equal(result.next_todo_id, "todo_task");
+});

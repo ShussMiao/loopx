@@ -26,6 +26,7 @@ _SECTION_BY_CONTENT_KIND = {
     "next_action": ("next_actions", 40),
     "runtime": ("supporting_evidence", 50),
     "delivery_receipt": ("supporting_evidence", 50),
+    "coverage": ("supporting_evidence", 50),
 }
 _SECTION_TITLES = {
     "en": {
@@ -44,7 +45,7 @@ _SECTION_TITLES = {
     },
 }
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
-_SUPPORTING_CONTENT_KINDS = {"runtime", "delivery_receipt"}
+_SUPPORTING_CONTENT_KINDS = {"coverage", "runtime", "delivery_receipt"}
 _MAX_PRIMARY_ITEMS = 8
 _MAX_SUPPORTING_ITEMS = 16
 

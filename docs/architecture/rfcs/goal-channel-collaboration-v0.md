@@ -1,6 +1,7 @@
 # RFC: Goal Channel Collaboration v0
 
-- Status: Draft
+- Status: Accepted
+- Supersedes / closes: none
 - Scope: provider-backed collaboration channels for one LoopX goal
 - Decision type: product architecture and staged integration contract
 
@@ -289,8 +290,12 @@ reuses the same bot verification, semantic idempotency, cooldown, provider
 idempotency key, and message readback as `notify-gate`.
 
 Use `loopx refresh-state ... --suppress-external-sinks` to suppress delivery for
-one refresh without disabling the binding. Disable automatic delivery
-persistently with:
+one refresh without disabling the binding. Turn-bound recovery remembers that
+pause and requires `--resume-external-sinks <resume_key>` to resume delivery using
+the returned key. This acknowledges the current operation, not new permissions;
+historical operations without pause evidence retain their previous behavior.
+See the [recovery handshake](../../state-interaction-model.md). Disable automatic
+delivery persistently with:
 
 ```bash
 loopx goal-channel configure --goal-id <goal-id> --no-auto-notify-human-gates --execute

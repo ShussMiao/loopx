@@ -124,3 +124,59 @@ def test_pending_intent_fallback_fails_closed_without_producer_evidence(
     _claim_gated_successors(registry.parent)
     assert f"todo:{GATED_TODO}" not in _editorial_fact_sources(registry, runtime)
     assert f"todo:{PLAIN_TODO}" in _editorial_fact_sources(registry, runtime)
+
+
+def test_post_writeback_frontier_and_progress_share_one_canonical_snapshot(
+    tmp_path, monkeypatch
+):
+    from tests.control_plane.canonical_authority_fixture import (
+        initialize_canonical_authority,
+    )
+    from loopx.control_plane.coordination.runtime_shadow import (
+        build_todo_runtime_shadow_projection,
+    )
+    from loopx.control_plane.todos.active_state_todo_parser import (
+        parse_active_state_todos,
+    )
+    from loopx.capabilities.periodic_report.post_writeback_hook import (
+        build_periodic_report_post_writeback_projection,
+    )
+    from loopx.capabilities.periodic_report import todo_source
+
+    _captured, registry, runtime = complete_todo_via_cli(
+        tmp_path,
+        journal_capabilities=["network"],
+        write_state=_write_unclaimed_frontier_state,
+    )
+    _claim_gated_successors(registry.parent)
+    state = registry.parent / "goal.md"
+    records = parse_active_state_todos(state.read_text(), item_limit=None)[
+        "agent_todos"
+    ]["items"]
+    source = build_todo_runtime_shadow_projection(
+        goal_id=GOAL_ID, todos=records, handoff_mode="soft_claim"
+    )
+    initialize_canonical_authority(runtime, GOAL_ID, source, state_path=state)
+    state.unlink()
+    reads = []
+    original = todo_source.read_canonical_todos_if_promoted
+
+    def observe(**kwargs):
+        result = original(**kwargs)
+        reads.append(result["provider_revision"])
+        return result
+
+    monkeypatch.setattr(todo_source, "read_canonical_todos_if_promoted", observe)
+    result = build_periodic_report_post_writeback_projection(
+        payload={"available_capabilities": ["network"]},
+        registry_path=registry,
+        runtime_root=runtime,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+    )
+    assert len(reads) == 1
+    assert result["stage_completion"]["acceptance"] == "validated"
+    assert f"todo:{GATED_TODO}" in {
+        r["source_ref"] for r in result["project_progress"]["items"]
+    }
+    assert not state.exists()

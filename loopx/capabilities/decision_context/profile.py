@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ...public_safe_text import COMPACT_TOKEN_PATTERN as _TOKEN_RE
 from .providers import decision_source_provider_registered
 from .sources import DecisionSourceSpec
 
@@ -19,7 +19,6 @@ DECISION_CONTEXT_ACTIVATION_STATUS_SCHEMA_VERSION = (
 MAX_DECISION_SOURCES = 64
 MAX_SOURCE_PROVIDER_BINDINGS = 16
 
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _CONFIG_FIELDS = {
     "schema_version",
     "goal_id",
@@ -59,6 +58,7 @@ _AUTOMATION_FIELDS = {
     "source_ids",
     "interval_seconds",
     "max_pending_batches",
+    "max_sources_per_tick",
 }
 
 
@@ -172,6 +172,7 @@ class DecisionContextProfile:
     capture_source_ids: tuple[str, ...] = ()
     capture_interval_seconds: int = 900
     capture_max_pending_batches: int = 1000
+    capture_max_sources_per_tick: int = 8
 
     def provider_binding_map(self) -> dict[str, Mapping[str, Any]]:
         return {
@@ -367,6 +368,11 @@ def normalize_decision_context_profile(
         field_name="max_pending_batches",
         maximum=10000,
     )
+    capture_scan_limit = _positive_int(
+        automation.get("max_sources_per_tick", 8),
+        field_name="max_sources_per_tick",
+        maximum=MAX_DECISION_SOURCES,
+    )
     if not fail_open:
         raise ValueError("decision-context providers must fail open")
 
@@ -382,6 +388,7 @@ def normalize_decision_context_profile(
         capture_source_ids=tuple(capture_ids),
         capture_interval_seconds=capture_interval,
         capture_max_pending_batches=capture_capacity,
+        capture_max_sources_per_tick=capture_scan_limit,
     )
 
 

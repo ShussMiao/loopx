@@ -20,6 +20,64 @@ class CaptureScope(str, Enum):
     CONFIGURED_CHAT_ALL = "configured_chat_all"
 
 
+class IngressMode(str, Enum):
+    LIVE_STEERING = "live_steering"
+    SESSION_QUEUE = "session_queue"
+    # Read compatibility for bindings created by the first Goal Topic slice.
+    DIRECT_SESSION = "direct_session"
+    ASYNC_INBOX = "async_inbox"
+
+
+class ReplyMode(str, Enum):
+    TOPIC_REPLY = "topic_reply"
+
+
+def _routing_value(
+    enum_type: type[CaptureScope | IngressMode | ReplyMode],
+    value: Any,
+    *,
+    default: str,
+    field: str,
+) -> str:
+    normalized = str(value or default).strip().lower()
+    try:
+        return enum_type(normalized).value
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in enum_type)
+        raise ValueError(f"{field} must be one of: {allowed}") from exc
+
+
+def _connection_routing_modes(
+    routing: Mapping[str, Any],
+) -> tuple[str, str, str]:
+    """Normalize persisted modes for both connection readback and event routing."""
+
+    capture_scope = _routing_value(
+        CaptureScope,
+        routing.get("capture_scope")
+        or (
+            "configured_chat_all"
+            if routing.get("incoming_mode") == "all"
+            else "addressed_only"
+        ),
+        default=CaptureScope.ADDRESSED_ONLY.value,
+        field="capture_scope",
+    )
+    ingress_mode = _routing_value(
+        IngressMode,
+        routing.get("ingress_mode"),
+        default=IngressMode.DIRECT_SESSION.value,
+        field="ingress_mode",
+    )
+    reply_mode = _routing_value(
+        ReplyMode,
+        routing.get("reply_mode"),
+        default=ReplyMode.TOPIC_REPLY.value,
+        field="reply_mode",
+    )
+    return capture_scope, ingress_mode, reply_mode
+
+
 def _normalize_mention_name(name: str) -> str:
     cleaned = str(name or "").strip()
     if cleaned.startswith("@"):

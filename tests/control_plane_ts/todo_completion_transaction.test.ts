@@ -84,6 +84,7 @@ test("declared validation is one external effect between two reductions", () => 
         validation_command_argv: ["python", "-c", "pass"],
         validation_label: "focused smoke",
         validation_timeout_seconds: "5",
+        task_repository: "git:github.com/example/repo-b",
       },
     }),
   );
@@ -100,6 +101,7 @@ test("declared validation is one external effect between two reductions", () => 
       validation_argv: ["python", "-c", "pass"],
       validation_label: "focused smoke",
       validation_timeout_seconds: 5,
+      task_repository: "git:github.com/example/repo-b",
     },
   });
 
@@ -145,6 +147,53 @@ test("declared validation is one external effect between two reductions", () => 
   assert.equal(rejected.decision, "reject");
   assert.equal(rejected.failure.kind, "validation_failed");
   assert.equal(rejected.failure.validation_receipt.passed, false);
+});
+
+test("revised validators reject stale or unbound validation receipts", () => {
+  const todo = {
+    ...baseTodo,
+    validation_command_argv: ["python", "-c", "pass"],
+    validation_label: "revised smoke",
+    completion_validation_revision: 1,
+  };
+  const pending = reduceTodoCompletionTransaction(request({todo}));
+  assert.equal(pending.decision, "execute_validation");
+  if (pending.decision !== "execute_validation") return;
+  const currentDigest = pending.validation_effect.validation_declaration_sha256;
+  assert.match(String(currentDigest), /^[a-f0-9]{64}$/u);
+
+  const receipt = {
+    schema_version: "issue_fix_validation_command_v0",
+    command_label: "revised smoke",
+    exit_code: 0,
+    passed: true,
+    stdout_captured: false,
+    stderr_captured: false,
+    local_path_captured: false,
+  };
+  assert.throws(
+    () => reduceTodoCompletionTransaction(request({todo, validation_receipt: receipt})),
+    /does not match the current validation declaration/,
+  );
+  assert.throws(
+    () => reduceTodoCompletionTransaction(request({
+      todo,
+      validation_receipt: {
+        ...receipt,
+        validation_declaration_sha256: "0".repeat(64),
+      },
+    })),
+    /does not match the current validation declaration/,
+  );
+
+  const committed = reduceTodoCompletionTransaction(request({
+    todo,
+    validation_receipt: {
+      ...receipt,
+      validation_declaration_sha256: currentDigest,
+    },
+  }));
+  assert.equal(committed.decision, "commit");
 });
 
 test("completion policy joins the coarse transaction only at commit", () => {

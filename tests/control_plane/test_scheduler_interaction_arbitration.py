@@ -171,8 +171,8 @@ def _payload(
                 delivery_allowed=False,
                 quiet_noop_allowed=True,
             ),
-            SchedulerDisposition.PEER_COORDINATION_STOP,
-            "peer_coordination_blocked",
+            SchedulerDisposition.PEER_COORDINATION_WAIT,
+            "peer_coordination_wait",
         ),
     ],
 )
@@ -372,7 +372,7 @@ def test_human_gate_respects_a_tighter_continuous_monitor_deadline(
     assert hint["codex_app"]["recommended_interval_minutes"] == 3
     assert hint["codex_app"]["example_progression_minutes"] == [3]
     assert hint["cold_path_detail"]["cadence_context"]["cap_minutes"] == 3
-    assert hint["reset_policy"]["codex_app_initial_interval_minutes"] == 3
+    assert hint["reset_policy"]["app_automation_initial_interval_minutes"] == 3
 
 
 def test_raw_should_run_cannot_override_blocking_gate() -> None:
@@ -502,7 +502,7 @@ def test_terminal_contract_with_open_action_fails_closed() -> None:
     )
 
 
-def test_blocked_peer_coordination_returns_to_owner_without_polling() -> None:
+def test_blocked_peer_coordination_uses_stateful_backoff() -> None:
     payload = _payload(
         mode="peer_coordination_blocked",
         should_run=False,
@@ -517,11 +517,13 @@ def test_blocked_peer_coordination_returns_to_owner_without_polling() -> None:
         agent_scope_frontier_actions=AGENT_SCOPE_ACTIONS,
     )
 
-    assert hint["action"] == "return_to_owner_until_material_change"
-    assert hint["codex_app"]["host_action"] == ("pause_or_delete_current_heartbeat")
-    assert hint["codex_app"]["host_action_required"] is True
-    assert hint["unchanged_poll"]["local_scheduler"] == "stop"
-    assert hint["unchanged_poll"]["final_quota_replan_check_enabled"] is False
+    assert hint["action"] == "backoff_until_reassigned"
+    assert hint["cadence_class"] == "peer_coordination_wait"
+    assert hint["codex_app"]["host_action"] == "update_current_heartbeat_rrule"
+    assert hint["codex_app"]["stateful_backoff"]["apply_needed"] is True
+    assert hint["codex_app"]["recommended_interval_minutes"] == 10
+    assert hint["codex_app"]["example_progression_minutes"] == [10, 20, 30, 60]
+    assert hint["unchanged_poll"]["final_quota_replan_check_enabled"] is True
 
 
 def test_structurally_invalid_contract_fails_closed() -> None:

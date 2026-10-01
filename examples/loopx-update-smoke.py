@@ -409,7 +409,8 @@ def test_check_compares_selected_source_version() -> None:
             doctor_payload=fake_fresh_doctor_payload(),
         )
     assert current_payload["source_version_check"]["matches_current"] is True, current_payload
-    assert "no update needed" in current_payload["recommended_action"], current_payload
+    assert current_payload["source_commit_check"]["status"] == "not_requested", current_payload
+    assert "no update needed" not in current_payload["recommended_action"], current_payload
 
 
 def test_check_degrades_when_source_version_is_unavailable() -> None:
@@ -425,6 +426,52 @@ def test_check_degrades_when_source_version_is_unavailable() -> None:
     assert source_check["status"] == "unavailable", payload
     assert source_check["attempted"] is True, payload
     assert "could not be checked" in payload["recommended_action"], payload
+
+
+def immutable_fresh_doctor_payload(ref: str) -> dict[str, object]:
+    payload = fake_fresh_doctor_payload()
+    freshness = payload["install_freshness"]
+    assert isinstance(freshness, dict)
+    freshness["manifest_source_ref"] = ref
+    freshness["freshness_source_label"] = f"example/loopx@{ref}"
+    freshness["freshness_source_git_commit"] = None
+    return payload
+
+
+def test_immutable_source_ref_qualifies_activation() -> None:
+    pinned = INSTALLED_COMMIT
+    with mock.patch(
+        "loopx.self_update.urlopen",
+        return_value=FakeVersionResponse(__version__),
+    ):
+        activated = build_update_plan(
+            repo="example/loopx",
+            ref=pinned,
+            check_only=True,
+            doctor_payload=immutable_fresh_doctor_payload(pinned),
+        )
+    qualification = activated["runtime_activation_qualification"]
+    assert qualification["decision"] == "runtime_active", activated
+    assert qualification["runtime_active"] is True, activated
+    assert qualification["target_source_commit"] == pinned, activated
+    assert qualification["revision_relation"] == "same", activated
+    assert "no update needed" in activated["recommended_action"], activated
+
+    other = TARGET_COMMIT
+    unproven = build_update_plan(
+        repo="example/loopx",
+        ref=other,
+        check_only=True,
+        doctor_payload=immutable_fresh_doctor_payload(other),
+    )
+    mismatch = unproven["runtime_activation_qualification"]
+    assert mismatch["decision"] == "activation_qualification_required", unproven
+    assert mismatch["target_source_commit"] == other, unproven
+    assert "does not match the selected immutable source commit" in mismatch["reason"], unproven
+    assert mismatch["successor"] == {
+        "required": True,
+        "kind": "activation_qualification",
+    }, unproven
 
 
 def test_rollback_previous_executes_with_temp_home() -> None:
@@ -521,7 +568,8 @@ def test_cli_rollback_previous_with_temp_home() -> None:
                 "previous",
             ],
             cwd=REPO_ROOT,
-            env={"HOME": str(home), "PATH": f"{home / '.local' / 'bin'}:{os.environ.get('PATH', '')}"},
+            env={"HOME": str(home), "PATH": f"{home / '.local' / 'bin'}:{os.environ.get('PATH', '')}",
+                 "LOOPX_USAGE_PING": "0"},
             text=True,
             capture_output=True,
         )
@@ -545,6 +593,7 @@ def main() -> int:
     test_fresh_check_is_noop_recommendation()
     test_check_compares_selected_source_version()
     test_check_degrades_when_source_version_is_unavailable()
+    test_immutable_source_ref_qualifies_activation()
     test_rollback_previous_executes_with_temp_home()
     test_rollback_restores_previous_when_doctor_fails()
     test_cli_check()

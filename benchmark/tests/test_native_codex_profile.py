@@ -115,6 +115,8 @@ def test_native_codex_app_server_shell_policy_is_explicit_and_fail_closed() -> N
         ),
         "-c",
         'shell_environment_policy.exclude=["PRIMARY_PROVIDER_KEY", "SECOND_PROVIDER_KEY"]',
+        "-c",
+        'shell_environment_policy.set.LOOPX_USAGE_PING="0"',
     )
 
 

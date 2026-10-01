@@ -11,6 +11,7 @@ from loopx.chat_goal_configuration_api import (
     CHAT_GOAL_CONFIGURATION_PATH,
     CHAT_GOAL_CONFIGURATION_PREVIEW_PATH,
     GoalConfigurationRequestMixin,
+    _goal_capability_options,
 )
 from loopx.control_plane.goals import configure_goal_service
 
@@ -303,6 +304,46 @@ def test_goal_configuration_merges_live_machine_defaults_without_goal_override()
     assert periodic["machine_current"]["route_ref"] == "loopx-manager"
     assert periodic["effective_configuration"]["source"] == "machine_default"
     assert periodic["effective_configuration"]["inherited"] is True
+
+
+def test_machine_inheritable_goal_capabilities_can_clear_their_overrides() -> None:
+    assert _goal_capability_options("todo_replan_cadence", None) == {
+        "clear_execution_replan_after_todos": True
+    }
+    assert _goal_capability_options("change_quality_qualification", None) == {
+        "clear_change_quality_configuration": True
+    }
+    assert _goal_capability_options("reward_memory", None) == {
+        "clear_reward_memory_config": True
+    }
+
+
+def test_reward_memory_goal_editor_reuses_the_capability_owned_configurator() -> None:
+    assert _goal_capability_options(
+        "reward_memory",
+        {
+            "config_path": ".loopx/config/reward-memory/private.json",
+            "enabled_agents": ["researcher"],
+        },
+    ) == {
+        "reward_memory_config": ".loopx/config/reward-memory/private.json",
+        "reward_memory_agents": ["researcher"],
+    }
+    assert _goal_capability_options(
+        "reward_memory", {"enabled_agents": ["researcher"]}
+    ) == {
+        "reward_memory_config": None,
+        "reward_memory_agents": ["researcher"],
+    }
+
+
+def test_coordination_runtime_shadow_editor_uses_the_transaction_bound_owner() -> None:
+    assert _goal_capability_options(
+        "coordination_runtime_shadow", {"enabled": True}
+    ) == {"coordination_runtime_shadow_file": True}
+    assert _goal_capability_options(
+        "coordination_runtime_shadow", {"enabled": False}
+    ) == {"clear_coordination_runtime_shadow": True}
 
 
 def test_goal_configuration_inspection_requires_one_goal_id() -> None:

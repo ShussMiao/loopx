@@ -1,5 +1,11 @@
+import {executeCoordinationTodoUpdate} from "../../loopx/control_plane/coordination/todo_update.ts";
+import {canonicalAuthoritySha256} from "../../loopx/control_plane/coordination/authority_store_codec.ts";
+import {TODO_DOMAIN_READ_RECORD_SCHEMA, TODO_DOMAIN_RECORD_CONTRACT} from "../../loopx/control_plane/coordination/coordination_state_contract.ts";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import { Pool, type PoolClient } from "pg";
 
@@ -11,6 +17,7 @@ import {
   type PostgreSqlAuthorityConnection,
   type PostgreSqlAuthorityDatabase,
 } from "../../loopx/control_plane/coordination/postgresql_authority_store.ts";
+import { openLocalAuthorityStoreHandle } from "../../loopx/control_plane/coordination/local_authority_provider.ts";
 import {
   authorityStoreCommitFixture as commit,
   registerAuthorityStoreConformance,
@@ -129,6 +136,133 @@ if (database && installed) {
     };
   });
 
+  test("PostgreSQL Todo priority edit survives reopen, replay and conflicting intent", async t => {
+    await installed;
+    const options = {tenant_id: `tenant-${randomUUID()}`, goal_id: `goal-${randomUUID()}`};
+    t.after(() => cleanScope(options.tenant_id, options.goal_id));
+    const store = new PostgreSqlAuthorityStore(database, options);
+    const todos = [{schema_version: "todo_domain_record_v0", todo_id: "todo_priority", role: "agent",
+      status: "open", done: false, archive_state: "active", text: "[P2] Existing work",
+      title: "Existing work", priority: "P2", task_class: "advancement_task"}];
+    await store.commitAuthority({operation_id: "seed-priority", expected_provider_revision: null,
+      events: [], receipts: [], next_projection: {goal_id: options.goal_id, todos, leases: [],
+        todo_read_model: {schema_version: TODO_DOMAIN_READ_RECORD_SCHEMA, todo_count: 1,
+          records_sha256: canonicalAuthoritySha256(todos), contract_fields: [...TODO_DOMAIN_RECORD_CONTRACT.fields]}}});
+    const request = {goal_id: options.goal_id, todo_id: "todo_priority", expected_role: "agent",
+      actor_agent_id: null, registered_agents: [], operation_id: "edit-priority",
+      patch: {text: "Renamed work"}, clear_fields: [], planning_intent: {priority: "P4"},
+      dry_run: false, now: new Date("2030-01-01T00:00:00Z")};
+    const result = await executeCoordinationTodoUpdate(store, request);
+    assert.equal(result.status, "applied", JSON.stringify(result));
+    const reopened = new PostgreSqlAuthorityStore(database, options);
+    assert.equal((await executeCoordinationTodoUpdate(reopened, request)).status, "replayed");
+    const before = await reopened.loadAuthority();
+    assert.equal(before.status, "loaded");
+    if (before.status !== "loaded") return;
+    assert.equal((before.head.todos as {priority: string}[])[0]!.priority, "P4");
+    assert.equal((await executeCoordinationTodoUpdate(reopened, {...request,
+      planning_intent: {priority: "P0"}})).status, "failed");
+    assert.deepEqual(await reopened.loadAuthority(), before);
+    assert.equal((await executeCoordinationTodoUpdate(reopened, {...request,
+      operation_id: "clear-priority", patch: {}, planning_intent: {clear_priority: true}})).status, "applied");
+    const cleared = await reopened.loadAuthority();
+    assert.equal(cleared.status, "loaded");
+    if (cleared.status === "loaded") assert.equal((cleared.head.todos as {priority?: string}[])[0]!.priority, undefined);
+  });
+
+  test("PostgreSQL owner deferral atomically retires the lease and replays after reopen", async t => {
+    await installed;
+    const options = {tenant_id: `tenant-${randomUUID()}`, goal_id: `goal-${randomUUID()}`};
+    t.after(() => cleanScope(options.tenant_id, options.goal_id));
+    const store = new PostgreSqlAuthorityStore(database, options);
+    const todos = [{schema_version: "todo_domain_record_v0", todo_id: "todo_wait", role: "agent",
+      status: "open", done: false, archive_state: "active", text: "Wait for dependency",
+      task_class: "advancement_task", claimed_by: "agent-a"}];
+    await store.commitAuthority({operation_id: "seed", expected_provider_revision: null,
+      events: [], receipts: [], next_projection: {goal_id: options.goal_id, handoff_mode: "hard_lease", todos,
+        leases: [{schema_version: "task_lease_v0", goal_id: options.goal_id, todo_id: "todo_wait",
+          owner: "agent-a", idempotency_key: "execution", version: 1, lease_epoch: 1,
+          status: "active", expires_at: "2030-01-01T01:00:00Z", write_scopes: []}],
+        todo_read_model: {schema_version: TODO_DOMAIN_READ_RECORD_SCHEMA, todo_count: 1,
+          records_sha256: canonicalAuthoritySha256(todos), contract_fields: [...TODO_DOMAIN_RECORD_CONTRACT.fields]}}});
+    const request = {goal_id: options.goal_id, todo_id: "todo_wait", expected_role: "agent",
+      actor_agent_id: "agent-a", registered_agents: ["agent-a"], operation_id: "defer",
+      patch: {}, clear_fields: [], planning_intent: {status: "deferred",
+        resume_when: "todo_done:todo_dependency", reason: "Dependency pending"},
+      lease_idempotency_key: "execution", lease_expected_version: 1,
+      dry_run: false, now: new Date("2030-01-01T00:00:00Z")};
+    const before = await store.loadAuthority();
+    assert.equal((await executeCoordinationTodoUpdate(store, {...request, lease_expected_version: 2})).status, "failed");
+    assert.deepEqual(await store.loadAuthority(), before);
+    assert.equal((await executeCoordinationTodoUpdate(store, request)).status, "applied");
+    const reopened = new PostgreSqlAuthorityStore(database, options);
+    const after = await reopened.loadAuthority();
+    assert.equal(after.status, "loaded");
+    if (after.status !== "loaded") return;
+    assert.equal((after.head.todos as {status: string}[])[0].status, "deferred");
+    assert.equal((after.head.leases as {status: string}[])[0].status, "released");
+    assert.equal((await executeCoordinationTodoUpdate(reopened, request)).status, "replayed");
+    assert.deepEqual(await reopened.loadAuthority(), after);
+  });
+
+  test("PostgreSQL scan binds head and rows to one snapshot during concurrent commit", async t => {
+    await installed;
+    const options = {tenant_id: `tenant-${randomUUID()}`, goal_id: `goal-${randomUUID()}`};
+    t.after(() => cleanScope(options.tenant_id, options.goal_id));
+    const writer = new PostgreSqlAuthorityStore(database, options);
+    const first = await writer.commitAuthority(commit(null, "snapshot-first", 1, 1));
+    assert.equal(first.status, "applied");
+    if (first.status !== "applied") return;
+    let interleaved = false;
+    const reader = new PostgreSqlAuthorityStore({connect: async () => {
+      const connection = await database.connect();
+      return {...connection, query: async (sql, values) => {
+        const result = await connection.query(sql, values);
+        if (!interleaved && sql.includes("FROM loopx_control_plane.authority_heads")) {
+          interleaved = true;
+          assert.equal((await writer.commitAuthority(commit(first.provider_revision,
+            "snapshot-second", 2, 2))).status, "applied");
+        }
+        return result;
+      }};
+    }}, options);
+    const page = await reader.scanCommitted(null, 10);
+    assert.equal(interleaved, true);
+    assert.equal(page.status, "page", JSON.stringify(page));
+    if (page.status !== "page") return;
+    assert.deepEqual(page.transactions.map(row => row.operation_id), ["snapshot-first"]);
+    assert.equal(page.has_more, false);
+    const next = await reader.scanCommitted(page.next_cursor, 10);
+    assert.equal(next.status, "page");
+    if (next.status === "page") assert.deepEqual(next.transactions.map(row => row.operation_id), ["snapshot-second"]);
+  });
+
+  for (const removedCursor of [2, 3]) {
+    test(`PostgreSQL scan rejects a missing retained row at cursor ${removedCursor}`, async t => {
+      await installed;
+      const options = {tenant_id: `tenant-${randomUUID()}`, goal_id: `goal-${randomUUID()}`};
+      t.after(() => cleanScope(options.tenant_id, options.goal_id));
+      const store = new PostgreSqlAuthorityStore(database, options);
+      let revision: string | null = null;
+      for (let index = 1; index <= 3; index++) {
+        const result = await store.commitAuthority(commit(revision, `gap-${index}`, index, index));
+        assert.equal(result.status, "applied");
+        if (result.status !== "applied") return;
+        revision = result.provider_revision;
+      }
+      await pool!.query("DELETE FROM loopx_control_plane.authority_commits WHERE tenant_id=$1 AND goal_id=$2 AND cursor=$3",
+        [options.tenant_id, options.goal_id, removedCursor]);
+      for (const limit of [1, 10]) {
+        const result = await store.scanCommitted(removedCursor === 3 ? "1" : null, limit);
+        assert.equal(result.status, "failed", JSON.stringify(result));
+        if (result.status === "failed") assert.equal(result.reason_code, "provider_protocol_violation");
+      }
+      const head = await store.loadAuthority();
+      assert.equal(head.status, "loaded");
+      if (head.status === "loaded") assert.equal(head.provider_revision, revision);
+    });
+  }
+
   test("PostgreSQL provider scopes identical goals and operations by tenant", async (t) => {
     await installed;
     const goalId = `goal-${randomUUID()}`;
@@ -154,6 +288,38 @@ if (database && installed) {
     assert.deepEqual(results.map((result) => result.status), ["applied", "applied"]);
     assert.equal((await first.readReceipt("shared-operation")).status, "found");
     assert.equal((await second.readReceipt("shared-operation")).status, "found");
+  });
+
+  test("local provider selector switches to a real PostgreSQL tenant", async (t) => {
+    await installed;
+    const root = await mkdtemp(join(tmpdir(), "loopx-local-provider-pg-"));
+    const tenantId = `tenant-${randomUUID()}`;
+    const goalId = `goal-${randomUUID()}`;
+    t.after(async () => {
+      await cleanScope(tenantId, goalId);
+      await rm(root, {recursive: true, force: true});
+    });
+    await mkdir(join(root, "authority"), {recursive: true});
+    const marker = join(root, "authority", `provider-${createHash("sha256").update(goalId).digest("hex")}.json`);
+    await writeFile(marker, JSON.stringify({
+      schema_version: "loopx_local_authority_provider_v0",
+      provider: "postgresql",
+      goal_id: goalId,
+      tenant_id: tenantId,
+      store_identity: STORE_IDENTITY,
+    }));
+    const handle = await openLocalAuthorityStoreHandle(root, goalId, {
+      openPostgresqlStore: selection => new PostgreSqlAuthorityStore(database, {
+        tenant_id: selection.tenant_id,
+        goal_id: selection.goal_id,
+      }),
+    });
+    assert.equal(handle.provider, "postgresql");
+    assert.equal(handle.sourceAuthority, "postgresql_v0");
+    assert.equal(handle.store.providerKind, "postgresql");
+    const applied = await handle.store.commitAuthority(commit(null, "selector-operation", 1, 1));
+    assert.equal(applied.status, "applied");
+    assert.equal((await handle.store.readReceipt("selector-operation")).status, "found");
   });
 
   test("PostgreSQL provider rolls back head, events, and receipts together", async (t) => {

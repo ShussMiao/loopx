@@ -10,12 +10,24 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
+from ...control_plane.runtime.public_safety import (
+    REMOTE_LOCATION_SURFACE_PATTERN,
+    SECRET_LIKE_SURFACE_PATTERN,
+    find_public_safe_local_path,
+)
+from ...public_safe_text import COMPACT_TOKEN_PATTERN as _TOKEN_RE
+
 DECISION_EVIDENCE_PACKET_SCHEMA_VERSION = "decision_evidence_packet_v0"
 DECISION_PROPOSAL_SCHEMA_VERSION = "decision_proposal_v0"
 DECISION_REVIEW_RECEIPT_SCHEMA_VERSION = "decision_review_receipt_v0"
 DECISION_OUTCOME_RECEIPT_SCHEMA_VERSION = "decision_outcome_receipt_v0"
 
-DECISION_CONTEXT_CAPABILITY_ID = "decision_context"
+# Packet-contract namespace. Capability packets identify the capability with
+# the underscore spelling (the sibling capability emits "material_lifecycle").
+# No consumer joins this value with the hyphenated catalog/extension id in
+# extension_provider.py: they are two slots for the same capability, both
+# consistent with their own siblings, so the spellings stay separate.
+DECISION_CONTEXT_PACKET_CAPABILITY_ID = "decision_context"
 DECISION_OUTCOME_VERIFICATION_STATUSES = {
     "pending",
     "verified",
@@ -29,9 +41,12 @@ DECISION_REVIEW_DISPOSITIONS = {
     "no_change",
 }
 
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-_LOCAL_PATH_RE = re.compile(r"(^|[\s:=])(?:/Users/|/private/|/tmp/|~/)")
-_RAW_LOCATION_RE = re.compile(r"(?i)\b(?:https?|file|s3|gs|tos|hdfs)://")
+# Refs #5136, direction 3: "does this text carry a local path?" is decided once
+# by find_public_safe_local_path; this site keeps its own rejection message and
+# length limit for whatever the owner recognizes.
+#
+# Local threshold policy only: the credential *shapes* are decided once by
+# SECRET_LIKE_SURFACE_PATTERN, which this site consults in addition to this list.
 _CREDENTIAL_RE = re.compile(
     "(?i)("
     + "|".join(
@@ -66,11 +81,11 @@ def _compact_text(value: Any, *, field: str, max_len: int = 320) -> str:
         raise ValueError(f"{field} must be non-empty")
     if len(text) > max_len:
         raise ValueError(f"{field} must be at most {max_len} characters")
-    if _LOCAL_PATH_RE.search(text):
+    if find_public_safe_local_path(text) is not None:
         raise ValueError(f"{field} must not contain a local path")
-    if _RAW_LOCATION_RE.search(text):
+    if REMOTE_LOCATION_SURFACE_PATTERN.search(text):
         raise ValueError(f"{field} must use an opaque source reference, not a raw URL")
-    if _CREDENTIAL_RE.search(text):
+    if SECRET_LIKE_SURFACE_PATTERN.search(text) or _CREDENTIAL_RE.search(text):
         raise ValueError(f"{field} contains a credential-like value")
     return text
 
@@ -204,7 +219,7 @@ def _packet_ref(prefix: str, packet: Mapping[str, Any]) -> str:
 
 def _capability_contract(*, packet_role: str) -> dict[str, Any]:
     return {
-        "capability_id": DECISION_CONTEXT_CAPABILITY_ID,
+        "capability_id": DECISION_CONTEXT_PACKET_CAPABILITY_ID,
         "scope": "goal",
         "default_enabled": False,
         "packet_role": packet_role,

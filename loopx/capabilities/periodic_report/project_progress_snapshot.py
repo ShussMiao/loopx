@@ -1,90 +1,44 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from datetime import datetime
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from ...control_plane.todos.active_state_todo_parser import parse_active_state_todos
-from ...control_plane.todos.projection import todo_item_is_actionable_open
-from ...registry import find_registry_goal, read_json, resolve_state_file
+from ...control_plane.todos.todo_semantics import todo_item_is_actionable_open
+from ...control_plane.effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from .todo_source import read_report_todo_source
 from .incremental import select_incremental_project_progress
-
-
-def _stage_timestamp(value: str) -> datetime | None:
-    """Parse an offset-aware ISO-8601 timestamp or reject the value.
-
-    Sibling validations (``_validated_snapshot_timestamp``,
-    ``_actual_work_window``, ``incremental._timestamp``) all reject naive
-    timestamps, so stage filtering must not compare offset-naive and
-    offset-aware datetimes either.
-    """
-
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed
-
-
-def _outcome_completed_at(
-    item: Mapping[str, Any], *, stage_time: datetime
-) -> str | None:
-    """Return the durable completion timestamp an outcome fact may carry.
-
-    A done todo without a trustworthy completion timestamp (handwritten
-    agent-lane entries may omit them) must not become an outcome fact: the
-    frozen fact would fail timestamp validation on every consumption retry.
-    """
-
-    raw = str(item.get("completed_at") or item.get("updated_at") or "").strip()
-    parsed = _stage_timestamp(raw)
-    if parsed is None or parsed > stage_time:
-        return None
-    return raw
-
-
-_META_ACTION_KINDS = frozenset(
-    {
-        "consume_periodic_report_intent",
-        "repair_periodic_report_intent_consumption",
-        "repair_periodic_report_editorial",
-    }
-)
 
 
 def build_project_progress_snapshot(
     *,
     registry_path: Path,
     goal_id: str,
+    runtime_root: Path | None = None,
     agent_id: str,
     completed_at: str,
     publication_cursor: Mapping[str, Any] | None = None,
+    goal_cursors: Sequence[Mapping[str, Any]] | None = None,
     available_capabilities: Any = None,
     rollout_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Build a bounded public-safe progress snapshot at a stage boundary."""
 
-    registry = read_json(registry_path)
-    goal = find_registry_goal(registry, goal_id)
-    if not isinstance(goal, Mapping):
-        raise ValueError("periodic-report Goal is not registered")
-    repo = Path(str(goal.get("repo") or "")).expanduser()
-    state_path = resolve_state_file(repo, str(goal.get("state_file") or ""))
-    if state_path is None or not state_path.is_file():
-        raise ValueError("periodic-report active state is unavailable")
-    return build_project_progress_snapshot_from_state(
-        state_text=state_path.read_text(encoding="utf-8"),
-        goal=dict(goal),
-        state_path=state_path,
+    fields, _ = read_report_todo_source(
+        registry_path=registry_path,
+        goal_id=goal_id,
+        runtime_root=runtime_root,
+        rollout_events=rollout_events,
+        available_capabilities=available_capabilities,
+    )
+    return build_project_progress_snapshot_from_fields(
+        fields=fields,
         goal_id=goal_id,
         agent_id=agent_id,
         completed_at=completed_at,
         publication_cursor=publication_cursor,
-        available_capabilities=available_capabilities,
-        rollout_events=rollout_events,
+        goal_cursors=goal_cursors,
     )
 
 
@@ -97,10 +51,17 @@ def build_project_progress_snapshot_from_state(
     agent_id: str,
     completed_at: str,
     publication_cursor: Mapping[str, Any] | None = None,
+    goal_cursors: Sequence[Mapping[str, Any]] | None = None,
     available_capabilities: Any = None,
     rollout_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Build a progress snapshot from one already-read authoritative state.
+    """Legacy text adapter; provider-aware callers use the shared Todo source.
+
+    Evidence is selected for the Goal, not for the calling lane: every Agent's
+    eligible rows are reportable and ``agent_id`` only ranks the reporting
+    Agent's own rows first, so a multi-Agent Goal does not lose peer progress
+    and the bounded outcome cap never evicts the reporter's own outcomes. A row
+    no Agent claimed has no producer and stays out of the report.
 
     Resume-gated todos are judged with the same typed resume evidence the
     scheduler consumes: ``rollout_events`` feeds ``pr_merged`` gates and
@@ -117,36 +78,64 @@ def build_project_progress_snapshot_from_state(
         rollout_events=rollout_events,
         available_capabilities=available_capabilities,
     )
-    agent_summary = parsed.get("agent_todos")
-    items = agent_summary.get("items") if isinstance(agent_summary, Mapping) else []
-    stage_time = _stage_timestamp(completed_at)
-    if stage_time is None:
-        raise ValueError("periodic-report stage completion timestamp is invalid")
+    return build_project_progress_snapshot_from_fields(
+        fields=parsed,
+        goal_id=goal_id,
+        agent_id=agent_id,
+        completed_at=completed_at,
+        publication_cursor=publication_cursor,
+        goal_cursors=goal_cursors,
+    )
 
-    def not_after_stage(item: Mapping[str, Any]) -> bool:
-        raw = str(item.get("updated_at") or item.get("completed_at") or "").strip()
-        if not raw:
-            return True
-        parsed = _stage_timestamp(raw)
-        if parsed is None:
-            return False
-        return parsed <= stage_time
 
-    done = [
-        dict(item)
-        for item in items or []
-        if isinstance(item, Mapping)
-        and item.get("status") == "done"
-        and str(item.get("claimed_by") or "") == agent_id
-        and not_after_stage(item)
-        and str(item.get("action_kind") or "") not in _META_ACTION_KINDS
-    ]
-    done.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+def build_project_progress_snapshot_from_fields(
+    *,
+    fields: Mapping[str, Any],
+    goal_id: str,
+    agent_id: str,
+    completed_at: str,
+    publication_cursor: Mapping[str, Any] | None = None,
+    goal_cursors: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Select facts from one complete evaluated snapshot, then apply publication history."""
+    items = list((fields.get("agent_todos") or {}).get("items") or [])
+    selection_fields = (
+        "todo_id",
+        "status",
+        "claimed_by",
+        "updated_at",
+        "completed_at",
+        "action_kind",
+        "task_class",
+    )
+    try:
+        selected = effect_runtime_result(
+            "capabilities.periodic_report.progress.select",
+            {
+                "schema_version": "periodic_report_progress_selection_request_v0",
+                "agent_id": agent_id,
+                "completed_at": completed_at,
+                "items": [
+                    {
+                        **{key: item.get(key) for key in selection_fields},
+                        "actionable": todo_item_is_actionable_open(item),
+                    }
+                    for item in items
+                ],
+            },
+        )
+    except EffectRuntimeRejected as error:
+        raise ValueError(str(error)) from error
+    if (
+        not isinstance(selected, dict)
+        or selected.get("schema_version")
+        != "periodic_report_progress_selection_result_v0"
+    ):
+        raise ValueError("periodic-report progress selection result mismatch")
     progress_items: list[dict[str, Any]] = []
-    for index, item in enumerate(done):
-        outcome_completed_at = _outcome_completed_at(item, stage_time=stage_time)
-        if outcome_completed_at is None:
-            continue
+    for outcome in selected["outcomes"]:
+        index = outcome["rank"]
+        item = items[outcome["index"]]
         summary = " ".join(
             str(
                 item.get("evidence") or item.get("note") or item.get("text") or ""
@@ -160,34 +149,20 @@ def build_project_progress_snapshot_from_state(
                 "summary": summary[:360] or "Validated completion is durably recorded.",
                 "content_kind": "outcome",
                 "value_rank": 10 + index,
-                "source_ref": f"todo:{item.get('todo_id')}",
-                "completed_at": outcome_completed_at,
+                "source_ref": f"todo:{item['todo_id']}",
+                "completed_at": outcome["completed_at"],
             }
         )
-    open_items = [
-        dict(item)
-        for item in items or []
-        if isinstance(item, Mapping)
-        and todo_item_is_actionable_open(dict(item))
-        and str(item.get("claimed_by") or "") == agent_id
-        and not_after_stage(item)
-        and item.get("task_class") != "continuous_monitor"
-        and item.get("action_kind")
-        not in {
-            "consume_periodic_report_intent",
-            "repair_periodic_report_intent_consumption",
-        }
-    ]
-    if open_items:
-        next_item = open_items[0]
+    if selected["next_index"] is not None:
+        item = items[selected["next_index"]]
         progress_items.append(
             {
                 "item_id": "next_action",
                 "title": "Next action",
-                "summary": " ".join(str(next_item.get("text") or "").split())[:360],
+                "summary": " ".join(str(item.get("text") or "").split())[:360],
                 "content_kind": "next_action",
                 "value_rank": 90,
-                "source_ref": f"todo:{next_item.get('todo_id')}",
+                "source_ref": f"todo:{item['todo_id']}",
             }
         )
     if not progress_items:
@@ -199,10 +174,13 @@ def build_project_progress_snapshot_from_state(
         "language": "zh-CN",
         "items": progress_items,
     }
-    if publication_cursor is not None:
+    if publication_cursor is not None or goal_cursors:
+        # A lane that has never published still must not re-announce what the
+        # Goal already announced, so the peer baseline applies without one.
         incremental = select_incremental_project_progress(
             snapshot,
             cursor=publication_cursor,
+            goal_cursors=goal_cursors,
         )
         if incremental is None:
             return None

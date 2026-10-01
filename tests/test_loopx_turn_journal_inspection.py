@@ -10,6 +10,7 @@ import pytest
 
 from loopx.cli import main as cli_main
 from loopx.cli_commands import turn as turn_command
+from loopx.cli_commands import turn_decision
 from loopx.cli_commands import turn_rendering, turn_todo_writeback
 from loopx.control_plane.turn_driver import executor
 from loopx.control_plane.turn_driver import turn_journal_runtime
@@ -109,6 +110,18 @@ def test_existing_run_once_markdown_renderer_remains_intact() -> None:
             "result_kind": "validated_progress",
             "validation": {"status": "passed", "recovery_kind": None},
             "receipt": {"next_phase": None},
+            "reason": "dsh_output_budget_exhausted_no_final",
+            "host_failure": {
+                "kind": "output_budget_exhausted",
+                "retryable": False,
+            },
+            "managed_executor": {
+                "execution_profile": "deepseek-v4-flash@high",
+                "output_token_budget": {
+                    "max_tokens": 16_384,
+                    "scope": "per_model_request",
+                },
+            },
             "effects": {
                 "host_invoked": True,
                 "state_written": True,
@@ -120,6 +133,27 @@ def test_existing_run_once_markdown_renderer_remains_intact() -> None:
     assert rendered.startswith("# LoopX Turn Run Once\n")
     assert "- validation: passed" in rendered
     assert "- quota_spent: True" in rendered
+    assert "- execution_profile: deepseek-v4-flash@high" in rendered
+    assert "- output_token_limit: 16384" in rendered
+    assert "- output_token_limit_scope: per_model_request" in rendered
+    assert "- host_failure_kind: output_budget_exhausted" in rendered
+    assert "- host_failure_retryable: False" in rendered
+    assert "- failure_reason: dsh_output_budget_exhausted_no_final" in rendered
+
+
+def test_non_budget_failure_keeps_the_existing_compact_rendering() -> None:
+    from loopx.cli_commands.turn_rendering import render_loopx_turn_execution_markdown
+
+    rendered = render_loopx_turn_execution_markdown({
+        "status": "failed", "result_kind": "host_failure",
+        "reason": "provider_failed",
+        "host_failure": {"kind": "auth_failed", "retryable": False},
+    })
+    assert rendered == "\n".join([
+        "# LoopX Turn Run Once", "- status: failed", "- result_kind: host_failure",
+        "- validation: None", "- recovery_kind: None", "- next_phase: None",
+        "- host_invoked: None", "- state_written: None", "- quota_spent: None",
+    ])
 
 
 def test_inspection_markdown_distinguishes_current_plan_from_last_result() -> None:
@@ -212,6 +246,8 @@ def test_inspection_returns_versioned_allowlisted_projection_without_mutation(
             "checks": [{"kind": "journal_consistency", "outcome": "passed"}],
         },
         "last_recovery": None,
+        "recorded_effects": {"host_invoked": True, "state_written": True,
+                             "quota_spent": True, "scheduler_acknowledged": None},
         "effects": [],
     }
     assert journal_path.read_bytes() == before_bytes
@@ -283,27 +319,45 @@ def test_inspection_rejects_invalid_agent_identity_before_file_access(
         )
 
 
+@pytest.mark.parametrize("unknown_intent", [False, True])
 def test_inspect_journal_cli_branches_before_live_or_write_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unknown_intent: bool,
 ) -> None:
-    _write_journal(tmp_path, _journal())
+    journal = _journal(status="in_progress" if unknown_intent else "committed")
+    if unknown_intent:
+        journal["completed_phases"] = []
+        journal["effect_attempts"] = {"unknown_provider_step": {
+            "status": "prepared", "effect_ref": "private-effect-ref-not-returned",
+        }}
+    journal_path = _write_journal(tmp_path, journal)
+    before = journal_path.read_bytes()
 
     def unexpected_call(*args: object, **kwargs: object) -> None:
         raise AssertionError("inspect-journal reached a live or write path")
 
     for name in (
-        "build_lark_operator_inbox_urgency_projector",
-        "collect_status",
-        "scheduler_execution_context_for_turn",
         "build_live_quota_should_run_decision",
         "build_loopx_turn_plan",
+        "build_turn_envelope",
         "run_codex_cli_host",
         "run_loopx_turn_once",
         "spend_quota_slot",
         "refresh_state_run",
     ):
         monkeypatch.setattr(turn_command, name, unexpected_call)
+    # The shared decision owner now performs the live reads this command used to
+    # resolve itself, so the guard has to patch them where they live. Patching
+    # the old ``turn_command`` names would fail loudly here instead of proving
+    # anything: `turn` no longer resolves its own status, scheduler context or
+    # operator-inbox projector.
+    for name in (
+        "build_lark_operator_inbox_urgency_projector",
+        "collect_status",
+        "scheduler_execution_context_for_turn",
+    ):
+        monkeypatch.setattr(turn_decision, name, unexpected_call)
     for name in ("complete_goal_todo", "update_goal_todo"):
         monkeypatch.setattr(turn_todo_writeback, name, unexpected_call)
     monkeypatch.setattr(executor, "execute_turn_driver_settlement", unexpected_call)
@@ -314,8 +368,17 @@ def test_inspect_journal_cli_branches_before_live_or_write_paths(
     payload = json.loads(raw_output)
     assert exit_code == 0
     assert payload["schema_version"] == "loopx_turn_journal_inspection_v1"
-    assert payload["decision"] == "replay_legal"
+    assert payload["decision"] == ("replay_blocked" if unknown_intent else "replay_legal")
     assert payload["effects"] == []
+    assert journal_path.read_bytes() == before
+    if unknown_intent:
+        assert payload["journal_consistent"] is False
+        assert "prepared_effect_step_unsupported" in payload["violations"]
+        assert payload["recovery_decision"]["action"] == "blocked"
+        assert payload["recovery_decision"]["can_continue"] is False
+        assert payload["recovery_decision"]["reinvoke_host"] is False
+        assert all(value is None for value in payload["recorded_effects"].values())
+        assert "private-effect-ref-not-returned" not in raw_output
 
 
 def test_inspect_journal_cli_json_and_markdown_share_allowlisted_projection(
@@ -348,6 +411,7 @@ def test_inspect_journal_cli_json_and_markdown_share_allowlisted_projection(
         "journal_consistent",
         "recovery_decision",
         "last_recovery",
+        "recorded_effects",
         "effects",
     }
     assert markdown_output == (
@@ -359,6 +423,8 @@ def test_inspect_journal_cli_json_and_markdown_share_allowlisted_projection(
         "- recovery_reason: terminal_result_retained\n"
         "- recovery_checks: journal_consistency:passed\n"
         "- journal_consistent: True\n"
+        "- original_turn_recorded_effects: {'host_invoked': True, 'state_written': True, "
+        "'quota_spent': True, 'scheduler_acknowledged': None}\n"
         "- replay_decision: replay_legal\n"
         "- journal_status: committed\n"
         "- replay_legal: True\n"
@@ -389,6 +455,27 @@ def test_inspect_journal_cli_returns_zero_for_identity_mismatch(tmp_path: Path) 
     assert payload["decision"] == "replay_blocked"
     assert payload["owner_matches"] is False
     assert payload["violations"] == ["owner_mismatch"]
+
+
+def test_inspect_journal_cli_blocks_contradictory_binding_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    journal = _journal()
+    identity = journal["plan"]["transaction"]["settlement_plan"]["identity"]
+    identity.update(binding_kind="autonomous_replan", binding_id="different-work")
+    path = _write_journal(tmp_path, journal)
+    before = path.read_bytes()
+
+    exit_code, raw_output = _run_inspection_cli(tmp_path, output_format="json")
+
+    payload = json.loads(raw_output)
+    assert exit_code == 0  # A successful inspection reports the invalid record.
+    assert payload["decision"] == "replay_blocked"
+    assert payload["journal_consistent"] is False
+    assert "settlement_identity_invalid" in payload["violations"]
+    assert payload["recovery_decision"]["action"] == "blocked"
+    assert payload["effects"] == []
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -444,7 +531,7 @@ def test_inspection_has_no_python_fallback_when_typescript_runtime_is_missing(
     _write_journal(tmp_path, _journal())
 
     def missing_node(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("Turn-journal inspection requires Node.js 22.6 or newer")
+        raise RuntimeError("Turn-journal inspection requires Node.js 22.22.3 or newer")
 
     monkeypatch.setattr(turn_journal_runtime, "effect_runtime_result", missing_node)
 
@@ -455,7 +542,7 @@ def test_inspection_has_no_python_fallback_when_typescript_runtime_is_missing(
     assert payload == {
         "ok": False,
         "schema_version": "loopx_turn_journal_inspection_v1",
-        "error": "Turn-journal inspection requires Node.js 22.6 or newer",
+        "error": "Turn-journal inspection requires Node.js 22.22.3 or newer",
         "effects": [],
     }
 
@@ -494,6 +581,8 @@ def test_typescript_runtime_uses_one_typed_rpc_call(
                 ],
             },
             "last_recovery": None,
+            "recorded_effects": {"host_invoked": True, "state_written": True,
+                                 "quota_spent": True, "scheduler_acknowledged": None},
             "effects": [],
         }
 
@@ -557,6 +646,8 @@ def test_typescript_runtime_rejects_malformed_projection_types(
             "checks": [{"kind": "journal_consistency", "outcome": "passed"}],
         },
         "last_recovery": None,
+        "recorded_effects": {"host_invoked": True, "state_written": True,
+                             "quota_spent": True, "scheduler_acknowledged": None},
         "effects": [],
     }
 

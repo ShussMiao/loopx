@@ -6,7 +6,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from loopx.chat_completed_todos import CompletedTodoPages
+from loopx.chat_completed_todos import CompletedTodoPages, _verify_goal_result_page
 from loopx.chat_server import ChatHTTPServer, ChatRequestHandler
 from loopx.control_plane.todos.contract import encode_metadata_value
 
@@ -55,6 +55,45 @@ def test_snapshot_byte_budget_is_enforced():
     with pytest.raises(ValueError, match="too_large"):
         pages.page(scope="a", cursor="", load=lambda: [{"text": "x" * 100}])
     assert not pages._snapshots
+
+
+def test_goal_report_verification_is_bounded_by_requested_page(monkeypatch):
+    calls = []
+    def read(**kwargs):
+        calls.append(kwargs["todo_id"])
+        return {"result": {"sha256": "a" * 64, "producer_agent_id": "lead",
+                           "content_type": "text/markdown", "size_bytes": 12}}
+    monkeypatch.setattr("loopx.control_plane.todos.completion_result.read_completion_result", read)
+    pages = CompletedTodoPages()
+    rows = [{"todo_id": f"todo_report_{index}", "title": "Report",
+             "sha256": "a" * 64, "producer_agent_id": "lead", "completed_at": None}
+            for index in range(85)]
+    first = pages.page(scope=("accepted_goal_results", "goal"), cursor="", load=lambda: rows)
+    verified = _verify_goal_result_page(page=first, registry_path=None, runtime_root=None, goal_id="goal")
+    assert len(verified["items"]) == len(calls) == 40
+    assert verified["next_cursor"]
+    assert verified["unavailable_count"] == 0
+    assert verified["unavailable_todo_ids"] == []
+
+
+def test_goal_report_page_names_unavailable_rows_instead_of_hiding_the_rest(monkeypatch):
+    def read(**kwargs):
+        if kwargs["todo_id"] == "todo_report_stale":
+            raise ValueError("completion result acceptance basis is stale")
+        return {"result": {"sha256": "a" * 64, "producer_agent_id": "lead",
+                           "content_type": "text/markdown", "size_bytes": 12}}
+    monkeypatch.setattr("loopx.control_plane.todos.completion_result.read_completion_result", read)
+    pages = CompletedTodoPages()
+    rows = [{"todo_id": todo_id, "title": "Report", "sha256": "a" * 64,
+             "producer_agent_id": "lead", "completed_at": None}
+            for todo_id in ("todo_report_stale", "todo_report_planned")]
+    page = pages.page(scope=("accepted_goal_results", "goal"), cursor="", load=lambda: rows)
+    verified = _verify_goal_result_page(page=page, registry_path=None, runtime_root=None, goal_id="goal")
+    # An unrelated unreadable report is named, not turned into a whole-page failure,
+    # so a reader that only needs its own Todo ids can still resolve them.
+    assert verified["unavailable_count"] == 1
+    assert verified["unavailable_todo_ids"] == ["todo_report_stale"]
+    assert [row["todo_id"] for row in verified["items"]] == ["todo_report_planned"]
 
 
 @pytest.mark.parametrize("count", [85, 4087])

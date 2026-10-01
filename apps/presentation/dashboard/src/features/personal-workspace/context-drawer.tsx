@@ -1,3 +1,6 @@
+import { GoalAcceptanceObservationCard } from "./goal-acceptance-observation-card";
+import { AttentionDetailCard } from "./attention-detail-card";
+import { attentionSuccessor, canReviewAttention } from "./attention-details";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
@@ -35,9 +38,19 @@ import type {
   WorkspaceTodo,
 } from "./personal-workspace-model";
 import type { LarkGoalConnection } from "../../data/chat";
-import { localizedAttentionAge, localizedGoalState, localizedSessionStatus, useWorkspaceI18n } from "./i18n";
+import { localizedGoalState, localizedSessionStatus, useWorkspaceI18n } from "./i18n";
 import { formatCostUsd, formatDurationMs, formatTokenCount, formatUsageValue } from "./personal-workspace-model";
-import { todoResumeWhenFromMessage } from "./personal-workspace-router";
+import { TeamPlanResult } from "./team-plan-result";
+import { parseTodoResumeCondition } from "./todo-resume-condition";
+import { formatMonitorDate } from "./monitor-readback";
+
+function subagentModelRequest(include: boolean, model: string, effort: string) {
+  if (!include) return {};
+  if (!model.trim()) return { modelConfig: null };
+  const modelConfig: { model: string; reasoning_effort?: string } = { model: model.trim() };
+  if (effort) modelConfig.reasoning_effort = effort;
+  return { modelConfig };
+}
 
 const focusableSelector = [
   "a[href]",
@@ -45,12 +58,16 @@ const focusableSelector = [
   "textarea:not([disabled])",
   "select:not([disabled])",
   "input:not([disabled])",
+  "summary",
   "[tabindex]:not([tabindex='-1'])",
 ].join(",");
 
 type TodoOperation = "block" | "complete" | "defer" | "successor_create";
 
 type GoalSubagentPreview = {
+  codexHostCapacity?: WorkspaceGoalSubagentConfiguration["codexHostCapacity"];
+  modelConfig?: { model: string; reasoning_effort?: string } | null;
+  executionConfig?: string;
   allowedDomains: string[];
   changed: boolean;
   enabled: boolean;
@@ -83,14 +100,30 @@ function subagentConfigurationsMatch(
 ) {
   return left.enabled === right.enabled
     && left.maxChildren === right.maxChildren
+    && JSON.stringify(left.modelConfig ?? null) === JSON.stringify(right.modelConfig ?? null)
+    && (left.executionConfig ?? "") === (right.executionConfig ?? "")
     && [...left.allowedDomains].sort((a, b) => a.localeCompare(b)).join("\u0000")
       === [...right.allowedDomains].sort((a, b) => a.localeCompare(b)).join("\u0000");
 }
 
 type ContextDrawerSelection = Exclude<WorkspaceDrawerSelection, { kind: "settings" }>;
 
-export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals = [], inspectorExpanded = false, larkConnections = [], onClose, onToggleInspectorSize, readOnly = false, runs = [], selection }: {
+
+type RunActionKind = "correct" | "close" | "interrupt" | "newSession" | "retry";
+type RunActionState = { message?: string; status: "error" | "pending" };
+type RunActionStates = Partial<Record<RunActionKind, RunActionState>>;
+const RUN_ACTION_LABEL_KEYS = {
+  close: "drawer.runCloseSession",
+  correct: "drawer.correctionSend",
+  interrupt: "drawer.runInterrupt",
+  newSession: "drawer.runNewSession",
+  retry: "drawer.recoveryRetry",
+} as const;
+
+export function ContextDrawer({ agents, attentionHistory = [], onSelectAttention, callbacks, goalNotifications = [], goals = [], inspectorExpanded = false, larkConnections = [], onClose, onToggleInspectorSize, readOnly = false, proposalReadbackUnavailable = false, onRetryProposalReadback, proposalReadbackFetching = false, runs = [], selection }: {
   agents: WorkspaceAgentOption[];
+  attentionHistory?: WorkspaceAttention[];
+  onSelectAttention?: (item: WorkspaceAttention) => void;
   callbacks: PersonalWorkspaceCallbacks;
   goalNotifications?: WorkspaceGoalNotification[];
   goals?: WorkspaceGoal[];
@@ -99,6 +132,9 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
   onClose: () => void;
   onToggleInspectorSize?: () => void;
   readOnly?: boolean;
+  proposalReadbackUnavailable?: boolean;
+  onRetryProposalReadback?: () => void;
+  proposalReadbackFetching?: boolean;
   runs?: WorkspaceRun[];
   selection: ContextDrawerSelection;
 }) {
@@ -107,15 +143,20 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [repositoryCopyState, setRepositoryCopyState] = useState<"idle" | "copied" | "error">("idle");
   const [runDrawerTab, setRunDrawerTab] = useState<"record" | "details">("record");
+  const [runActions, setRunActions] = useState<Record<string, RunActionStates>>({});
   const [subagentAllowedDomains, setSubagentAllowedDomains] = useState<string[]>([]);
   const [subagentFeedback, setSubagentFeedback] = useState<string | null>(null);
   const [subagentMaxChildren, setSubagentMaxChildren] = useState(2);
+  const [subagentModel, setSubagentModel] = useState("");
+  const [subagentEffort, setSubagentEffort] = useState("");
+  const [subagentExecutionConfig, setSubagentExecutionConfig] = useState("");
   const [subagentMutationState, setSubagentMutationState] = useState<"idle" | "previewing" | "ready" | "applying" | "success" | "warning" | "error">("idle");
   const [subagentPreview, setSubagentPreview] = useState<GoalSubagentPreview | null>(null);
   const [verifiedSubagentConfiguration, setVerifiedSubagentConfiguration] = useState<WorkspaceGoalSubagentConfiguration | null>(null);
   const lastAuthoritativeSubagentConfigurationRef = useRef<WorkspaceGoalSubagentConfiguration | null>(null);
   const verifiedSubagentBaselineRef = useRef<WorkspaceGoalSubagentConfiguration | null>(null);
   const [todoAgentId, setTodoAgentId] = useState(agents.find((agent) => agent.available)?.agentId ?? "codex");
+  const [todoPriority, setTodoPriority] = useState("");
   const [todoResumeWhen, setTodoResumeWhen] = useState("");
   const closeRef = useRef<HTMLButtonElement>(null);
   const drawerRef = useRef<HTMLDivElement>(null);
@@ -136,6 +177,9 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
     setTodoResumeWhen("");
     const configuration = selection.kind === "goal" ? selection.item.subagentExecution : undefined;
     setSubagentAllowedDomains(configuration?.allowedDomains ?? []);
+    setSubagentModel(configuration?.modelConfig?.model ?? "");
+    setSubagentEffort(configuration?.modelConfig?.reasoning_effort ?? "");
+    setSubagentExecutionConfig(configuration?.executionConfig ?? "");
     setSubagentMaxChildren(configuration?.maxChildren ? Math.min(configuration.maxChildren, 32) : 2);
     setSubagentFeedback(null);
     setSubagentMutationState("idle");
@@ -163,6 +207,9 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
     if (!verifiedSubagentConfiguration) {
       if (authoritativeConfigurationChanged && authoritativeSubagentConfiguration) {
         setSubagentAllowedDomains(authoritativeSubagentConfiguration.allowedDomains);
+        setSubagentModel(authoritativeSubagentConfiguration.modelConfig?.model ?? "");
+        setSubagentEffort(authoritativeSubagentConfiguration.modelConfig?.reasoning_effort ?? "");
+        setSubagentExecutionConfig(authoritativeSubagentConfiguration.executionConfig ?? "");
         setSubagentMaxChildren(authoritativeSubagentConfiguration.maxChildren || 2);
         setSubagentFeedback(null);
         setSubagentMutationState("idle");
@@ -186,6 +233,9 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
     if (authoritativeSupersedesReceipt) {
       if (authoritativeSubagentConfiguration) {
         setSubagentAllowedDomains(authoritativeSubagentConfiguration.allowedDomains);
+        setSubagentModel(authoritativeSubagentConfiguration.modelConfig?.model ?? "");
+        setSubagentEffort(authoritativeSubagentConfiguration.modelConfig?.reasoning_effort ?? "");
+        setSubagentExecutionConfig(authoritativeSubagentConfiguration.executionConfig ?? "");
         setSubagentMaxChildren(
           authoritativeSubagentConfiguration.maxChildren || 2,
         );
@@ -219,7 +269,7 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
       }
       if (event.key === "Tab" && selection.kind !== "todo") {
         const focusable = Array.from(drawerRef.current?.querySelectorAll<HTMLElement>(focusableSelector) ?? [])
-          .filter((element) => !element.hasAttribute("disabled") && element.getAttribute("aria-hidden") !== "true");
+          .filter((element) => !element.hasAttribute("disabled") && element.getAttribute("aria-hidden") !== "true" && element.checkVisibility({ visibilityProperty: true }));
         if (focusable.length === 0) return;
         const first = focusable[0];
         const last = focusable[focusable.length - 1];
@@ -238,11 +288,16 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
     };
   }, [closeDrawer, selection.kind]);
 
+  const operationUnknown = selection.kind === "proposal"
+    && selection.item.reviewPlan?.operationFrame?.kind === "result"
+    && selection.item.reviewPlan.operationFrame.resultKind === "unknown";
   const title = selection.kind === "attention" ? t("drawer.titleAttention")
     : selection.kind === "todo" ? t("drawer.taskDetails")
       : selection.kind === "run" ? t("drawer.runDetails")
         : selection.kind === "output" ? t("drawer.titleOutput")
-          : selection.kind === "proposal" ? t(selection.item.status === "applied" ? "drawer.titleProposalApplied" : "drawer.titleProposalConfirm")
+          : selection.kind === "proposal" && selection.item.actionKind === "team.plan" && selection.item.status === "applied" ? t("proposal.teamPlan.resultTitle")
+          : selection.kind === "proposal" && selection.item.actionKind === "operation.execute" ? t("drawer.operationReadOnly")
+          : selection.kind === "proposal" ? t(selection.item.reviewPlan?.retryOriginal ? "drawer.recoverEditResult" : selection.item.status === "applied" ? "drawer.titleProposalApplied" : "drawer.titleProposalConfirm")
             : selection.kind === "schedule" ? (selection.item.scheduleKind === "heartbeat" ? "Heartbeat" : t("drawer.titleSchedule"))
               : t("drawer.goalDetails");
   const goalId = selection.kind === "proposal" ? selection.item.goalId ?? "manager"
@@ -253,6 +308,8 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
         : selection.kind === "output" ? selection.item.goalTitle ?? t("drawer.currentGoal")
           : selection.kind === "goal" ? selection.item.title
             : selection.kind === "schedule" ? t("drawer.goalAutoRun")
+              : selection.kind === "proposal" && selection.item.status === "applied" && selection.item.actionKind === "team.plan" ? selection.item.goalId ?? t("drawer.currentGoal")
+              : selection.kind === "proposal" && selection.item.actionKind === "operation.execute" ? t("drawer.operationCanonicalStatus")
               : selection.item.goalId ? t("drawer.goalChanges") : t("drawer.managerChanges");
   const selectedGoalRun = selection.kind === "goal"
     ? runs.find((run) => run.goalId === selection.item.goalId && Boolean(run.sessionId))
@@ -263,13 +320,56 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
     || Boolean(selection.item.latestActivity)
     || Boolean(selection.item.outputs?.length)
   );
-  const attentionAge = selection.kind === "attention" ? localizedAttentionAge(selection.item.updatedAt, t) : null;
-  const normalizedTodoResumeWhen = todoResumeWhenFromMessage(todoResumeWhen);
+  const normalizedTodoResumeWhen = parseTodoResumeCondition(todoResumeWhen);
+
+  const selectedRunId = selection.kind === "run" ? selection.item.runId : null;
+  const selectedRunActions: RunActionStates = selectedRunId ? runActions[selectedRunId] ?? {} : {};
+  const runActionPending = (kind: RunActionKind) => selectedRunActions[kind]?.status === "pending";
+  const runActionFeedback = (Object.entries(selectedRunActions) as [RunActionKind, RunActionState][])
+    .filter(([kind, state]) => state.status === "error" || kind !== "correct");
+
+  function setRunActionState(runId: string, kind: RunActionKind, state: RunActionState | null) {
+    setRunActions((current) => {
+      const { [kind]: _previous, ...rest } = current[runId] ?? {};
+      const next: RunActionStates = state ? { ...rest, [kind]: state } : rest;
+      const { [runId]: _run, ...others } = current;
+      return Object.keys(next).length > 0 ? { ...others, [runId]: next } : others;
+    });
+  }
+
+  // Run actions reach the Chat service. A rejected request must stay visible in
+  // the drawer instead of escaping as an unhandled rejection. Each control only
+  // guards itself: a correction Turn in flight must never block interrupting it.
+  // State belongs to the Run that issued the request, so a late result can
+  // never report on, or release the guard of, another Run's action, and it is
+  // still there when the user returns to that Run.
+  async function performRunAction(run: WorkspaceRun, kind: RunActionKind, action: () => void | Promise<void>) {
+    if (runActions[run.runId]?.[kind]?.status === "pending") return false;
+    setRunActionState(run.runId, kind, { status: "pending" });
+    try {
+      await action();
+      setRunActionState(run.runId, kind, null);
+      return true;
+    } catch (error) {
+      setRunActionState(run.runId, kind, { message: error instanceof Error ? error.message : String(error), status: "error" });
+      return false;
+    }
+  }
+
+  function runActionHandler(kind: RunActionKind, callback: ((run: WorkspaceRun) => void | Promise<void>) | undefined) {
+    return () => {
+      if (selection.kind !== "run" || !callback) return;
+      const run = selection.item;
+      void performRunAction(run, kind, () => callback(run));
+    };
+  }
 
   async function sendCorrection() {
-    if (selection.kind !== "run" || !correction.trim()) return;
-    await callbacks.onCorrectRun?.(selection.item, correction.trim());
-    setCorrection("");
+    if (selection.kind !== "run" || !correction.trim() || !callbacks.onCorrectRun) return;
+    const run = selection.item;
+    const message = correction.trim();
+    const onCorrectRun = callbacks.onCorrectRun;
+    if (await performRunAction(run, "correct", () => onCorrectRun(run, message))) setCorrection("");
   }
 
   async function previewTodoTransition(todo: WorkspaceTodo, operation: TodoOperation, label: string, resumeWhen?: string) {
@@ -300,6 +400,7 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
   }
 
   async function previewDecision(attention: WorkspaceAttention, decision: "approve" | typeof decisionTransitions[number]["resolution"], label: string) {
+    if (readOnly || !canReviewAttention(attention)) return;
     await callbacks.onPreviewAction?.({
       actionKind: "gate.resolve",
       context: { goal_id: attention.goalId, kind: "todo", todo_id: attention.todoId },
@@ -313,7 +414,7 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
     });
   }
 
-  const currentSubagentConfiguration = selection.kind === "goal"
+  const currentSubagentConfiguration: WorkspaceGoalSubagentConfiguration = selection.kind === "goal"
     ? verifiedSubagentConfiguration
       ?? selection.item.subagentExecution
       ?? { allowedDomains: [], domainCandidates: [], enabled: false, maxChildren: 0 }
@@ -353,6 +454,9 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
 
   function resetSubagentDraft() {
     setSubagentAllowedDomains(currentSubagentConfiguration.allowedDomains);
+    setSubagentModel(currentSubagentConfiguration.modelConfig?.model ?? "");
+    setSubagentEffort(currentSubagentConfiguration.modelConfig?.reasoning_effort ?? "");
+    setSubagentExecutionConfig(currentSubagentConfiguration.executionConfig ?? "");
     setSubagentMaxChildren(currentSubagentConfiguration.maxChildren || 2);
     setSubagentFeedback(null);
     setSubagentMutationState("idle");
@@ -373,9 +477,14 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
     setSubagentFeedback(null);
   }
 
-  async function previewGoalSubagentConfiguration(enabled: boolean) {
+  async function previewGoalSubagentConfiguration(enabled: boolean, includeModel = enabled) {
     if (selection.kind !== "goal" || !callbacks.onPreviewGoalSubagentConfiguration) return;
     const allowedDomains = enabled ? normalizedSubagentDomains() : [];
+    if (includeModel && !subagentModel.trim() && subagentEffort) {
+      setSubagentMutationState("error");
+      setSubagentFeedback(t("drawer.subagentModelRequired"));
+      return;
+    }
     if (enabled && !allowedDomains) {
       setSubagentMutationState("error");
       setSubagentFeedback(t("drawer.subagentDomainInvalid"));
@@ -383,10 +492,13 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
       return;
     }
     const request = {
+      alignCodexHostCapacity: enabled,
       allowedDomains: allowedDomains ?? [],
       enabled,
       goalId: selection.item.goalId,
       maxChildren: enabled ? subagentMaxChildren : 0,
+      executionConfig: subagentExecutionConfig.trim(),
+      ...subagentModelRequest(includeModel, subagentModel, subagentEffort),
     };
     setSubagentMutationState("previewing");
     setSubagentFeedback(t("drawer.subagentPreviewing"));
@@ -401,12 +513,20 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
           domainCandidates: currentSubagentConfiguration.domainCandidates,
         });
         setSubagentAllowedDomains(preview.configuration.allowedDomains);
+        setSubagentModel(preview.configuration.modelConfig?.model ?? "");
+        setSubagentEffort(preview.configuration.modelConfig?.reasoning_effort ?? "");
+        setSubagentExecutionConfig(preview.configuration.executionConfig ?? "");
         setSubagentMaxChildren(preview.configuration.maxChildren || 2);
         setSubagentMutationState("success");
         setSubagentFeedback(t("drawer.subagentNoChange"));
         return;
       }
-      setSubagentPreview({ ...request, changed: preview.changed, previewId: preview.previewId });
+      setSubagentPreview({
+        ...request,
+        codexHostCapacity: preview.configuration.codexHostCapacity,
+        changed: preview.changed,
+        previewId: preview.previewId,
+      });
       setSubagentMutationState("ready");
       setSubagentFeedback(t("drawer.subagentPreviewReady"));
     } catch (error) {
@@ -422,9 +542,12 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
     try {
       const verifiedConfiguration = await callbacks.onApplyGoalSubagentConfiguration({
         allowedDomains: subagentPreview.allowedDomains,
+        alignCodexHostCapacity: subagentPreview.enabled,
         enabled: subagentPreview.enabled,
         goalId: subagentPreview.goalId,
         maxChildren: subagentPreview.maxChildren,
+        modelConfig: subagentPreview.modelConfig,
+        executionConfig: subagentPreview.executionConfig,
         previewId: subagentPreview.previewId,
       });
       verifiedSubagentBaselineRef.current = authoritativeSubagentConfiguration
@@ -434,9 +557,16 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
         domainCandidates: currentSubagentConfiguration.domainCandidates,
       });
       setSubagentAllowedDomains(verifiedConfiguration.allowedDomains);
+      setSubagentModel(verifiedConfiguration.modelConfig?.model ?? "");
+      setSubagentEffort(verifiedConfiguration.modelConfig?.reasoning_effort ?? "");
+      setSubagentExecutionConfig(verifiedConfiguration.executionConfig ?? "");
       setSubagentMaxChildren(verifiedConfiguration.maxChildren || 2);
       setSubagentMutationState("success");
-      setSubagentFeedback(t("drawer.subagentApplied"));
+      setSubagentFeedback(t(
+        verifiedConfiguration.codexHostCapacity?.newSessionRequired
+          ? "drawer.subagentAppliedRestart"
+          : "drawer.subagentApplied",
+      ));
       setSubagentPreview(null);
       try {
         await callbacks.onRefresh?.();
@@ -475,18 +605,8 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
       <div className="personal-drawer-body">
         {selection.kind === "attention" ? (
           <>
-            <section className="personal-detail-card is-attention">
-              <small>{selection.item.blocking ? t("drawer.attentionBlocking") : t("drawer.attentionWaiting")}</small>
-              <h3>{selection.item.text}</h3>
-              <dl>
-                <div><dt>Goal</dt><dd>{selection.item.goalTitle ?? selection.item.goalId}</dd></div>
-                <div><dt>{t("drawer.priority")}</dt><dd>{selection.item.priority ?? "medium"}</dd></div>
-                {attentionAge ? <div><dt>{t("common.waiting")}</dt><dd>{t("tasks.waitingAge", { age: attentionAge })}</dd></div> : null}
-                <div><dt>{t("drawer.reason")}</dt><dd>{selection.item.explanation ?? t("drawer.decisionDefaultReason")}</dd></div>
-                <div><dt>{t("drawer.evidence")}</dt><dd>{selection.item.evidence ?? t("drawer.decisionDefaultEvidence")}</dd></div>
-              </dl>
-            </section>
-            {!readOnly ? <>
+            <AttentionDetailCard item={selection.item} onSelect={onSelectAttention} successor={attentionSuccessor(selection.item, attentionHistory)} />
+            {!readOnly && canReviewAttention(selection.item) ? <>
               <button className="personal-primary-action" onClick={() => void previewDecision(selection.item, "approve", t("common.confirm"))} type="button"><Check size={17} />{t("drawer.decisionReview")}</button>
               <details className="personal-compact-menu">
                 <summary><MoreHorizontal size={17} />{t("drawer.decisionMore")}</summary>
@@ -521,8 +641,15 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                 <div><dt>{t("common.status")}</dt><dd>{selection.item.done ? t("drawer.taskStatusCompleted") : selection.item.status === "deferred" ? t("drawer.taskStatusDeferred") : selection.item.status === "blocked" ? t("drawer.taskStatusBlocked") : t("drawer.taskStatusOpen")}</dd></div>
                 <div><dt>{t("drawer.priority")}</dt><dd>{selection.item.priority ?? t("drawer.notSet")}</dd></div>
                 <div><dt>{t("drawer.dependencies")}</dt><dd>{selection.item.dependencies?.join(" · ") || t("common.none")}</dd></div>
-                {selection.item.status === "deferred" ? <div><dt>{t("drawer.resumeWhen")}</dt><dd>{selection.item.resumeWhen || t("drawer.notSet")}</dd></div> : null}
-                <div><dt>{t("drawer.nextTransition")}</dt><dd>{selection.item.nextTransition ?? (selection.item.done ? t("drawer.taskNextCompleted") : selection.item.status === "deferred" ? t("drawer.taskNextDeferred") : t("drawer.taskNextOpen"))}</dd></div>
+                {selection.item.status === "deferred" || selection.item.resumeWhen ? <div><dt>{t("drawer.resumeWhen")}</dt><dd>{selection.item.resumeWhen || t("drawer.notSet")}</dd></div> : null}
+                {selection.item.resumeWhen ? <div><dt>{t("drawer.resumeState")}</dt><dd>{selection.item.resumeReady ? t("drawer.resumeReady") : t("drawer.resumePending")}</dd></div> : null}
+                {selection.item.resumeReceiptId ? <div><dt>{t("drawer.resumeReceipt")}</dt><dd>{selection.item.resumeReceiptId}</dd></div> : null}
+                {selection.item.validationDigest ? <>
+                  <div><dt>{t("drawer.validationRevision")}</dt><dd>{selection.item.validationRevision ?? 0}</dd></div>
+                  <div><dt>{t("drawer.validationDigest")}</dt><dd><code>{selection.item.validationDigest}</code></dd></div>
+                  {selection.item.validationRevisionActor ? <div><dt>{t("drawer.validationRevisionActor")}</dt><dd>{selection.item.validationRevisionActor}</dd></div> : null}
+                </> : null}
+                <div><dt>{t("drawer.nextTransition")}</dt><dd>{selection.item.nextTransition ?? (selection.item.done ? t("drawer.taskNextCompleted") : selection.item.resumeReady ? t("drawer.taskNextResumeReady") : selection.item.status === "deferred" ? t("drawer.taskNextDeferred") : t("drawer.taskNextOpen"))}</dd></div>
               </dl>
             </section>
             {!readOnly && !selection.item.done ? <div className="personal-task-inspector-actions" aria-label={t("drawer.taskActions")}>
@@ -540,6 +667,21 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                       idempotencyKey: `workspace-todo-${selection.item.todoId}-reassign-${todoAgentId}-${Date.now().toString(36)}`,
                       normalizedParameters: { agent_id: todoAgentId, goal_id: selection.item.goalId, operation: "reassign", todo_id: selection.item.todoId },
                       summary: t("drawer.reassignSummary", { task: selection.item.text }),
+                    })} type="button">{t("timeline.review")}</button>
+                  </label>
+                  <label className="personal-inline-agent-select">{t("drawer.taskPriority")}
+                    <select aria-label={t("drawer.taskPriority")} value={todoPriority} onChange={(event) => setTodoPriority(event.target.value)}>
+                      <option value="">{t("drawer.taskPriorityChoose")}</option>
+                      {["P0", "P1", "P2", "P3", "P4"].map((priority) => <option key={priority} value={priority}>{priority}</option>)}
+                      <option value="clear">{t("drawer.taskPriorityClear")}</option>
+                    </select>
+                    <button className="personal-secondary-action" disabled={!todoPriority} onClick={() => void callbacks.onPreviewAction?.({
+                      actionKind: "todo.update",
+                      context: {goal_id: selection.item.goalId, kind: "todo", todo_id: selection.item.todoId},
+                      idempotencyKey: `workspace-todo-${selection.item.todoId}-priority-${todoPriority}-${Date.now().toString(36)}`,
+                      normalizedParameters: {goal_id: selection.item.goalId, todo_id: selection.item.todoId, operation: "edit",
+                        ...(todoPriority === "clear" ? {clear_priority: true} : {priority: todoPriority})},
+                      summary: `${t("drawer.taskPriority")}: ${todoPriority === "clear" ? t("drawer.taskPriorityClear") : todoPriority}`,
                     })} type="button">{t("timeline.review")}</button>
                   </label>
                   <strong>{t("drawer.taskDeferUntil")}</strong>
@@ -579,6 +721,7 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                 <div><dt>{t("drawer.duration")}</dt><dd>{formatUsageValue(selection.item.usage?.durationMs24h, t("drawer.usageNotMeasured"), formatDurationMs)} / {formatUsageValue(selection.item.usage?.durationMs7d, t("drawer.usageNotMeasured"), formatDurationMs)}</dd></div>
               </dl>
             </section>
+            <GoalAcceptanceObservationCard goal={selection.item} />
             {(() => {
               const notification = goalNotifications.find((row) => row.goalId === selection.item.goalId);
               const connection = larkConnections.find((row) => row.goal_id === selection.item.goalId);
@@ -649,6 +792,18 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
               <button className="personal-secondary-action" onClick={() => callbacks.onRequestScheduleConfig?.("heartbeat", selection.item.goalId)} type="button"><Radio size={16} />{t("drawer.setupHeartbeat")}</button>
               <button className="personal-secondary-action" onClick={() => callbacks.onRequestScheduleConfig?.("monitor", selection.item.goalId)} type="button"><CalendarClock size={16} />{t("drawer.scheduleAdd")}</button>
             </div> : null}
+            {selection.item.nativeChildActivity?.observation === "coordinator_reported" ? (
+              <section className="personal-detail-card personal-native-child-activity">
+                <h3>{t("drawer.subagentReportTitle")}</h3>
+                <p>{t("drawer.subagentReportedActivity", {
+                  started: selection.item.nativeChildActivity.launched_count,
+                  skipped: selection.item.nativeChildActivity.skipped_count,
+                  rejected: selection.item.nativeChildActivity.capacity_rejected_count,
+                  failed: selection.item.nativeChildActivity.host_failed_count,
+                  accepted: selection.item.nativeChildActivity.parent_accepted_count,
+                })}</p>
+              </section>
+            ) : null}
             {selection.item.subagentExecution ? <section className="personal-detail-card personal-goal-subagents">
               <div className="personal-subagent-heading">
                 <div>
@@ -686,6 +841,17 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                         domains: subagentPreview.allowedDomains.join(" · ") || t("drawer.subagentDomainsUnrestricted"),
                       })
                     : t("drawer.subagentDisableSummary")}</p>
+                  {subagentPreview.modelConfig !== undefined ? <p>{t("drawer.subagentModel")}: {subagentPreview.modelConfig?.model || t("drawer.subagentModelDefault")} · {subagentPreview.modelConfig?.reasoning_effort || t("drawer.subagentModelDefault")}</p> : null}
+                  <p>{t("drawer.subagentExecutionConfig")}: {subagentPreview.executionConfig || t("drawer.subagentExecutionConfigNone")}</p>
+                  {subagentPreview.enabled && subagentPreview.codexHostCapacity ? <p>{t(
+                    subagentPreview.codexHostCapacity.writeRequired
+                      ? "drawer.subagentHostCapacityRaise"
+                      : "drawer.subagentHostCapacityReady",
+                    {
+                      configured: subagentPreview.codexHostCapacity.configuredChildren ?? t("drawer.subagentHostCapacityImplicit"),
+                      required: subagentPreview.codexHostCapacity.requiredChildren,
+                    },
+                  )}</p> : null}
                   <div>
                     <button className="personal-primary-action" onClick={() => void applyGoalSubagentConfiguration()} type="button">{t("common.confirm")}</button>
                     <button className="personal-secondary-action" onClick={resetSubagentDraft} type="button">{t("common.cancel")}</button>
@@ -699,8 +865,11 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                 </p>
               ) : null}
               <dl>
+                <div><dt>{t("drawer.subagentModel")}</dt><dd>{currentSubagentConfiguration.modelConfig?.model || t("drawer.subagentModelDefault")}</dd></div>
+                <div><dt>{t("drawer.subagentEffort")}</dt><dd>{currentSubagentConfiguration.modelConfig?.reasoning_effort || t("drawer.subagentModelDefault")}</dd></div>
                 <div><dt>{t("drawer.subagentCurrentBoundary")}</dt><dd>{currentSubagentConfiguration.allowedDomains.join(" · ") || t("drawer.subagentDomainsUnrestricted")}</dd></div>
                 <div><dt>{t("drawer.subagentChildLimit")}</dt><dd>{currentSubagentConfiguration.maxChildren || 0}</dd></div>
+                <div><dt>{t("drawer.subagentExecutionConfig")}</dt><dd>{currentSubagentConfiguration.executionConfig || t("drawer.subagentExecutionConfigNone")}</dd></div>
               </dl>
               {readOnly ? (
                 <p className="personal-subagent-read-only">{t("drawer.subagentRemoteReadOnly")}</p>
@@ -733,6 +902,31 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                     )}
                     <small>{t("drawer.subagentDomainsHint")}</small>
                   </fieldset>
+                  <label>
+                    <span>{t("drawer.subagentModel")}</span>
+                    <input aria-label={t("drawer.subagentModel")} disabled={subagentBusy} value={subagentModel} placeholder="gpt-5.6-luna" onChange={(event) => { setSubagentModel(event.target.value); setSubagentPreview(null); setSubagentMutationState("idle"); setSubagentFeedback(null); }} />
+                  </label>
+                  <label>
+                    <span>{t("drawer.subagentEffort")}</span>
+                    <select aria-label={t("drawer.subagentEffort")} disabled={subagentBusy} value={subagentEffort} onChange={(event) => { setSubagentEffort(event.target.value); setSubagentPreview(null); setSubagentMutationState("idle"); setSubagentFeedback(null); }}>
+                      <option value="">{t("drawer.subagentModelDefault")}</option>
+                      {["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map((value) => <option key={value} value={value}>{value}</option>)}
+                    </select>
+                  </label>
+                  <button className="personal-secondary-action" disabled={subagentBusy} type="button" onClick={() => { setSubagentModel("gpt-5.6-luna"); setSubagentEffort("max"); setSubagentPreview(null); setSubagentMutationState("idle"); setSubagentFeedback(null); }}>{t("drawer.subagentLunaPreset")}</button>
+                  <button className="personal-secondary-action" disabled={subagentBusy} type="button" onClick={() => { setSubagentModel(""); setSubagentEffort(""); setSubagentPreview(null); setSubagentMutationState("idle"); setSubagentFeedback(null); }}>{t("drawer.subagentClearModel")}</button>
+                  <p>{t("drawer.subagentModelHint")}</p>
+                  <label>
+                    <span>{t("drawer.subagentExecutionConfig")}</span>
+                    <input
+                      aria-label={t("drawer.subagentExecutionConfig")}
+                      disabled={subagentBusy}
+                      onChange={(event) => { setSubagentExecutionConfig(event.target.value); setSubagentPreview(null); setSubagentMutationState("idle"); setSubagentFeedback(null); }}
+                      placeholder=".loopx/config/delegations.json"
+                      value={subagentExecutionConfig}
+                    />
+                  </label>
+                  <p>{t("drawer.subagentExecutionConfigHint")}</p>
                   <label className="personal-subagent-limit-field">
                     <span>{t("drawer.subagentMaxChildren")}</span>
                     <select
@@ -749,14 +943,12 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                       {subagentChildLimits.map((value) => <option key={value} value={value}>{value}</option>)}
                     </select>
                   </label>
-                  {currentSubagentConfiguration.enabled ? (
-                    <button
+                  <button
                       className="personal-secondary-action"
                       disabled={subagentBusy}
-                      onClick={() => void previewGoalSubagentConfiguration(true)}
+                      onClick={() => void previewGoalSubagentConfiguration(currentSubagentConfiguration.enabled, true)}
                       type="button"
                     >{t("drawer.subagentPreviewBoundary")}</button>
-                  ) : null}
                 </div>
               )}
             </section> : null}
@@ -827,8 +1019,8 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                   <section className="personal-recovery-panel" aria-label={t("drawer.recoveryFailed")}>
                     <strong>{t("drawer.recoveryFailed")}</strong>
                     <p>{t("drawer.recoveryDescription")}</p>
-                    <button className="personal-primary-action" onClick={() => void callbacks.onRetryResumeRun?.(selection.item)} type="button"><RotateCcw size={16} />{t("drawer.recoveryRetry")}</button>
-                    <button className="personal-secondary-action" onClick={() => void callbacks.onStartNewRunSession?.(selection.item)} type="button"><Play size={16} />{t("drawer.recoveryNewSession")}</button>
+                    <button className="personal-primary-action" disabled={runActionPending("retry")} onClick={runActionHandler("retry", callbacks.onRetryResumeRun)} type="button"><RotateCcw size={16} />{t("drawer.recoveryRetry")}</button>
+                    <button className="personal-secondary-action" disabled={runActionPending("newSession")} onClick={runActionHandler("newSession", callbacks.onStartNewRunSession)} type="button"><Play size={16} />{t("drawer.recoveryNewSession")}</button>
                   </section>
                 ) : null}
                 {!readOnly ? <section className="personal-correction-panel">
@@ -842,18 +1034,26 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
                       rows={3}
                       value={correction}
                     />
-                    <button aria-label={t("drawer.correctionSend")} disabled={!correction.trim()} onClick={() => void sendCorrection()} type="button"><Send size={16} /></button>
+                    <button aria-label={t("drawer.correctionSend")} disabled={!correction.trim() || runActionPending("correct")} onClick={() => void sendCorrection()} type="button"><Send size={16} /></button>
                   </div>
                 </section> : null}
                 {!readOnly ? <details className="personal-compact-menu personal-run-more">
                   <summary><MoreHorizontal size={17} />{t("drawer.moreRunActions")}</summary>
                   <div>
-                    <button disabled={!selection.item.canInterrupt} onClick={() => void callbacks.onInterruptRun?.(selection.item)} type="button"><Pause size={16} />{t("drawer.runInterrupt")}</button>
-                    <button disabled={selection.item.resumable === false} onClick={() => void callbacks.onRetryResumeRun?.(selection.item)} type="button"><RotateCcw size={16} />{t("drawer.recoveryRetry")}</button>
-                    <button onClick={() => void callbacks.onStartNewRunSession?.(selection.item)} type="button"><Play size={16} />{t("drawer.runNewSession")}</button>
-                    <button onClick={() => void callbacks.onCloseRunSession?.(selection.item)} type="button"><Square size={16} />{t("drawer.runCloseSession")}</button>
+                    <button disabled={!selection.item.canInterrupt || runActionPending("interrupt")} onClick={runActionHandler("interrupt", callbacks.onInterruptRun)} type="button"><Pause size={16} />{t("drawer.runInterrupt")}</button>
+                    <button disabled={selection.item.resumable === false || runActionPending("retry")} onClick={runActionHandler("retry", callbacks.onRetryResumeRun)} type="button"><RotateCcw size={16} />{t("drawer.recoveryRetry")}</button>
+                    <button disabled={runActionPending("newSession")} onClick={runActionHandler("newSession", callbacks.onStartNewRunSession)} type="button"><Play size={16} />{t("drawer.runNewSession")}</button>
+                    <button disabled={runActionPending("close")} onClick={runActionHandler("close", callbacks.onCloseRunSession)} type="button"><Square size={16} />{t("drawer.runCloseSession")}</button>
                   </div>
                 </details> : null}
+                {runActionFeedback.map(([kind, state]) => (
+                  <p className={`personal-run-action-feedback is-${state.status}`} key={kind} role={state.status === "error" ? "alert" : "status"}>
+                    {state.status === "pending" ? <RotateCcw className="personal-spin" size={13} /> : null}
+                    {state.status === "pending"
+                      ? t("drawer.runActionPending", { action: t(RUN_ACTION_LABEL_KEYS[kind]) })
+                      : t("drawer.runActionFailed", { action: t(RUN_ACTION_LABEL_KEYS[kind]), reason: state.message ?? "" })}
+                  </p>
+                ))}
               </>
             )}
           </>
@@ -904,20 +1104,39 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
 
         {selection.kind === "proposal" ? (
           <>
-            <section className="personal-proposal-card">
-              <small>{selection.item.actionKind} · {selection.item.status}</small>
+            {proposalReadbackUnavailable && selection.item.actionKind === "operation.execute"
+              ? <div role="status" className="personal-proposal-state is-error" data-testid="operation-readback-unavailable"><p>{t("proposal.readbackUnavailable")}</p>
+                {onRetryProposalReadback ? <button type="button" className="personal-secondary-action" disabled={proposalReadbackFetching} onClick={onRetryProposalReadback}>{t("proposal.readbackRetry")}</button> : null}</div> : null}
+            {selection.item.actionKind === "team.plan" && selection.item.status === "applied" ? <TeamPlanResult proposal={selection.item} t={t} /> : <section className="personal-proposal-card">
+              <small>{selection.item.reviewPlan?.operationFrame?.kind === "pending"
+                ? t(`proposal.kind.${selection.item.actionKind}`)
+                : `${selection.item.actionKind} · ${selection.item.status}`}</small>
               <h3>{selection.item.title}</h3>
-              <p>{selection.item.impact}</p>
-              {selection.item.status === "ready" ? <p className="personal-proposal-explainer">{t("drawer.proposalExplainer")}</p> : null}
+              {selection.item.impact ? <p>{selection.item.impact}</p> : null}
+              {selection.item.reviewPlan && !selection.item.reviewPlan.retryOriginal && selection.item.actionKind !== "team.plan" ? <p className="personal-proposal-explainer" data-action-review={selection.item.reviewPlan.interaction}>{operationUnknown
+                ? t("actionReview.operation_reconcile_original")
+                : selection.item.reviewPlan.operationFrame?.kind === "inactive"
+                ? t(`actionReview.${selection.item.reviewPlan.operationFrame.reason}`)
+                : selection.item.actionKind === "operation.execute" && selection.item.status === "gated"
+                ? t(selection.item.reviewPlan.operationFrame?.kind === "confirmation"
+                  && selection.item.reviewPlan.operationFrame.confirmationDeliveryVerified
+                  ? "actionReview.operation_group_confirmation" : "proposal.impact.operationDeliveryPending")
+                : selection.item.actionKind === "operation.execute" && selection.item.reviewPlan.reason === "readback_unverified"
+                  ? t("actionReview.operation_result_delivery_pending")
+                  : t(`actionReview.${selection.item.reviewPlan.reason}`)}</p> : null}
+              {selection.item.status === "ready" && selection.item.actionKind !== "team.plan" ? <p className="personal-proposal-explainer">{t("drawer.proposalExplainer")}</p> : null}
               <dl>{selection.item.fields.map((field) => <div key={field.key}><dt>{field.label}</dt><dd>{field.value}</dd></div>)}</dl>
-            </section>
-            {selection.item.status === "applied" ? <p className="personal-proposal-state is-applied"><Check size={16} />{t("drawer.proposalApplied")}</p> : null}
-            {selection.item.status === "applied" && selection.item.goalId ? <button className="personal-primary-action" onClick={() => { const goalId = selection.item.goalId!; onClose(); void callbacks.onOpenGoal?.(goalId); }} type="button"><ExternalLink size={16} />{selection.item.actionKind === "goal.create" ? t("drawer.proposalEnterGoal") : t("drawer.proposalViewGoal")}</button> : null}
+            </section>}
+            {selection.item.status === "applied" && selection.item.actionKind !== "team.plan" ? <p className={`personal-proposal-state ${selection.item.actionKind === "operation.execute" && selection.item.reviewPlan?.reason === "readback_unverified" ? "is-gated" : "is-applied"}`}><Check size={16} />{selection.item.actionKind === "operation.execute" ? selection.item.primaryLabel : t("drawer.proposalApplied")}</p> : null}
+            {selection.item.status === "applied" && selection.item.actionKind !== "operation.execute" && selection.item.goalId ? <button className="personal-primary-action" onClick={() => { const goalId = selection.item.goalId!; onClose(); void callbacks.onOpenGoal?.(goalId); }} type="button"><ExternalLink size={16} />{selection.item.actionKind === "goal.create" ? t("drawer.proposalEnterGoal") : t(selection.item.actionKind === "team.plan" ? "proposal.teamPlan.openGoal" : "drawer.proposalViewGoal")}</button> : null}
             {selection.item.status === "stale" ? <p className="personal-proposal-state is-stale">{t("drawer.proposalStale")}</p> : null}
-            {selection.item.status === "error" ? <div className="personal-proposal-state is-error"><span>{t("drawer.proposalApplyFailed")}</span>{selection.item.errorMessage ? <small>{selection.item.errorMessage}</small> : null}<small>{t("drawer.proposalApplyFailedHint")}</small></div> : null}
+            {selection.item.status === "error" && !selection.item.reviewPlan?.retryOriginal ? <div className="personal-proposal-state is-error"><span>{operationUnknown ? t("proposal.operationState.submission_unknown") : selection.item.reviewPlan?.reason === "readback_unverified" ? t("actionReview.readback_unverified") : t("drawer.proposalApplyFailed")}</span>{selection.item.errorMessage ? <small>{selection.item.errorMessage}</small> : null}<small>{t(operationUnknown ? "actionReview.operation_reconcile_original" : selection.item.actionKind === "team.plan" ? "proposal.teamPlan.retryHint" : "drawer.proposalApplyFailedHint")}</small></div> : null}
             {selection.item.status === "rejected" ? <p className="personal-proposal-state is-error">{t("drawer.proposalRejected")}</p> : null}
+            {selection.item.reviewPlan?.operationFrame?.kind === "result"
+              && selection.item.reviewPlan.operationFrame.resultKind === "cancelled"
+              ? <p className="personal-proposal-state is-stale">{t("proposal.primary.operationCancelled")}</p> : null}
             {selection.item.status === "deferred" ? <p className="personal-proposal-state is-gated">{t("drawer.proposalDeferred")}</p> : null}
-            {selection.item.status === "gated" ? <div className="personal-proposal-state is-gated"><span><strong>{t("drawer.gateRequiresHost")}</strong>{t("drawer.gateRequiresHostDescription")}</span>{selection.item.gate?.nextAction ? <small>{selection.item.gate.nextAction}</small> : null}</div> : null}
+            {selection.item.status === "gated" ? <div className="personal-proposal-state is-gated"><span><strong>{selection.item.actionKind === "operation.execute" ? selection.item.primaryLabel : selection.item.workspaceCandidates?.length ? selection.item.title : t("drawer.gateRequiresHost")}</strong>{selection.item.actionKind === "operation.execute" || selection.item.workspaceCandidates?.length ? selection.item.impact : t("drawer.gateRequiresHostDescription")}</span>{selection.item.gate?.nextAction ? <small>{selection.item.gate.nextAction}</small> : null}</div> : null}
             {selection.item.status === "gated" && selection.item.actionKind === "gate.resolve" ? (() => {
               const fieldValue = (key: string) => selection.item.fields.find((field) => field.key === key)?.value;
               const gateGoalId = fieldValue("goal_id");
@@ -932,9 +1151,9 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
               );
             })() : null}
             {!readOnly && selection.item.workspaceCandidates?.length ? <div className="personal-workspace-candidates" aria-label={t("drawer.workspaceCandidates")}>{selection.item.workspaceCandidates.map((candidate) => <button key={candidate.workspaceRef} onClick={() => void callbacks.onSelectWorkspaceCandidate?.(selection.item, candidate.workspaceRef)} type="button"><strong>{candidate.label}</strong><small>{candidate.workspaceRef}</small></button>)}</div> : null}
-            {!readOnly && selection.item.status === "error" ? <button className="personal-primary-action" onClick={() => void callbacks.onTransitionProposal?.(selection.item, "regenerate")} type="button"><RotateCcw size={17} />{t("drawer.proposalRegenerate")}</button> : !readOnly && selection.item.status !== "gated" ? <button className="personal-primary-action" disabled={!['ready', 'deferred'].includes(selection.item.status)} onClick={() => void callbacks.onApplyProposal?.(selection.item)} type="button"><Check size={17} />{selection.item.status === "applying" ? t("drawer.applying") : selection.item.primaryLabel ?? t("drawer.apply")}</button> : null}
-            {!readOnly && ["stale", "gated", "rejected"].includes(selection.item.status) ? <button className="personal-secondary-action" onClick={() => void callbacks.onTransitionProposal?.(selection.item, "regenerate")} type="button"><RotateCcw size={16} />{t("drawer.proposalRecheck")}</button> : null}
-            {!readOnly && ["ready", "gated"].includes(selection.item.status) ? <div className="personal-drawer-action-grid"><button className="personal-secondary-action" onClick={() => void callbacks.onTransitionProposal?.(selection.item, "defer")} type="button">{t("drawer.proposalDefer")}</button><button className="personal-secondary-action" onClick={() => void callbacks.onTransitionProposal?.(selection.item, "reject")} type="button">{t("drawer.decisionReject")}</button></div> : null}
+            {!readOnly && selection.item.actionKind !== "operation.execute" && selection.item.status === "error" ? <button className="personal-primary-action" onClick={() => void ((selection.item.actionKind === "team.plan" || selection.item.reviewPlan?.retryOriginal) ? callbacks.onApplyProposal?.(selection.item) : callbacks.onTransitionProposal?.(selection.item, "regenerate"))} type="button"><RotateCcw size={17} />{t(selection.item.reviewPlan?.retryOriginal ? "drawer.retryOriginal" : selection.item.actionKind === "team.plan" ? "proposal.teamPlan.retry" : "drawer.proposalRegenerate")}</button> : !readOnly && selection.item.actionKind !== "operation.execute" && selection.item.status !== "gated" && !(selection.item.actionKind === "team.plan" && selection.item.status === "applied") ? <button className="personal-primary-action" disabled={!['ready', 'deferred'].includes(selection.item.status) || selection.item.reviewPlan?.canApply === false} onClick={() => void callbacks.onApplyProposal?.(selection.item)} type="button"><Check size={17} />{selection.item.status === "applying" ? t("drawer.applying") : selection.item.primaryLabel ?? t("drawer.apply")}</button> : null}
+            {!readOnly && selection.item.actionKind !== "operation.execute" && (["stale", "gated", "rejected"].includes(selection.item.status) || (selection.item.status === "ready" && selection.item.reviewPlan?.canApply === false)) ? <button className="personal-secondary-action" onClick={() => void callbacks.onTransitionProposal?.(selection.item, "regenerate")} type="button"><RotateCcw size={16} />{t("drawer.proposalRecheck")}</button> : null}
+            {!readOnly && selection.item.actionKind !== "operation.execute" && ["ready", "gated"].includes(selection.item.status) ? <div className="personal-drawer-action-grid"><button className="personal-secondary-action" onClick={() => void callbacks.onTransitionProposal?.(selection.item, "defer")} type="button">{t("drawer.proposalDefer")}</button><button className="personal-secondary-action" onClick={() => void callbacks.onTransitionProposal?.(selection.item, "reject")} type="button">{t("drawer.decisionReject")}</button></div> : null}
             {!["applied", "applying"].includes(selection.item.status) ? <button className="personal-secondary-action" onClick={onClose} type="button">{t("drawer.proposalClose")}</button> : null}
           </>
         ) : null}
@@ -947,10 +1166,20 @@ export function ContextDrawer({ agents, callbacks, goalNotifications = [], goals
               <p>{selection.item.target ?? selection.item.schedule ?? t("drawer.scheduleDefaultTarget")}</p>
               <dl>
                 <div><dt>{t("drawer.scheduleTimezone")}</dt><dd>{selection.item.timezone ?? t("drawer.scheduleLocalTimezone")}</dd></div>
-                <div><dt>{t("drawer.scheduleNext")}</dt><dd>{selection.item.nextRunAt ?? t("drawer.schedulePending")}</dd></div>
-                <div><dt>{t("drawer.scheduleLast")}</dt><dd>{selection.item.previousRunAt ?? t("drawer.scheduleNeverRun")}</dd></div>
-                <div><dt>{t("drawer.scheduleNotification")}</dt><dd>{selection.item.notificationRule ?? t("drawer.scheduleDefaultNotification")}</dd></div>
-                <div><dt>{t("drawer.scheduleStopCondition")}</dt><dd>{selection.item.stopCondition ?? t("drawer.scheduleDefaultStop")}</dd></div>
+                {selection.item.scheduleKind === "monitor" ? <>
+                  <div><dt>{t("drawer.scheduleOwner")}</dt><dd>{selection.item.agentId ?? t("drawer.scheduleUnknown")}</dd></div>
+                  <div><dt>{t("drawer.scheduleCadence")}</dt><dd>{selection.item.schedule ?? t("drawer.scheduleUnknown")}</dd></div>
+                  <div><dt>{t("drawer.scheduleNextCheck")}</dt><dd>{formatMonitorDate(selection.item.nextRunAt, locale) ?? t("drawer.scheduleUnknown")}</dd></div>
+                  <div><dt>{t("drawer.scheduleLastCheck")}</dt><dd>{formatMonitorDate(selection.item.previousRunAt, locale) ?? t("drawer.scheduleUnknown")}</dd></div>
+                  <div><dt>{t("drawer.scheduleExpires")}</dt><dd>{formatMonitorDate(selection.item.expiresAt, locale) ?? t("drawer.scheduleUnknown")}</dd></div>
+                  <div><dt>{t("drawer.scheduleWatchOnly")}</dt><dd>{selection.item.watchOnly === true ? t("drawer.scheduleWatchYes") : selection.item.watchOnly === false ? t("drawer.scheduleWatchNo") : t("drawer.scheduleUnknown")}</dd></div>
+                  <div><dt>{t("drawer.scheduleResumeWhen")}</dt><dd>{selection.item.stopCondition ?? t("drawer.scheduleUnknown")}</dd></div>
+                </> : <>
+                  <div><dt>{t("drawer.scheduleNext")}</dt><dd>{selection.item.nextRunAt ?? t("drawer.schedulePending")}</dd></div>
+                  <div><dt>{t("drawer.scheduleLast")}</dt><dd>{selection.item.previousRunAt ?? t("drawer.scheduleNeverRun")}</dd></div>
+                  <div><dt>{t("drawer.scheduleStopCondition")}</dt><dd>{selection.item.stopCondition ?? t("drawer.scheduleDefaultStop")}</dd></div>
+                </>}
+                <div><dt>{t("drawer.scheduleNotification")}</dt><dd>{selection.item.notificationRule ?? (selection.item.scheduleKind === "monitor" ? t("drawer.scheduleUnknown") : t("drawer.scheduleDefaultNotification"))}</dd></div>
               </dl>
             </section>
             {!readOnly && selection.item.scheduleKind === "monitor" ? <button className="personal-primary-action" onClick={() => void callbacks.onUpdateSchedule?.(selection.item, "run_now")} type="button"><Play size={16} />{t("drawer.scheduleRunNow")}</button> : null}

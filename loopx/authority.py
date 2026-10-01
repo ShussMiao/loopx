@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import json
-import os
 import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .control_plane.projects.registry_codec import (
+    load_project_registry,
+    mutate_project_registry,
+    require_runtime_compatible_project_registry,
+)
 from .control_plane.runtime.time import now_local_iso
 from .public_safe_text import (
     PRIVATE_TEXT_PATTERNS as SHARED_PRIVATE_TEXT_PATTERNS,
@@ -53,21 +56,6 @@ AUTHORITY_REGISTRY_CANONICAL_FIELDS = (
 
 def now_local() -> str:
     return now_local_iso()
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    with path.open(encoding="utf-8") as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"{path} must contain a JSON object")
-    return payload
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp_path.replace(path)
 
 
 def validate_authority_source_id(source_id: str) -> str:
@@ -343,6 +331,82 @@ def render_doc_registry_authority_import_markdown(payload: dict[str, Any]) -> st
     return "\n".join(lines)
 
 
+def _apply_authority_entry(
+    registry: dict[str, Any],
+    *,
+    goal_id: str,
+    entry: dict[str, Any],
+    registered_at: str,
+    imported_topics: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    goal_index = find_goal_index(registry, goal_id)
+    goals = registry.get("goals")
+    if not isinstance(goals, list) or not isinstance(goals[goal_index], dict):
+        raise ValueError("registry goal entry must be an object")
+    goal = goals[goal_index]
+
+    authority_registry = (
+        dict(goal["authority_registry"])
+        if isinstance(goal.get("authority_registry"), dict)
+        else {}
+    )
+    materials = normalize_project_materials(
+        authority_registry.get("project_materials")
+    )
+    previous_entry = materials.get(entry["id"])
+    materials[str(entry["id"])] = dict(entry)
+    authority_registry["project_materials"] = materials
+    authority_registry.setdefault("read_status", "registered")
+    if imported_topics:
+        topic_map = normalize_topic_authority(
+            authority_registry.get("topic_authority")
+        )
+        topic_map.update(imported_topics)
+        authority_registry["topic_authority"] = topic_map
+    goal["authority_registry"] = authority_registry
+
+    compact_source_fields = (
+        "schema_version",
+        "id",
+        "role",
+        "source_kind",
+        "freshness",
+        "boundary",
+        "source_ref_kind",
+        "source_ref_sha256",
+        "source_ref_redacted",
+        "owner_status",
+        "gate_status",
+        "revision",
+        "conflict_rule",
+        "registered_at",
+        "default_entry_count",
+        "topic_authority_count",
+        "imported_topic_count",
+    )
+    compact_source = {
+        key: entry[key] for key in compact_source_fields if key in entry
+    }
+    authority_sources = goal.get("authority_sources")
+    if not isinstance(authority_sources, list):
+        authority_sources = []
+    goal["authority_sources"] = [
+        item
+        for item in authority_sources
+        if not (
+            isinstance(item, dict)
+            and str(item.get("id") or item.get("source_id") or "") == entry["id"]
+        )
+    ] + [compact_source]
+
+    registry["updated_at"] = registered_at
+    project = Path(str(goal["repo"])).expanduser() if goal.get("repo") else None
+    summary = compact_authority_registry(goal, project=project)
+    summary.pop("default_entries", None)
+    apply_authority_registry_summary(authority_registry, summary)
+    return summary, previous_entry
+
+
 def register_authority_source(
     *,
     registry_path: Path,
@@ -361,13 +425,6 @@ def register_authority_source(
     dry_run: bool,
 ) -> dict[str, Any]:
     registry_path = registry_path.expanduser()
-    registry = read_json(registry_path)
-    goal_index = find_goal_index(registry, goal_id)
-    updated_registry = copy.deepcopy(registry)
-    goals = updated_registry.get("goals")
-    if not isinstance(goals, list) or not isinstance(goals[goal_index], dict):
-        raise ValueError("registry goal entry must be an object")
-    goal = goals[goal_index]
     registered_at = now_local()
     entry = compact_registered_authority_source(
         source_id=source_id,
@@ -383,58 +440,36 @@ def register_authority_source(
         registered_at=registered_at,
     )
 
-    authority_registry = goal.get("authority_registry") if isinstance(goal.get("authority_registry"), dict) else {}
-    authority_registry = dict(authority_registry)
-    materials = normalize_project_materials(authority_registry.get("project_materials"))
-    previous_entry = materials.get(entry["id"])
-    materials[str(entry["id"])] = dict(entry)
-    authority_registry["project_materials"] = materials
-    authority_registry.setdefault("read_status", "registered")
+    imported_topics: dict[str, str] = {}
     if topic:
         topic_text = public_safe_optional("topic", topic)
         if topic_text:
-            topics = normalize_topic_authority(authority_registry.get("topic_authority"))
-            topics[topic_text] = str(entry["id"])
-            authority_registry["topic_authority"] = topics
-    goal["authority_registry"] = authority_registry
+            imported_topics[topic_text] = str(entry["id"])
 
-    authority_sources = goal.get("authority_sources")
-    if not isinstance(authority_sources, list):
-        authority_sources = []
-    compact_source = {
-        key: entry[key]
-        for key in (
-            "schema_version",
-            "id",
-            "role",
-            "source_kind",
-            "freshness",
-            "boundary",
-            "source_ref_kind",
-            "source_ref_sha256",
-            "source_ref_redacted",
-            "owner_status",
-            "gate_status",
-            "revision",
-            "conflict_rule",
-            "registered_at",
+    def reduce(
+        registry: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        return _apply_authority_entry(
+            registry,
+            goal_id=goal_id,
+            entry=entry,
+            registered_at=registered_at,
+            imported_topics=imported_topics,
         )
-        if key in entry
-    }
-    authority_sources = [
-        item
-        for item in authority_sources
-        if not (isinstance(item, dict) and str(item.get("id") or item.get("source_id") or "") == entry["id"])
-    ]
-    authority_sources.append(compact_source)
-    goal["authority_sources"] = authority_sources
 
-    updated_registry["updated_at"] = registered_at
-    summary = compact_authority_registry(goal, project=Path(str(goal.get("repo"))).expanduser() if goal.get("repo") else None)
-    summary.pop("default_entries", None)
-    apply_authority_registry_summary(authority_registry, summary)
-    if not dry_run:
-        write_json(registry_path, updated_registry)
+    if dry_run:
+        registry = load_project_registry(registry_path)
+        require_runtime_compatible_project_registry(
+            registry,
+            operation="authority source registration",
+        )
+        summary, previous_entry = reduce(copy.deepcopy(registry))
+    else:
+        summary, previous_entry = mutate_project_registry(
+            registry_path,
+            operation="register_authority_source",
+            reducer=reduce,
+        )
 
     action = "would update" if dry_run else "updated"
     write_effect = (
@@ -482,13 +517,6 @@ def import_doc_registry_authority(
     registry_path = registry_path.expanduser()
     doc_registry_path = doc_registry_path.expanduser()
     contract = read_doc_registry_contract(doc_registry_path)
-    registry = read_json(registry_path)
-    goal_index = find_goal_index(registry, goal_id)
-    updated_registry = copy.deepcopy(registry)
-    goals = updated_registry.get("goals")
-    if not isinstance(goals, list) or not isinstance(goals[goal_index], dict):
-        raise ValueError("registry goal entry must be an object")
-    goal = goals[goal_index]
     registered_at = now_local()
     entry = compact_registered_authority_source(
         source_id=source_id,
@@ -532,59 +560,30 @@ def import_doc_registry_authority(
         }
     )
 
-    authority_registry = goal.get("authority_registry") if isinstance(goal.get("authority_registry"), dict) else {}
-    authority_registry = dict(authority_registry)
-    materials = normalize_project_materials(authority_registry.get("project_materials"))
-    previous_entry = materials.get(entry["id"])
-    materials[str(entry["id"])] = dict(entry)
-    authority_registry["project_materials"] = materials
-    authority_registry.setdefault("read_status", "registered")
-    if imported_topics:
-        topic_map = normalize_topic_authority(authority_registry.get("topic_authority"))
-        topic_map.update(imported_topics)
-        authority_registry["topic_authority"] = topic_map
-    goal["authority_registry"] = authority_registry
-
-    authority_sources = goal.get("authority_sources")
-    if not isinstance(authority_sources, list):
-        authority_sources = []
-    compact_source = {
-        key: entry[key]
-        for key in (
-            "schema_version",
-            "id",
-            "role",
-            "source_kind",
-            "freshness",
-            "boundary",
-            "source_ref_kind",
-            "source_ref_sha256",
-            "source_ref_redacted",
-            "owner_status",
-            "gate_status",
-            "revision",
-            "conflict_rule",
-            "registered_at",
-            "default_entry_count",
-            "topic_authority_count",
-            "imported_topic_count",
+    def reduce(
+        registry: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        return _apply_authority_entry(
+            registry,
+            goal_id=goal_id,
+            entry=entry,
+            registered_at=registered_at,
+            imported_topics=imported_topics,
         )
-        if key in entry
-    }
-    authority_sources = [
-        item
-        for item in authority_sources
-        if not (isinstance(item, dict) and str(item.get("id") or item.get("source_id") or "") == entry["id"])
-    ]
-    authority_sources.append(compact_source)
-    goal["authority_sources"] = authority_sources
 
-    updated_registry["updated_at"] = registered_at
-    summary = compact_authority_registry(goal, project=Path(str(goal.get("repo"))).expanduser() if goal.get("repo") else None)
-    summary.pop("default_entries", None)
-    apply_authority_registry_summary(authority_registry, summary)
-    if not dry_run:
-        write_json(registry_path, updated_registry)
+    if dry_run:
+        registry = load_project_registry(registry_path)
+        require_runtime_compatible_project_registry(
+            registry,
+            operation="authority registry import",
+        )
+        summary, previous_entry = reduce(copy.deepcopy(registry))
+    else:
+        summary, previous_entry = mutate_project_registry(
+            registry_path,
+            operation="import_doc_registry_authority",
+            reducer=reduce,
+        )
 
     action = "would import" if dry_run else "imported"
     write_effect = (

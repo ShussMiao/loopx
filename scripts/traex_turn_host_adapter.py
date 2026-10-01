@@ -17,7 +17,6 @@ stay in ``loopx turn run-once``; this is a dumb translation layer.
 from __future__ import annotations
 
 import argparse
-from hashlib import sha256
 import json
 import os
 import sys
@@ -34,13 +33,16 @@ from loopx.extensions.process_runtime import (  # noqa: E402
     CappedProcessResult,
     run_capped_process,
 )
-from loopx.control_plane.quota.turn_envelope import (  # noqa: E402
-    turn_envelope_action_signature_document,
+from loopx.control_plane.turn_driver.host_candidate import (  # noqa: E402
+    COMPLETED_PHASES as COMPLETED_PHASES,
+    LOOPX_TURN_HOST_REQUEST_SCHEMA,
+    LOOPX_TURN_RESULT_SCHEMA as LOOPX_TURN_RESULT_SCHEMA,
+    TEXT_LIMITS,
+    build_result as build_host_result,
+    extract_action_text as extract_action_text,
+    extract_turn_authority,
 )
 
-LOOPX_TURN_HOST_REQUEST_SCHEMA = "loopx_turn_host_request_v0"
-LOOPX_TURN_RESULT_SCHEMA = "loopx_turn_result_v0"
-COMPLETED_PHASES = ["host_execute", "typed_result"]
 TRAEX_OUTPUT_LIMIT_BYTES = 1_000_000
 
 ACCEPTED_RESULT_KINDS = {
@@ -50,80 +52,6 @@ ACCEPTED_RESULT_KINDS = {
     "user_action_required",
     "wait",
 }
-MATERIAL_KINDS = {"validated_progress", "repair_required", "replan_required"}
-
-TEXT_LIMITS = {
-    "classification": 120,
-    "recommended_action": 1_200,
-    "next_action": 1_200,
-    "vision_unchanged_reason": 240,
-    "summary": 400,
-}
-
-def _bounded(value: Any, *, limit: int) -> str:
-    text = str(value or "").strip()
-    if len(text) > limit:
-        return text[: limit - 3].rstrip() + "..."
-    return text
-
-
-def _mapping(value: Any) -> dict[str, Any]:
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _canonical_hash(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return "sha256:" + sha256(encoded).hexdigest()
-
-
-def extract_turn_authority(request: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the signed action and safety boundary exactly as projected."""
-
-    envelope = _mapping(request.get("turn_envelope"))
-    signature = _mapping(envelope.get("action_signature"))
-    source_hash = str(signature.get("source_hash") or "")
-    envelope_hash = str(signature.get("envelope_hash") or "")
-    computed_envelope_hash = _canonical_hash(
-        turn_envelope_action_signature_document(envelope)
-    )
-    if (
-        signature.get("matches") is not True
-        or not source_hash
-        or source_hash != envelope_hash
-        or envelope_hash != computed_envelope_hash
-    ):
-        raise ValueError("TurnEnvelope action signature is missing or does not match")
-
-    action = _mapping(envelope.get("action"))
-    primary_action = _bounded(
-        action.get("primary_action"),
-        limit=TEXT_LIMITS["recommended_action"],
-    )
-    if not primary_action:
-        raise ValueError("signed TurnEnvelope has no primary_action")
-
-    boundary = _mapping(envelope.get("boundary"))
-    required_reads = envelope.get("required_reads")
-    write_scope = boundary.get("write_scope")
-    return {
-        "primary_action": primary_action,
-        "required_reads": list(required_reads) if isinstance(required_reads, list) else [],
-        "write_scope": list(write_scope) if isinstance(write_scope, list) else [],
-        "workspace_guard": _mapping(boundary.get("workspace_guard")),
-    }
-
-
-def extract_action_text(request: Mapping[str, Any]) -> str:
-    """Return the bounded, control-plane-authored task body for the host."""
-
-    return str(extract_turn_authority(request)["primary_action"])
-
-
 def render_prompt(authority: Mapping[str, Any]) -> str:
     """Wrap one signed Turn authority packet in the result-block framing.
 
@@ -199,73 +127,13 @@ def build_result(
 ) -> dict[str, Any]:
     """Shape a model result block into a valid loopx_turn_result_v0."""
 
-    turn_key = str(request.get("turn_key") or "")
-    if candidate is None:
-        # Fail closed: no typed material claim means a stop, never fabricated
-        # progress. This spends no quota.
-        return {
-            "schema_version": LOOPX_TURN_RESULT_SCHEMA,
-            "turn_key": turn_key,
-            "result_kind": "wait",
-            "completed_phases": list(COMPLETED_PHASES),
-            "classification": "no_typed_host_result",
-            "next_action": _bounded(
-                fallback_reason
-                or "TraeX returned no typed result block; rerun or inspect the host session.",
-                limit=TEXT_LIMITS["next_action"],
-            ),
-            "vision_unchanged_reason": _bounded(
-                "host adapter could not confirm a material change",
-                limit=TEXT_LIMITS["vision_unchanged_reason"],
-            ),
-        }
-
-    kind = str(candidate.get("result_kind") or "").strip()
-    result: dict[str, Any] = {
-        "schema_version": LOOPX_TURN_RESULT_SCHEMA,
-        "turn_key": turn_key,
-        "result_kind": kind,
-        "completed_phases": list(COMPLETED_PHASES),
-    }
-    for field, limit in TEXT_LIMITS.items():
-        if field == "vision_unchanged_reason":
-            continue
-        value = candidate.get(field)
-        text = _bounded(value, limit=limit) if value else ""
-        if text:
-            result[field] = text
-
-    if kind in MATERIAL_KINDS:
-        result["delivery_batch_scale"] = "single_surface"
-        result["delivery_outcome"] = "outcome_progress"
-        # Material results require these bounded text fields; fill them from
-        # adjacent fields if the model returned a sparse block.
-        if not result.get("recommended_action"):
-            result["recommended_action"] = _bounded(
-                result.get("next_action") or result.get("classification") or kind,
-                limit=TEXT_LIMITS["recommended_action"],
-            )
-        if not result.get("next_action"):
-            result["next_action"] = _bounded(
-                result.get("recommended_action"),
-                limit=TEXT_LIMITS["next_action"],
-            )
-        if not result.get("classification"):
-            result["classification"] = _bounded(
-                kind, limit=TEXT_LIMITS["classification"]
-            )
-    # This adapter has no goal-vision packet, so the executor treats the path
-    # delta as unchanged and requires a bounded reason for material results.
-    result["vision_unchanged_reason"] = _bounded(
-        candidate.get("vision_unchanged_reason")
-        or (
-            "host reported material work without a goal vision replan packet"
-            if kind in MATERIAL_KINDS
-            else "host reported no material change"
+    return build_host_result(
+        request, candidate, host_name="TraeX",
+        fallback_reason=fallback_reason or (
+            "TraeX returned no typed result block; rerun or inspect the host session."
+            if candidate is None else ""
         ),
-        limit=TEXT_LIMITS["vision_unchanged_reason"],
     )
-    return result
 
 
 def run_traex(

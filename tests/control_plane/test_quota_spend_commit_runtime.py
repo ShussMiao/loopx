@@ -10,9 +10,14 @@ from loopx.control_plane.quota.spend_commit import (
     build_quota_slot_spend_event,
     record_quota_slot_spend_from_preview,
 )
+from loopx.control_plane.testing.quota_fixtures import (
+    quota_status_payload,
+    quota_todo_item,
+)
 from loopx.presentation.renderers.quota_event_markdown import (
     render_quota_slot_preview_markdown,
 )
+from loopx.quota import spend_quota_slot
 
 
 GOAL_ID = "quota-spend-commit-runtime"
@@ -52,6 +57,7 @@ def _preview(**updates: object) -> dict[str, object]:
         "agent_id": AGENT_ID,
         "appended": False,
         "registry_mutated": False,
+        "expected_index_digest": None,
         "before": _decision(0),
         "after": _decision(1),
         "delivery_completion_spend": False,
@@ -71,6 +77,23 @@ def _commit(runtime_root: Path, preview: dict[str, object]) -> dict[str, object]
     )
 
 
+def _status(runtime_root: Path) -> dict[str, object]:
+    todo = quota_todo_item(
+        todo_id="todo_quota_basis",
+        title="Advance the bounded quota slice.",
+    )
+    status = quota_status_payload(
+        goal_id=GOAL_ID,
+        status="active",
+        agent_todo_items=[todo],
+        recommended_action=todo["text"],
+        next_action=todo["text"],
+    )
+    status["runtime_root"] = str(runtime_root)
+    status["run_history"]["goals"][0]["index_digest"] = None
+    return status
+
+
 def test_python_facade_uses_typed_event_and_durable_transaction(
     tmp_path: Path,
 ) -> None:
@@ -84,12 +107,31 @@ def test_python_facade_uses_typed_event_and_durable_transaction(
     assert record["quota_spend_commit"]["schema_version"] == (
         "quota_spend_commit_receipt_v0"
     )
+    assert record["quota_event"]["accounting_projection"] == {
+        "schema_version": "quota_slot_accounting_projection_v0",
+        "settlement_event_semantics": "append_only",
+        "spent_slots_semantics": "rolling_window_aggregate",
+        "before_after_semantics": "same_status_payload_projection",
+        "window_hours": 24,
+    }
+    assert "does not replay or undo" in record["quota_event"]["rolling_window_note"]
 
     written = _commit(tmp_path, preview)
     assert written["appended"] is True
     assert written["idempotent_replay"] is False
     persisted = json.loads(Path(written["json_path"]).read_text(encoding="utf-8"))
     assert persisted["quota_spend_commit"]["effect_id"] == written["effect_id"]
+    assert (
+        persisted["quota_event"]["accounting_projection"]
+        == written["accounting_projection"]
+    )
+    assert (
+        persisted["quota_event"]["rolling_window_note"]
+        == written["rolling_window_note"]
+    )
+    assert "settlement_event=append_only" in Path(written["markdown_path"]).read_text(
+        encoding="utf-8"
+    )
     assert Path(written["markdown_path"]).read_text(encoding="utf-8") == (
         render_quota_slot_preview_markdown(written) + "\n"
     )
@@ -117,9 +159,66 @@ def test_python_facade_serializes_concurrent_exact_effect_retries(
     assert len(index_path.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_python_facade_rejects_a_second_effect_from_the_same_quota_basis(
+    tmp_path: Path,
+) -> None:
+    first_preview = _preview(
+        effect_ref="provider-effect-a#quota_spend",
+        expected_index_digest=None,
+    )
+    second_preview = _preview(
+        effect_ref="provider-effect-b#quota_spend",
+        expected_index_digest=None,
+    )
+
+    written = _commit(tmp_path, first_preview)
+
+    assert written["appended"] is True
+    with pytest.raises(
+        ValueError,
+        match="quota run index compare-and-swap precondition failed",
+    ):
+        _commit(tmp_path, second_preview)
+    index_path = Path(written["index_path"])
+    assert len(index_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_spend_quota_slot_rejects_reusing_a_stale_status_snapshot(
+    tmp_path: Path,
+) -> None:
+    status = _status(tmp_path)
+
+    written = spend_quota_slot(
+        status,
+        goal_id=GOAL_ID,
+        execute=True,
+        source="controller",
+        effect_ref="provider-effect-a#quota_spend",
+    )
+
+    assert written["appended"] is True
+    with pytest.raises(
+        ValueError,
+        match="quota run index compare-and-swap precondition failed",
+    ):
+        spend_quota_slot(
+            status,
+            goal_id=GOAL_ID,
+            execute=True,
+            source="controller",
+            effect_ref="provider-effect-b#quota_spend",
+        )
+    index_path = Path(written["index_path"])
+    assert len(index_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_python_facade_rejects_malformed_and_semantically_invalid_requests(
     tmp_path: Path,
 ) -> None:
+    missing_basis = _preview()
+    missing_basis.pop("expected_index_digest")
+    with pytest.raises(ValueError, match="does not include its index basis"):
+        _commit(tmp_path, missing_basis)
     with pytest.raises(ValueError, match="after.spent_slots"):
         _commit(tmp_path, _preview(after=_decision(2)))
     with pytest.raises(ValueError, match="source must be one of"):

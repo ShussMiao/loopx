@@ -129,10 +129,10 @@ def merged_lifecycle() -> dict[str, object]:
         "ok": True,
         "schema_version": "issue_fix_pr_lifecycle_monitor_v0",
         "observation": {
-            "repo": "huangruiteng/loopx",
+            "repo": "loopx-project/loopx",
             "pr_ref": "pull_8",
             "number": 8,
-            "permalink": "https://github.com/huangruiteng/loopx/pull/8",
+            "permalink": "https://github.com/loopx-project/loopx/pull/8",
             "state": "MERGED",
             "is_draft": False,
             "checks": {
@@ -159,7 +159,7 @@ def outcome_packet(
     commit_ref: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     feasibility = build_issue_fix_feasibility_packet(
-        url="https://github.com/huangruiteng/loopx/issues/7",
+        url="https://github.com/loopx-project/loopx/issues/7",
         reproduction_status="confirmed",
         reproduction_label="focused worker reproduction",
         scope_class="bounded",
@@ -176,7 +176,7 @@ def outcome_packet(
         "repository_commit_evidence": {
             "schema_version": "issue_fix_repository_commit_evidence_v0",
             "status": "verified",
-            "repo": "huangruiteng/loopx",
+            "repo": "loopx-project/loopx",
             "repository_fingerprint": "sha256:" + "a" * 64,
             "repository_revision": revision,
             "declared_commit_ref": commit_ref or revision,
@@ -192,7 +192,7 @@ def outcome_packet(
         "outputs": [
             {
                 "kind": "pull_request",
-                "url": "https://github.com/huangruiteng/loopx/pull/8",
+                "url": "https://github.com/loopx-project/loopx/pull/8",
             }
         ],
         "risks": ["broader integration validation was not run"],
@@ -664,12 +664,22 @@ def main() -> int:
         fake_ov.write_text(
             "#!/usr/bin/env python3\n"
             "import json, sys\n"
+            "from pathlib import Path\n"
             "args = sys.argv[1:]\n"
+            "state_path = Path(__file__).with_suffix('.state')\n"
+            "try: state = json.loads(state_path.read_text())\n"
+            "except (FileNotFoundError, json.JSONDecodeError): state = {}\n"
             "if args == ['--version']: print('openviking 0.4.9.dev11')\n"
             "elif args and args[0] == 'status': print(json.dumps({'status':'healthy'}))\n"
-            "elif args and args[0] == 'tree': print(json.dumps({'resources':[]}))\n"
-            "elif args and args[0] in {'read','ls'}: sys.exit(1)\n"
-            "elif args and args[0] in {'mkdir','add-resource'}: print(json.dumps({'result':'ok'}))\n"
+            "elif args and args[0] == 'read':\n"
+            "    target = args[1]; content = state.get(target)\n"
+            "    print(json.dumps({'uri': target, 'content': content})) if content is not None else sys.exit(1)\n"
+            "elif args and args[0] in {'tree','ls'}:\n"
+            "    prefix = args[1].rstrip('/') if len(args) > 1 else ''\n"
+            "    print(json.dumps({'resources': [{'uri': key} for key in state if key == prefix or key.startswith(prefix + '/')] }))\n"
+            "elif args and args[0] == 'mkdir': print(json.dumps({'result':'ok'}))\n"
+            "elif args and args[0] == 'add-resource':\n"
+            "    target = args[args.index('--to') + 1]; state[target] = Path(args[1]).read_text(); state_path.write_text(json.dumps(state)); print(json.dumps({'result':'ok'}))\n"
             "else: sys.exit(2)\n",
             encoding="utf-8",
         )
@@ -701,7 +711,7 @@ def main() -> int:
             "--goal-id",
             "public-issue-fix-goal",
             "--repo",
-            "huangruiteng/loopx",
+            "loopx-project/loopx",
             "--issue-ref",
             str(feasibility["observation"]["issue_ref"]),
             "--feasibility-json",

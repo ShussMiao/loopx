@@ -9,19 +9,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..projects.registry_codec import load_registry
+from ...paths import resolve_runtime_root
 from ..coordination.coordination_state_contract_generated import (
     LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA,
     TASK_LEASE_ACQUIRE_REQUEST_SCHEMA,
+    TASK_LEASE_CANONICAL_ACQUIRE_REQUEST_SCHEMA,
+    TASK_LEASE_CANONICAL_LIFECYCLE_REQUEST_SCHEMA,
+    TASK_LEASE_CANONICAL_CLAIM_TRANSFER_REQUEST_SCHEMA,
     TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA,
 )
-
-from ...history import load_registry
-from ...paths import resolve_runtime_root
 from ..coordination.runtime_shadow import resolve_coordination_runtime_shadow_config
-from ..goals.active_state_event_projection import (
+from ..goals.legacy_event_source import (
     state_event_log_candidates as _state_event_log_candidates,
 )
-from ..goals.path_resolution import resolve_goal_local_path
 from ..todos.contract import normalize_todo_id
 from ..todos.handoff_mode import HANDOFF_MODE_LEGACY
 from .local_lease_record import TASK_LEASE_SCHEMA_VERSION, TaskLeaseError
@@ -29,42 +30,6 @@ from .local_lease_record import TASK_LEASE_SCHEMA_VERSION, TaskLeaseError
 TASK_LEASE_ACQUIRE_NATIVE_SCHEMA_VERSION = TASK_LEASE_ACQUIRE_REQUEST_SCHEMA
 TASK_LEASE_LIFECYCLE_NATIVE_SCHEMA_VERSION = TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA
 TASK_LEASE_AUTHORITY_SNAPSHOT_ATTEMPTS = 3
-
-
-def _attach_local_authority_shadow(
-    result: dict[str, Any],
-    *,
-    registry_path: Path | None,
-    runtime_root: Path,
-    goal_id: str,
-    todo_id: str,
-    operation: str,
-) -> dict[str, Any]:
-    """Observe a committed public lease mutation without changing its verdict."""
-
-    if registry_path is None:
-        return result
-    lease = result.get("lease") if isinstance(result.get("lease"), dict) else {}
-    observation_trigger = ":".join(
-        (
-            f"task_lease_{operation}",
-            str(todo_id),
-            str(lease.get("version") or "none"),
-            str(lease.get("lease_epoch") or "none"),
-            str(lease.get("updated_at") or lease.get("released_at") or "unknown"),
-        )
-    )
-    from ..coordination.local_authority_shadow_observation import observe_local_authority_commit
-
-    evidence = observe_local_authority_commit(
-        registry_path=registry_path,
-        runtime_root=runtime_root,
-        goal_id=str(goal_id),
-        observation_trigger=observation_trigger,
-    )
-    if evidence is not None:
-        result["authority_shadow"] = evidence
-    return result
 
 
 def _authority_source_receipt(source_id: str, path: Path) -> dict[str, Any]:
@@ -125,7 +90,6 @@ def _task_lease_authority_source_paths(
         _state_event_log_candidates(
             goal,
             state_path=state_file,
-            resolve_goal_local_path=resolve_goal_local_path,
         )
     ):
         sources.append((f"state_event_{index}", path))
@@ -199,6 +163,7 @@ def _task_lease_authority_projection(
     todo_id: str,
     goal: dict[str, Any] | None,
     state_file: Path | None,
+    project_todos: bool = True,
 ) -> tuple[Any, list[Any], list[dict[str, Any]], dict[str, Any] | None]:
     from ...todos import list_goal_todos
     from ..goals.active_state_metadata import parse_state_frontmatter
@@ -211,6 +176,8 @@ def _task_lease_authority_projection(
         handoff_mode = parse_state_frontmatter(
             state_file.read_text(encoding="utf-8")
         ).get("handoff_mode")
+    if not project_todos:
+        return handoff_mode, _raw_registered_agent_candidates(goal), [], None
     try:
         projection = list_goal_todos(
             registry_path=registry_path,
@@ -254,6 +221,7 @@ def _task_lease_authority_snapshot_attempt(
     registry_path: Path,
     goal_id: str,
     todo_id: str,
+    project_todos: bool = True,
 ) -> dict[str, Any] | None:
     registry_receipt_before = _authority_source_receipt("registry", registry_path)
     registry = load_registry(registry_path)
@@ -275,6 +243,7 @@ def _task_lease_authority_snapshot_attempt(
             todo_id=todo_id,
             goal=goal,
             state_file=state_file,
+            project_todos=project_todos,
         )
     )
 
@@ -305,14 +274,16 @@ def task_lease_acquire_authority_facts(
     registry_path: Path,
     goal_id: str,
     todo_id: str,
+    project_todos: bool = True,
 ) -> dict[str, Any]:
-    """Project a source-stable, decision-free acquire input snapshot."""
+    """Project source-stable facts; inspection can defer Todo parsing to TS demand."""
 
     for _attempt in range(TASK_LEASE_AUTHORITY_SNAPSHOT_ATTEMPTS):
         facts = _task_lease_authority_snapshot_attempt(
             registry_path=registry_path,
             goal_id=goal_id,
             todo_id=todo_id,
+            project_todos=project_todos,
         )
         if facts is not None:
             return facts
@@ -332,6 +303,27 @@ def _require_native_acquire_shape(payload: object) -> dict[str, Any]:
     ):
         raise RuntimeError("native task-lease acquire result shape mismatch")
     return payload
+
+
+def _canonical_lease_authority_facts(registry_path: Path, goal_id: str) -> dict[str, Any]:
+    """Only registration is external to the canonical head; bind its source."""
+    for _attempt in range(TASK_LEASE_AUTHORITY_SNAPSHOT_ATTEMPTS):
+        before = _authority_source_receipt("registry", registry_path)
+        goal = _registry_goal(load_registry(registry_path), goal_id)
+        after = _authority_source_receipt("registry", registry_path)
+        if before != after:
+            continue
+        if goal is None:
+            raise TaskLeaseError("canonical lease lifecycle goal is not registered", code="goal_not_found")
+        return {
+            # This neutral transport value never decides a canonical mode.
+            "handoff_mode": HANDOFF_MODE_LEGACY,
+            "registered_agent_candidates": _raw_registered_agent_candidates(goal),
+            "todos": [],
+            "todo_projection_error": None,
+            "source_receipts": [after],
+        }
+    raise TaskLeaseError("canonical lease lifecycle registry changed; retry", code="authority_source_changed")
 
 
 def _finalize_native_acquire_result(
@@ -359,14 +351,6 @@ def _finalize_native_acquire_result(
             runtime_root=runtime_root,
             goal_id=goal_id,
         )
-        result = _attach_local_authority_shadow(
-            result,
-            registry_path=registry_path,
-            runtime_root=runtime_root,
-            goal_id=goal_id,
-            todo_id=todo_id,
-            operation="acquire",
-        )
     return result
 
 
@@ -381,20 +365,27 @@ def execute_native_task_lease_acquire(
     ttl_seconds: int | None = None,
     write_scopes: list[str] | None = None,
     expected_version: int | None = None,
+    write_worktree: str | None = None,
     _legacy_provider_projection: bool = False,
 ) -> dict[str, Any]:
     """Transport one compact acquire request to the native TypeScript owner."""
 
-    from ..effect_runtime import effect_runtime_result
+    from ..effect_runtime import (
+        CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+        effect_runtime_result,
+    )
 
+    from ..coordination.local_authority import local_authority_is_promoted
+
+    canonical = local_authority_is_promoted(runtime_root=runtime_root, goal_id=str(goal_id))
     for attempt in range(TASK_LEASE_AUTHORITY_SNAPSHOT_ATTEMPTS):
-        authority = task_lease_acquire_authority_facts(
+        authority = _canonical_lease_authority_facts(registry_path, str(goal_id)) if canonical else task_lease_acquire_authority_facts(
             registry_path=registry_path,
             goal_id=str(goal_id or ""),
             todo_id=str(todo_id or ""),
         )
         request = {
-            "schema_version": TASK_LEASE_ACQUIRE_NATIVE_SCHEMA_VERSION,
+            "schema_version": TASK_LEASE_CANONICAL_ACQUIRE_REQUEST_SCHEMA if canonical else TASK_LEASE_ACQUIRE_NATIVE_SCHEMA_VERSION,
             "runtime_root": str(runtime_root),
             "goal_id": goal_id,
             "todo_id": todo_id,
@@ -402,24 +393,39 @@ def execute_native_task_lease_acquire(
             "idempotency_key": idempotency_key,
             "ttl_seconds": ttl_seconds,
             "write_scopes": list(write_scopes or []),
+            **({"write_worktree": (
+                str(Path(write_worktree).expanduser().absolute())
+                if write_worktree else write_worktree
+            )} if write_worktree is not None else {}),
             "expected_version": expected_version,
             "authority": authority,
         }
         registry = load_registry(registry_path)
         goal = _registry_goal(registry, str(goal_id))
-        if resolve_coordination_runtime_shadow_config(goal).enabled:
+        if not canonical and resolve_coordination_runtime_shadow_config(goal).enabled:
             request["runtime_shadow"] = {
                 "schema_version": LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA,
                 "provider": "file_v0",
             }
         payload = _require_native_acquire_shape(
-            effect_runtime_result("task_lease.acquire.native", request, timeout=15.0)
+            effect_runtime_result(
+                "task_lease.acquire.native", request,
+                timeout=(CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS if canonical else 15.0),
+            )
         )
         if (
             payload.get("error_code") == "authority_source_changed"
             and attempt + 1 < TASK_LEASE_AUTHORITY_SNAPSHOT_ATTEMPTS
         ):
             continue
+        if canonical:
+            if payload.get("ok") is True and (
+                payload.get("source_authority") not in ("file_v0", "sqlite_v0")
+                or payload.get("decision_read_from_provider") is not True
+                or payload.get("legacy_fallback_used") is not False
+            ):
+                raise RuntimeError("canonical acquire omitted valid provider evidence")
+            return payload
         return _finalize_native_acquire_result(
             payload,
             authority=authority,
@@ -533,6 +539,34 @@ def _normalize_lifecycle_expected_version(
         ) from exc
 
 
+def _settle_canonical_lifecycle_result(
+    result: dict[str, Any], *, request: dict[str, Any], registry_path: Path | None,
+) -> dict[str, Any]:
+    """Validate provider provenance and deliver the committed Todo projection."""
+    if (
+        request["operation"] not in {"renew", "transfer", "release"}
+        or result.get("source_authority") not in ("file_v0", "sqlite_v0")
+        or result.get("decision_read_from_provider") is not True
+        or result.get("legacy_fallback_used") is not False
+    ):
+        raise RuntimeError("canonical task-lease result has invalid provider evidence")
+    # The provider already owns its lease/event/receipt. No legacy shadow write
+    # is allowed here, and lease-only commands require no Todo display delivery.
+    if request.get("transfer_claim") is not True:
+        return result
+    if result.get("transfer_claim") is not True or result.get("claimed_by") != request["new_owner"]:
+        raise RuntimeError("canonical claim transfer omitted its committed result")
+    from ..todos.provider_projection import settle_canonical_todo_projection
+
+    assert registry_path is not None
+    # Display failure cannot undo the joint authority commit. The existing
+    # outbox reports pending; retries render current head, not the old receipt.
+    return settle_canonical_todo_projection(
+        result, registry_path=registry_path, runtime_root=Path(request["runtime_root"]),
+        goal_id=request["goal_id"],
+    )
+
+
 def execute_native_task_lease_lifecycle(
     *,
     runtime_root: Path,
@@ -546,6 +580,7 @@ def execute_native_task_lease_lifecycle(
     ttl_seconds: int | None = None,
     new_owner: str | None = None,
     new_idempotency_key: str | None = None,
+    transfer_claim: bool = False,
     todo: dict[str, Any] | None = None,
     delegated_authority: bool = False,
     allow_user_gate_auto_acquire: bool = False,
@@ -571,6 +606,8 @@ def execute_native_task_lease_lifecycle(
     """
 
     normalized_operation = str(operation or "").strip()
+    if not isinstance(transfer_claim, bool) or (transfer_claim and normalized_operation != "transfer"):
+        raise TaskLeaseError("transfer_claim is valid only for transfer", code="invalid_claim_transfer_request")
     normalized_expected_version = _normalize_lifecycle_expected_version(
         expected_version,
         operation=normalized_operation or "lifecycle",
@@ -591,9 +628,21 @@ def execute_native_task_lease_lifecycle(
         fence_operation_id = secrets.token_hex(32)
     for attempt in range(TASK_LEASE_AUTHORITY_SNAPSHOT_ATTEMPTS):
         authority: dict[str, Any] | None = None
-        if registry_path is not None and (needs_authority or normalized_operation == "release"):
+        canonical_lifecycle = False
+        if normalized_operation in {"renew", "transfer", "release"}:
+            from ..coordination.local_authority import local_authority_is_promoted
+
+            canonical_lifecycle = local_authority_is_promoted(
+                runtime_root=runtime_root, goal_id=goal_id
+            )
+        if transfer_claim and not canonical_lifecycle:
+            raise TaskLeaseError(
+                "atomic claim transfer requires canonical authority; inspect provider readiness first",
+                code="claim_transfer_requires_canonical_authority",
+            )
+        if registry_path is not None and (needs_authority or (normalized_operation == "release" and not canonical_lifecycle)):
             try:
-                authority = task_lease_acquire_authority_facts(
+                authority = _canonical_lease_authority_facts(registry_path, goal_id) if canonical_lifecycle else task_lease_acquire_authority_facts(
                     registry_path=registry_path,
                     goal_id=str(goal_id or ""),
                     todo_id=str(todo_id or ""),
@@ -613,7 +662,10 @@ def execute_native_task_lease_lifecycle(
                 # optional source projection is unavailable.
                 authority = None
         request: dict[str, Any] = {
-            "schema_version": TASK_LEASE_LIFECYCLE_NATIVE_SCHEMA_VERSION,
+            "schema_version": (
+                TASK_LEASE_CANONICAL_LIFECYCLE_REQUEST_SCHEMA
+                if canonical_lifecycle else TASK_LEASE_LIFECYCLE_NATIVE_SCHEMA_VERSION
+            ),
             "operation": normalized_operation,
             "runtime_root": str(runtime_root),
             "goal_id": goal_id,
@@ -652,7 +704,17 @@ def execute_native_task_lease_lifecycle(
             # CLI argument or persisted authority fact.
             "current_time": _now.isoformat() if _now is not None else None,
         }
-        if registry_path is not None:
+        if canonical_lifecycle:
+            request = {key: request[key] for key in (
+                "schema_version", "operation", "runtime_root", "goal_id", "todo_id",
+                "owner", "idempotency_key", "expected_version", "ttl_seconds", "authority", "current_time",
+            )}
+            if normalized_operation == "transfer":
+                request.update(new_owner=new_owner, new_idempotency_key=new_idempotency_key)
+                if transfer_claim:
+                    request.update(schema_version=TASK_LEASE_CANONICAL_CLAIM_TRANSFER_REQUEST_SCHEMA,
+                                   transfer_claim=True)
+        if registry_path is not None and not canonical_lifecycle:
             registry = load_registry(registry_path)
             goal = _registry_goal(registry, str(goal_id))
             if resolve_coordination_runtime_shadow_config(goal).enabled:
@@ -660,15 +722,27 @@ def execute_native_task_lease_lifecycle(
                     "schema_version": LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA,
                     "provider": "file_v0",
                 }
+                if normalized_operation == "fence_close" and committed and release_lease:
+                    # The preceding Todo write may have changed the source.
+                    # Capture the current graph, not the terminal-verify snapshot
+                    # or the append-retained lease directory. Default-off cleanup
+                    # still needs no authority read.
+                    request["authority"] = task_lease_acquire_authority_facts(
+                        registry_path=registry_path, goal_id=goal_id, todo_id=todo_id,
+                    )
         compacted_todo = _compact_lifecycle_todo(todo, todo_id=str(todo_id))
-        if compacted_todo is not None:
+        if compacted_todo is not None and not canonical_lifecycle:
             request["todo"] = compacted_todo
-        from ..effect_runtime import effect_runtime_result
+        from ..effect_runtime import (
+            CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+            effect_runtime_result,
+        )
 
         payload = effect_runtime_result(
             "task_lease.lifecycle.native",
             request,
-            timeout=15.0,
+            timeout=(CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS
+                     if canonical_lifecycle else 15.0),
         )
         if not isinstance(payload, dict):
             raise RuntimeError("native task-lease lifecycle result shape mismatch")
@@ -686,6 +760,10 @@ def execute_native_task_lease_lifecycle(
                 owner=owner,
             )
         result = dict(payload)
+        if canonical_lifecycle and "source_authority" not in result:
+            raise RuntimeError("canonical lease lifecycle omitted provider evidence")
+        if "source_authority" in result:
+            return _settle_canonical_lifecycle_result(result, request=request, registry_path=registry_path)
         if authority is not None and authority.get("handoff_mode") and "handoff_mode" not in result:
             result["handoff_mode"] = authority["handoff_mode"]
         if _legacy_provider_projection:
@@ -701,25 +779,71 @@ def execute_native_task_lease_lifecycle(
                 runtime_root=runtime_root,
                 goal_id=str(goal_id),
             )
-        committed_mutation = (
-            normalized_operation == "renew" and result.get("renewed") is True
-        ) or (
-            normalized_operation == "transfer"
-            and result.get("transferred") is True
-        ) or (
-            normalized_operation == "release"
-            and result.get("released") is True
-        )
-        if committed_mutation and result.get("idempotent") is not True:
-            result = _attach_local_authority_shadow(
-                result,
-                registry_path=registry_path,
-                runtime_root=runtime_root,
-                goal_id=str(goal_id),
-                todo_id=str(todo_id),
-                operation=normalized_operation,
-            )
         # lock_token is an internal bridge value.  Callers that need a held
         # fence read it from the nested native payload before redacting it.
         return result
     raise RuntimeError("native task-lease lifecycle exhausted source-CAS retries")
+
+
+def inspect_native_task_lease(
+    *, registry_path: Path, runtime_root: Path, goal_id: str, todo_id: str,
+) -> dict[str, Any]:
+    """Project source facts; the typed reader owns lease interpretation."""
+    from ..coordination.local_authority import (
+        LOCAL_AUTHORITY_SOURCES, LocalCoordinationAuthorityUnavailable,
+        local_authority_is_promoted,
+    )
+    from ..effect_runtime import (
+        CANONICAL_AUTHORITY_READ_TIMEOUT_SECONDS,
+        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        effect_runtime_result,
+    )
+
+    for attempt in range(TASK_LEASE_AUTHORITY_SNAPSHOT_ATTEMPTS):
+        canonical = local_authority_is_promoted(runtime_root=runtime_root, goal_id=goal_id)
+        # TS alone decides whether the retained lease needs current Todo facts.
+        # Inactive legacy inspection must not parse the full work document.
+        authority = _canonical_lease_authority_facts(registry_path, goal_id) if canonical else task_lease_acquire_authority_facts(
+            registry_path=registry_path, goal_id=goal_id, todo_id=todo_id, project_todos=False,
+        )
+        request = {
+            "schema_version": "loopx_task_lease_inspect_request_v0",
+            "source": "canonical" if canonical else "legacy",
+            "phase": "effective_lease" if canonical else "lease_record",
+            "runtime_root": str(runtime_root.resolve()), "goal_id": goal_id,
+            "todo_id": todo_id, "authority": authority,
+        }
+        result = effect_runtime_result(
+            "task_lease.inspect.native", request,
+            timeout=(CANONICAL_AUTHORITY_READ_TIMEOUT_SECONDS
+                     if canonical else DEFAULT_REQUEST_TIMEOUT_SECONDS),
+        )
+        if isinstance(result, dict) and result.get("todo_projection_required") is True:
+            if canonical or result.get("schema_version") != TASK_LEASE_SCHEMA_VERSION or result.get("ok") is not True or result.get("action") != "inspect":
+                raise RuntimeError("native lease inspection requested an invalid source projection")
+            request["phase"] = "effective_lease"
+            request["authority"] = task_lease_acquire_authority_facts(
+                registry_path=registry_path, goal_id=goal_id, todo_id=todo_id,
+            )
+            # Re-read the lease and fence: neither the record nor its expiry is
+            # assumed unchanged while Python prepares the Todo projection.
+            result = effect_runtime_result(
+                "task_lease.inspect.native", request,
+                timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            )
+        if not isinstance(result, dict) or result.get("schema_version") != TASK_LEASE_SCHEMA_VERSION or result.get("action") != "inspect" or not isinstance(result.get("ok"), bool):
+            raise RuntimeError("native lease inspection result shape mismatch")
+        if result.get("error_code") == "authority_source_changed" and attempt + 1 < TASK_LEASE_AUTHORITY_SNAPSHOT_ATTEMPTS:
+            continue
+        if result.get("ok") is not True:
+            code = str(result.get("error_code") or "task_lease_inspection_unavailable")
+            exception = LocalCoordinationAuthorityUnavailable if canonical and code != "corrupt_lease" else TaskLeaseError
+            raise exception(str(result.get("error") or "lease inspection unavailable"), code=code, payload=result)
+        if not isinstance(result.get("active"), bool) or (canonical and (
+            result.get("source_authority") not in LOCAL_AUTHORITY_SOURCES
+            or not isinstance(result.get("provider_revision"), str)
+            or result.get("legacy_fallback_used") is not False
+        )):
+            raise RuntimeError("native lease inspection omitted source evidence")
+        return result
+    raise RuntimeError("native lease inspection exhausted source retries")

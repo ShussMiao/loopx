@@ -41,6 +41,16 @@ test("digest uses JSON structure, not property insertion order", () => {
   assert.equal(first.vision_request_digest, second.vision_request_digest);
 });
 
+test("checkpoint replay is bound to the read receipt used for the committed judgment", () => {
+  const supplement = {...request, unchanged_reason: "Still applicable", checkpoint_read_context_id: "read-A"};
+  const admitted = refreshRecovery(supplement, prior, true, "unknown", false);
+  const complete = {...prior, refresh_recovery: admitted,
+    vision_checkpoint: {...prior.vision_checkpoint, decision: "unchanged_with_reason", satisfied: true}};
+  assert.equal(refreshRecovery(supplement, complete, true, "unknown", true).decision, "replay");
+  assert.equal(refreshRecovery({...supplement, checkpoint_read_context_id: "read-B"}, complete, true, "unknown", false).decision, "reject");
+  assert.equal(refreshRecovery({...supplement, checkpoint_read_context_id: null}, complete, true, "unknown", false).decision, "reject");
+});
+
 test("workspace supplements preserve the monitor compatibility boundary", () => {
   const monitor = { ...prior, classification: "quota_monitor_poll", material_change: true,
     vision_checkpoint: null, delivery_batch_scale: null };
@@ -52,6 +62,9 @@ test("workspace supplements preserve the monitor compatibility boundary", () => 
   assert.equal(refreshRecovery(closeout, monitor, false, "required", true).decision, "reject");
   for (const invalid of [
     { ...monitor, material_change: false }, { ...monitor, classification: "ordinary_refresh" },
+    { ...monitor, material_change: undefined, monitor_event: { material_change: true } },
+    { ...monitor, material_change: null, monitor_event: { material_change: true } },
+    { ...monitor, material_change: "true", monitor_event: { material_change: true } },
     { ...monitor, refresh_recovery: admitted }, { ...monitor, vision_checkpoint: prior.vision_checkpoint },
   ]) assert.equal(refreshRecovery(closeout, invalid, false, "required", false).decision, "reject");
   for (const invalid of [

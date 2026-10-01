@@ -1,12 +1,13 @@
 """Per-goal handoff mode: which ownership authority governs todo handoffs.
 
-The goal's ACTIVE_GOAL_STATE.md YAML front-matter may declare ``handoff_mode``:
+Before promotion the active-state frontmatter declares ``handoff_mode``; afterward
+the selected canonical provider owns it. Public show/set route by that authority:
 
 * absent / ``legacy`` (default): today's dual soft-claim + hard-lease
   behavior, byte-for-byte. The known soft-claim/hard-lease split brain stays
   open in this mode by design; it is surfaced additively, never silently
   repaired.
-* ``soft_claim``: the markdown claim is the only ownership record. Task-lease
+* ``soft_claim``: the Todo claim is the only ownership record. Task-lease
   acquire/renew/transfer are typed-rejected; release and inspect stay allowed
   for cleanup and observability of legacy leftovers.
 * ``hard_lease``: ownership changes on an existing todo require the acting
@@ -17,19 +18,13 @@ The goal's ACTIVE_GOAL_STATE.md YAML front-matter may declare ``handoff_mode``:
   ``coordination.todo_lifecycle_authority`` override is the one audited door
   through the gate.
 
-The mode lives in the front-matter (not the registry) because the markdown
-file is the artifact that travels across endpoints; lease JSON and registry
-are host-local. Pre-NoKV the file syncs last-writer-wins, so two hosts can
-briefly disagree about the mode; that window is documented, not engineered
-around here.
+Canonical mode, complete Todo/lease quiescence, CAS and replay share one TypeScript
+transaction. Stale or missing Markdown and local lease files are not fallback
+sources. The legacy mode below remains a frontmatter compatibility contract.
 
-The v0 transition scan is materialized-state only: it reads open claims from
-the locked ``ACTIVE_GOAL_STATE.md`` text plus time-active local lease files. It
-does not merge the event projection, so a claim that exists only in the event
-log can be missed. A successful switch is therefore not a proof that every
-projection is quiescent. The selected mode's typed per-write gate remains the
-safety boundary for later governed ownership and completion mutations,
-including event-projected completion.
+Unpromoted transitions read complete Markdown Todos and local leases under
+their writer mutexes. The same typed quiescence rule governs both paths;
+nonempty retired Todo event sources are refused, never treated as empty.
 """
 
 from __future__ import annotations
@@ -39,15 +34,11 @@ from pathlib import Path
 from typing import Any
 
 from ..coordination.authority_core import (
-    CoordinationSnapshot,
-    DecisionOutcome,
     HandoffMode,
-    HandoffModeTransitionCommand,
     OwnershipGate,
-    decide,
     ownership_gate_requirement,
 )
-from ..goals.active_state_metadata import parse_state_frontmatter
+from ..goals.active_state_metadata import parse_state_frontmatter, split_state_frontmatter
 from .contract import normalize_todo_claimed_by
 
 HANDOFF_MODE_SCHEMA_VERSION = "goal_handoff_mode_v0"
@@ -119,13 +110,8 @@ def goal_handoff_mode_for_goal(
     project: Path | None = None,
     state_file: Path | None = None,
 ) -> str:
-    _project, resolved_state_file = _resolve_state(
-        registry_path=registry_path,
-        goal_id=goal_id,
-        project=project,
-        state_file=state_file,
-    )
-    return goal_handoff_mode(resolved_state_file.read_text(encoding="utf-8"))
+    return str(show_goal_handoff_mode(registry_path=registry_path, goal_id=goal_id,
+        project=project, state_file=state_file)["handoff_mode"])
 
 
 def enter_todo_ownership_handoff_gate(
@@ -255,7 +241,17 @@ def show_goal_handoff_mode(
     goal_id: str,
     project: Path | None = None,
     state_file: Path | None = None,
+    runtime_root_arg: str | None = None,
 ) -> dict[str, Any]:
+    from ..work_items.task_lease import runtime_root_from_registry
+    from .provider_handoff_mode import read_canonical_handoff_mode
+
+    canonical = read_canonical_handoff_mode(
+        runtime_root=runtime_root_from_registry(registry_path, runtime_root_arg), goal_id=goal_id)
+    if canonical is not None:
+        return {"ok": True, "schema_version": HANDOFF_MODE_SCHEMA_VERSION, "action": "show",
+                "goal_id": goal_id, **canonical,
+                "handoff_mode": normalize_handoff_mode(canonical["handoff_mode"]), "source": "canonical_provider"}
     _project, resolved_state_file = _resolve_state(
         registry_path=registry_path,
         goal_id=goal_id,
@@ -277,120 +273,19 @@ def show_goal_handoff_mode(
     }
 
 
-def _frontmatter_bounds(lines: list[str]) -> tuple[int, int]:
-    if not lines or lines[0].strip() != "---":
+def _plan_legacy_mode(request: dict[str, Any]) -> dict[str, Any]:
+    from ..effect_runtime import effect_runtime_result
+
+    result = effect_runtime_result("coordination.handoff_mode.legacy_plan", request)
+    if not isinstance(result, dict) or result.get("schema_version") != "loopx_legacy_handoff_mode_plan_result_v0":
+        raise HandoffModeError("invalid typed handoff plan", code="handoff_mode_plan_unavailable")
+    if result.get("outcome") == "rejected":
         raise HandoffModeError(
-            "active state file has no YAML front-matter; add one before setting "
-            "handoff_mode",
-            code="state_frontmatter_missing",
+            "handoff mode change rejected; resolve the reported state or ownership blockers",
+            code=result["code"], payload={key: value for key, value in result.items()
+                if key not in {"schema_version", "outcome", "code", "changed"}},
         )
-    for index in range(1, len(lines)):
-        if lines[index].strip() == "---":
-            return 1, index
-    raise HandoffModeError(
-        "active state front-matter is not terminated by ---",
-        code="state_frontmatter_missing",
-    )
-
-
-def _quiescence_offenders(
-    *,
-    registry_path: Path,
-    goal_id: str,
-    state_text: str,
-    runtime_root: Path | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return blockers visible to the v0 materialized-state scan.
-
-    Event-projection overlays are intentionally outside this pre-NoKV scan.
-    Callers must not interpret an empty result as an authority-wide safety
-    guarantee; later governed writes still cross the selected handoff-mode
-    gate.
-    """
-
-    from ..work_items.task_lease import (
-        lease_is_active,
-        read_lease,
-        runtime_root_from_registry,
-        task_lease_dir,
-    )
-    from .active_state_todo_parser import parse_active_state_todos
-
-    claimed: list[dict[str, Any]] = []
-    todos = parse_active_state_todos(state_text, item_limit=None)
-    for role in ("user_todos", "agent_todos"):
-        summary = todos.get(role)
-        items = summary.get("items") if isinstance(summary, dict) else []
-        for item in items or []:
-            if not isinstance(item, dict) or item.get("done") is True:
-                continue
-            owner = normalize_todo_claimed_by(item.get("claimed_by"))
-            if owner:
-                claimed.append(
-                    {
-                        "todo_id": item.get("todo_id"),
-                        "claimed_by": owner,
-                        "status": item.get("status"),
-                    }
-                )
-    leases: list[dict[str, Any]] = []
-    if runtime_root is None:
-        runtime_root = runtime_root_from_registry(registry_path, None)
-    lease_dir = task_lease_dir(runtime_root=runtime_root, goal_id=goal_id)
-    if lease_dir.exists():
-        for path in sorted(lease_dir.glob("todo_*.json")):
-            lease = read_lease(path)
-            if lease_is_active(lease):
-                leases.append(
-                    {
-                        "todo_id": lease.get("todo_id"),
-                        "owner": lease.get("owner"),
-                        "expires_at": lease.get("expires_at"),
-                        "lease_path": str(path),
-                    }
-                )
-    return claimed, leases
-
-
-def _authority_offender_tokens(
-    offenders: list[dict[str, Any]],
-    *,
-    kind: str,
-) -> tuple[str, ...]:
-    """Keep every offender represented without changing its public payload."""
-
-    return tuple(
-        str(offender.get("todo_id") or f"<missing-{kind}-todo-id:{index}>")
-        for index, offender in enumerate(offenders, start=1)
-    )
-
-
-def _previous_handoff_mode_fields(
-    previous_raw: object,
-) -> tuple[str, dict[str, Any]]:
-    """Type the persisted front-matter mode; invalid values stay reportable."""
-
-    try:
-        previous = normalize_handoff_mode(previous_raw)
-    except HandoffModeError as exc:
-        previous = str(previous_raw or "").strip()
-        return previous, {
-            "previous_mode": previous,
-            "previous_mode_valid": False,
-            "previous_mode_error_code": exc.code,
-        }
-    return previous, {"previous_mode": previous, "previous_mode_valid": True}
-
-
-def _write_handoff_mode_frontmatter(lines: list[str], requested: str) -> None:
-    """Replace or insert the handoff_mode key inside the front-matter block."""
-
-    open_index, close_index = _frontmatter_bounds(lines)
-    for index in range(open_index, close_index):
-        if lines[index].split(":", 1)[0].strip() == HANDOFF_MODE_FRONTMATTER_KEY:
-            lines[index] = f"{HANDOFF_MODE_FRONTMATTER_KEY}: {requested}"
-            return
-    lines.insert(close_index, f"{HANDOFF_MODE_FRONTMATTER_KEY}: {requested}")
+    return result
 
 
 def set_goal_handoff_mode(
@@ -401,27 +296,30 @@ def set_goal_handoff_mode(
     project: Path | None = None,
     state_file: Path | None = None,
     runtime_root_arg: str | None = None,
+    operation_id: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Set the goal handoff mode; requires a quiescent goal for transitions.
+    """Set the authoritative goal mode; changed modes require quiescence.
 
-    In v0, quiescence means no open todo materialized in the locked active-state
-    Markdown carries a claimed_by owner and no time-active lease file exists
-    under the goal. The scan does not overlay event-only todos, so success is a
-    pre-NoKV migration check rather than an authority-wide safety guarantee;
-    every later governed ownership or completion write still crosses the
-    selected mode's typed gate. Visible non-quiescence refuses with a typed
-    offender list and there is no force override. Hand-editing the front-matter
-    bypasses this check and is out of contract.
+    Promoted Goals use one provider transaction; the remaining text below
+    describes the unpromoted compatibility writer.
+
+    Changed modes require complete unclaimed Todo state and no time-active
+    leases. Event source locks remain held through the frontmatter replacement.
+    Hand-editing frontmatter bypasses this check and is outside the contract.
     """
 
-    from ...file_lock import (
-        exclusive_cross_runtime_file_lock as exclusive_file_lock,
+    from ..work_items.task_lease import runtime_root_from_registry
+    from .handoff_mode_source import handoff_mode_source
+    from ..coordination.legacy_writer_fence import (
+        LegacyCoordinationWriterFenced,
+        legacy_todo_write_transaction,
+        require_legacy_coordination_write_allowed,
     )
-    from ..work_items.task_lease import (
-        runtime_root_from_registry,
-        task_lease_lock_path,
+    from ..coordination.local_authority import (
+        LocalCoordinationAuthorityRejection,
+        LocalCoordinationAuthorityUnavailable,
     )
-    from ..coordination.legacy_writer_fence import legacy_todo_write_transaction
     from ..coordination.runtime_shadow_writer_adapter import (
         write_captured_todo_state,
         begin_todo_runtime_shadow_capture,
@@ -434,119 +332,87 @@ def set_goal_handoff_mode(
             "handoff-mode set requires an explicit --mode value",
             code="invalid_handoff_mode",
         )
+    from .provider_handoff_mode import set_canonical_handoff_mode
+
+    runtime_root = runtime_root_from_registry(registry_path, runtime_root_arg)
+    try:
+        canonical = set_canonical_handoff_mode(
+            runtime_root=runtime_root,
+            goal_id=goal_id,
+            mode=requested,
+            operation_id=operation_id,
+            dry_run=dry_run,
+        )
+    except LocalCoordinationAuthorityRejection:
+        raise
+    except LocalCoordinationAuthorityUnavailable:
+        # A present legacy fence is the admission boundary for this caller.
+        # Re-check it when canonical dispatch is unavailable so an outage cannot
+        # turn a fenced legacy writer into an attempted Markdown mutation.
+        try:
+            require_legacy_coordination_write_allowed(
+                runtime_root=runtime_root,
+                goal_id=goal_id,
+            )
+        except LegacyCoordinationWriterFenced:
+            raise
+        raise
+    if canonical is not None:
+        return canonical
+    if operation_id is not None:
+        raise HandoffModeError("--operation-id requires canonical authority", code="handoff_mode_operation_id_unsupported")
     _project, resolved_state_file = _resolve_state(
         registry_path=registry_path,
         goal_id=goal_id,
         project=project,
         state_file=state_file,
     )
-    # One effective runtime root for the lease lock, the quiescence scan, and
-    # the post-commit observation of this call.
-    runtime_root = runtime_root_from_registry(registry_path, runtime_root_arg)
+    # The already resolved root also governs the legacy lock, scan and capture.
     with legacy_todo_write_transaction(
         registry_path, goal_id, resolved_state_file, None, "handoff_mode_set",
-        False, runtime_root=runtime_root,
+        dry_run, runtime_root=runtime_root,
     ):
-        original = resolved_state_file.read_text(encoding="utf-8")
-        previous, previous_mode_fields = _previous_handoff_mode_fields(
-            parse_state_frontmatter(original).get(HANDOFF_MODE_FRONTMATTER_KEY)
-        )
-        payload = {
-            "ok": True,
-            "schema_version": HANDOFF_MODE_SCHEMA_VERSION,
-            "action": "set",
-            "goal_id": goal_id,
-            **previous_mode_fields,
-            "handoff_mode": requested,
-            "state_file": str(resolved_state_file),
+        with resolved_state_file.open(encoding="utf-8", newline="") as source:
+            original = source.read()
+        metadata, body = split_state_frontmatter(original)
+        frontmatter = original[:len(original) - len(body)]
+        request = {
+            "schema_version": "loopx_legacy_handoff_mode_plan_request_v0",
+            "previous_value": metadata.get(HANDOFF_MODE_FRONTMATTER_KEY),
+            "requested_mode": requested, "frontmatter_text": frontmatter,
+            "todos": None, "leases": None,
         }
-        if previous == requested:
-            payload["changed"] = False
+        plan = _plan_legacy_mode(request)
+        payload = {
+            "ok": True, "schema_version": HANDOFF_MODE_SCHEMA_VERSION,
+            "action": "set", "goal_id": goal_id, "state_file": str(resolved_state_file),
+            **{key: value for key, value in plan.items() if key.startswith("previous_mode")},
+            "handoff_mode": requested, "changed": False,
+            **({"dry_run": True} if dry_run else {}),
+        }
+        if plan["outcome"] == "no_change":
             return payload
-        capture = begin_todo_runtime_shadow_capture(
-            registry_path=registry_path, runtime_root=runtime_root, goal_id=goal_id,
-            state_path=resolved_state_file, write_class="handoff_mode_set",
-            original_text=original,
-        )
-        lease_lock = task_lease_lock_path(runtime_root=runtime_root, goal_id=goal_id)
-        with exclusive_file_lock(lease_lock, operation="handoff_mode_set"):
-            claimed, leases = _quiescence_offenders(
-                registry_path=registry_path,
-                goal_id=goal_id,
-                state_text=original,
-                runtime_root=runtime_root,
-            )
-            requested_core_mode = HandoffMode(requested)
-            if previous in HANDOFF_MODE_VALUES:
-                previous_core_mode = HandoffMode(previous)
-            else:
-                # Invalid persisted front-matter can be repaired, but it is
-                # never an idempotent transition.  Pick any distinct typed
-                # source mode; quiescence is independent of the source mode.
-                previous_core_mode = next(
-                    candidate
-                    for candidate in HandoffMode
-                    if candidate is not requested_core_mode
-                )
-            transition = decide(
-                CoordinationSnapshot(
-                    handoff_mode=previous_core_mode,
-                    active_claimed_todo_ids=_authority_offender_tokens(
-                        claimed,
-                        kind="claimed",
-                    ),
-                    active_lease_todo_ids=_authority_offender_tokens(
-                        leases,
-                        kind="lease",
-                    ),
-                ),
-                HandoffModeTransitionCommand(requested_mode=requested_core_mode),
-            )
-            if transition.code == "handoff_mode_not_quiescent":
-                raise HandoffModeError(
-                    "handoff_mode can only change while the goal is quiescent: "
-                    f"{len(claimed)} claimed open todo(s), "
-                    f"{len(leases)} time-active lease(s)",
-                    code="handoff_mode_not_quiescent",
-                    payload={
-                        "goal_id": goal_id,
-                        "requested_mode": requested,
-                        **previous_mode_fields,
-                        "claimed_todos": claimed,
-                        "active_leases": leases,
-                    },
-                )
-            if transition.outcome is not DecisionOutcome.APPLY:
-                raise HandoffModeError(
-                    f"handoff_mode transition rejected by authority core: "
-                    f"{transition.code}",
-                    code=transition.code,
-                    payload={
-                        "goal_id": goal_id,
-                        "requested_mode": requested,
-                        **previous_mode_fields,
-                        "claimed_todos": claimed,
-                        "active_leases": leases,
-                    },
-                )
-            lines = original.splitlines()
-            _write_handoff_mode_frontmatter(lines, requested)
-            new_text = "\n".join(lines) + ("\n" if original.endswith("\n") else "")
+        if plan["outcome"] != "snapshot_required":
+            raise HandoffModeError("unexpected handoff planning phase", code="handoff_mode_plan_unavailable")
+        with handoff_mode_source(registry_path=registry_path, goal_id=goal_id,
+            state_path=resolved_state_file, state_text=original, runtime_root=runtime_root) as facts:
+            try:
+                plan = _plan_legacy_mode({**request, **facts})
+            except HandoffModeError as error:
+                error.payload.update(goal_id=goal_id, requested_mode=requested)
+                raise
+            if plan.get("outcome") != "apply" or not isinstance(plan.get("next_frontmatter_text"), str):
+                raise HandoffModeError("incomplete handoff mutation plan", code="handoff_mode_plan_unavailable")
+            if dry_run:
+                return {**payload, "changed": True}
+            capture = begin_todo_runtime_shadow_capture(
+                registry_path=registry_path, runtime_root=runtime_root, goal_id=goal_id,
+                state_path=resolved_state_file, write_class="handoff_mode_set", original_text=original)
             write_captured_todo_state(capture, runtime_root=runtime_root, goal_id=goal_id,
-                state_path=resolved_state_file, text=new_text)
+                state_path=resolved_state_file, text=plan["next_frontmatter_text"] + body)
     payload["changed"] = True
-    from ..coordination.local_authority_shadow_observation import observe_local_authority_commit
-
-    evidence = observe_local_authority_commit(
-        registry_path=registry_path,
-        runtime_root=runtime_root,
-        goal_id=goal_id,
-        observation_trigger=f"handoff_mode_set:{previous}:{requested}",
-    )
-    if evidence is not None:
-        payload["authority_shadow"] = evidence
     return settle_todo_runtime_shadow_capture(
         payload, registry_path=registry_path, runtime_root=runtime_root,
-        goal_id=goal_id, write_class="handoff_mode_set", capture=capture,
-        observe_legacy=False, emit_disabled=False,
+        goal_id=goal_id, capture=capture,
+        emit_disabled=False,
     )

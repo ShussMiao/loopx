@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Callable
 from pathlib import Path
 
+from ..goal_portfolio import build_goal_portfolio, render_goal_portfolio
 from ..global_risks import (
     build_global_risks,
     build_global_risks_error,
@@ -65,6 +66,27 @@ def register_summary_all_command(
     subparsers: argparse._SubParsersAction,
     add_subcommand_format: Callable[[argparse.ArgumentParser], None],
 ) -> None:
+    portfolio = subparsers.add_parser(
+        "goal-portfolio", help="Read scoped Goal evidence with explicit source coverage."
+    )
+    add_subcommand_format(portfolio)
+    portfolio.add_argument("--manager-view", choices=("portfolio", "todos", "deliveries", "agents"), help="Export an audience-safe manager evidence page from this registry.")
+    portfolio.add_argument("--query", default="", help="Search registered Agent identities and responsibilities with --manager-view agents.")
+    portfolio.add_argument("--offset", type=int, default=0)
+    portfolio.add_argument("--days", type=int, default=1)
+    portfolio.add_argument("--include-stopped", action="store_true")
+    portfolio.add_argument(
+        "--goal-id", action="append", dest="portfolio_goal_ids",
+        help="Exact registered Goal to include; repeat to narrow scope.",
+    )
+    portfolio.add_argument(
+        "--limit", type=int, default=8,
+        help="Maximum Goals to read, 1..128; omitted Goals remain in coverage.",
+    )
+    portfolio.add_argument(
+        "--max-age-hours", type=float, default=24,
+        help="Maximum age of a progress source before it is marked stale.",
+    )
     parser = subparsers.add_parser(
         "global-summary",
         help=(
@@ -144,12 +166,39 @@ def handle_summary_all_command(
     print_payload: PrintPayload,
 ) -> int | None:
     if args.command not in {
+        "goal-portfolio",
         "global-summary",
         "global-gates",
         "global-todos",
         "global-risks",
     }:
         return None
+    if args.command == "goal-portfolio":
+        if args.manager_view:
+            from ..capabilities.manager_context.evidence_export import export_page
+            try:
+                payload = export_page(registry_path, runtime_root_arg, args)
+            except (OSError, ValueError, TypeError):
+                payload = {"ok": False, "error": "manager_evidence_unavailable_or_invalid", "rows": []}
+            import json
+            print_payload(payload, output_format(args), lambda p: json.dumps(p, ensure_ascii=False, indent=2))
+            return 0 if payload.get("ok") else 1
+        try:
+            payload = build_goal_portfolio(
+                registry_path=registry_path,
+                runtime_root_override=runtime_root_arg,
+                goal_ids=args.portfolio_goal_ids,
+                limit=args.limit,
+                max_age_hours=args.max_age_hours,
+            )
+        except ValueError:
+            payload = {
+                "ok": False, "error": "Invalid portfolio scope or bounds.",
+                "coverage": {"discovered": None, "verified": 0, "complete": False},
+                "goals": [],
+            }
+        print_payload(payload, output_format(args), render_goal_portfolio)
+        return 0 if payload.get("ok") else 1
     if args.command == "global-risks":
         try:
             payload = build_global_risks(

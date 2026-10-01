@@ -35,6 +35,7 @@ a:focus-visible, summary:focus-visible { outline: 2px solid var(--blue); outline
 .language { min-width: 44px; justify-content: center; }
 .blog-index { max-width: 1000px; min-height: calc(100vh - 200px); margin: 0 auto; padding: 96px 0 64px; }
 .eyebrow { font: 500 12px/20px var(--font-mono); text-transform: uppercase; letter-spacing: .06em; color: var(--body); }
+.keep-together { white-space: nowrap; }
 h1 { font-size: clamp(36px, 4.4vw, 56px); line-height: 1.08; font-weight: 600; letter-spacing: -.045em; text-wrap: balance; }
 .index-heading h1 { margin: 20px 0 24px; }
 .lead { color: var(--body); font-size: 18px; line-height: 1.65; max-width: 760px; }
@@ -165,4 +166,16 @@ caption { text-align: left; font-size: 12px; margin-bottom: 12px; color: var(--b
   .site-header nav { gap: 10px; }
   .github { padding: 12px 10px; font-size: 12px; }
   .index-note { flex-direction: column; gap: 8px; }
+}
+
+/* Approved vector figures: native-size reading on narrow screens. */
+.architecture-viewport { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: #fff; }
+.architecture-viewport a { display: block; }
+.architecture-viewport img { display: block; width: 100%; height: auto; }
+.architecture-viewport:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+.architecture-hint { display: block; margin-top: 6px; }
+/* Keep the foundations diagrams readable in the narrower tablet article column. */
+.kanban-figure a { min-width: 720px; }
+@media (max-width: 600px) {
+  .architecture-viewport a { min-width: 960px; }
 }

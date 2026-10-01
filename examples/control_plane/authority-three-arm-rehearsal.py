@@ -43,8 +43,9 @@ import {join} from 'node:path';
 import {Pool} from 'pg';
 import {FileAuthorityStore} from '__FILE_STORE__';
 import {PostgreSqlAuthorityStore, installPostgreSqlAuthorityStoreSchema} from '__PG_STORE__';
-import {executeCoordinationTodoArchiveCompleted} from '__TERMINAL__';
+import {executeCoordinationTodoArchiveCompleted} from '__ARCHIVE__';
 import {canonicalAuthorityBytes} from '__CODEC__';
+import {evaluateTodoResumeConditions} from '__RESUME__';
 
 let input = '';
 for await (const chunk of process.stdin) input += chunk;
@@ -77,6 +78,11 @@ const archiveFailureCategory = (result) => {
 const semanticTodo = (todo) => {
   const result = {...todo};
   delete result.index;
+  if (result.resume_condition) {
+    result.resume_condition = {...result.resume_condition};
+    // Imported Markdown location is presentation, not completion evidence.
+    delete result.resume_condition.target_source_section;
+  }
   return result;
 };
 const pool = new Pool({connectionString: process.env.LOOPX_TEST_POSTGRES_URL, max: 4});
@@ -111,17 +117,35 @@ try {
       next_projection: request.initial,
     });
     assert.equal(initialized.status, 'applied', `${name} initialization failed`);
-    const archived = await executeCoordinationTodoArchiveCompleted(store, {
+    // Lose the response after the actual backend commit. Recovery must read
+    // the original receipt rather than attempt the archive a second time.
+    let commitCount = 0;
+    const responseLostStore = {
+      storeIdentity: () => store.storeIdentity(),
+      loadAuthority: () => store.loadAuthority(),
+      readReceipt: (id) => store.readReceipt(id),
+      scanCommitted: (cursor, limit) => store.scanCommitted(cursor, limit),
+      commitAuthority: async (request) => {
+        commitCount++;
+        const committed = await store.commitAuthority(request);
+        assert.equal(committed.status, 'applied');
+        return {status: 'ambiguous', reason_code: 'synthetic_response_loss',
+          reason: 'isolated rehearsal discarded the commit response'};
+      },
+    };
+    const archiveRequest = {
       goal_id: request.goal_id,
       role: request.role,
       max_active_done: request.max_active_done,
       operation_id: `${name}-three-arm-archive`,
       dry_run: false,
       now: new Date('2026-01-01T00:00:00Z'),
-    });
+    };
+    const archived = await executeCoordinationTodoArchiveCompleted(responseLostStore, archiveRequest);
+    assert.equal(commitCount, 1);
     assert.equal(
       archived.status,
-      'applied',
+      'recovered',
       `${name} archive failed (${String(archived.reason_code ?? 'unknown')}:` +
         `${archiveFailureCategory(archived)})`,
     );
@@ -129,6 +153,24 @@ try {
     assert.equal(loaded.status, 'loaded', `${name} readback failed`);
     const receipt = await store.readReceipt(`${name}-three-arm-archive`);
     assert.equal(receipt.status, 'found', `${name} receipt missing`);
+    const firstPage = await store.scanCommitted(null, 1);
+    assert.equal(firstPage.status, 'page', `${name} first journal page failed`);
+    assert.equal(firstPage.has_more, true);
+    assert.deepEqual(firstPage.transactions[0].projection, request.initial);
+    const finalPage = await store.scanCommitted(firstPage.next_cursor, 1);
+    assert.equal(finalPage.status, 'page', `${name} final journal page failed`);
+    assert.equal(finalPage.has_more, false);
+    assert.deepEqual(finalPage.transactions[0].projection, loaded.head);
+    assert.equal(finalPage.transactions[0].provider_revision, loaded.provider_revision);
+    assert.deepEqual(finalPage.transactions[0].receipts, receipt.receipts);
+    const end = await store.scanCommitted(finalPage.next_cursor, 1);
+    assert.deepEqual(end, {status: 'page', transactions: [],
+      next_cursor: finalPage.next_cursor, has_more: false});
+    assert.deepEqual(await store.loadAuthority(), loaded, 'journal reads changed authority');
+    const replay = await executeCoordinationTodoArchiveCompleted(store, archiveRequest);
+    assert.equal(replay.status, 'replayed');
+    assert.equal(replay.cursor, archived.cursor);
+    assert.deepEqual(await store.loadAuthority(), loaded);
     results[name] = {archived, head: loaded.head};
   }
 
@@ -143,9 +185,10 @@ try {
     todo.archive_state === 'archive' &&
     initialById.get(todo.todo_id)?.archive_state !== 'archive');
   const movedIds = new Set(moved.map((todo) => todo.todo_id));
-  const legacyIds = new Set(request.legacy.todos.map((todo) => todo.todo_id));
+  const legacyActive = request.legacy.todos.filter(todo => todo.archive_state === 'active');
+  const legacyIds = new Set(legacyActive.map((todo) => todo.todo_id));
   const removedByLegacy = request.initial.todos
-    .filter((todo) => !legacyIds.has(todo.todo_id))
+    .filter((todo) => todo.archive_state === 'active' && !legacyIds.has(todo.todo_id))
     .map((todo) => todo.todo_id)
     .sort();
   assert.equal(
@@ -176,14 +219,23 @@ try {
   // compacts the remaining display indexes. Provider heads retain archived
   // records and stable imported indexes. Compare active domain records without
   // absolute display ordinals, then prove the per-role relative order itself.
-  const activeTodos = results.file.head.todos.filter((todo) =>
-    todo.archive_state === 'active');
+  // Compare current consumer semantics, not stale derived diagnostics stored
+  // before archive. The full post-commit head remains the only fact source.
+  const evaluated = evaluateTodoResumeConditions({
+    schema_version: 'todo_resume_evaluation_request_v0',
+    items: results.file.head.todos, source_items: results.file.head.todos,
+    kinds: ['todo_done', 'monitor_changed'],
+  });
+  const conditions = new Map(evaluated.conditions.map(entry => [entry.todo_id, entry.condition]));
+  const activeTodos = results.file.head.todos.filter(todo => todo.archive_state === 'active')
+    .map(todo => conditions.has(todo.todo_id) ? {...todo,
+      resume_condition: conditions.get(todo.todo_id), resume_ready: conditions.get(todo.todo_id).satisfied === true} : todo);
   const activeIds = new Set(activeTodos.map((todo) => todo.todo_id));
   const activeLeases = results.file.head.leases.filter((lease) =>
     activeIds.has(lease.todo_id));
   assert.equal(
     digest(activeTodos.map(semanticTodo)),
-    digest(request.legacy.todos.map(semanticTodo)),
+    digest(legacyActive.map(semanticTodo)),
     'legacy and provider active Todo semantics differ',
   );
   assert.equal(
@@ -198,7 +250,7 @@ try {
       .map((todo) => todo.todo_id);
     assert.equal(
       digest(order(activeTodos)),
-      digest(order(request.legacy.todos)),
+      digest(order(legacyActive)),
       `${role} relative order differs`,
     );
   }
@@ -215,6 +267,7 @@ try {
     active_lease_count_after: activeLeases.length,
     moved_ids_sha256_prefix: movedDigest.slice(0, 16),
     provider_heads_exact: true,
+    journal_pages_exact: true,
     legacy_active_semantics_exact: true,
     relative_order_exact: true,
     non_target_semantics_unchanged: true,
@@ -259,10 +312,10 @@ def _node_script(repository: Path) -> str:
             ),
         )
         .replace(
-            "__TERMINAL__",
+            "__ARCHIVE__",
             _module_uri(
                 repository,
-                "loopx/control_plane/coordination/todo_terminal_lifecycle.ts",
+                "loopx/control_plane/coordination/todo_archive.ts",
             ),
         )
         .replace(
@@ -272,6 +325,7 @@ def _node_script(repository: Path) -> str:
                 "loopx/control_plane/coordination/authority_store_codec.ts",
             ),
         )
+        .replace("__RESUME__", _module_uri(repository, "loopx/control_plane/todos/resume_condition.ts"))
     )
 
 
@@ -323,6 +377,20 @@ def main() -> int:
     # The live source arm is a point-in-time input. Keep it detached from any
     # compatibility code exercised by the cloned legacy arm below.
     initial = copy.deepcopy(initial)
+    captured_ids = {item["todo_id"] for item in initial["todos"]}
+    missing_history = sum(
+        1 for item in initial["todos"]
+        if isinstance((condition := item.get("resume_condition")), dict)
+        and condition.get("kind") == "todo_done"
+        and condition.get("target_status") == "done"
+        and condition.get("target_archive_state") == "archive"
+        and condition.get("target_todo_id") not in captured_ids
+    )
+    if missing_history:
+        raise SystemExit(
+            f"source projection omits {missing_history} archived resume target records; "
+            "promotion rehearsal held (derived readiness is not canonical evidence)"
+        )
 
     with tempfile.TemporaryDirectory(prefix="loopx-three-arm-legacy-") as temporary:
         root = Path(temporary)

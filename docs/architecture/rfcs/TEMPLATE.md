@@ -1,18 +1,23 @@
 # RFC: <Decision or Capability Name> (v0)
 
-- **RFC status:** Draft | Under review | Accepted | Rejected | Superseded
+- **RFC status:** Accepted
+- **Supersedes / closes:** none | <links to the RFCs this one replaces or closes>
+- **Superseded by:** <link> (only when the status is Superseded)
 - **Delivery maturity:** Proposal | Experiment | Partial | Implemented | Promoted
 - **Authors / owners:** <public identities or roles>
 - **Created:** YYYY-MM-DD
 - **Last normative revision:** YYYY-MM-DD
 - **Implementation baseline:** `<commit>` or not applicable
 - **Related contracts:** <links>
-- **Language mirror:** <link, if maintained>
+- **Language mirror:** [中文版](https://github.com/huangruiteng/loopx/blob/main/docs/architecture/rfcs/<same-basename>.zh-CN.md)
 
 ## Document map and maintenance contract
 
 State which sections are normative, which are current implementation facts,
-and which are historical evidence. Use this default:
+and which are historical evidence. Use this default. Every new RFC must ship an
+English document and a `<same-basename>.zh-CN.md` semantic mirror; a language
+link is required in both documents. Keep the two versions synchronized when
+normative sections change:
 
 - Sections 1-10 are the durable design and acceptance contract.
 - Section 11 is the normative delivery plan.
@@ -20,9 +25,26 @@ and which are historical evidence. Use this default:
 - Appendices contain the non-normative execution ledger, decision log, evidence
   registry, rejected alternatives, and incident lessons.
 
-RFC maturity and delivery maturity are independent. Dated progress entries do
-not amend normative sections. If an appendix becomes hard to review, move it
-without loss into a companion `<rfc-name>-execution.md` and link it here.
+Merge accepts an active RFC as a qualified, claimable design basis. Do not keep
+Draft or Under review as merged lifecycle states. Design acceptance and delivery
+maturity are independent: implementation, live qualification, default changes
+and promotion still require their own evidence and authorization. Historical
+dispositions are Superseded, Retired and Rejected. Dated progress entries do
+not amend normative sections. Dated checkpoints live in
+[`ledger/<rfc-slug>/YYYY-MM-DD-slug.md`](ledger/README.md), never as a
+dated execution entry above the first appendix; the execution-ledger appendix only
+points at that directory. Lifecycle state is read from the header above into
+the generated [`STATUS.md`](STATUS.md): the value must be one of the
+lifecycle states, optionally followed by punctuation and a note, `Supersedes / closes` is mandatory (`none` is an explicit
+answer), and a `Superseded` RFC must link its successor that reciprocally names
+its predecessor. Normative checkpoint persistence/recovery headings and
+historical appendix records are legal.
+
+`Delivery maturity: Proposal` means that implementation has not shipped; it
+does not make an Accepted RFC a draft. In the README's delivery column, name
+the implemented slice and remaining delivery boundary. Keep lifecycle state
+in the canonical header and generated index rather than describing a merged
+active RFC as Draft or Under review in delivery prose.
 
 ---
 
@@ -128,8 +150,8 @@ this section only when the RFC cannot affect a running system, and say why.
 
 ## 11. Normative delivery plan
 
-Use cohesive milestones with explicit entry and exit gates. A milestone may
-ship while the RFC remains Draft.
+Use cohesive milestones with explicit entry and exit gates. An Accepted RFC
+may still have unimplemented or unqualified milestones.
 
 | Milestone | Shipped behavior | Entry gate | Exit evidence | Rollback |
 | --- | --- | --- | --- | --- |
@@ -148,10 +170,11 @@ approval.
 
 ## Appendix A: Execution ledger (non-normative)
 
-Append dated entries; do not rewrite history to resemble the current plan.
-Each entry states the exact implementation baseline and claim boundary.
-
-### YYYY-MM-DD — <milestone or finding>
+Dated entries live in [`ledger/<rfc-slug>/`](ledger/README.md), one file per
+measured slice named `YYYY-MM-DD-slug.md` with a `.zh-CN.md` mirror; this
+appendix only links the directory. Do not rewrite history to resemble the
+current plan. Each entry states the exact implementation baseline and claim
+boundary:
 
 - **Baseline:** `<commit>` / PR
 - **Delivered:** <observable behavior>

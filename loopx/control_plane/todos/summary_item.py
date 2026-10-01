@@ -18,9 +18,11 @@ from .contract import (
 )
 from .handoff_gate import handoff_ready_successor_todo_ids
 from .handoff_note import attach_todo_handoff_note, compact_todo_continuation_hint
-from .projection import todo_item_task_class
+from .todo_semantics import todo_blocker_reason, todo_item_task_class
+from .frontier_revision import FRONTIER_REVISION_FIELDS
 
 TODO_SUMMARY_COMPACT_FIELDS = (
+    "goal_acceptance_guard",
     "schema_version",
     "todo_id",
     "role",
@@ -190,8 +192,9 @@ def compact_todo_summary_item(
         continuation_hint = compact_todo_continuation_hint(item)
         if continuation_hint:
             compact["continuation_hint"] = continuation_hint
-    if compact["task_class"] == "blocker" and str(item.get("reason") or "").strip():
-        compact["reason"] = str(item.get("reason") or "").strip()
+    reason = todo_blocker_reason(item)
+    if reason:
+        compact["reason"] = reason
     attach_todo_handoff_note(compact)
     return compact
 
@@ -273,7 +276,8 @@ def todo_planning_source_items(
             seen.add(todo_id)
             compact = compact_todo_summary_item(item, text=text)
             if include_terminal:
-                for field in ("evidence", "note", "last_actor_agent_id"):
+                # Terminal-inclusive planning also proves exact frontier causality.
+                for field in (*FRONTIER_REVISION_FIELDS, "evidence", "note", "last_actor_agent_id"):
                     if item.get(field) is not None:
                         compact[field] = item[field]
             planning_items.append(compact)

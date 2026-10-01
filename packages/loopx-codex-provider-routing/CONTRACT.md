@@ -14,6 +14,8 @@ Integration candidate: `codex_provider_integration_candidate_v0`
 
 Heartbeat transport qualification: `codex_app_heartbeat_transport_qualification_v0`
 
+Stream recovery qualification: `codex_stream_recovery_qualification_v0`
+
 Desktop patch qualification: `codex_desktop_patch_qualification_v0`
 
 Quota recovery qualification: `codex_quota_recovery_qualification_v0`
@@ -138,3 +140,59 @@ settings revision and a turn receipt that matches it. The content-free runtime
 snapshot must also report each resilient route's entry point, ordered
 candidates, terminal tail and maximum cycle count; catalog compilation alone
 cannot qualify a deployment.
+
+## Stream and session recovery
+
+`qualify_stream_recovery` is an additive, read-only operation in version 0.11.0.
+Existing routing, retry, configuration and qualification defaults do not change.
+No new capability or provider is registered: the optional
+`loopx-codex-provider-routing` extension owns qualification, Codex App owns its
+session and configuration, and CPA owns online request/stream adaptation. The
+managed extension still has no permissions and accepts no raw request/history.
+
+For an observed `sse_idle_timeout`, collect the previous and effective
+`stream_idle_timeout_ms`, the observed silent gap, and the previous and effective
+`stream_max_retries`. The new deadline must be strictly larger than the gap;
+raising retries alone repeats the failing request. A short gap below the old
+idle deadline cannot establish this failure class. Generic transport errors
+must be diagnosed separately rather than relabeled as an idle timeout.
+
+Use provider-specific timing evidence to choose a bounded deadline. The example
+uses 300000 -> 900000 milliseconds and retains five retries; these are fixture
+values, not a changed product default. Read back the effective settings after
+reloading the owning runtime. Prove incremental delivery of a small event
+before upstream EOF and observe an upstream terminal event; adapter-generated
+completion and HTTP 200 alone are insufficient.
+
+Resume the original session in its owning home and perform a bounded text and
+tool round-trip check. Preserve history. Do not copy rollout files or database
+rows to another home, create a replacement session as proof, or delete failing
+history. For orphan host outputs, also run `qualify_host_control_recovery` on
+both historical replay and a newly injected host input. Confirmed unpaired host
+control output preserves its semantic text as user input; unknown, paired or
+empty outputs fail closed. Do not invent call IDs to silence schema errors.
+
+After installing this package and registering the extension as described in
+README, activate qualification per request:
+
+```sh
+loopx extension run loopx-codex-provider-routing \
+  --input-json packages/loopx-codex-provider-routing/examples/stream-recovery.json \
+  --execute --format json
+loopx extension run loopx-codex-provider-routing \
+  --input-json packages/loopx-codex-provider-routing/examples/host-control-recovery.json \
+  --execute --format json
+```
+
+Read `result.qualified` and `result.failure_codes`; outer `ok=true` means the
+request was valid, not that recovery passed. Replace fixture booleans with
+observed evidence. The JSON contract cannot authenticate a caller's claims.
+Qualification grants no credential, account, session-store or remote-write
+permission. There are no new frontend or Lark controls: this is an additional
+operation on the existing extension JSON entrypoint, not a machine setting.
+
+To stop using it, stop submitting this operation; disabling or uninstalling the
+extension follows the existing managed lifecycle. It creates no service or
+configuration to roll back. An operator who separately changes a runtime must
+keep a private settings backup and restore it through that runtime's owner.
+The local incident proxy is not shipped as a second LoopX data plane.

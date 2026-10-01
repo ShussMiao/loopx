@@ -1,10 +1,6 @@
 import type { JsonObject } from "../effect_program.ts";
 import type {
-  AuthorityStore,
   AuthorityStoreCommit,
-  AuthorityStoreCommitResult,
-  AuthorityStoreReadFailure,
-  AuthorityStoreReceiptResult,
 } from "./authority_store.ts";
 import {
   AuthorityStoreProtocolError,
@@ -15,19 +11,45 @@ import {
   requireAuthorityStoreId,
 } from "./authority_store_codec.ts";
 import {
-  canonicalCoordinationTodoRecord,
-  canonicalTodoDomainRecord,
   TODO_DOMAIN_READ_RECORD_SCHEMA,
   TODO_DOMAIN_RECORD_CONTRACT,
   TODO_CANONICAL_READ_RECORD_FIELDS,
   TODO_CANONICAL_READ_RECORD_SCHEMA,
 } from "./coordination_state_contract.ts";
+import {canonicalTodoRecord} from "./todo_presentation.ts";
 
 export const COORDINATION_PROJECTION_MUTATION_EVENT_SCHEMA =
   "loopx_coordination_projection_mutation_event_v0";
 export const COORDINATION_PROJECTION_MUTATION_RECEIPT_SCHEMA =
   "loopx_coordination_projection_mutation_receipt_v0";
 export { TODO_CANONICAL_READ_RECORD_FIELDS, TODO_CANONICAL_READ_RECORD_SCHEMA };
+
+/**
+ * Build the revision-bound Todo read model carried by a canonical projection.
+ *
+ * The read model is projection metadata, not another source of Todo meaning.
+ * Keeping its construction beside validation prevents shadow capture, native
+ * transactions, and conformance fixtures from drifting on schema fields or
+ * digest inputs.  Callers still choose the legacy/native schema explicitly;
+ * this helper never performs a compatibility conversion.
+ */
+export function coordinationTodoReadModel(
+  records: readonly JsonObject[],
+  schemaVersion: unknown,
+): JsonObject {
+  const isNative = schemaVersion === TODO_DOMAIN_READ_RECORD_SCHEMA;
+  if (!isNative && schemaVersion !== TODO_CANONICAL_READ_RECORD_SCHEMA) {
+    throw new AuthorityStoreProtocolError("coordination Todo read-model schema mismatch");
+  }
+  return {
+    schema_version: schemaVersion,
+    todo_count: records.length,
+    records_sha256: canonicalAuthoritySha256(records),
+    contract_fields: [...(isNative
+      ? TODO_DOMAIN_RECORD_CONTRACT.fields
+      : TODO_CANONICAL_READ_RECORD_FIELDS)],
+  };
+}
 
 export interface CoordinationTodoProjectionIndex {
   readonly todos: ReadonlyMap<string, JsonObject>;
@@ -53,21 +75,50 @@ export interface CoordinationProjectionCommitInput {
   readonly mutations: readonly CoordinationProjectionMutation[];
 }
 
-export interface CoordinationProjectionMutationInput {
-  readonly goal_id: string;
-  readonly operation_id: string;
-  readonly expected_provider_revision: string;
-  readonly mutations: readonly CoordinationProjectionMutation[];
+/**
+ * Field groups appended to the v0 Todo manifest by released contract
+ * revisions, oldest first.
+ *
+ * The v0 manifest keeps one schema version while revisions add fields, so the
+ * `contract_fields` a persisted head declares identifies the release that
+ * wrote it. Naming one group per released revision keeps every previously
+ * written head exactly reproducible. Deriving the historical shape from the
+ * current field list instead would silently drop heads written by the release
+ * that is current today, which is the upgrade path this validation exists to
+ * protect.
+ */
+const TODO_CONTRACT_REVISION_FIELDS: readonly (readonly string[])[] = [
+  ["completion_validation_revision", "completion_validation_revision_history"],
+  ["completion_result"],
+];
+
+interface HistoricalTodoContract {
+  /** The exact field list a head written before the later revisions declares. */
+  readonly fields: readonly string[];
+  /** Fields that release had not added yet, so its records must not carry them. */
+  readonly absentFields: ReadonlySet<string>;
 }
 
-export type CoordinationProjectionMutationResult =
-  | {
-    readonly status: "applied" | "replayed" | "recovered";
-    readonly provider_revision: string;
-    readonly cursor: string;
+/**
+ * Enumerate the released pre-extension shapes of one Todo manifest, newest
+ * first. This is not a general subset rule: a declaration must equal one
+ * released field list exactly, so partial revision groups, reordered,
+ * duplicated and unknown fields all fail.
+ */
+function historicalTodoContracts(
+  fields: readonly string[],
+): readonly HistoricalTodoContract[] {
+  const contracts: HistoricalTodoContract[] = [];
+  const absentFields = new Set<string>();
+  for (let index = TODO_CONTRACT_REVISION_FIELDS.length - 1; index >= 0; index -= 1) {
+    for (const field of TODO_CONTRACT_REVISION_FIELDS[index]!) absentFields.add(field);
+    contracts.push({
+      fields: fields.filter((field) => !absentFields.has(field)),
+      absentFields: new Set(absentFields),
+    });
   }
-  | Extract<AuthorityStoreCommitResult, { status: "conflict" | "ambiguous" }>
-  | AuthorityStoreReadFailure;
+  return contracts;
+}
 
 function sortedIds(values: Iterable<string>): string[] {
   return [...values].sort(authorityUnicodeCompare);
@@ -128,10 +179,19 @@ export function validateCoordinationTodoReadModel(
   value: JsonObject,
   expectedGoalId: string,
 ): JsonObject {
-  const index = indexCoordinationProjectionTodos(value, expectedGoalId);
+  return validateIndexedTodoReadModel(value, indexCoordinationProjectionTodos(value, expectedGoalId));
+}
+
+function validateIndexedTodoReadModel(
+  value: JsonObject,
+  index: CoordinationTodoProjectionIndex,
+): JsonObject {
   const records = index.todo_ids.map((todoId) => index.todos.get(todoId)!);
-  if (!Array.isArray(value.todos) ||
-      !canonicalAuthorityBytes(value.todos).equals(canonicalAuthorityBytes(records))) {
+  // Identity indexing already validates/copies every record and rejects duplicate
+  // IDs. The insertion order of those same records proves order; serializing
+  // both full arrays again adds no content validation. The digest below still
+  // covers every field, including nested metadata.
+  if ([...index.todos.keys()].some((todoId, position) => todoId !== index.todo_ids[position])) {
     throw new AuthorityStoreProtocolError(
       "coordination Todo read records must use deterministic todo_id order",
     );
@@ -150,25 +210,24 @@ export function validateCoordinationTodoReadModel(
   if (readModel.records_sha256 !== canonicalAuthoritySha256(records)) {
     throw new AuthorityStoreProtocolError("coordination Todo read-model digest mismatch");
   }
-  if (!canonicalAuthorityBytes(readModel.contract_fields).equals(
-    canonicalAuthorityBytes(domain ? TODO_DOMAIN_RECORD_CONTRACT.fields : TODO_CANONICAL_READ_RECORD_FIELDS)
-  )) {
+  const fields = domain ? TODO_DOMAIN_RECORD_CONTRACT.fields : TODO_CANONICAL_READ_RECORD_FIELDS;
+  // Contract revisions extended the v0 manifest without changing its schema.
+  // Retain every released pre-extension shape for persisted heads.
+  const declaredFields = canonicalAuthorityBytes(readModel.contract_fields);
+  const currentContract = declaredFields.equals(canonicalAuthorityBytes(fields));
+  const historicalContract = currentContract ? undefined : historicalTodoContracts(fields)
+    .find((contract) => declaredFields.equals(canonicalAuthorityBytes(contract.fields)));
+  if (!currentContract && historicalContract === undefined) {
     throw new AuthorityStoreProtocolError("coordination Todo read-model field contract mismatch");
   }
-  const validateRecord = domain ? canonicalTodoDomainRecord : canonicalCoordinationTodoRecord;
+  if (historicalContract !== undefined &&
+      records.some((record) => [...historicalContract.absentFields].some((field) => field in record))) {
+    throw new AuthorityStoreProtocolError("coordination Todo record exceeds its historical field contract");
+  }
   for (const [recordIndex, record] of records.entries()) {
-    validateRecord(record, `coordination Todo read record ${recordIndex}`);
+    canonicalTodoRecord(record, `coordination Todo read record ${recordIndex}`);
   }
   return readModel;
-}
-
-function todoReadModel(records: readonly JsonObject[], previous: JsonObject): JsonObject {
-  return {
-    schema_version: previous.schema_version,
-    contract_fields: previous.contract_fields,
-    todo_count: records.length,
-    records_sha256: canonicalAuthoritySha256(records),
-  };
 }
 
 function requireCompleteTodoReplacement(
@@ -251,7 +310,13 @@ export function indexCoordinationProjection(
   value: JsonObject,
   expectedGoalId: string,
 ): CoordinationProjectionIndex {
-  const todoIndex = indexCoordinationProjectionTodos(value, expectedGoalId);
+  return indexCoordinationLeases(value, indexCoordinationProjectionTodos(value, expectedGoalId));
+}
+
+function indexCoordinationLeases(
+  value: JsonObject,
+  todoIndex: CoordinationTodoProjectionIndex,
+): CoordinationProjectionIndex {
   const leases = indexRecords(value.leases, "leases");
   for (const todoId of leases.keys()) {
     if (!todoIndex.todos.has(todoId)) {
@@ -265,6 +330,37 @@ export function indexCoordinationProjection(
     leases,
     lease_todo_ids: sortedIds(leases.keys()),
   };
+}
+
+/**
+ * One synchronous consumer's read of an already-loaded projection. Reuse its
+ * validated Todo identities across read-model and lease checks; never retain
+ * this object across provider reads, mutations or asynchronous work. Getters
+ * let each consumer preserve its existing validation order and lease scope.
+ * This owns no provider revision cache and grants no write or lease authority.
+ */
+export class CoordinationProjectionRead {
+  private todos: CoordinationTodoProjectionIndex | undefined;
+  private coordination: CoordinationProjectionIndex | undefined;
+  private readonly head: JsonObject;
+  private readonly goalId: string;
+
+  constructor(head: JsonObject, goalId: string) {
+    this.head = head;
+    this.goalId = goalId;
+  }
+
+  get todoIndex(): CoordinationTodoProjectionIndex {
+    return this.todos ??= indexCoordinationProjectionTodos(this.head, this.goalId);
+  }
+
+  get coordinationIndex(): CoordinationProjectionIndex {
+    return this.coordination ??= indexCoordinationLeases(this.head, this.todoIndex);
+  }
+
+  validateTodoReadModel(): JsonObject {
+    return validateIndexedTodoReadModel(this.head, this.todoIndex);
+  }
 }
 
 /**
@@ -323,7 +419,7 @@ export function reduceCoordinationProjection(
     leases: sortedIds(leases.keys()).map((todoId) => leases.get(todoId)!),
     ...(readModel === undefined
       ? {}
-      : { todo_read_model: todoReadModel(nextTodos, readModel) }),
+      : { todo_read_model: coordinationTodoReadModel(nextTodos, readModel.schema_version) }),
   }, "coordination projection");
   if (value.todo_read_model !== undefined) {
     validateCoordinationTodoReadModel(reduced, expectedGoalId);
@@ -393,142 +489,5 @@ export function prepareCoordinationProjectionCommit(
       schema_version: COORDINATION_PROJECTION_MUTATION_RECEIPT_SCHEMA,
       ...common,
     }],
-  };
-}
-
-function expectedMutationReceiptIdentity(
-  input: CoordinationProjectionMutationInput,
-): JsonObject {
-  return canonicalAuthorityObject({
-    schema_version: COORDINATION_PROJECTION_MUTATION_RECEIPT_SCHEMA,
-    operation_id: requireAuthorityStoreId(input.operation_id, "operation id"),
-    goal_id: requireAuthorityStoreId(input.goal_id, "goal id"),
-    mutation_sha256: canonicalAuthoritySha256(input.mutations),
-  }, "coordination mutation receipt identity");
-}
-
-function receiptProvesMutation(
-  result: AuthorityStoreReceiptResult,
-  expected: JsonObject,
-): result is Extract<AuthorityStoreReceiptResult, { status: "found" }> {
-  if (result.status !== "found" || result.receipts.length !== 1) return false;
-  const receipt = result.receipts[0]!;
-  return receipt.schema_version === expected.schema_version &&
-    receipt.operation_id === expected.operation_id &&
-    receipt.goal_id === expected.goal_id &&
-    receipt.mutation_sha256 === expected.mutation_sha256;
-}
-
-function receiptIdentityMismatch(
-  result: AuthorityStoreReceiptResult,
-  expected: JsonObject,
-): CoordinationProjectionMutationResult | null {
-  if (result.status !== "found" || receiptProvesMutation(result, expected)) return null;
-  return {
-    status: "failed",
-    reason_code: "coordination_operation_identity_mismatch",
-    reason: "operation id already names a different coordination mutation",
-  };
-}
-
-/**
- * Execute one provider-first coordination mutation against the exact loaded
- * head. The caller supplies no projection, which prevents a legacy snapshot
- * from being smuggled back into the canonical write path after promotion.
- */
-export async function commitCoordinationProjectionMutation(
-  store: AuthorityStore,
-  input: CoordinationProjectionMutationInput,
-): Promise<CoordinationProjectionMutationResult> {
-  let expectedReceipt: JsonObject;
-  try {
-    expectedReceipt = expectedMutationReceiptIdentity(input);
-  } catch (error) {
-    return {
-      status: "failed",
-      reason_code: "invalid_coordination_mutation",
-      reason: error instanceof Error ? error.message : "invalid coordination mutation",
-    };
-  }
-
-  const existing = await store.readReceipt(input.operation_id);
-  if (existing.status === "found") {
-    return receiptProvesMutation(existing, expectedReceipt)
-      ? {
-        status: "replayed",
-        provider_revision: existing.provider_revision,
-        cursor: existing.cursor,
-      }
-      : {
-        status: "failed",
-        reason_code: "coordination_operation_identity_mismatch",
-        reason: "operation id already names a different coordination mutation",
-      };
-  }
-  if (existing.status !== "missing") return existing;
-
-  const head = await store.loadAuthority();
-  if (head.status === "missing") {
-    return {
-      status: "failed",
-      reason_code: "coordination_authority_missing",
-      reason: "canonical coordination authority must be initialized before mutation",
-    };
-  }
-  if (head.status !== "loaded") return head;
-
-  let commit: AuthorityStoreCommit;
-  try {
-    commit = prepareCoordinationProjectionCommit({
-      ...input,
-      projection: head.head,
-    });
-  } catch (error) {
-    return {
-      status: "failed",
-      reason_code: "invalid_coordination_mutation",
-      reason: error instanceof Error ? error.message : "invalid coordination mutation",
-    };
-  }
-  const committed = await store.commitAuthority(commit);
-  if (committed.status === "conflict" || committed.status === "ambiguous") {
-    const readback = await store.readReceipt(input.operation_id);
-    if (receiptProvesMutation(readback, expectedReceipt)) {
-      return {
-        status: "recovered",
-        provider_revision: readback.provider_revision,
-        cursor: readback.cursor,
-      };
-    }
-    const mismatch = receiptIdentityMismatch(readback, expectedReceipt);
-    if (mismatch !== null) return mismatch;
-    return committed;
-  }
-  if (committed.status === "failed") {
-    const readback = await store.readReceipt(input.operation_id);
-    if (receiptProvesMutation(readback, expectedReceipt)) {
-      return {
-        status: "recovered",
-        provider_revision: readback.provider_revision,
-        cursor: readback.cursor,
-      };
-    }
-    const mismatch = receiptIdentityMismatch(readback, expectedReceipt);
-    if (mismatch !== null) return mismatch;
-    return committed;
-  }
-
-  const readback = await store.readReceipt(input.operation_id);
-  if (!receiptProvesMutation(readback, expectedReceipt)) {
-    return {
-      status: "failed",
-      reason_code: "coordination_commit_readback_mismatch",
-      reason: "applied coordination mutation lacks its exact durable receipt",
-    };
-  }
-  return {
-    status: "applied",
-    provider_revision: readback.provider_revision,
-    cursor: readback.cursor,
   };
 }

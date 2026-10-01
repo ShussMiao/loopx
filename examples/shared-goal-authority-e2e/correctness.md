@@ -143,14 +143,14 @@ Appendix C). `effect_id` follows each verb's existing rule: acquire reports
 settlement identity when the request carries `owner` and `idempotency_key`
 and `null` otherwise.
 
-Previews: `archive-completed` without `--execute` and `capture-followups
---dry-run` write nothing. After promotion, public terminal/archive commands
+Previews: `archive-completed` without `--execute` and `todo add --dry-run`
+write nothing. After promotion, public terminal/archive commands
 route to canonical authority instead of treating the promotion fence as an
 error. A hard-lease terminal preview therefore rejects with
 `handoff_mode_requires_lease` when its target has no lease, succeeds for a
 matching lease, and may preview the declared user-gate auto-acquire path; all
 three leave the primary record and receipts unchanged. Legacy-only writers
-such as `todo update` and `capture-followups --execute` remain fenced. A fenced
+such as `todo add` and `todo update` remain fenced. A fenced
 committed releasing `fence_close` releases the caller's claimed mutation lock
 in `finally` while the lease stays `active` and its `held` receipt is
 untouched; the caller's fence token is spent, a retry reports
@@ -169,13 +169,29 @@ completion-policy admission on an otherwise unchanged legacy terminal call.
 
 The complete observable behaviour is pinned row by row in
 `tests/fixtures/control_plane/legacy_writer_fence_caller_parity_v0.json`
-(21 TypeScript entry rows, 26 real-process CLI rows; whole-object legacy
+(21 TypeScript entry rows, 21 real-process CLI rows; whole-object legacy
 envelopes, stable-field subsets for provider-first rows, exact exit status,
 exclusion-free effect snapshots, and declared after-state) and
 enforced by `tests/control_plane_ts/legacy_writer_fence_caller_parity.test.ts`
 and `tests/control_plane/test_shadow_fence_caller_parity_e2e.py`; the
 `baseline` entries of that fixture document earlier revisions and are never
 executed.
+
+Promoted CLI acquire, renew, transfer and release rows assert provider commits and
+independent lease readback; fresh acquisition C is separate from keyless A and
+existing-lease B so one newly working caller does not invalidate another row's intended negative precondition. Acquisition replay verifies current proof.
+The direct legacy-wire rows remain fenced. The CLI
+scenario carries the validated current owner/key/version after renewal or
+transfer, rejects the superseded completion proof, and previews with the current
+proof before release. Release follows the active-lease/quiescence checks and
+must leave completion unauthorized. Capture-enabled rows still create no second
+legacy record or shadow outbox entry. When migrating an entry point, update this
+caller matrix and its downstream proof flow together; focused transaction tests
+or generic premerge canaries do not replace it. Run the owning matrix directly:
+
+```bash
+uv run --extra test python -m pytest -q tests/control_plane/test_shadow_fence_caller_parity_e2e.py
+```
 
 Baseline delta (0fb497af8 is the PR's diff baseline; ee1b17217 the previously
 reviewed head):
@@ -299,7 +315,7 @@ Python/TS/JSON provenance, and reads back through an independent native process.
 
 | Obligation | Retained oracle |
 | --- | --- |
-| Full baseline, mixed Python/native writers, handoff, followups, monitor successor, one receipt per mutation | `test_runtime_shadow_bounded_e2e.py`, `test_shadow_drain_e2e.py` |
+| Full baseline, mixed Python/native writers, handoff, todo add, monitor successor, one receipt per mutation | `test_runtime_shadow_bounded_e2e.py`, `test_shadow_drain_e2e.py` |
 | Cursor attacks, complete proof before bounded cleanup, missing cursor writer-first, dual drainers | `test_shadow_cursor_safety.py`, `test_shadow_drain_adversarial.py`, `shadow_cursor_safety.test.ts` |
 | Todo/lease abandoned prefixes, later mutations, all cursor consumers and forged applied digests | `test_shadow_cursor_recovery_e2e.py` |
 | Full caller diagnostics, argument readback and no-effect controls with absent/disabled/enabled capture | `test_shadow_observable_e2e.py` |
@@ -308,12 +324,16 @@ Python/TS/JSON provenance, and reads back through an independent native process.
 | Fence and maintenance boundaries, source and Goal override races, whole-file durability, paragraph injection, refresh CAS | `test_shadow_writer_boundaries.py`, `test_shadow_writer_variant_e2e.py`, `shadow_native_writer_boundary.test.ts`, `test_shadow_drain_adversarial.py` |
 | Canonical native/v0 Todo updates through CLI and native RPC, real pending management, M ordering, and unchanged authority on hold | `test_shadow_native_todo_update_e2e.py` |
 | History flaws despite equal snapshots, legacy mixed profile, source drift, event-only hold, qualified reads | `coordination_runtime_shadow.test.ts`, `file_outbox_qualification.test.ts`, `test_runtime_shadow_bounded_e2e.py` |
+| Ladder parity half through the public CLI and management interfaces: deferred entries, bounded and idempotent drain, primary and drain SIGKILL windows, rollback with pending entries, sustained mixed-writer parity, drift, the event-only hold, migration refusal and rebootstrap, growth measurement | `test_shared_goal_authority_e2e.py` (`s2c2.*` rows), `ladder.py --stage 2c2` |
 | Installed lifecycle and resource provenance in wheel and sdist | `installed.py` |
 | Missing checks, lock placement, duplicate mirror, early marker, cursor regression | `mutants.py` with unchanged GREEN controls and assertion RED results |
 
 The mandatory repair set must have zero failures, skips, pending, or unverified
-cases. Broader ladder rows retain their declared pending/environment gates;
-these tests grant neither production promotion nor a completed Stage 2C claim.
+cases. Broader ladder rows retain their declared pending/environment gates:
+`s2c2.archive_after_leased_completion_parity` is now an executable
+deterministic row rather than a declaration, and `s2c2.sustained_parity_soak`
+stays pending until the Section 7.2 soak exists; these tests grant neither
+production promotion nor a completed Stage 2C claim.
 
 For a caller comparison, run both `test_shadow_observable*_e2e.py` files with
 `LOOPX_SHADOW_COMPARISON_SOURCE` set to an immutable baseline checkout, then to

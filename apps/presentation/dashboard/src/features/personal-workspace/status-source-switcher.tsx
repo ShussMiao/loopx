@@ -10,13 +10,16 @@ import {
 import { useWorkspaceI18n } from "./i18n";
 import { WorkspaceSelect } from "./workspace-select";
 
-export type StatusSourceConnectionState = "connected" | "error" | "loading";
+// "degraded": the status source answers but the Chat execution service does
+// not, so state stays readable while Agent runs cannot be listed or started.
+export type StatusSourceConnectionState = "connected" | "degraded" | "error" | "loading";
 
 export type StatusSourceControl = {
   activeSource: StatusSource;
   connectionState: StatusSourceConnectionState;
   errorMessage?: string | null;
-  onAdd: (input: { ensureTunnel?: boolean; label: string; statusUrl: string }) => { error?: string };
+  onAdd: (input: { ensureTunnel?: boolean; hostAlias?: string; label: string; statusUrl: string }) => { error?: string };
+  onConfiguredHostsLoaded?: (hostAliases: string[]) => void;
   onRemove: (sourceId: string) => void;
   onSelect: (sourceId: string) => void;
   sources: StatusSource[];
@@ -27,6 +30,7 @@ export function StatusSourceSwitcher({
   connectionState,
   errorMessage,
   onAdd,
+  onConfiguredHostsLoaded,
   onRemove,
   onSelect,
   sources,
@@ -71,6 +75,7 @@ export function StatusSourceSwitcher({
     try {
       const catalog = await fetchConfiguredSshHosts();
       setConfiguredHosts(catalog.hosts);
+      onConfiguredHostsLoaded?.(catalog.hosts.map((host) => host.alias));
       setHostAlias((current) => current || catalog.hosts[0]?.alias || "");
       if (!catalog.hosts.length) setConfiguredHostsError(t("source.hostEmpty"));
     } catch (caught) {
@@ -113,7 +118,7 @@ export function StatusSourceSwitcher({
       setError(configuredDraft.error ?? t("source.invalid"));
       return;
     }
-    const result = onAdd({ ensureTunnel: true, label: configuredDraft.label, statusUrl: configuredDraft.statusUrl });
+    const result = onAdd({ ensureTunnel: true, hostAlias: configuredDraft.hostAlias, label: configuredDraft.label, statusUrl: configuredDraft.statusUrl });
     if (result.error) {
       setError(result.error);
       return;
@@ -142,7 +147,7 @@ export function StatusSourceSwitcher({
       setError(draft.error ?? t("source.invalid"));
       return;
     }
-    const result = onAdd({ ensureTunnel: true, label: draft.label, statusUrl: draft.statusUrl });
+    const result = onAdd({ ensureTunnel: true, hostAlias: draft.hostAlias, label: draft.label, statusUrl: draft.statusUrl });
     if (result.error) setError(result.error);
     else setError(null);
     setLocalPort(freePort);
@@ -183,7 +188,7 @@ export function StatusSourceSwitcher({
         value={activeSource.id}
       />
       <div className="personal-status-source-meta">
-        <span className={`is-${connectionState}`}><i />{connectionState === "loading" ? t("source.connecting") : connectionState === "error" ? t("source.notAvailable") : t("source.connected")}</span>
+        <span className={`is-${connectionState}`}><i />{connectionState === "loading" ? t("source.connecting") : connectionState === "error" ? t("source.notAvailable") : connectionState === "degraded" ? t("source.executionUnavailable") : t("source.connected")}</span>
         <small>{activeSource.readOnly ? t("source.readOnly") : t("source.localInteractive")}</small>
         {activeSource.kind === "ssh_tunnel" ? (
           <button aria-label={t("source.remove", { source: activeSource.label })} onClick={() => onRemove(activeSource.id)} title={t("source.removeCurrent")} type="button"><Trash2 size={12} /></button>

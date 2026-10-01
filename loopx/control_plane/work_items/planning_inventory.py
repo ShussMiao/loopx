@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from ..agents.agent_scope import _selected_candidate_priority_frontier
 from ..todos.contract import (
     TODO_TASK_CLASS_ADVANCEMENT,
     TODO_TASK_CLASS_MONITOR,
     normalize_todo_claimed_by,
     normalize_todo_id,
 )
-from ..todos.projection import (
+from ..todos.todo_semantics import (
     todo_item_is_actionable_open,
     todo_item_task_class,
 )
@@ -49,6 +50,7 @@ def quota_runnable_action_candidates(
 
     if not isinstance(agent_todo_summary, Mapping):
         return []
+    summary = dict(agent_todo_summary)
     capability_candidates = (
         capability_gate.get("runnable_candidates")
         if isinstance(capability_gate, Mapping)
@@ -80,6 +82,14 @@ def quota_runnable_action_candidates(
                 or todo_item_task_class(candidate) != TODO_TASK_CLASS_ADVANCEMENT
                 or (claimed_by is not None and claimed_by != agent_id)
             ):
+                continue
+            if _selected_candidate_priority_frontier(
+                agent_id=agent_id,
+                summary=summary,
+                selected=candidate,
+            ):
+                # The ready higher-priority successor owns this turn's lifecycle
+                # decision; it cannot be advertised as a runnable alternative.
                 continue
             compact = compact_planning_candidate(candidate)
             if compact is None:

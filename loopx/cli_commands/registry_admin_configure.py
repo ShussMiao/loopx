@@ -41,7 +41,16 @@ def register_configure_goal_command(subparsers: argparse._SubParsersAction) -> N
         help=(
             "Require goal review after this many same-agent advancement Todo completions "
             "without a covering outcome checkpoint. Default 5; use 2 or 3 for earlier "
-            "review, or 5 to restore the default. Applies to standard and fine modes."
+            "review. This writes a Goal override; use the clear flag to inherit the "
+            "machine default. Applies to standard and fine modes."
+        ),
+    )
+    configure_goal_parser.add_argument(
+        "--clear-execution-replan-after-todos",
+        action="store_true",
+        help=(
+            "Remove the Goal review-cadence override and restore live machine-default "
+            "inheritance."
         ),
     )
     configure_goal_parser.add_argument(
@@ -70,6 +79,8 @@ def register_configure_goal_command(subparsers: argparse._SubParsersAction) -> N
         default=None,
         help="Enable or disable waiting-projection repair for this goal.",
     )
+    configure_goal_parser.add_argument("--pr-review-wait-for-ci", action=argparse.BooleanOptionalAction, default=None, help="Whether this Goal waits for CI during PR review; omitted inherits the machine default (true).")
+    configure_goal_parser.add_argument("--clear-pr-review-configuration", action="store_true", help="Remove Goal PR review overrides and restore machine defaults.")
     configure_goal_parser.add_argument(
         "--change-quality-enabled",
         action=argparse.BooleanOptionalAction,
@@ -87,6 +98,46 @@ def register_configure_goal_command(subparsers: argparse._SubParsersAction) -> N
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Require a valid exact-scope quality receipt at premerge.",
+    )
+    configure_goal_parser.add_argument(
+        "--clear-change-quality-configuration",
+        action="store_true",
+        help=(
+            "Remove the complete Goal change-quality override and restore live "
+            "machine-default inheritance."
+        ),
+    )
+    configure_goal_parser.add_argument(
+        "--progress-review-mode",
+        choices=["off", "shadow", "assist"],
+        help=(
+            "Optional scoped progress-review sentinel: shadow records typed drift "
+            "receipts; assist lets consecutive drift receipts raise the existing "
+            "autonomous replan obligation. Grants no pause or gate authority."
+        ),
+    )
+    configure_goal_parser.add_argument(
+        "--progress-review-signal",
+        choices=["noul", "choice"],
+        help="Which receipt judgment pair counts as drift for this goal.",
+    )
+    configure_goal_parser.add_argument(
+        "--progress-review-drift-threshold",
+        type=int,
+        help="Consecutive completed drift receipts required before an obligation (2-20).",
+    )
+    configure_goal_parser.add_argument(
+        "--progress-review-contract-revision",
+        help=(
+            "sha256 of the observer basis that receipts must be bound to, as printed "
+            "by `loopx-jev drift init`; assist raises nothing without it. Pass an "
+            "empty string to remove the pin."
+        ),
+    )
+    configure_goal_parser.add_argument(
+        "--clear-progress-review-configuration",
+        action="store_true",
+        help="Remove the Goal progress-review policy and return to the default off.",
     )
     configure_goal_parser.add_argument(
         "--multi-subagent-feature",
@@ -109,6 +160,39 @@ def register_configure_goal_command(subparsers: argparse._SubParsersAction) -> N
     )
     configure_goal_parser.add_argument(
         "--max-children", type=int, help="Maximum child agents for orchestration."
+    )
+    configure_goal_parser.add_argument(
+        "--align-codex-subagent-capacity",
+        action="store_true",
+        help=(
+            "Preview or apply the Codex host child-thread limit needed by this Goal. "
+            "Apply is explicit, raises only, preserves higher limits, and affects new sessions."
+        ),
+    )
+    configure_goal_parser.add_argument(
+        "--subagent-model",
+        help="Persist a child model preference; does not enable spawning or change the parent model.",
+    )
+    configure_goal_parser.add_argument(
+        "--subagent-reasoning-effort",
+        help="Persist child reasoning effort; requires a configured child model. An empty string clears only effort.",
+    )
+    configure_goal_parser.add_argument(
+        "--clear-subagent-model-config",
+        action="store_true",
+        help="Remove child model and effort preferences together.",
+    )
+    configure_goal_parser.add_argument(
+        "--subagent-execution-config",
+        help=(
+            "Repo-relative operator binding file under .loopx/config/ used by "
+            "the existing local delegation entrypoint."
+        ),
+    )
+    configure_goal_parser.add_argument(
+        "--clear-subagent-execution-config",
+        action="store_true",
+        help="Remove the Goal's local delegation binding pointer.",
     )
     configure_goal_parser.add_argument(
         "--allowed-domain",
@@ -265,8 +349,8 @@ def register_configure_goal_command(subparsers: argparse._SubParsersAction) -> N
         "--local-authority-shadow-file",
         action="store_true",
         help=(
-            "Enable default-off, one-way capture of post-commit local snapshots "
-            "in FileAuthorityStore. This does not compare source and candidate."
+            "Retired; rejected without writing. Use --coordination-runtime-shadow-file "
+            "and explicit coordination-shadow bootstrap for transaction-bound capture."
         ),
     )
     configure_goal_parser.add_argument(
@@ -275,6 +359,22 @@ def register_configure_goal_command(subparsers: argparse._SubParsersAction) -> N
         help=(
             "Disable the local authority shadow. This does not delete retained "
             "candidate observations."
+        ),
+    )
+    configure_goal_parser.add_argument(
+        "--coordination-runtime-shadow-file",
+        action="store_true",
+        help=(
+            "Enable the default-off transaction-bound FileAuthorityStore shadow "
+            "used by coordination-shadow qualification and reviewed promotion."
+        ),
+    )
+    configure_goal_parser.add_argument(
+        "--clear-coordination-runtime-shadow",
+        action="store_true",
+        help=(
+            "Disable transaction-bound coordination shadow capture. Retained "
+            "shadow evidence is not deleted."
         ),
     )
     configure_goal_parser.add_argument(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -29,15 +30,32 @@ def _item(*, areas: dict[str, int]) -> dict[str, object]:
 def test_execution_contract_owns_deep_review_requirements() -> None:
     response = build_agent_response_contract()
 
+    selection = response["selection_execution_contract"]
+    assert selection == {
+        "schema_version": "pr_review_selection_execution_contract_v0",
+        "explicit_selection_scope": "ordering_only",
+        "review_action_authority": "pull_requests[].review_action_kind",
+        "review_sequence_membership": "review_action_kind_non_null_only",
+        "no_action_inventory_location": "pull_requests",
+        "generic_rereview_terms_force_fresh_audit": False,
+        "no_action_behavior": "compact_exact_head_conclusion_readback_only",
+        "no_action_execution_artifacts": "plan_and_template_null_commands_empty",
+        "force_fresh_audit_requires": (
+            "An explicit request to rerun evidence despite the unchanged/no-action "
+            "exact head, or a concrete new concern or evidence invalidation, encoded "
+            "as --fresh-audit-exact-head NUMBER@HEAD_OID."
+        ),
+    }
+
     assert response["required_packet_fields_to_preserve"] == [
         "agent_response_contract",
         "agent_response_contract.review_execution_contract",
         "result_completeness",
         "scheduling_policy",
         "review_groups",
-        "pull_requests[].review_plan",
-        "pull_requests[].review_template",
-        "pull_requests[].evidence_commands",
+        "pull_requests[review_action_kind!=null].review_plan",
+        "pull_requests[review_action_kind!=null].review_template",
+        "pull_requests[review_action_kind!=null].evidence_commands",
     ]
     contract = response["review_execution_contract"]
     assert contract["schema_version"] == "pull_request_review_execution_contract_v2"
@@ -64,6 +82,7 @@ def test_execution_contract_owns_deep_review_requirements() -> None:
         "behavior_change_disclosure",
         "guidance_vs_obligation",
         "durable_smoke_value",
+        "semantic_alignment",
     }
     assert requirements["symbol_map"]["item_count"] == {
         "minimum": 2,
@@ -85,6 +104,15 @@ def test_execution_contract_owns_deep_review_requirements() -> None:
         "silent behavior changes" in requirements["behavior_change_disclosure"]["rule"]
     )
     assert "must_attempt_work" in requirements["guidance_vs_obligation"]["rule"]
+    attribution = requirements["validation_matrix"]["failure_attribution"]
+    assert attribution["non_blocking_dispositions"] == [
+        "pre_existing_unrelated", "external_unrelated",
+    ]
+    assert "same normalized failing identity" in attribution["rule"]
+    assert "merge readiness remains on hold" in attribution["rule"]
+    assert "APPROVE when a required red check" in contract["verdict_policy"][
+        "unrelated_validation_failure"
+    ]
     proportionality = requirements["change_proportionality"]
     assert proportionality["required_when"] == "code_change"
     assert proportionality["verdict_values"] == [
@@ -96,6 +124,22 @@ def test_execution_contract_owns_deep_review_requirements() -> None:
     assert "maintenance_and_migration_cost" in proportionality["fields"]
     assert "green CI" in proportionality["rule"]
     assert "original problem" in proportionality["rule"]
+    semantic = requirements["semantic_alignment"]
+    assert semantic["required_when"] == "semantic_alignment_required"
+    assert set(semantic["candidate_decisions"]) == {
+        "reuse_existing",
+        "extend_vocabulary",
+        "create_vocabulary",
+        "local_only",
+        "external_input",
+        "compatibility_only",
+        "unknown",
+    }
+    assert "unjustified budget increases" in semantic["rule"]
+    assert semantic["fields"] == ["checked_scope", "impact_reason", "verdict"]
+    assert semantic["fields_by_verdict"]["not_applicable"] == []
+    assert "analysis_limit" in semantic["fields_by_verdict"]["advisory"]
+    assert "minimum_repair" in semantic["fields_by_verdict"]["not_yet_proven"]
     isolation = requirements["default_off_isolation"]
     assert isolation["required_when"] == "behavior_bearing_change"
     assert isolation["verdict_values"] == [
@@ -126,11 +170,13 @@ def test_execution_contract_owns_deep_review_requirements() -> None:
     assert contract["completion_gate"]["metadata_only_verdict_allowed"] is False
     assert contract["completion_gate"]["stale_head_verdict_allowed"] is False
     assert contract["completion_gate"]["blocking_evidence_verdicts"] == {
+        "problem_context": ["off_goal", "fragmented", "not_yet_proven"],
         "repository_reuse": ["unjustified_duplication", "not_yet_proven"],
         "observable_semantics": ["unintended_drift", "not_yet_proven"],
         "change_proportionality": ["disproportionate", "not_yet_proven"],
         "default_off_isolation": ["not_isolated", "not_yet_proven"],
         "authority_semantics": ["misleading", "not_yet_proven"],
+        "semantic_alignment": ["not_yet_proven", "violated"],
     }
     assert contract["finding_contract"]["findings_first"] is True
     verdict = contract["verdict_policy"]
@@ -312,6 +358,37 @@ def test_non_behavior_review_keeps_existing_coverage_policy(area: str) -> None:
     assert "repository_reuse" not in plan["required_evidence_ids"]
 
 
+def test_code_review_requires_only_semantic_triage_before_contract_impact_is_known() -> None:
+    plan = build_review_plan(_item(areas={"product_runtime": 1}))
+
+    assert plan["applicability"]["semantic_alignment_required"] is True
+    assert "semantic_alignment" in plan["required_evidence_ids"]
+    assert "semantic_alignment_context" not in plan["applicability"]
+
+
+@pytest.mark.parametrize("repo", ["huangruiteng/loopx", "example/service"])
+def test_semantic_triage_does_not_inject_repository_facts_or_infer_from_preview(repo: str) -> None:
+    item = _item(areas={"product_runtime": 1})
+    item["repository"] = repo
+    item["key_files"] = [{"path": f"src/file_{i}.py"} for i in range(10)]
+    plan = build_review_plan(item)
+    item["key_files"].append({"path": "loopx/semantics/vocabulary_v0.json"})
+    assert build_review_plan(item) == plan
+    semantic = next(
+        row for row in build_agent_response_contract()["review_execution_contract"]["evidence_requirements"]
+        if row["evidence_id"] == "semantic_alignment"
+    )
+    assert "Sign-off" not in json.dumps(semantic)
+    assert "merge-gate" not in json.dumps(semantic)
+    assert "loopx/semantics" not in json.dumps(semantic)
+
+
+def test_generated_inventory_does_not_create_a_detailed_review_obligation() -> None:
+    item = _item(areas={"public_docs": 1})
+    item["key_files"] = [{"path": "loopx/semantics/inventory_v0.json"}]
+    assert "semantic_alignment" not in build_review_plan(item)["required_evidence_ids"]
+
+
 def test_reuse_evidence_compares_semantics_beyond_the_diff() -> None:
     contract = build_agent_response_contract()["review_execution_contract"]
     reuse = next(
@@ -389,14 +466,32 @@ def test_public_cli_delivers_state_review_without_claiming_it_was_performed(caps
         "introduced_or_newly_enforced_state"
     )
     assert requirements["observable_semantics"]["state_projection_counterfactuals"]["cases"]
+    # The shipped packet must support justified growth as well as compaction;
+    # neither smaller output nor a passing revised ceiling proves correctness.
+    budget_rule = requirements["semantic_alignment"]["rule"]
+    for obligation in (
+        "hard limits from regression budgets and presentation caps",
+        "base/head measurements under the same workload and metric",
+        "consumer value, true redundancy, compatibility cost and headroom",
+        "Evidence-backed budget increases are valid",
+        "deleting decision semantics",
+        "Frozen experiment or promotion thresholds",
+    ):
+        assert obligation in budget_rule
     assert packet["pull_requests"]
     reviewed_code = False
     for item in packet["pull_requests"]:
+        if not item["review_action_kind"]:
+            assert item["review_plan"] is None
+            assert item["review_template"] is None
+            assert item["evidence_commands"] == []
+            continue
         evidence = item["review_plan"]["result_template"]["evidence"]
         if "repository_reuse" in item["review_plan"]["required_evidence_ids"]:
             reviewed_code = True
             assert evidence["repository_reuse"] == {"status": "unverified"}
             assert evidence["observable_semantics"] == {"status": "unverified"}
+            assert evidence["semantic_alignment"] == {"status": "unverified"}
     assert reviewed_code
 
 
@@ -520,3 +615,22 @@ def test_observable_semantics_covers_diagnostics_and_claim_neutral_note_paths() 
         "observable_semantics"
         in contract["verdict_policy"]["open_pr_unresolved_semantics"]
     )
+
+
+def test_pr_review_skill_tracks_the_capability_policy_revision() -> None:
+    """The host skill must not pin a policy revision the capability owns.
+
+    A hardcoded number here goes stale on the next capability bump and blocks
+    reviewers with an unrelated mismatch: the skill text said ``== 6`` while
+    the installed contract already emitted 7. The skill has to compare the
+    packet's ``review_execution_contract.policy_revision`` with the result's
+    ``review_policy_revision`` instead of naming a value itself.
+    """
+
+    skill = (
+        Path(__file__).resolve().parents[2] / "skills/loopx-pr-review/SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "review_execution_contract.policy_revision" in skill
+    assert "review_policy_revision" in skill
+    assert re.search(r"policy_revision\s*==\s*\d+", skill) is None, skill

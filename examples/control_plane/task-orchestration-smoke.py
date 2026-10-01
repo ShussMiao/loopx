@@ -286,15 +286,30 @@ def main() -> int:
         assert blocked_turn["interaction_contract"]["mode"] == (
             "peer_coordination_blocked"
         ), blocked_turn
+        assert blocked_turn["automation_liveness"]["keep_active"] is True, (
+            blocked_turn
+        )
+        assert blocked_turn["automation_liveness"]["pause_allowed"] is False, (
+            blocked_turn
+        )
+        assert blocked_turn["automation_liveness"]["automation_action"] == (
+            "keep_active_peer_coordination_backoff"
+        ), blocked_turn
         assert blocked_turn["scheduler_hint"]["action"] == (
-            "return_to_owner_until_material_change"
+            "backoff_until_reassigned"
         ), blocked_turn
-        assert blocked_turn["scheduler_hint"]["codex_app"]["host_action"] == (
-            "pause_or_delete_current_heartbeat"
+        assert blocked_turn["scheduler_hint"]["cadence_class"] == (
+            "peer_coordination_wait"
         ), blocked_turn
-        assert blocked_turn["scheduler_hint"]["unchanged_poll"][
+        assert blocked_turn["scheduler_hint"]["codex_app"][
+            "recommended_interval_minutes"
+        ] == 10, blocked_turn
+        assert blocked_turn["scheduler_hint"]["codex_app"][
+            "example_progression_minutes"
+        ] == [10, 20, 30, 60], blocked_turn
+        assert blocked_turn["scheduler_hint"]["unchanged_poll"]["limits"][
             "local_scheduler"
-        ] == "stop", blocked_turn
+        ] == 3, blocked_turn
         assert blocked_turn["interaction_contract"]["cli_channel"][
             "spend_after_validation"
         ] is False, blocked_turn

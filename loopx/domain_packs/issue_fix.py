@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ..control_plane.content_digest import ENVELOPED_SHA256_PATTERN
 from ..domain_state import default_domain_state_file_path, upsert_domain_state_jsonl
 from ..file_lock import exclusive_file_lock
 
@@ -16,7 +17,7 @@ ISSUE_FIX_DOMAIN_STATE_LEDGER_FILENAME = "pr-lifecycle.jsonl"
 ISSUE_FIX_FEASIBILITY_LEDGER_FILENAME = "feasibility.jsonl"
 ISSUE_FIX_CANDIDATE_PREFLIGHT_LEDGER_FILENAME = "candidate-preflight.jsonl"
 ISSUE_FIX_REPOSITORY_SNAPSHOT_LEDGER_FILENAME = "repository-snapshots.jsonl"
-REVIEWER_NOTIFICATION_RECEIPT_PATTERN = re.compile(r"sha256:[a-f0-9]{64}")
+REVIEWER_NOTIFICATION_RECEIPT_PATTERN = ENVELOPED_SHA256_PATTERN
 REVIEWER_NOTIFICATION_QUEUE_RECEIPT_SCHEMA_VERSION = (
     "issue_fix_reviewer_notification_queue_receipt_v1"
 )
@@ -170,7 +171,7 @@ def promote_issue_fix_feasibility_ledger_jsonl(
         canonical_existing: dict[str, Any] | None = None
         if path.exists():
             for index, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), start=1
+                path.read_text(encoding="utf-8").split("\n"), start=1
             ):
                 if not line.strip():
                     continue
@@ -530,7 +531,7 @@ def retain_issue_fix_repository_snapshot_jsonl(
     path = Path(ledger_path)
     existing_rows: list[dict[str, Any]] = []
     if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8").split("\n"):
             try:
                 value = json.loads(line)
             except (TypeError, ValueError):

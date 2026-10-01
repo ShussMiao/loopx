@@ -23,6 +23,7 @@ from .skill_install_readback import (
     SKILL_VERSION_MARKER_FILENAME,
     hash_skill_tree,
     inspect_skill_install_readback,
+    retire_duplicate_managed_skills,
     write_skill_install_readback,
 )
 from .slash_command_install import materialize_loopx_entry_skill
@@ -44,11 +45,12 @@ _PACKAGED_SKILL_SENTINEL = PurePosixPath(
 _INSTALL_LOCK_STEM = ".loopx-workflow-skills"
 
 
-def _valid_source_root(path: Path) -> bool:
+def _valid_source_root(path: Path, *, require_bundled_scorer: bool = False) -> bool:
     return all(
         (path / skill_id / "SKILL.md").is_file()
         for skill_id in PACKAGED_HOST_SKILL_IDS
-    )
+    ) and (not require_bundled_scorer or
+           (path / "loopx-self-repair/scripts/lexical_retrieval.py").is_file())
 
 
 def resolve_workflow_skill_source() -> dict[str, Any]:
@@ -68,7 +70,7 @@ def resolve_workflow_skill_source() -> dict[str, Any]:
                     bundle_root / "share" / "loopx" / "skills",
                     bundle_root / "skills",
                 )
-                if _valid_source_root(candidate)
+                if _valid_source_root(candidate, require_bundled_scorer=True)
             ),
             None,
         )
@@ -165,6 +167,16 @@ def _exclusive_install_lock(skills_dir: Path) -> Iterator[None]:
 
 
 def _install_one_skill(source: Path, target: Path) -> str:
+    # Wheel/frozen skill data already includes this resource. A source install
+    # materializes the same canonical file, then uses the existing hash/atomic
+    # install path so repeated installs and drift readback include the scorer.
+    if source.name == "loopx-self-repair" and not (source / "scripts/lexical_retrieval.py").is_file():
+        with tempfile.TemporaryDirectory(prefix="loopx-repair-skill-") as staging:
+            bundle = Path(staging) / source.name
+            shutil.copytree(source, bundle)
+            shutil.copy2(Path(__file__).with_name("lexical_retrieval.py"),
+                         bundle / "scripts/lexical_retrieval.py")
+            return _install_one_skill(bundle, target)
     ignored = (SKILL_VERSION_MARKER_FILENAME,)
     if target.is_dir() and hash_skill_tree(
         source, ignored_relative_paths=ignored
@@ -337,6 +349,9 @@ def workflow_skill_install(
             "install_required": (
                 not before.get("ready")
                 or entry_preview.get("status") != "unchanged"
+                or entry_preview.get("metadata_status") in {
+                    "would_create", "updated", "upgraded_legacy_managed",
+                }
             ),
             "install_command": shlex.join(install_command),
         }
@@ -390,6 +405,7 @@ def workflow_skill_install(
             loopx_version=__version__,
         )
 
+    reconciliation = retire_duplicate_managed_skills(target_root, execute=True)
     after = inspect_skill_install_readback(
         skills_dir=target_root,
         required_skill_ids=ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
@@ -407,6 +423,7 @@ def workflow_skill_install(
         "installed": installed,
         "entry": entry,
         "after": after,
+        "skill_reconciliation": reconciliation,
         "rollback_command": shlex.join(
             [
                 "loopx",

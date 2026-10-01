@@ -9,6 +9,30 @@ This replaces the current ad hoc pattern where priority is encoded only by
 changing automation periods. A timer can wake the executor, but the product
 policy should live in LoopX.
 
+## Read-only observation scope
+
+`loopx quota status --goal-id example` and `loopx quota plan --goal-id example`
+collect only the selected Goal's status and history. Previously these commands
+silently ignored `--goal-id` and collected the whole registry. The selector now
+also partitions the optional status projection cache; it is not an output-only
+filter. Omitting it retains the global view and ordering.
+
+Scoped JSON includes `goal_filter`. Its counts, groups and `next_automatic_turn`
+describe that selected Goal only, not its rank among all Goals. An unknown or
+unregistered Goal returns `status=goal_not_found` and a nonzero exit code.
+Goal selection reuses the existing status health contract: unrelated Goal-local
+errors are outside the query, while applicable global errors remain visible.
+Observation neither opens a Turn nor grants execution/spend authority; use
+`quota should-run` with the current lane's identity for execution admission.
+`status_projection_envelope` retains the TS-owned source freshness and coverage
+of that observation, including explicit cache use; the Markdown view shows it.
+
+`quota status/plan --goal-id` 现在按指定 Goal 收集状态与历史，缓存也按同一范围隔离；
+之前会静默忽略选择器并读取全部 Goal。不传仍是全局视图。定向结果中的计数、分组和
+`next_automatic_turn` 只针对该 Goal，不代表全局排名；不存在或未注册的 Goal 明确
+报错。沿用既有 status 健康合同，保留相关全局错误。这是只读观测，不创建 Turn、
+不授予执行／spend 权限，不能代替带当前身份的 `quota should-run`。
+
 ## Product Scope
 
 In v0.1, quota means **compute quota only**.
@@ -54,11 +78,12 @@ depending on the executor:
 
 ## Completed-Todo Review Cadence
 
-`execution_profile.replan_after_completed_todos` is a Goal-level integer
-hyperparameter, default **5** in both standard and fine-grained Turn modes.
-Set it to 2 or 3 for earlier review. Supported values are 1–5: the current
-agent projection retains five recent completions, so larger values are rejected.
-Restoring 5 removes the override and preserves the existing default behavior.
+`execution_profile.replan_after_completed_todos` is an integer hyperparameter,
+default **5** in both standard and fine-grained Turn modes. It may be set as a
+live machine default, while an explicit Goal value remains pinned until it is
+cleared. Set it to 2 or 3 for earlier review. Supported values are 1–5: the
+current agent projection retains five recent completions, so larger values are
+rejected.
 
 ```bash
 # Preview, apply, and read back the Goal setting.
@@ -66,13 +91,17 @@ loopx configure-goal --goal-id example --execution-replan-after-todos 3
 loopx configure-goal --goal-id example --execution-replan-after-todos 3 --execute
 loopx configure-goal --goal-id example
 
-# Restore the default cadence.
-loopx configure-goal --goal-id example --execution-replan-after-todos 5 --execute
+# Restore live machine-default inheritance.
+loopx configure-goal --goal-id example --clear-execution-replan-after-todos --execute
 ```
 
-The Dashboard's Goal configuration catalog exposes **Goal review cadence** as
-an integer field through the existing preview/apply flow. This is a setting of
-the built-in goal control plane, with no provider or plugin installation.
+The Dashboard exposes **Goal review cadence** in both Machine Configuration and
+Goal capability settings. Machine changes are revision-locked and affect every
+Goal without an explicit override at its next quota/frontier evaluation. A Goal
+override is a complete value, not a field merge; clearing it restores live
+inheritance. Removing the machine namespace restores the capability default of
+5. This is a setting of the built-in control plane, with no provider or plugin
+installation. It does not create host turns, spend quota, or grant authority.
 
 The count includes completed advancement Todos claimed by the same Agent, with
 valid completion timestamps, after the latest qualifying outcome checkpoint.
@@ -100,7 +129,8 @@ Other cadences are independent: the standard profile's two-small-delivery
 streak suggests widening work; fine mode's five-small-delivery streak suggests
 direction review. Neither is this completed-Todo counter. The periodic review
 window of 20 material run records and long-open-Todo-chain triggers also retain
-their existing thresholds.
+their existing thresholds. Quiet or unchanged Monitor polls do not consume the
+periodic material-run window; their dedicated Monitor replan thresholds still apply.
 
 ### Governed Turn Execution
 
@@ -123,6 +153,31 @@ invoke this controller or maintain that counter. `run-once` executes one Turn;
 an outer caller still owns repeated execution. A completed-Todo threshold, a
 per-Turn path declaration, and a same-Todo continuation budget are different
 controls.
+
+### Receipt-backed settlement progress
+
+Turn-scoped `refresh-state` and `quota spend-slot` expose
+`settlement_progress` from the TypeScript receipt readback. The states are
+`identity_required`, `writeback_required`, `writeback_receipt_required`,
+`spend_required`, `spend_receipt_required`, and `settled`. A durable run without
+its matching receipt is incomplete. Ordinarily, `settled` certifies the
+writeback/spend chain. An exact typed blocked writeback with a bounded retry
+instead sets `closeout_kind=typed_blocked_writeback_no_spend` and settles the
+Turn without a quota debit. Todo completion and Goal acceptance retain their
+separate checks in both cases.
+
+When a quota spend remains owed after verified writeback,
+`settlement_owed.command` carries the original Goal, Agent, Todo or replan
+obligation, Turn, registry/runtime route and spend source. Execute it unchanged.
+The typed blocked no-spend closeout has no spend command. In
+`spend_receipt_required`, the same idempotent spend
+writer restores the receipt without another debit. Refresh and recovery never
+spend automatically. JSON and normal/recovery Markdown expose the same step.
+Rejected recovery reports observed progress without offering a spend command.
+The raw Python refresh API returns `writeback_receipt_required` until its CLI
+caller appends the refresh receipt and rereads the chain; it must not offer a
+spend command before that point. Older guards without a persisted spend source
+retain the existing heartbeat default.
 
 ## Minimal Contract
 
@@ -288,12 +343,23 @@ from `classification`. New writes should use one of:
 execution-profile hints only as a compatibility fallback for historical runs;
 new control-plane decisions should be driven by the enum above.
 
-An `outcome_gap` does not become delivery progress. It may settle and spend one
-exact Todo-bound Turn only when the same writeback includes a
+An `outcome_gap` does not become delivery progress. A blocked writeback is
+eligible for exact Todo-bound Turn settlement only when it includes a
 `typed_progress_observation_v0` with `result_class=blocked`, the matching
 `work_item_id`, a stable `blocker_id`, and a non-empty array of stable
 `evidence_ids`. Missing schemas, prose-only blockers, malformed evidence, and
 Todo identity mismatches remain fail-closed.
+
+New Turn-bound blocked writebacks also require a bounded retry on the same
+unfinished advancement Todo. A legacy Todo must have a pending
+`resume_when=resume_at:<timezone-aware-time>` due in 1–30 minutes. With promoted
+File/SQLite authority, an open Todo without its own resume condition can use
+a five-minute retry stored on the committed Turn instead; the peer-gated Todo
+and its completion validator stay unchanged. That exact writeback settles the
+Turn without spending quota. The retry suppresses only the blocked Todo for
+the same Agent until due or superseded by newer work, so independent eligible
+Todos can still be selected. Historical blocked writebacks without a bounded
+retry retain their prior spend readback; no debit is retroactively erased.
 
 `quota should-run` also separates long-running observation from work that should
 advance the selected goal. When the selected goal's current projection is a
@@ -372,17 +438,62 @@ repair-mode routing, but they are not hard execution gates.
 `quota should-run` compares the visible executable advancement queue with the
 current launcher capabilities. Basic local capabilities such as `shell`,
 `filesystem_read`, and `filesystem_write` are assumed by default; launchers can
-add temporary capabilities with `--available-capability`, for example:
+declare observed capabilities with `--available-capability`, for example:
 
 ```bash
 loopx --format json quota should-run \
-  --goal-id <goal-id> \
+  --goal-id <goal-id> --agent-id <registered-agent-id> \
   --available-capability benchmark_runner
 ```
 
-Use the same `--available-capability` flags for `quota spend-slot` after a
-validated turn, because spend preview recomputes the same should-run guard
-before writing quota accounting.
+A live `quota should-run` or executing `turn run-once` automatically remembers,
+through the admitted turn-start capability hook, these five runtime observations
+for the registered Agent on this host:
+`network`, `benchmark_runner`, `external_evidence_poll`, `worker_bridge`, and
+`cli_bridge`. Later decisions, including `quota spend-slot` and `monitor-poll`
+rechecks, read that Agent's observations without repeating flags. Goal/project
+`available_capabilities` declarations are inherited dynamically; Agent observations
+never write back into Goal configuration or propagate to peer Agents.
+The hook declares only its Agent-private write scope, returns no private payload,
+and fails in isolation; quota selection itself performs no provider or memory write.
+
+The scope is the resolved runtime root, registry path, Goal id and registered
+Agent id. Separate hosts/runtimes or registries do not inherit these observations.
+A reused Agent id in the same scope refers to the same runtime declaration;
+use distinct Agent identities for environments with different tools. Observations
+are caller declarations, not independently verified probe receipts. They persist
+until corrected or forgotten; omission of a flag does not revoke them.
+
+```bash
+# Read current Agent observations and inherited/effective declarations.
+loopx --format json agent-capabilities --goal-id <goal-id> --agent-id <agent-id>
+
+# After a real task-facing availability failure, override Goal inheritance locally.
+loopx agent-capabilities --goal-id <goal-id> --agent-id <agent-id> \
+  --unavailable-capability network --execute
+
+# After successful recovery, record availability again.
+loopx agent-capabilities --goal-id <goal-id> --agent-id <agent-id> \
+  --available-capability network --execute
+
+# Remove the local observation; Goal inheritance applies again.
+loopx agent-capabilities --goal-id <goal-id> --agent-id <agent-id> \
+  --forget-capability network --execute
+```
+
+Omit `--execute` on the management command to preview a correction without writing.
+`turn plan` and non-executing `turn run-once` also remain read-only. Unknown or
+permission/enablement capability names retain invocation-only semantics, including
+`credentials`, `production_access` and optional feature activation tokens. A local
+negative overrides an inherited runtime declaration; a fresh explicit positive
+observation replaces that negative. Removing a Goal declaration does not erase an
+Agent's independently recorded observation: clear or correct both scopes when needed.
+The readback exposes Goal, Agent, invocation, unavailable and effective sources.
+
+This intentionally changes the former session-only default for those five runtime
+capabilities. Generated follow-up commands still carry runtime declarations for
+compatibility. No credentials, production grant, optional capability enablement,
+shared-authority head, lease or provider selection is created by this memory.
 
 The resulting `capability_gate` is a read-only projection:
 
@@ -436,7 +547,23 @@ bounded suggestions. That request is only a pending selection: the second guard
 re-runs current lane arbitration and eligibility checks before upgrading the
 receipt. A newly due hard-priority monitor, blocking user gate, or other current
 preemption defers the request and leaves the receipt identity-less. Delivery and
-quota spend remain disabled until binding succeeds. A single-candidate response
+quota spend remain disabled until binding succeeds. Deferred/rejected selections
+return the TS-owned `recovery_action=reenter_guard_without_selection`: execute
+the single command in `interaction_contract.cli_channel.next_cli_actions`, with
+the same turn id and no Todo/replan argument. That guard either binds the current
+hard lane or returns a refreshed portfolio. No settlement plan is exposed before
+reentry, and a previously bound receipt cannot be retargeted. `recommended_action`
+retains the human-readable rejection or deferral guidance; the executable recovery
+command lives in `next_cli_actions` and `agent_channel.primary_action`.
+Fresh explicit selection reads the complete Todo source through the same reader
+as `todo list`, before display or Agent-lane compaction. Before shared-authority
+promotion, that reader retains Markdown plus the existing event overlay. After
+promotion, it reads the selected canonical provider, including authoritative
+empty results; missing/stale display and provider failure never authorize a
+Markdown fallback. The guard does not append a second Markdown candidate list.
+Historical receipt-bound recovery remains separate from new work admission.
+
+A single-candidate response
 keeps the direct execution path and does not add an extra selection round trip.
 
 When the selected Todo has meaningful strategic context, the same default
@@ -470,13 +597,15 @@ exact `blocked_todo_ids`. The interaction contract turns an owner-held binding
 into an idempotent scoped `user_gate` write linked by `unblocks_todo_id`, while
 an agent-repairable binding becomes an idempotent advancement todo with the
 capability in `target_capabilities`. The user gate does not block unrelated
-runnable todos. `quota should-run` remains read-only; the agent or host executes
-the projected todo write before normal writeback.
+runnable todos. Capability-gate projection does not write Todos; the agent or host
+executes the projected todo write before normal writeback. Live should-run may
+record the scoped runtime observations described above.
 
 Completing a repair or owner todo is not proof that the runtime capability is
-available. The current host must still verify the real callsite and pass the
-capability through `--available-capability` on both preflight and spend. This
-keeps capability truth session-scoped and prevents stale persistent grants.
+available. The current host must verify the real callsite before declaring the
+capability through `--available-capability`. Supported observations are remembered
+for that Agent; after a later real failure, mark the capability unavailable rather
+than repeating a stale positive flag. This memory never grants operation authority.
 
 Runtime capability absence is not permission authority. A missing `network`
 declaration therefore remains in the agent repair lane: the agent should
@@ -540,6 +669,14 @@ contract allows safe scoped fallback work. The action portfolio keeps a
 higher-priority typed wait visible as `availability_reason=resume_condition_pending`
 while making the runnable fallback and its bounded continuation context the
 default model-facing action.
+
+For `resume_at:<timezone-aware-rfc3339-timestamp>`, the active-state read takes
+one runtime-clock snapshot and passes it through the shared Todo reducer. A
+future timestamp therefore produces the same `agent_scope_wait` or fallback
+selection in CLI and heartbeat paths. Once due, quota selects the deferred Todo
+through `successor_replan_required`; the managed Turn sees the same stable
+resume receipt and must perform the normal explicit lifecycle update. Repeated
+ticks do not create additional material-change generations or receipts.
 
 If an active per-agent vision has no other selectable advancement and its
 existing current-agent or unclaimed successor is blocked by an exact supported
@@ -657,6 +794,14 @@ gap, autonomy blocker, or replan obligation fail closed. This keeps recurring
 controllers alive during ordinary waits while honoring an explicit completed
 goal shutdown without another quota-spending turn.
 
+An explicit `peer_coordination_blocked` decision is a recoverable typed wait,
+not a terminal host stop. It keeps the recurring heartbeat alive without
+spending quota and uses the existing TypeScript-owned stateful backoff
+transition with a 10/20/30/60 minute progression. Peer activation capability,
+peer runtime readiness, coordinator configuration, or newly projected local
+work changes the reset identity and restores the initial cadence. Goal stopped,
+quota paused, and validated terminal no-follow-up remain the stop cases.
+
 An individual registered peer can instead be put in `monitor_only` work mode:
 
 ```bash
@@ -666,10 +811,15 @@ loopx configure-goal --goal-id <goal-id> \
 
 This suppresses that peer's advancement, autonomous replan, repair, fallback,
 and new-topic lanes while preserving due `continuous_monitor` todos and verified
-direct operator replies. A future or unchanged monitor stays quiet and no-spend;
-a due monitor may spend only after a validated material transition. Other peers
-remain active. Use `--clear-agent-work-mode <agent-id>` (or set `=active`) to
-resume ordinary advancement.
+direct operator replies. A future monitor stays quiet; a committed monitor poll
+is the Turn's no-spend closeout whether unchanged or material. A material poll
+may atomically release an independent advancement successor, whose later
+delivery has its own quota identity. Same-Turn readback and prior-Turn recovery
+accept the same exact committed effect, including the shipped turn-only receipt;
+a preview or a row with missing or mismatched commit metadata cannot close the
+Turn. Other peers remain active. Use
+`--clear-agent-work-mode <agent-id>` (or set `=active`) to resume ordinary
+advancement.
 
 The read model exposes that derivation as
 `goal_frontier_projection.terminal_state={kind:no_followup, derived:true,
@@ -740,6 +890,24 @@ The first screen should make it obvious why a project is quiet:
 - or it is eligible and should run next.
 
 ## CLI Surface
+
+`quota status` and `quota plan` now default to bounded Todo summaries in JSON,
+reusing the summaries already used by `quota should-run`. Previously these two
+observation commands returned full Todo lists. Counts, quota decisions, ordering
+and health remain intact; `payload_compaction` identifies omitted lists and their
+detail command. Planning still consumes complete input before this CLI projection.
+Consumers that read individual Todo metadata or every item must opt into detail:
+
+```bash
+loopx --format json quota status --include-detail all
+loopx --format json quota plan --include-detail agent-todos --include-detail user-todos
+```
+
+Keep the original registry, runtime and Goal selection when following a detail
+command. `all` expands only the sections supported by that command. Detail reads
+do not acquire a Turn or spend quota. Markdown plan rendering and standalone
+`status`/`todo list` are unchanged. This bounds Todo-list display growth, not the
+cost of gathering and verifying the input or the total number of Goals returned.
 
 The first read-only or preview commands are:
 
@@ -823,7 +991,7 @@ of an error string.
       "execution_required": false,
       "request": "loopx quota should-run --include-detail scheduler",
       "hot_path_runtime_fields": [
-        "codex_app",
+        "app_automation",
         "unchanged_poll",
         "reset_policy"
       ],
@@ -840,8 +1008,8 @@ of an error string.
     "reset_policy": {
       "reset_token": "0123456789abcdef",
       "host_state_key": "scheduler_hint.reset_policy.reset_token",
-      "codex_app_initial_interval_minutes": 30,
-      "codex_app_initial_rrule": "FREQ=MINUTELY;INTERVAL=30",
+      "app_automation_initial_interval_minutes": 30,
+      "app_automation_initial_rrule": "FREQ=MINUTELY;INTERVAL=30",
       "identity_signature": "123456789abc"
     }
   },
@@ -992,10 +1160,22 @@ common modes are:
 - `mapped_noop_if_unchanged`: the latest compact read-only map already exists;
   if there is no new user instruction, owner evidence, agent todo, stale source,
   or safe handoff, return a quiet no-op without another dry-run or quota spend.
-- `steering_audit_then_one_step`: the goal is eligible but needs the normal
-  steering audit before selecting one bounded progress segment. A coherent
-  implementation/test/state batch is valid when scope and validation are clear;
-  the contract is bounded, not tiny.
+- `steering_audit_then_one_step`: this compatibility mode name does not impose
+  a one-operation limit. The eligible goal needs a steering audit before
+  scope-bounded work toward a verifiable result. Work size follows task,
+  evidence and risk, not calls, files or wake cadence. Related implementation,
+  research, tests and writeback may form one coherent effort; a focused
+  correction can also be sufficient. Explicit stops, budgets, Todo/lease
+  boundaries, settlement and replan requirements remain authoritative.
+
+All heartbeat prompt sizes, including the default thin prompt, carry this
+scope-bounded work guidance. This is a prompt clarification, not a change to
+execution-profile thresholds, scheduler cadence, permissions or spend rules.
+Fine-grained mode still plans independently verifiable checkpoints and checks
+fresh evidence before a successor; checkpoint granularity is not a tool-call
+limit. Read-only monitor polls, bounded recovery attempts and explicit
+`end_current_heartbeat` transitions retain their existing limits. Do not turn
+this guidance into a minimum batch size or a reason to bypass those limits.
 
 The same response includes `interaction_contract.schema_version =
 loopx_interaction_contract_v0`, the top-level user/agent/CLI protocol
@@ -1014,21 +1194,29 @@ slows Codex App and stops CLI/Claude loops after repeated unchanged polls;
 agent-to-agent handoff cadence too quickly;
 `backoff_until_material_transition` handles monitor-only quiet polls; and
 `backoff_until_fresh_evidence` handles mapped or post-handoff no-op waits.
+`preserve_current_schedule` handles `heartbeat_settled_skip`: settlement closes
+one Turn, not the Goal or its remaining Todos. Replay keeps the installed host
+cadence and emits no target interval/RRULE, scheduler reset, ACK, fallback or
+host-update instruction, even when no host cadence has been observed. The next
+trigger uses a fresh Turn identity to evaluate the live frontier; it never
+re-executes or spends for the closed Turn. Native Goal runtimes continue to that
+fresh guard instead of blocking the Goal. Explicit Goal stop or quota pause
+still takes precedence. Actual fresh-Turn waits retain their existing backoff.
 For Codex App and local schedulers, `recommended_interval_minutes` is the next
 target interval. For Codex App heartbeats, `recommended_rrule` is emitted only
-when `codex_app.stateful_backoff.apply_needed=true`; if the desired RRULE is
+when `app_automation.stateful_backoff.apply_needed=true`; if the desired RRULE is
 already applied, it is omitted so the agent does not call a host tool again.
 If that match still needs a reset-token/identity binding,
 `stateful_backoff.ack_needed=true` and the bound ack runs without a host update.
 When an apply is required but `automation_update` is unavailable in the
-session, `codex_app.fallback_hint` carries the bounded `loopx-apply-rrule`
+session, `app_automation.fallback_hint` carries the bounded `loopx-apply-rrule`
 command for the resolved automation (backup `codex-dev.db`, sync TOML+SQLite,
 run the bound ACK). Direct SQLite edits bypass the app API, so the fallback is
 projected only for this gap and never as the routine path; an unresolved
 automation id projects `available=false` and requires the pasteable heartbeat
 gate instead of guessing.
 After a successful host RRULE update, the agent records that fact with
-`loopx` plus `codex_app.ack_hint.cli_args`; current payloads use
+`loopx` plus `app_automation.ack_hint.cli_args`; current payloads use
 `quota scheduler-ack-current` to re-read the latest scheduler hint before LoopX
 advances the per goal/agent scheduler state without spending quota. Human gates
 can move Codex App heartbeats through `[30, 60]` after the concrete user todo
@@ -1059,7 +1247,7 @@ Agent-scope waits use a more conservative adjustment curve such as
 agent-to-agent interaction cadence before cooling further.
 The compact hot path carries only the reset fields hosts need to act:
 `reset_policy.reset_token`, `host_state_key`,
-`codex_app_initial_interval_minutes`, `codex_app_initial_rrule`, and the short
+`app_automation_initial_interval_minutes`, `app_automation_initial_rrule`, and the short
 `identity_signature`. Hosts should cache and compare `reset_token` across
 unchanged polls and reset the unchanged streak whenever the token changes. The
 token is derived from scheduler action plus the current identity/profile inputs;
@@ -1068,13 +1256,13 @@ stateful-backoff policy live in `scheduler_hint.cold_path_detail` when callers
 request `loopx quota should-run --include-detail scheduler`. Hosts should also
 reset when an external event makes the goal actionable again, such as user
 feedback in the thread, a new or reassigned todo, a resolved gate, or material
-evidence transition. A reset applies `codex_app_initial_interval_minutes` (and
+evidence transition. A reset applies `app_automation_initial_interval_minutes` (and
 the matching local scheduler initial interval) before starting unchanged
 backoff again; it never spends quota.
 For Codex App heartbeats, hosts and agents should use `automation_update` only
-when `codex_app.stateful_backoff.apply_needed=true` and
-`codex_app.recommended_rrule` is present. After `automation_update` succeeds,
-the agent must run `codex_app.ack_hint.cli_args`. Current payloads use
+when `app_automation.stateful_backoff.apply_needed=true` and
+`app_automation.recommended_rrule` is present. After `automation_update` succeeds,
+the agent must run `app_automation.ack_hint.cli_args`. Current payloads use
 `quota scheduler-ack-current`, so LoopX then persists `reset_token`,
 `identity_signature`, `progression_index`, and
 `last_applied_rrule` under the runtime root. Repeated unchanged identity
@@ -1088,7 +1276,7 @@ quota state. If `apply_needed=false` and `ack_needed=true`, the same command
 records an exact matching host readback without calling `automation_update`.
 If `automation_update` fails or times out, the agent must not ACK. LoopX keeps
 the observed host RRULE authoritative. The agent runs
-`codex_app.failure_hint.cli_args` once to persist the failed target/observed-host
+`app_automation.failure_hint.cli_args` once to persist the failed target/observed-host
 pair without quota spend. LoopX retains up to four distinct pairs for 24 hours,
 so active-work and monitor-wait targets cannot overwrite one another while the
 host RRULE remains unchanged. Later heartbeats expose `apply_needed=false` and

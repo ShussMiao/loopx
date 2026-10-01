@@ -94,15 +94,16 @@ def register_dash_commands(
         help="Start the loopback single-page panel; auto-refreshes in place.",
     )
     add_subcommand_format(serve)
+    # Inherit options parsed by `dash`; only explicit child options override them.
     serve.add_argument(
         "--goal-id",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Narrow the panel to one goal. Defaults to the whole fleet.",
     )
-    serve.add_argument("--host", default=DEFAULT_DASH_HOST, help="Loopback bind host.")
-    serve.add_argument("--port", type=int, default=DEFAULT_DASH_PORT)
-    serve.add_argument("--refresh-seconds", type=int, default=DEFAULT_DASH_REFRESH_SECONDS)
-    serve.add_argument("--verbose", action="store_true", help="Print HTTP request logs.")
+    serve.add_argument("--host", default=argparse.SUPPRESS, help="Loopback bind host.")
+    serve.add_argument("--port", type=int, default=argparse.SUPPRESS)
+    serve.add_argument("--refresh-seconds", type=int, default=argparse.SUPPRESS)
+    serve.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help="Print HTTP request logs.")
 
     generate = sub.add_parser(
         "generate",
@@ -111,7 +112,7 @@ def register_dash_commands(
     add_subcommand_format(generate)
     generate.add_argument(
         "--goal-id",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Narrow the snapshot to one goal. Defaults to the whole fleet.",
     )
     generate.add_argument("--out", default=None, help="Output HTML path. Prints to stdout when omitted.")

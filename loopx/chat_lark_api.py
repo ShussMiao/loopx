@@ -24,12 +24,25 @@ from .extensions.lark.goal_topic_connections import (
     list_lark_apps,
     list_lark_connections,
     list_lark_group_chats,
+    rebind_lark_manager_session,
 )
 from .extensions.lark.goal_topic_batch import connect_lark_goal_topics
 from .extensions.lark.presentation.kanban import (
     CommandRunner,
     default_subprocess_runner,
 )
+from .chat_agent import CodexChatAgentError
+from .chat_manager import (
+    controller_runtime_root,
+    manager_channel,
+    manager_connection_executor_endpoint,
+    manager_executor_endpoint_default,
+    open_manager_session,
+    steward_machine_defaults,
+)
+from .chat_store import RESUMABLE_SESSION_STATES
+from .extensions.lark.goal_channel_contracts import binding_for_goal, goal_from_registry
+from .extensions.lark.goal_channel_targets import goal_channel_target_for_name
 from .history import load_registry
 from .paths import resolve_runtime_root
 from .registry import registry_goals
@@ -82,7 +95,7 @@ def _default_git_runner(args: list[str]) -> dict[str, Any]:
             args,
             capture_output=True,
             check=False,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -180,6 +193,142 @@ def build_lark_goal_topic_runtime_snapshot(
         "target_payload": target_payload,
         "binding_payloads": binding_payloads,
         "goal_contexts": goal_contexts,
+    }
+
+
+def reconcile_lark_manager_route(
+    *,
+    route: Mapping[str, Any],
+    registry_path: Path,
+    runtime_root_override: str | None,
+    runtime_controller: Any,
+) -> dict[str, Any]:
+    """Converge a durable manager route on this machine's live executor.
+
+    The replacement Session is opened before the durable compare-and-swap, so
+    a failed open or write keeps the previous binding intact. A concurrent
+    successful repair is accepted after canonical readback.
+    """
+
+    if route.get("conversation_kind") != "manager":
+        return dict(route)
+    goal_id = _compact_text(route.get("goal_id"), limit=160)
+    connection_id = _compact_text(route.get("connection_id"), limit=160)
+    if not goal_id or not connection_id:
+        raise ValueError("manager route has no durable connection identity")
+
+    registry = load_registry(registry_path)
+    goal = goal_from_registry(registry, goal_id)
+    source_route = resolve_goal_source_runtime_route(
+        registry_path=registry_path,
+        goal_id=goal_id,
+        registry=registry,
+    )
+    source_registry_path = Path(str(source_route["source_registry"]))
+    binding_path = default_goal_channel_binding_path(source_registry_path)
+    binding = binding_for_goal(
+        read_goal_channel_binding(binding_path),
+        goal_id,
+        connection_id=connection_id,
+    )
+    if not binding or binding.get("enabled") is not True:
+        raise ValueError("manager connection is no longer durably configured")
+    routing = binding.get("routing")
+    routing = routing if isinstance(routing, Mapping) else {}
+    if routing.get("conversation_kind") != "manager":
+        raise ValueError("durable connection is no longer a manager route")
+
+    runtime_root = resolve_runtime_root(
+        registry,
+        runtime_root_override,
+        registry_path=registry_path,
+    )
+    target = goal_channel_target_for_name(
+        read_goal_channel_targets(default_goal_channel_target_path(runtime_root)),
+        str(binding.get("target_ref") or ""),
+    )
+    if not target or target.get("enabled") is not True:
+        raise ValueError("manager connection target is unavailable")
+    identity = target.get("identity")
+    identity = identity if isinstance(identity, Mapping) else {}
+    channel = target.get("channel")
+    channel = channel if isinstance(channel, Mapping) else {}
+    app_ref = str(identity.get("sender_profile") or "")
+    chat_id = str(channel.get("chat_id") or "")
+    if not app_ref or not chat_id:
+        raise ValueError("manager connection target has no provider audience")
+    audience = f"{app_ref}\0{chat_id}"
+    expected_channel = manager_channel(provider="lark", audience=audience)
+    executor_endpoint_id, executor_endpoint_source = (
+        manager_connection_executor_endpoint(runtime_root)
+    )
+
+    def current_session(
+        current_binding: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        session_id = str(current_binding.get("session_id") or "")
+        if not session_id:
+            return None
+        try:
+            return runtime_controller.store.load_session(session_id)
+        except KeyError:
+            return None
+
+    def session_matches(
+        session: Mapping[str, Any] | None,
+        current_binding: Mapping[str, Any],
+    ) -> bool:
+        return bool(
+            session
+            and session.get("session_id") == current_binding.get("session_id")
+            and session.get("agent_id") == executor_endpoint_id
+            and session.get("channel_id") == expected_channel
+            and str(session.get("status") or "") in RESUMABLE_SESSION_STATES
+        )
+
+    session = current_session(binding)
+    if not session_matches(session, binding):
+        replacement, _created = open_manager_session(
+            controller=runtime_controller,
+            goal_id=goal_id,
+            work_dir=Path(str(goal.get("repo") or "")).expanduser().resolve(),
+            executor_endpoint_id=executor_endpoint_id,
+            provider="lark",
+            audience=audience,
+        )
+        try:
+            binding = rebind_lark_manager_session(
+                binding_path=binding_path,
+                goal_id=goal_id,
+                connection_id=connection_id,
+                expected_session_id=str(binding.get("session_id") or ""),
+                session_id=str(replacement["session_id"]),
+                executor_endpoint_id=executor_endpoint_id,
+                executor_endpoint_source=executor_endpoint_source,
+            )
+        except ValueError:
+            # Another event may have completed the same repair after our read.
+            binding = binding_for_goal(
+                read_goal_channel_binding(binding_path),
+                goal_id,
+                connection_id=connection_id,
+            ) or {}
+        session = current_session(binding)
+        if not session_matches(session, binding):
+            raise ValueError("manager connection Session rebind did not converge")
+
+    return {
+        **dict(route),
+        "agent_id": str(binding.get("agent_id") or ""),
+        "session_id": str(binding.get("session_id") or ""),
+        "executor_endpoint_id": executor_endpoint_id,
+        "executor_endpoint_source": executor_endpoint_source,
+        "manager_channel_id": expected_channel,
+        **(
+            {"connector": dict(binding["connector"])}
+            if isinstance(binding.get("connector"), Mapping)
+            else {}
+        ),
     }
 
 
@@ -416,6 +565,10 @@ class LarkChatRequestMixin:
                 "agent_bindings",
                 "app_ref",
                 "capture_scope",
+                "connection_id",
+                "conversation_kind",
+                "turn_trigger",
+                "executor_endpoint_id",
                 "chat_id",
                 "chat_name",
                 "execute",
@@ -433,31 +586,119 @@ class LarkChatRequestMixin:
             incoming_mode = (
                 _compact_text(body.get("incoming_mode"), limit=40) or "mentions"
             )
+            connection_id = _compact_text(body.get("connection_id"), limit=160) or None
             agent_id = _compact_text(body.get("agent_id"), limit=160) or None
             capture_scope = _compact_text(body.get("capture_scope"), limit=40) or None
-            ingress_mode = (
-                _compact_text(body.get("ingress_mode"), limit=40) or "async_inbox"
-            )
+            ingress_mode = _compact_text(body.get("ingress_mode"), limit=40) or None
             reply_mode = (
                 _compact_text(body.get("reply_mode"), limit=40) or "topic_reply"
             )
             app_refs_by_agent = _parse_lark_agent_bindings(body)
+            if connection_id and app_refs_by_agent is not None:
+                raise ValueError(
+                    "connection_id edits exactly one connection, not an Agent batch"
+                )
             if (
                 not goal_id
-                or not chat_id
-                or not chat_name
-                or (app_refs_by_agent is None and not app_ref)
+                or (not connection_id and not chat_id)
+                or (not connection_id and not chat_name)
+                or (not connection_id and app_refs_by_agent is None and not app_ref)
                 or (app_refs_by_agent is not None and not app_refs_by_agent)
             ):
                 raise ValueError(
                     "goal_id, one or more App bindings, chat_id, and chat_name are required"
                 )
             registry, binding_path = self._goal_channel_context(goal_id)
+            stored = (
+                binding_for_goal(
+                    read_goal_channel_binding(binding_path),
+                    goal_id,
+                    connection_id=connection_id,
+                )
+                if connection_id
+                else None
+            )
+            stored_routing = (stored or {}).get("routing") or {}
+            conversation_kind = (
+                _compact_text(body.get("conversation_kind"), limit=40)
+                or stored_routing.get("conversation_kind")
+                or "goal"
+            )
+            if "turn_trigger" in body:
+                from .control_plane.collaboration import conversation_trigger
+                if conversation_kind != "manager" or app_refs_by_agent is not None:
+                    raise ValueError("turn_trigger is only supported for manager connections")
+                conversation_trigger(body["turn_trigger"])
+            # The machine owns its manager channel's executor, so the machine
+            # setting -- not a stored connection field or a request field --
+            # decides which endpoint this connection runs on and which Session
+            # it binds. The connection write below records the resolution.
+            executor_endpoint_id = (
+                manager_executor_endpoint_default(
+                    machine_defaults=steward_machine_defaults(
+                        self.server.runtime_controller
+                    )
+                )
+                if conversation_kind == "manager"
+                else None
+            )
             session_id: str | None = None
             session_ids_by_agent: dict[str, str] = {}
-            if ingress_mode in {"live_steering", "session_queue"}:
+            if conversation_kind == "manager":
+                if app_refs_by_agent is not None:
+                    raise ValueError(
+                        "the machine manager is one recipient, not an Agent batch"
+                    )
+                if ingress_mode and ingress_mode != "session_queue":
+                    raise ValueError(
+                        "the machine manager uses synchronous session_queue delivery"
+                    )
+                ingress_mode = "session_queue"
+                audience_app, audience_chat = app_ref, chat_id
+                if stored:
+                    target = (
+                        goal_channel_target_for_name(
+                            read_goal_channel_targets(self._goal_channel_target_path()),
+                            str(stored.get("target_ref") or ""),
+                        )
+                        or {}
+                    )
+                    audience_app = str(
+                        (target.get("identity") or {}).get("sender_profile")
+                        or "default"
+                    )
+                    audience_chat = str(
+                        (target.get("channel") or {}).get("chat_id") or ""
+                    )
+                if not audience_app or not audience_chat:
+                    raise ValueError(
+                        "the manager requires an exact App and group audience"
+                    )
+                audience = f"{audience_app}\0{audience_chat}"
+                if body.get("execute") is True:
+                    goal = goal_from_registry(registry, goal_id)
+                    session, _ = open_manager_session(
+                        controller=self.server.runtime_controller,
+                        goal_id=goal_id,
+                        work_dir=Path(str(goal.get("repo") or ""))
+                        .expanduser()
+                        .resolve(),
+                        executor_endpoint_id=executor_endpoint_id,
+                        provider="lark",
+                        audience=audience,
+                    )
+                else:
+                    session = self.server.chat_store.latest_session(
+                        goal_id=None,
+                        agent_id=executor_endpoint_id,
+                        channel_id=manager_channel(provider="lark", audience=audience),
+                    )
+                session_id = str(session["session_id"]) if session else None
+            elif ingress_mode in {"live_steering", "session_queue"}:
                 session_agent_ids = (
-                    list(app_refs_by_agent) if app_refs_by_agent is not None else [agent_id]
+                    list(app_refs_by_agent)
+                    if app_refs_by_agent is not None
+                    else [agent_id]
                 )
                 if not all(session_agent_ids):
                     raise ValueError(f"{ingress_mode} requires a registered agent_id")
@@ -485,9 +726,12 @@ class LarkChatRequestMixin:
                 "chat_name": chat_name,
                 "incoming_mode": incoming_mode,
                 "capture_scope": capture_scope,
-                "ingress_mode": ingress_mode,
+                "ingress_mode": ingress_mode or "async_inbox",
                 "reply_mode": reply_mode,
                 "registry_path": binding_path.parent / "registry.json",
+                "runtime_root": controller_runtime_root(
+                    getattr(self.server, "runtime_controller", None)
+                ),
                 "execute": body.get("execute") is True,
                 "runner": self._lark_runner(),
                 "cli_bin": cli_bin,
@@ -503,8 +747,19 @@ class LarkChatRequestMixin:
                     **common,
                     app_ref=app_ref,
                     agent_id=agent_id,
+                    connection_id=connection_id,
+                    conversation_kind=conversation_kind,
+                    turn_trigger=body.get("turn_trigger"),
+                    executor_endpoint_id=executor_endpoint_id
+                    if conversation_kind == "manager"
+                    else None,
                     session_id=session_id,
                 )
+        except CodexChatAgentError as exc:
+            self._send_error(
+                str(exc), status=400, gate=exc.gate, error_code=exc.error_code
+            )
+            return
         except ValueError as exc:
             self._send_error(str(exc), status=400, error_code="invalid_lark_connection")
             return
@@ -521,9 +776,8 @@ class LarkChatRequestMixin:
                 or packet.get("blocker")
                 or "Lark connection failed"
             )
-        if (
-            body.get("execute") is True
-            and _connection_packet_has_committed_binding(packet)
+        if body.get("execute") is True and _connection_packet_has_committed_binding(
+            packet
         ):
             self._refresh_lark_goal_topic_runtime()
         self._send_json(packet, status=200 if packet.get("ok") else 400)

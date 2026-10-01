@@ -13,9 +13,14 @@ from .control_plane.heartbeat.agent import (
     normalize_agent_scopes,
     render_peer_agent_scope_instruction,
 )
+from .control_plane.heartbeat.agent_input import (
+    HEARTBEAT_AGENT_INPUT_SCHEMA_VERSION,
+    project_heartbeat_agent_input,
+)
 from .control_plane.heartbeat.budget import (
     INTERFACE_BUDGET_CHARS,
     NATIVE_GOAL_HOST_MAX_CHARS,
+    REWARD_MEMORY_OUTCOME_PROMPT_HEADROOM_CHARS,
     build_interface_budget,
     heartbeat_prompt_mode,
     prompt_budget_text,
@@ -51,9 +56,11 @@ __all__ = [
     "DEFAULT_MATERIAL_QUEUE_RULE",
     "DEFAULT_PERMISSION_RULE",
     "HEARTBEAT_NOTIFICATION_RULE_SHORT",
+    "HEARTBEAT_AGENT_INPUT_SCHEMA_VERSION",
     "HEARTBEAT_VISION_WRITEBACK_RULE_SHORT",
     "INTERFACE_BUDGET_CHARS",
     "NATIVE_GOAL_HOST_MAX_CHARS",
+    "REWARD_MEMORY_OUTCOME_PROMPT_HEADROOM_CHARS",
     "RUNTIME_CAPABILITY_PROJECTION_THIN_RULE",
     "RUNTIME_EXECUTION_ROUTING_RULE",
     "SCHEDULER_HINT_APPLICATION_RULE",
@@ -77,6 +84,7 @@ __all__ = [
     "normalize_agent_scope",
     "normalize_agent_scopes",
     "prompt_budget_text",
+    "project_heartbeat_agent_input",
     "render_ark_managed_agent_goal_task_body",
     "render_brief_heartbeat_task_body",
     "render_compact_heartbeat_task_body",

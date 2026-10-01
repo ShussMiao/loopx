@@ -1,5 +1,6 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useId, useRef, useState } from "react";
 import { z } from "zod";
+import {compactWorkspaceText} from "./personal-workspace-model";
 import type { WorkspaceAgentTodo, WorkspaceDrawerSelection, WorkspaceGoal } from "./personal-workspace-model";
 import { useWorkspaceI18n } from "./i18n";
 
@@ -9,9 +10,9 @@ const pageSchema = z.object({
 });
 
 /** Fixed-height previews keep layout/DOM cost bounded; the drawer retains full text. */
-export function CompletedTaskLane({ goal, agentId, seed, enabled, listView = false, onSelect }: {
+export function CompletedTaskLane({ goal, agentId, seed, enabled, refreshRevision = 0, listView = false, onSelect }: {
   goal: WorkspaceGoal; agentId: string; seed: WorkspaceAgentTodo[]; enabled: boolean;
-  listView?: boolean; onSelect: (selection: WorkspaceDrawerSelection) => void;
+  refreshRevision?: number; listView?: boolean; onSelect: (selection: WorkspaceDrawerSelection) => void;
 }) {
   const { t } = useWorkspaceI18n();
   const historyId = useId();
@@ -36,6 +37,23 @@ export function CompletedTaskLane({ goal, agentId, seed, enabled, listView = fal
     observer.observe(element);
     return () => { observer.disconnect(); request.current?.abort(); };
   }, []);
+  // A workspace reread invalidates the independent history snapshot, even if
+  // the directory, selected Goal and completed count did not change. Keep the
+  // user's list expansion; cancel old pages before opening a fresh cursor.
+  const resetSnapshot = useEffectEvent(() => {
+    request.current?.abort();
+    request.current = null;
+    setRows(seed);
+    setTotal(agentId === "all" ? goal.doneTodoCount ?? seed.length : seed.length);
+    setCursor(undefined);
+    setBusy(false);
+    setError(false);
+    setExpired(false);
+    setFocused(null);
+    if (scroll.current) scroll.current.scrollTop = 0;
+    setViewport({ top: 0, height: scroll.current?.clientHeight ?? 600 });
+  });
+  useEffect(() => { resetSnapshot(); }, [refreshRevision]);
   const needsPage = cursor === undefined || viewport.top + viewport.height >= rows.length * rowHeight - rowHeight * 2;
   useEffect(() => {
     if (!enabled || !visible || !needsPage || cursor === null || error || request.current) return;
@@ -46,6 +64,7 @@ export function CompletedTaskLane({ goal, agentId, seed, enabled, listView = fal
     if (agentId !== "all") query.set("agent_id", agentId);
     if (cursor) query.set("cursor", cursor);
     void fetch(`/api/chat/completed-todos?${query}`, { signal: controller.signal }).then(async (response) => {
+      if (controller.signal.aborted) return;
       if (response.status === 409) setExpired(true);
       if (!response.ok) throw new Error("history unavailable");
       const page = pageSchema.parse(await response.json());
@@ -75,7 +94,7 @@ export function CompletedTaskLane({ goal, agentId, seed, enabled, listView = fal
           const todo = rows[index]!;
           return <div className="personal-task-card personal-completed-row" key={todo.todoId} style={{ top: index * rowHeight, height: rowHeight }}>
             <button type="button" onFocus={() => setFocused(index)} onBlur={() => setFocused(null)} onClick={() => onSelect({ kind: "todo", item: { ...todo, goalId: goal.goalId, goalTitle: goal.title, ownerLabel: todo.claimedBy ?? goal.agentLabel ?? goal.agentId } })}>
-              <span className="is-done">✓</span><strong>{todo.text}</strong><small>{todo.claimedBy ?? goal.agentLabel ?? goal.agentId}</small>
+              <span className="is-done">✓</span><strong>{compactWorkspaceText(todo.text, 112)}</strong><small>{todo.claimedBy ?? goal.agentLabel ?? goal.agentId}</small>
             </button>
           </div>;
         })}

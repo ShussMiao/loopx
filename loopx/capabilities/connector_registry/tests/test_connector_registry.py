@@ -93,7 +93,7 @@ def test_cli_path_override_reads_the_registry_it_writes(tmp_path: Path) -> None:
         check=True,
         cwd=Path.cwd(),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     assert json.loads(register.stdout)["ok"] is True
 
@@ -112,7 +112,7 @@ def test_cli_path_override_reads_the_registry_it_writes(tmp_path: Path) -> None:
         check=True,
         cwd=Path.cwd(),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     payload = json.loads(listed.stdout)
     assert any(row["id"] == "probe-cli" for row in payload["ranked"])
@@ -132,6 +132,6 @@ def test_cli_path_override_reads_the_registry_it_writes(tmp_path: Path) -> None:
         check=True,
         cwd=Path.cwd(),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     assert any(row["id"] == "probe-cli" for row in json.loads(ranked.stdout)["ranked"])

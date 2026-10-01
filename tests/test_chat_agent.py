@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import queue
 from pathlib import Path
 
 import loopx.chat_agent as chat_agent
+import loopx.chat_providers as chat_providers
+import loopx.chat_runtime as chat_runtime
 import pytest
 
 
@@ -33,6 +36,92 @@ class _FakeAppServerProcess:
         self.returncode = -1
 
 
+class _FakeClaudeProcess:
+    def __init__(self, stdout: str) -> None:
+        self.stdout = io.StringIO(stdout)
+
+    def wait(self) -> int:
+        return 0
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "",
+        "not-json\n[]\n",
+        json.dumps({"type": "result", "result": ""}) + "\n",
+    ],
+)
+def test_claude_code_rejects_successful_process_without_a_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stdout: str,
+) -> None:
+    monkeypatch.setattr(
+        chat_providers.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeClaudeProcess(stdout),
+    )
+    adapter = chat_providers.ClaudeCodeAdapter(
+        claude_bin="claude",
+        work_dir=tmp_path,
+        session_id="session-fixture",
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    with pytest.raises(chat_agent.CodexChatAgentError) as caught:
+        adapter.start_turn(
+            "Reply briefly.",
+            lambda kind, payload: events.append((kind, payload)),
+        )
+
+    assert caught.value.error_code == "provider_empty_response"
+    assert not any(kind == "answer.final" for kind, _ in events)
+    assert adapter.resumed is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "result", "result": "Completed."},
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Completed."},
+            },
+        },
+    ],
+)
+def test_claude_code_accepts_a_nonempty_response_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    stdout = json.dumps({**payload, "session_id": "upstream-session"})
+    monkeypatch.setattr(
+        chat_providers.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeClaudeProcess(stdout + "\n"),
+    )
+    adapter = chat_providers.ClaudeCodeAdapter(
+        claude_bin="claude",
+        work_dir=tmp_path,
+        session_id="session-fixture",
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    response = adapter.start_turn(
+        "Reply briefly.",
+        lambda kind, payload: events.append((kind, payload)),
+    )
+
+    assert response["message"] == "Completed."
+    assert sum(kind == "answer.final" for kind, _ in events) == 1
+    assert adapter.session_id == "upstream-session"
+    assert adapter.resumed is True
+
+
 def test_codex_chat_app_server_stdio_uses_utf8(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -57,3 +146,430 @@ def test_codex_chat_app_server_stdio_uses_utf8(
         assert launch_options["encoding"] == "utf-8"
     finally:
         session.close()
+
+
+@pytest.mark.parametrize(
+    ("item", "expected_activity"),
+    [
+        ({"type": "userMessage"}, "Agent 已收到消息"),
+        ({"type": "agentMessage"}, "Agent 正在生成回答"),
+        ({"type": "commandExecution"}, "Agent 正在执行命令"),
+        ({"type": "reasoning"}, "Agent 正在思考"),
+        ({"type": "mcpToolCall"}, "Agent 正在调用工具"),
+        ({"type": "futureItem", "text": "private-fixture-content"}, "Agent 正在处理"),
+        ({}, "Agent 正在处理"),
+    ],
+)
+def test_turn_activity_does_not_invent_goal_reads_or_successful_checks(
+    monkeypatch,
+    tmp_path,
+    item,
+    expected_activity,
+):
+    session = chat_agent.CodexChatAgentSession(
+        process=_FakeAppServerProcess(),
+        messages=queue.Queue(),
+        thread_id="thread-fixture",
+        work_dir=tmp_path,
+    )
+    upstream = iter(
+        [
+            {"method": "turn/started", "params": {"turn": {"id": "turn-fixture"}}},
+            {"method": "item/started", "params": {"item": item}},
+            # Completion can mean a failed command or receipt of a user message;
+            # neither is evidence that a Goal check passed.
+            {
+                "method": "item/completed",
+                "params": {"item": {**item, "status": "failed"}},
+            },
+            {"method": "item/agentMessage/delta", "params": {"delta": "Ready."}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+    )
+    monkeypatch.setattr(
+        session, "_request", lambda *a, **kw: {"turn": {"id": "turn-fixture"}}
+    )
+    monkeypatch.setattr(session, "_next_event", lambda **kw: next(upstream))
+    events = []
+    session.send(
+        "Reply briefly.", on_event=lambda kind, payload: events.append((kind, payload))
+    )
+    phases = [p for kind, p in events if kind == "agent.phase"]
+    assert phases[1]["label"] == expected_activity
+    assert phases[0]["label"] == "Agent 已开始处理"
+    assert phases[2]["label"] == "Agent 返回了处理状态"
+    assert not any("检查" in p["label"] or "Goal" in p["label"] for p in phases)
+    assert "private-fixture-content" not in json.dumps(phases)
+    assert any(kind == "answer.delta" and p["text"] == "Ready." for kind, p in events)
+
+
+def test_codex_chat_pins_explicit_home_in_child_environment(monkeypatch, tmp_path):
+    options = {}
+
+    def popen(command, **kwargs):
+        options.update(kwargs)
+        return _FakeAppServerProcess()
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "ambient"))
+    monkeypatch.setattr(chat_agent.shutil, "which", lambda _: "codex")
+    monkeypatch.setattr(chat_agent.subprocess, "Popen", popen)
+    session = chat_agent.CodexChatAgentSession.start(
+        codex_bin="codex",
+        work_dir=tmp_path,
+        goal_id="fixture",
+        objective="fixture",
+        codex_home=tmp_path / "bound",
+    )
+    try:
+        assert options["env"]["CODEX_HOME"] == str((tmp_path / "bound").resolve())
+        assert chat_agent.os.environ["CODEX_HOME"] == str(tmp_path / "ambient")
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("commentary", ["I will read the context.", '{"answer":"not-final"}'])
+@pytest.mark.parametrize("final_phase", [None, "final_answer"])
+def test_structured_turn_uses_completed_answer_not_commentary_or_partial_deltas(
+    monkeypatch, tmp_path, commentary, final_phase,
+):
+    session = chat_agent.CodexChatAgentSession(
+        process=_FakeAppServerProcess(), messages=queue.Queue(), thread_id="thread-fixture",
+        work_dir=tmp_path, execution_mode=True,
+    )
+    params = {"threadId": "thread-fixture", "turnId": "turn-fixture"}
+    final = {"type": "agentMessage", "text": '{"answer":"actual"}'}
+    if final_phase is not None:
+        final["phase"] = final_phase
+    upstream = iter([
+        {"method": "item/agentMessage/delta", "params": {**params, "delta": commentary}},
+        {"method": "item/completed", "params": {**params, "item": {
+            "type": "agentMessage", "phase": "commentary", "text": commentary}}},
+        {"method": "item/agentMessage/delta", "params": {**params, "delta": '{"answer":'}},
+        {"method": "item/completed", "params": {**params, "item": final}},
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+    ])
+    monkeypatch.setattr(session, "_request", lambda *a, **kw: {"turn": {"id": "turn-fixture"}})
+    monkeypatch.setattr(session, "_next_event", lambda **kw: next(upstream))
+    assert session.send("Return the structured result.", output_schema={"type": "object"}) == {"answer": "actual"}
+
+
+@pytest.mark.parametrize("phase", ["commentary", "futurePhase", []])
+def test_structured_turn_cannot_promote_nonfinal_json_to_a_final_result(monkeypatch, tmp_path, phase):
+    session = chat_agent.CodexChatAgentSession(
+        process=_FakeAppServerProcess(), messages=queue.Queue(), thread_id="thread-fixture",
+        work_dir=tmp_path, execution_mode=True,
+    )
+    upstream = iter([
+        {"method": "item/agentMessage/delta", "params": {"delta": '{"answer":"not-final"}'}},
+        {"method": "item/completed", "params": {"item": {
+            "type": "agentMessage", "phase": phase, "text": '{"answer":"not-final"}'}}},
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+    ])
+    monkeypatch.setattr(session, "_request", lambda *a, **kw: {"turn": {"id": "turn-fixture"}})
+    monkeypatch.setattr(session, "_next_event", lambda **kw: next(upstream))
+    with pytest.raises(chat_agent.CodexChatAgentError, match="structured output"):
+        session.send("Return the structured result.", output_schema={"type": "object"})
+
+
+def test_trusted_manager_profile_reaches_app_server_and_turn_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    process = _FakeAppServerProcess()
+    monkeypatch.setattr(chat_agent.shutil, "which", lambda _: "codex")
+    monkeypatch.setattr(chat_agent.subprocess, "Popen", lambda *a, **k: process)
+    session = chat_agent.CodexChatAgentSession.start(
+        codex_bin="codex",
+        work_dir=tmp_path,
+        goal_id="loopx-manager",
+        objective="global",
+        runtime_profile="trusted_owner",
+    )
+    try:
+        requests = [json.loads(line) for line in process.stdin.getvalue().splitlines()]
+        start = next(row for row in requests if row["method"] == "thread/start")
+        assert start["params"]["sandbox"] == "danger-full-access"
+
+        turns = []
+
+        def request(method, params, **kwargs):
+            turns.append((method, params))
+            return {"turn": {"id": "fixture-turn"}}
+
+        monkeypatch.setattr(session, "_request", request)
+        monkeypatch.setattr(
+            session,
+            "_next_event",
+            lambda **kwargs: {
+                "method": "turn/completed",
+                "params": {"turn": {"status": "completed"}},
+            },
+        )
+        session.send("Inspect and repair the project.")
+        prompt = turns[0][1]["input"][0]["text"]
+        assert "effective runtime profile is trusted_owner" in prompt
+        assert "Do not edit files" not in prompt
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize(
+    ("runtime_profile", "sandbox"),
+    [
+        ("restricted", "workspace-write"),
+        ("restricted", "danger-full-access"),
+        ("trusted_owner", "read-only"),
+        ("trusted_owner", "workspace-write"),
+    ],
+)
+def test_manager_profile_rejects_mismatched_sandbox_before_app_server_start(
+    monkeypatch,
+    tmp_path,
+    runtime_profile,
+    sandbox,
+):
+    started = False
+
+    def popen(*args, **kwargs):
+        nonlocal started
+        started = True
+        return _FakeAppServerProcess()
+
+    monkeypatch.setattr(chat_agent.shutil, "which", lambda _: "codex")
+    monkeypatch.setattr(chat_agent.subprocess, "Popen", popen)
+
+    with pytest.raises(ValueError, match="does not match"):
+        chat_agent.CodexChatAgentSession.start(
+            codex_bin="codex",
+            work_dir=tmp_path,
+            goal_id="loopx-manager",
+            objective="global",
+            runtime_profile=runtime_profile,
+            sandbox=sandbox,
+        )
+
+    assert started is False
+
+
+def test_app_server_adapter_cannot_bypass_manager_profile_sandbox_binding(
+    monkeypatch,
+    tmp_path,
+):
+    started = False
+
+    def popen(*args, **kwargs):
+        nonlocal started
+        started = True
+        return _FakeAppServerProcess()
+
+    monkeypatch.setattr(chat_agent.shutil, "which", lambda _: "codex")
+    monkeypatch.setattr(chat_agent.subprocess, "Popen", popen)
+
+    with pytest.raises(ValueError, match="does not match"):
+        chat_runtime.CodexAppServerAdapter.start(
+            codex_bin="codex",
+            work_dir=tmp_path,
+            goal_id="loopx-manager",
+            objective="global",
+            runtime_profile="restricted",
+            sandbox="danger-full-access",
+        )
+
+    assert started is False
+
+
+@pytest.mark.parametrize("resume_thread_id", [None, "thread-loopx-chat"])
+def test_explicit_manager_model_and_effort_reach_start_resume_and_turn(
+    monkeypatch, tmp_path, resume_thread_id
+):
+    process = _FakeAppServerProcess()
+    monkeypatch.setattr(chat_agent.shutil, "which", lambda _: "codex")
+    monkeypatch.setattr(chat_agent.subprocess, "Popen", lambda *a, **k: process)
+    session = chat_agent.CodexChatAgentSession.start(
+        codex_bin="codex",
+        work_dir=tmp_path,
+        goal_id="loopx-manager",
+        objective="global",
+        model="gpt-6-astra",
+        reasoning_effort="medium",
+        resume_thread_id=resume_thread_id,
+    )
+    try:
+        requests = [json.loads(line) for line in process.stdin.getvalue().splitlines()]
+        start = next(
+            r for r in requests if r["method"] in {"thread/start", "thread/resume"}
+        )
+        assert start["params"]["model"] == "gpt-6-astra"
+        assert start["params"]["config"]["model_reasoning_effort"] == "medium"
+        turns = []
+
+        def request(method, params, **kwargs):
+            turns.append((method, params))
+            return {"turn": {"id": "fixture-turn"}}
+
+        monkeypatch.setattr(session, "_request", request)
+        monkeypatch.setattr(
+            session,
+            "_next_event",
+            lambda **kwargs: {
+                "method": "turn/completed",
+                "params": {"turn": {"status": "completed"}},
+            },
+        )
+        session.send("Which Goals?")
+        assert turns[0][0] == "turn/start"
+        assert turns[0][1]["model"] == "gpt-6-astra"
+        assert turns[0][1]["effort"] == "medium"
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("terminal_method", ["error", "turn/completed"])
+@pytest.mark.parametrize(
+    "info,expected",
+    [
+        ("cyberPolicy", "cyber_policy"),
+        ("misalignmentPolicyViolation", "misalignment_policy_violation"),
+        ("usageLimitExceeded", "usage_limit_exceeded"),
+        ("rateLimitExceeded", "rate_limit_exceeded"),
+        ("contextWindowExceeded", "context_window_exceeded"),
+        ("unauthorized", "unauthorized"),
+        ("futureVariant", "host_gate"),
+        ({"unknown": "cyberPolicy"}, "host_gate"),
+        (None, "host_gate"),
+    ],
+)
+def test_typed_terminal_errors_preserve_category_without_promoting_partial_answer(
+    monkeypatch,
+    tmp_path,
+    terminal_method,
+    info,
+    expected,
+):
+    session = chat_agent.CodexChatAgentSession(
+        process=_FakeAppServerProcess(),
+        messages=queue.Queue(),
+        thread_id="thread-fixture",
+        work_dir=tmp_path,
+    )
+    error = {
+        "codexErrorInfo": info,
+        "message": "private-fixture cyberPolicy",
+        "additionalDetails": "private-fixture",
+    }
+    params = {"threadId": "thread-fixture", "turnId": "turn-fixture"}
+    if terminal_method == "error":
+        params.update(error=error, willRetry=False)
+    else:
+        params["turn"] = {"id": "turn-fixture", "status": "failed", "error": error}
+    upstream = iter(
+        [
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"delta": "Partial answer."},
+            },
+            {"method": terminal_method, "params": params},
+        ]
+    )
+    monkeypatch.setattr(
+        session, "_request", lambda *a, **kw: {"turn": {"id": "turn-fixture"}}
+    )
+    monkeypatch.setattr(session, "_next_event", lambda **kw: next(upstream))
+    events = []
+    with pytest.raises(chat_agent.CodexChatAgentError) as caught:
+        session.send("Report progress.", on_event=lambda k, p: events.append((k, p)))
+    assert caught.value.error_code == expected
+    assert "private-fixture" not in str(caught.value) + json.dumps(caught.value.gate)
+    assert not any(k == "answer.final" for k, _ in events)
+    if expected in {"cyber_policy", "misalignment_policy_violation"}:
+        assert caught.value.gate["kind"] == "policy_gate"
+        assert "不会自动重放" in caught.value.gate["next_action"]
+
+
+def test_structured_invalid_upstream_request_is_not_a_generic_host_gate() -> None:
+    error = chat_agent._terminal_turn_error(
+        {
+            "codexErrorInfo": "other",
+            "message": json.dumps(
+                {
+                    "type": "error",
+                    "status": 400,
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "private upstream model detail",
+                    },
+                }
+            ),
+        },
+        "generic fallback",
+    )
+    assert error.error_code == "upstream_invalid_request"
+    assert "private upstream" not in str(error) + json.dumps(error.gate)
+    assert "模型" in error.gate["next_action"]
+
+
+def test_unstructured_upstream_error_stays_generic() -> None:
+    error = chat_agent._terminal_turn_error(
+        {"codexErrorInfo": "other", "message": "private upstream error"},
+        "generic fallback",
+    )
+    assert error.error_code == "host_gate"
+    assert "private upstream" not in str(error) + json.dumps(error.gate)
+
+
+def test_retry_and_unrelated_policy_events_do_not_terminate_current_turn(
+    monkeypatch, tmp_path
+):
+    session = chat_agent.CodexChatAgentSession(
+        process=_FakeAppServerProcess(),
+        messages=queue.Queue(),
+        thread_id="thread-fixture",
+        work_dir=tmp_path,
+    )
+    upstream = iter(
+        [
+            {
+                "method": "error",
+                "params": {
+                    "threadId": "other-thread",
+                    "turnId": "turn-fixture",
+                    "error": {"codexErrorInfo": "cyberPolicy"},
+                    "willRetry": False,
+                },
+            },
+            {
+                "method": "error",
+                "params": {
+                    "threadId": "thread-fixture",
+                    "turnId": "other-turn",
+                    "error": {"codexErrorInfo": "cyberPolicy"},
+                    "willRetry": False,
+                },
+            },
+            {
+                "method": "error",
+                "params": {
+                    "threadId": "thread-fixture",
+                    "turnId": "turn-fixture",
+                    "error": {"codexErrorInfo": "rateLimitExceeded"},
+                    "willRetry": True,
+                },
+            },
+            {"method": "item/agentMessage/delta", "params": {"delta": "Recovered."}},
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-fixture", "status": "completed"}},
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        session, "_request", lambda *a, **kw: {"turn": {"id": "turn-fixture"}}
+    )
+    monkeypatch.setattr(session, "_next_event", lambda **kw: next(upstream))
+    events = []
+    result = session.send(
+        "Report progress.", on_event=lambda k, p: events.append((k, p))
+    )
+    assert result["message"] == "Recovered."
+    assert any(k == "agent.phase" and p["label"] == "Codex 正在重试" for k, p in events)
+    assert sum(k == "answer.final" for k, p in events) == 1

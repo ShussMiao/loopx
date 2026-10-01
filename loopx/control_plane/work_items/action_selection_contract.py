@@ -4,13 +4,14 @@ import shlex
 from collections.abc import Mapping
 from typing import Any
 
+from ..agents.capability_gate import runtime_capabilities_for_cli_projection
+from ..todos.contract import normalize_todo_id
+from ..quota.effective_action import EffectiveAction
 
-def render_cli_command_prefix(*, runtime_root: str | None = None) -> str:
-    return (
-        f"loopx --runtime-root {shlex.quote(str(runtime_root))}"
-        if runtime_root
-        else "loopx"
-    )
+
+def render_cli_command_prefix(*, runtime_root: str | None = None, registry_path: str | None = None) -> str:
+    return ("loopx" + (f" --registry {shlex.quote(str(registry_path))}" if registry_path else "")
+        + (f" --runtime-root {shlex.quote(str(runtime_root))}" if runtime_root else ""))
 
 
 def action_portfolio_requires_explicit_selection(
@@ -153,3 +154,248 @@ def delivery_spend_allowed(
     return spend_after_validation and not action_portfolio_requires_explicit_selection(
         payload
     )
+
+
+def current_action_selection_admission(
+    payload: Mapping[str, Any], *, requested_todo_id: str,
+    agent_must_attempt: bool, agent_delivery_refused: bool,
+) -> tuple[str | None, bool]:
+    """Read current obligation admission, including repair and monitor positives."""
+    selected_todo = payload.get("selected_todo")
+    selected_todo_id = (
+        normalize_todo_id(selected_todo.get("todo_id"))
+        if isinstance(selected_todo, Mapping)
+        else None
+    )
+    qualification_value = payload.get("action_selection_qualification")
+    qualification: Mapping[str, object] = (
+        qualification_value if isinstance(qualification_value, Mapping) else {}
+    )
+    if selected_todo_id is None and str(qualification.get("state") or "") == (
+        "qualified"
+    ):
+        # An unsettled-host-turn recovery decision carries no top-level
+        # `selected_todo`: its qualification names the Todo that prior Turn
+        # has to settle, and binding the guard to that Todo is the documented
+        # closeout path rather than a conflict with the projection.
+        qualification_selected = qualification.get("selected_todo")
+        selected_todo_id = (
+            normalize_todo_id(qualification_selected.get("todo_id"))
+            if isinstance(qualification_selected, Mapping)
+            else None
+        )
+    selection_binding = (
+        selected_todo.get("selection_binding")
+        if isinstance(selected_todo, Mapping)
+        else None
+    )
+    execution_obligation_value = payload.get("execution_obligation")
+    execution_obligation: Mapping[str, object] = (
+        execution_obligation_value
+        if isinstance(execution_obligation_value, Mapping)
+        else {}
+    )
+    pending_selection_delivery_qualified = (
+        selection_binding == "pending_action_selection"
+        and payload.get("normal_delivery_allowed") is True
+    )
+    pending_selection_workspace_repair_qualified = (
+        selection_binding == "pending_action_selection"
+        and payload.get("workspace_repair_allowed") is True
+        and payload.get("effective_action") == EffectiveAction.AGENT_WORKSPACE_REPAIR.value
+        and execution_obligation.get("kind") == "agent_workspace_repair"
+        and execution_obligation.get("must_attempt_work") is True
+        and agent_must_attempt
+        and agent_delivery_refused
+    )
+    exact_current_obligation_qualified = (
+        selection_binding != "pending_action_selection"
+        and execution_obligation.get("must_attempt_work") is True
+        and agent_must_attempt
+    )
+    if (
+        selected_todo_id == requested_todo_id
+        and payload.get("ok") is True
+        and payload.get("should_run") is True
+        and (
+            pending_selection_delivery_qualified
+            or pending_selection_workspace_repair_qualified
+            or exact_current_obligation_qualified
+        )
+    ):
+        return selected_todo_id, True
+
+    return selected_todo_id, False
+
+
+def action_selection_needs_recovery(
+    payload: Mapping[str, Any], *, agent_must_attempt: bool = False,
+    agent_delivery_refused: bool = False,
+) -> bool:
+    """Read the typed qualifier's result without reimplementing admission."""
+    qualification = payload.get("action_selection_qualification")
+    if not isinstance(qualification, Mapping) or qualification.get("state") not in {"deferred", "rejected"}:
+        return False
+    # A committed binding is reconciled by the receipt owner, not by pending
+    # selection recovery. Preserve the same exemption as CLI preflight.
+    selected = payload.get("selected_todo")
+    replan = payload.get("autonomous_replan_obligation")
+    if any(isinstance(value, Mapping) and value.get("selection_binding") == "heartbeat_receipt"
+           for value in (selected, replan)):
+        return False
+    _, admitted = current_action_selection_admission(
+        payload, requested_todo_id=str(qualification.get("requested_todo_id") or ""),
+        agent_must_attempt=agent_must_attempt, agent_delivery_refused=agent_delivery_refused,
+    )
+    if admitted:
+        return False
+    if qualification.get("recovery_action") != "reenter_guard_without_selection":
+        raise RuntimeError("rejected action selection omitted its typed recovery action")
+    return True
+
+
+def action_selection_recovery_fields(
+    recovery: dict[str, Any],
+) -> dict[str, Any]:
+    """Complete the one preflight result in the owning projection module."""
+    recovery["execution_obligation"] = {
+        "must_attempt_work": False,
+        "kind": EffectiveAction.QUOTA_SKIP.value,
+        "delivery_allowed": False,
+        "notify_is_execution_gate": False,
+        "reason": recovery["recommended_action"],
+        "spend_policy": "no quota spend until an eligible Todo is selected",
+    }
+    return recovery
+
+
+def build_action_selection_recovery_fields(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Construct the closed root facts for one typed selection refusal."""
+
+    qualification = payload.get("action_selection_qualification")
+    if not isinstance(qualification, Mapping):
+        raise RuntimeError("selection recovery requires a typed qualification")
+    qualification_state = str(qualification.get("state") or "")
+    if qualification_state not in {"deferred", "rejected"}:
+        raise RuntimeError("selection recovery requires a deferred or rejected state")
+    qualification_reason = str(
+        qualification.get("reason") or "candidate_not_currently_eligible"
+    )
+    deferred = qualification_state == "deferred"
+    auxiliary_monitor = (
+        qualification_reason
+        == "auxiliary_monitor_not_selectable_in_advancement_lane"
+    )
+    error_code = (
+        "quota_action_selection_deferred"
+        if deferred
+        else "quota_action_selection_rejected"
+    )
+    recovery = {
+        "ok": False,
+        "spend_allowed_now": False,
+        "spend_after_validation": False,
+        "decision": "skip",
+        "should_run": False,
+        "normal_delivery_allowed": False,
+        "recovery_delivery_allowed": False,
+        "self_repair_allowed": False,
+        "capability_repair_allowed": False,
+        "workspace_repair_allowed": False,
+        "actionable_by_codex": False,
+        # An unadmitted selection grants no safe bypass either: the heartbeat
+        # task body reads safe_bypass_allowed as permission to run one bounded
+        # step and spend, so the refusal must close that authority too.
+        "safe_bypass_allowed": False,
+        "safe_bypass_kind": None,
+        "safe_bypass_policy": None,
+        "effective_action": EffectiveAction.QUOTA_SKIP.value,
+        "state": error_code,
+        "waiting_on": "codex",
+        "status": error_code,
+        "error_code": error_code,
+        "reason": (
+            "explicit action selection was deferred by the current "
+            f"delivery frontier: {qualification_reason}"
+            if deferred
+            else "explicit action selection is not currently eligible: "
+            f"{qualification_reason}"
+        ),
+        "recommended_action": (
+            "handle the current delivery preemption, then rerun quota "
+            "should-run with the same --turn-instance-id; omit --todo-id "
+            "first when a refreshed action portfolio is needed"
+            if deferred
+            else "the due monitor is visible as auxiliary context, not an "
+            "independently selectable action in the current advancement lane; "
+            "choose a current advancement Todo, or rerun after the monitor "
+            "becomes the hard lane"
+            if auxiliary_monitor
+            else "rerun quota should-run with the same --turn-instance-id "
+            "without --todo-id, then choose a currently eligible Todo"
+        ),
+    }
+    return action_selection_recovery_fields(recovery)
+
+
+def apply_action_selection_recovery_projection(payload: dict[str, Any]) -> bool:
+    """Replace an unadmitted action with its closed pre-finalization facts."""
+
+    qualification = payload.get("action_selection_qualification")
+    if not isinstance(qualification, Mapping) or qualification.get("state") not in {
+        "deferred",
+        "rejected",
+    }:
+        return False
+    if qualification.get("recovery_action") != "reenter_guard_without_selection":
+        raise RuntimeError("rejected action selection omitted its typed recovery action")
+    payload.update(build_action_selection_recovery_fields(payload))
+    return True
+
+
+def action_selection_recovery_command(
+    *, registry_path: str | None = None, runtime_root: str | None = None,
+    goal_id: str, agent_id: str | None, turn_instance_id: str | None,
+    scheduler_args: str, available_capabilities: Any = None,
+) -> str:
+    argv = ["loopx"]
+    if registry_path:
+        argv.extend(["--registry", registry_path])
+    if runtime_root:
+        argv.extend(["--runtime-root", runtime_root])
+    argv.extend(["--format", "json", "quota", "should-run", "--goal-id", goal_id])
+    if agent_id:
+        argv.extend(["--agent-id", agent_id])
+    if turn_instance_id:
+        argv.extend(["--turn-instance-id", turn_instance_id])
+    for capability in runtime_capabilities_for_cli_projection(available_capabilities):
+        argv.extend(["--available-capability", capability])
+    return shlex.join(argv) + scheduler_args
+
+
+def action_selection_recovery_cli_channel(command: str) -> dict[str, Any]:
+    return {
+        "next_cli_actions": [command], "selection_required": False,
+        "spend_allowed_now": False, "spend_after_validation": False,
+        "spend_policy": "rerun this turn's guard before delivery or settlement",
+    }
+
+
+def bind_action_selection_recovery_command(
+    payload: dict[str, Any], *, registry_path: str, runtime_root: str,
+    goal_id: str, agent_id: str | None, turn_instance_id: str | None,
+    scheduler_args: str, available_capabilities: Any = None,
+) -> None:
+    """Bind the existing recovery projection to the invoking CLI's exact argv."""
+    if not action_selection_needs_recovery(payload):
+        raise RuntimeError("selection recovery binding requires a typed recovery result")
+    command = action_selection_recovery_command(
+        registry_path=registry_path, runtime_root=runtime_root, goal_id=goal_id,
+        agent_id=agent_id, turn_instance_id=turn_instance_id,
+        scheduler_args=scheduler_args, available_capabilities=available_capabilities,
+    )
+    interaction = payload["interaction_contract"]
+    interaction["agent_channel"]["primary_action"] = command
+    interaction["cli_channel"]["next_cli_actions"] = [command]

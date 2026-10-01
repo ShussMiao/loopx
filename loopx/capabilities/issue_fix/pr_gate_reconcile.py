@@ -8,9 +8,12 @@ from ...paths import resolve_runtime_root
 from ...control_plane.todos.contract import (
     normalize_todo_decision_scope,
 )
-from ...control_plane.todos.projection import todo_item_task_class
+from ...control_plane.todos.todo_semantics import todo_item_task_class
 from ...todos import complete_goal_todo, list_goal_todos
-from .pr_lifecycle import build_issue_fix_pr_lifecycle_monitor_packet
+from .pr_lifecycle import (
+    TERMINAL_PR_STATES,
+    build_issue_fix_pr_lifecycle_monitor_packet,
+)
 from .pr_lifecycle_rollout import append_pr_merge_rollout_event
 from .pr_review_ack import (
     load_issue_fix_pr_review_ack_receipts,
@@ -23,7 +26,6 @@ PR_REVIEW_RECONCILIATION_SCHEMA_VERSION = "issue_fix_pr_review_reconciliation_v0
 PR_REVIEW_ACKED_RECONCILIATION_SCHEMA_VERSION = (
     "issue_fix_pr_review_acked_reconciliation_v0"
 )
-TERMINAL_PR_STATES = {"MERGED", "CLOSED"}
 
 
 def _validate_merge_gate(todo: Mapping[str, Any], *, pr_number: int) -> None:

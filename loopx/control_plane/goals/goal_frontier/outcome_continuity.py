@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from ...agents.agent_scope import agent_scope_item_claimed_by
@@ -21,6 +22,13 @@ VISION_OUTCOME_CHECKPOINT_CONTINUATION_OUTCOMES = {
     "no_change",
     "replan",
 }
+
+
+class OutcomeCheckpointReason(StrEnum):
+    CLAIM_MISSING = "final_outcome_claim_missing"
+    INCOMPLETE = "final_outcome_checkpoint_incomplete"
+
+
 def _compact_text(value: Any, *, limit: int) -> str | None:
     text = " ".join(str(value or "").strip().split())
     return text[:limit] if text else None
@@ -267,22 +275,43 @@ def acceptance_gaps_from_outcome_checkpoint(
         == qualification_vision.get("generated_at")
     )
     outcome_gap_reported = "outcome_gap" in delivery_outcomes
-    checkpoint_complete = bool(
-        checkpoint.get("satisfied") is True
-        and (fresh_vision_patch or unchanged_vision_revision)
-        and claim
-        and evidence_refs
-        and path_outcome in VISION_OUTCOME_CHECKPOINT_CONTINUATION_OUTCOMES
-        and not outcome_gap_reported
-    )
-    if checkpoint_complete:
+    # The same component facts own both qualification and its explanation.
+    component_checks = {
+        "checkpoint_satisfied": checkpoint.get("satisfied") is True,
+        "checkpoint_fresh": fresh_vision_patch or unchanged_vision_revision,
+        "path_outcome_valid": path_outcome in VISION_OUTCOME_CHECKPOINT_CONTINUATION_OUTCOMES,
+        "evidence_refs_present": bool(evidence_refs),
+        "final_outcome_claim_present": bool(claim),
+        "no_reported_outcome_gap": not outcome_gap_reported,
+    }
+    failed_components = [key for key, passed in component_checks.items() if not passed]
+    if not failed_components:
         return []
+    claim_only_missing = failed_components == ["final_outcome_claim_present"]
+    reason = (
+        OutcomeCheckpointReason.CLAIM_MISSING
+        if claim_only_missing else OutcomeCheckpointReason.INCOMPLETE
+    )
 
     gap: dict[str, Any] = {
         "kind": VISION_OUTCOME_CHECKPOINT_REQUIRED_TRIGGER,
         "source": "latest_vision_checkpoint",
         "agent_id": checkpoint.get("agent_id") or agent_vision.get("agent_id"),
+        "reason_code": reason.value,
+        "component_checks": component_checks,
+        "resolution_hint": (
+            "Add or restore a bounded vision_patch.acceptance_summary stating the "
+            "final outcome supported by the existing evidence. Retain that route "
+            "and its refs in the required path_delta.outcome=replan correction. "
+            "A learning milestone alone is not completion."
+            if claim_only_missing else
+            "Repair the failed checkpoint components with a fresh evidence-linked "
+            "final-outcome claim and a valid continuation path decision."
+        ),
         "replan_trigger_summary": (
+            "the checkpoint, path decision, and evidence are valid, but the "
+            "final-outcome claim (vision_patch.acceptance_summary) is missing"
+            if claim_only_missing else
             "a material milestone closed without a fresh evidence-linked final-outcome "
             "path decision"
         ),

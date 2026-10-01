@@ -42,8 +42,8 @@ def _registry(tmp_path: Path) -> tuple[Path, Path, Path]:
     return registry, runtime_root, state_file
 
 
-def _authority_read() -> dict[str, object]:
-    return {
+def _authority_read(**kwargs) -> dict[str, object]:
+    result = {
         "status": "loaded",
         "source_authority": "file_v0",
         "provider_revision": "file:7:abc",
@@ -71,6 +71,16 @@ def _authority_read() -> dict[str, object]:
         ],
     }
 
+    if "projection_readback" in kwargs:
+        witness = kwargs["projection_readback"]
+        result["projection_readback"] = {
+            "provider_revision": witness["provider_revision"],
+            "observed_provider_revision": result["provider_revision"],
+            "status": "delivered" if witness["changed"] else "current",
+        "next_action": "finish",
+        }
+    return result
+
 
 def test_project_current_canonical_todos_is_durable_and_idempotent(
     monkeypatch: pytest.MonkeyPatch,
@@ -80,7 +90,7 @@ def test_project_current_canonical_todos_is_durable_and_idempotent(
     monkeypatch.setattr(
         provider_projection,
         "read_canonical_todos_if_promoted",
-        lambda **_kwargs: _authority_read(),
+        _authority_read,
     )
 
     delivered = provider_projection.project_current_canonical_todos(
@@ -116,12 +126,12 @@ def test_settlement_preserves_commit_and_replays_after_projection_failure(
     monkeypatch.setattr(
         provider_projection,
         "read_canonical_todos_if_promoted",
-        lambda **_kwargs: _authority_read(),
+        _authority_read,
     )
-    real_write = provider_projection._atomic_write_text
+    real_write = provider_projection.atomic_write_state_text
     monkeypatch.setattr(
         provider_projection,
-        "_atomic_write_text",
+        "atomic_write_state_text",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("crash")),
     )
 
@@ -150,7 +160,7 @@ def test_settlement_preserves_commit_and_replays_after_projection_failure(
     }
     assert state_file.read_text(encoding="utf-8") == SOURCE
 
-    monkeypatch.setattr(provider_projection, "_atomic_write_text", real_write)
+    monkeypatch.setattr(provider_projection, "atomic_write_state_text", real_write)
     replay = provider_projection.settle_canonical_todo_projection(
         {"status": "replayed", "changed": False},
         registry_path=registry,
@@ -169,7 +179,7 @@ def test_explicit_projection_fences_requested_revision(
     monkeypatch.setattr(
         provider_projection,
         "read_canonical_todos_if_promoted",
-        lambda **_kwargs: _authority_read(),
+        _authority_read,
     )
 
     with pytest.raises(ValueError, match="does not match"):
@@ -181,3 +191,39 @@ def test_explicit_projection_fences_requested_revision(
         )
 
     assert state_file.read_text(encoding="utf-8") == SOURCE
+
+
+def test_projection_delivery_status_contract_is_strict():
+    assert provider_projection.parse_projection_delivery("delivered") is provider_projection.ProjectionDeliveryStatus.DELIVERED
+    assert provider_projection.projection_delivery_requires_ack("current") is True
+    assert provider_projection.projection_delivery_requires_ack("pending") is False
+    with pytest.raises(ValueError, match="unsupported projection_delivery"):
+        provider_projection.parse_projection_delivery("completed")
+
+
+def test_projection_delivery_composition_fixture_matches_provider_semantics():
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "control_plane" / "projection_delivery_composition_v0.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    for case in fixture["cases"]:
+        status = (
+            provider_projection.parse_projection_delivery(case["readback"]).value
+            if "readback" in case
+            else provider_projection.projection_delivery_for_mutation(case.get("changed", False)).value
+        )
+        assert status == case["expected"], case["name"]
+        assert provider_projection.projection_delivery_requires_ack(status) is case["requires_ack"], case["name"]
+
+
+def test_projection_delivery_e2e_fixture_preserves_causal_states():
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "control_plane" / "projection_delivery_e2e_v1.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    observed = []
+    for transition in fixture["transitions"]:
+        if "readback" in transition:
+            status = provider_projection.parse_projection_delivery(transition["readback"]).value
+        else:
+            status = provider_projection.projection_delivery_for_mutation(transition["changed"]).value
+        observed.append(status)
+        assert status == transition["delivery"], transition["step"]
+        assert provider_projection.projection_delivery_requires_ack(status) is transition["ack"], transition["step"]
+    assert observed == ["pending", "delivered", "current", "not_required", "pending"]

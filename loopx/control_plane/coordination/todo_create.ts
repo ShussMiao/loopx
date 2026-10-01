@@ -1,5 +1,8 @@
+import {planTodoPriority} from "../todos/priority.ts";
+import {AUTHORITY_SOURCE_CHANGED, uncheckedAuthoritySource, type AuthoritySourceCheck} from "./authority_source.ts";
 import type { JsonObject } from "../effect_program.ts";
-import type { AuthorityStore, AuthorityStoreReceiptResult } from "./authority_store.ts";
+import {CoordinationCommandReceipt} from "./command_receipt.ts";
+import type { AuthorityStore } from "./authority_store.ts";
 import {
   AuthorityStoreProtocolError,
   canonicalAuthorityObject,
@@ -8,11 +11,10 @@ import {
 } from "./authority_store_codec.ts";
 import {normalizeRegisteredTodoAgents, normalizeTodoAgent} from "./todo_agents.ts";
 import {
-  TODO_DOMAIN_READ_RECORD_SCHEMA,
   TODO_DOMAIN_ITEM_SCHEMA,
-  TODO_ITEM_SCHEMA,
   canonicalTodoDomainRecord,
 } from "./coordination_state_contract.ts";
+import {materializeTodoRecordForSchema} from "./todo_presentation.ts";
 import {
   indexCoordinationProjection,
   prepareCoordinationProjectionCommit,
@@ -48,38 +50,16 @@ function failure(code: string, reason: string, detail: JsonObject = {}): Coordin
   };
 }
 
-function replayCreate(
-  receipt: AuthorityStoreReceiptResult,
-  input: CoordinationTodoCreateInput,
-  requestSha: string,
-  status: "replayed" | "applied" | "recovered",
-): CoordinationTodoCreateResult | null {
-  if (receipt.status === "missing") return null;
-  if (receipt.status !== "found") {
-    return {schema_version: COORDINATION_TODO_CREATE_RESULT_SCHEMA, ...receipt};
-  }
-  const original = receipt.receipts[0];
-  if (receipt.receipts.length !== 1 ||
-      original?.schema_version !== COORDINATION_TODO_CREATE_RECEIPT_SCHEMA ||
-      original.operation_id !== input.operation_id || original.goal_id !== input.goal_id ||
-      original.request_sha256 !== requestSha || original.todo_id !== input.todo.todo_id) {
-    return failure(
-      "coordination_operation_identity_mismatch",
-      "operation id already names a different Todo create request",
-    );
-  }
-  return {
-    schema_version: COORDINATION_TODO_CREATE_RESULT_SCHEMA,
-    status,
-    changed: status !== "replayed",
-    todo_id: original.todo_id,
-    todo: original.todo,
-    provider_revision: receipt.provider_revision,
-    cursor: receipt.cursor,
-    original_receipt: original,
-    projection_delivery: "pending",
-    projection_source: "committed_authority_journal",
-  };
+function createReceipt(input: CoordinationTodoCreateInput, requestSha: string) {
+  return new CoordinationCommandReceipt({result_schema: COORDINATION_TODO_CREATE_RESULT_SCHEMA,
+    identity: {schema_version: COORDINATION_TODO_CREATE_RECEIPT_SCHEMA,
+      operation_id: input.operation_id, goal_id: input.goal_id, todo_id: String(input.todo.todo_id),
+      request_sha256: requestSha}, failure,
+    decode(original) {
+      const todo = canonicalAuthorityObject(original.todo, "created Todo receipt");
+      if (todo.todo_id !== input.todo.todo_id) throw new AuthorityStoreProtocolError("created Todo receipt identity mismatch");
+      return {fields: {todo_id: original.todo_id, todo, original_receipt: original}, changed: true};
+    }});
 }
 
 function normalizeCreateInput(rawInput: CoordinationTodoCreateInput): CoordinationTodoCreateInput {
@@ -151,19 +131,41 @@ function createCandidate(
   input: CoordinationTodoCreateInput,
   readModelSchema: unknown,
 ): JsonObject {
-  const domainCreated = canonicalTodoDomainRecord({
+  const priority = Object.hasOwn(input.todo, "priority")
+    ? planTodoPriority({}, {text: input.todo.text, priority: input.todo.priority}) : {};
+  const candidate: JsonObject = {
     ...input.todo,
+    ...priority,
     schema_version: TODO_DOMAIN_ITEM_SCHEMA,
     created_by: input.actor_agent_id,
     last_actor_agent_id: input.actor_agent_id,
     updated_at: input.now.toISOString().replace(/\.\d{3}Z$/u, "Z"),
-  }, "created Todo");
-  if (readModelSchema === TODO_DOMAIN_READ_RECORD_SCHEMA) return domainCreated;
-  return {
-    ...domainCreated,
-    schema_version: TODO_ITEM_SCHEMA,
-    source_section: domainCreated.role === "agent" ? "Agent Todo" : "User Todo",
   };
+  if (priority.priority === null) { delete candidate.priority; delete candidate.title; }
+  const domainCreated = canonicalTodoDomainRecord(candidate, "created Todo");
+  return materializeTodoRecordForSchema(domainCreated, readModelSchema, "created Todo");
+}
+
+/** In-process create planning for a caller-owned canonical transaction. Never
+ * commits or authorizes the enclosing operation; single create and Monitor
+ * batches share record admission, attribution and semantic duplicate rules. */
+export function planCoordinationTodoCreate(
+  rawInput: CoordinationTodoCreateInput,
+  todos: ReadonlyMap<string, JsonObject>,
+  readModelSchema: unknown,
+  identity: "role_text" | "operation_lane" = "role_text",
+): CoordinationTodoCreateResult {
+  const input = normalizeCreateInput(rawInput);
+  const candidate = createCandidate(input, readModelSchema);
+  const duplicate = identity === "role_text" ? [...todos.values()].find((todo) =>
+    todo.role === input.todo.role && todo.archive_state === "active" &&
+    todo.status !== "done" && todo.status !== "deferred" && todo.text === candidate.text) : undefined;
+  if (identity === "role_text" && duplicate !== undefined) return semanticDuplicateResult(candidate, duplicate, null, null);
+  if (todos.has(String(input.todo.todo_id))) {
+    return failure("todo_already_exists", "Todo id already exists in canonical authority", {todo_id: input.todo.todo_id});
+  }
+  return {schema_version: COORDINATION_TODO_CREATE_RESULT_SCHEMA, status: "planned",
+    changed: true, todo_id: input.todo.todo_id, todo: candidate};
 }
 
 async function commitCreate(
@@ -189,21 +191,14 @@ async function commitCreate(
     todo_id: todoId,
     todo: created,
   }];
-  const committed = await store.commitAuthority(commit);
-  const readback = replayCreate(
-    await store.readReceipt(input.operation_id), input, requestSha,
-    committed.status === "applied" ? "applied" : "recovered",
-  );
-  if (readback !== null) return readback;
-  return committed.status === "applied"
-    ? failure("coordination_commit_readback_mismatch", "applied create lacks its durable receipt")
-    : {schema_version: COORDINATION_TODO_CREATE_RESULT_SCHEMA, ...committed, changed: false};
+  return createReceipt(input, requestSha).commit(store, commit);
 }
 
 /** Create one canonical work item through the provider transaction and outbox. */
 export async function executeCoordinationTodoCreate(
   store: AuthorityStore,
   rawInput: CoordinationTodoCreateInput,
+  authoritySourcesCurrent: AuthoritySourceCheck = uncheckedAuthoritySource,
 ): Promise<CoordinationTodoCreateResult> {
   let input: CoordinationTodoCreateInput;
   try {
@@ -221,12 +216,14 @@ export async function executeCoordinationTodoCreate(
     actor_agent_id: input.actor_agent_id,
     dry_run: input.dry_run,
   });
-  const existing = replayCreate(
-    await store.readReceipt(input.operation_id), input, requestSha, "replayed",
-  );
+  const receipt = createReceipt(input, requestSha);
+  const existing = await receipt.read(store);
   if (existing !== null) return existing;
 
-  const head = await store.loadAuthority();
+  if (!await authoritySourcesCurrent()) return failure(AUTHORITY_SOURCE_CHANGED.code, AUTHORITY_SOURCE_CHANGED.reason);
+  const observation = await receipt.observe(store);
+  if (observation.kind === "receipt") return observation.result;
+  const head = observation.authority;
   if (head.status !== "loaded") {
     return {schema_version: COORDINATION_TODO_CREATE_RESULT_SCHEMA, ...head};
   }
@@ -241,18 +238,11 @@ export async function executeCoordinationTodoCreate(
     );
   }
   const todoId = requireAuthorityStoreId(input.todo.todo_id, "todo id");
-  const duplicate = [...projection.todos.values()].find((todo) =>
-    todo.role === input.todo.role && todo.archive_state === "active" &&
-    todo.status !== "done" && todo.status !== "deferred" && todo.text === input.todo.text
-  );
-  if (duplicate !== undefined) {
-    return semanticDuplicateResult(input.todo, duplicate, head.provider_revision, head.cursor);
-  }
-  if (projection.todos.has(todoId)) {
-    return failure("todo_already_exists", "Todo id already exists in canonical authority", {todo_id: todoId});
-  }
   const readModel = canonicalAuthorityObject(head.head.todo_read_model, "Todo read model");
-  const created = createCandidate(input, readModel.schema_version);
+  const plan = planCoordinationTodoCreate(input, projection.todos, readModel.schema_version);
+  if (!await authoritySourcesCurrent()) return failure(AUTHORITY_SOURCE_CHANGED.code, AUTHORITY_SOURCE_CHANGED.reason);
+  if (plan.status !== "planned") return {...plan, provider_revision: head.provider_revision, cursor: head.cursor};
+  const created = canonicalAuthorityObject(plan.todo, "created Todo");
   if (input.dry_run) {
     return {
       schema_version: COORDINATION_TODO_CREATE_RESULT_SCHEMA,

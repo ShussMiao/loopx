@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,11 @@ from urllib.parse import parse_qs, urlparse
 
 from .control_plane.goals.configure_goal_service import (
     configure_goal_with_global_sync,
+)
+from .capabilities.multi_subagent import (
+    apply_codex_subagent_capacity,
+    plan_codex_subagent_capacity,
+    public_codex_host_capacity,
 )
 from .capabilities.periodic_report.workspace import (
     DEFAULT_WORKSPACE_INDEX_LIMIT,
@@ -76,6 +82,7 @@ CONFIGURE_GOAL_REQUEST_FIELDS = {
     "orchestration_mode",
     "spawn_allowed",
     "max_children",
+    "align_codex_subagent_capacity",
     "allowed_domains",
     "clear_allowed_domains",
     "registered_agents",
@@ -103,6 +110,34 @@ CONFIGURE_GOAL_REQUEST_FIELDS = {
     "clear_boundary_authority",
 }
 CONFIGURE_GOAL_APPLY_FIELDS = CONFIGURE_GOAL_REQUEST_FIELDS | {"preview_id"}
+
+
+def _reject_non_standard_json_constant(value: str) -> None:
+    raise ValueError(
+        f"request body must be strict JSON; non-standard constant {value} is not allowed"
+    )
+
+
+def _require_finite_json_numbers(value: Any) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("request body must be strict JSON; non-finite numbers are not allowed")
+    if isinstance(value, dict):
+        for item in value.values():
+            _require_finite_json_numbers(item)
+    elif isinstance(value, list):
+        for item in value:
+            _require_finite_json_numbers(item)
+
+
+def parse_strict_json_object(raw: bytes) -> dict[str, Any]:
+    payload = json.loads(
+        raw.decode("utf-8"),
+        parse_constant=_reject_non_standard_json_constant,
+    )
+    _require_finite_json_numbers(payload)
+    if not isinstance(payload, dict):
+        raise ValueError("request body must be a JSON object")
+    return payload
 
 
 def parse_goal_activation_filter(query: dict[str, list[str]]) -> str | None:
@@ -167,12 +202,18 @@ def reward_preview_id(payload: dict[str, Any]) -> str:
 
 
 def configure_goal_preview_id(payload: dict[str, Any]) -> str:
+    codex_host_capacity = payload.get("codex_host_capacity")
+    if isinstance(codex_host_capacity, dict) and isinstance(
+        codex_host_capacity.get("plan_before_apply"), dict
+    ):
+        codex_host_capacity = codex_host_capacity["plan_before_apply"]
     stable_payload = {
         "goal_id": payload.get("goal_id"),
         "changed": payload.get("changed"),
         "changed_fields": payload.get("changed_fields"),
         "before": payload.get("before"),
         "after": payload.get("after"),
+        "codex_host_capacity": codex_host_capacity,
     }
     stable = json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
@@ -223,11 +264,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("request body is empty")
         if content_length > 64_000:
             raise ValueError("request body is too large")
-        raw = self.rfile.read(content_length)
-        payload = json.loads(raw.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("request body must be a JSON object")
-        return payload
+        return parse_strict_json_object(self.rfile.read(content_length))
 
     def _parse_reward_body(self, body: dict[str, Any], *, append: bool) -> tuple[str, str | None, dict[str, Any]]:
         allowed = REWARD_APPEND_FIELDS if append else REWARD_REQUEST_FIELDS
@@ -311,6 +348,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             goal_id=goal_id,
             run_generated_at=run_generated_at,
             reward=reward,
+            actor_kind="owner",
             dry_run=True,
             write_active_state_summary=(
                 _json_boolean(body, "write_active_state_summary", default=True)
@@ -391,6 +429,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 goal_id=goal_id,
                 run_generated_at=run_generated_at,
                 reward=reward,
+                actor_kind="owner",
                 dry_run=False,
                 write_active_state_summary=_json_boolean(
                     body, "write_active_state_summary", default=True
@@ -478,6 +517,9 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             "orchestration_mode": body.get("orchestration_mode"),
             "spawn_allowed": _optional_json_boolean(body, "spawn_allowed"),
             "max_children": body.get("max_children"),
+            "align_codex_subagent_capacity": _json_boolean(
+                body, "align_codex_subagent_capacity"
+            ),
             "allowed_domains": [str(item) for item in allowed_domains] if allowed_domains is not None else None,
             "clear_allowed_domains": _json_boolean(body, "clear_allowed_domains"),
             "registered_agents": [str(item) for item in registered_agents] if registered_agents is not None else None,
@@ -542,6 +584,11 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             orchestration_mode=values["orchestration_mode"],
             spawn_allowed=values["spawn_allowed"],
             max_children=values["max_children"],
+            align_codex_subagent_capacity=values[
+                "align_codex_subagent_capacity"
+            ],
+            codex_host_capacity_planner=plan_codex_subagent_capacity,
+            codex_host_capacity_applier=apply_codex_subagent_capacity,
             allowed_domains=values["allowed_domains"],
             clear_allowed_domains=values["clear_allowed_domains"],
             registered_agents=values["registered_agents"],
@@ -589,6 +636,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             "control_plane_summary": payload.get("control_plane_summary"),
             "orchestration_summary": payload.get("orchestration_summary"),
             "feature_summary": payload.get("feature_summary"),
+            "goal_configuration_changed": payload.get(
+                "goal_configuration_changed"
+            ),
+            "codex_host_capacity": public_codex_host_capacity(payload),
             "heartbeat_prompt_migration": payload.get("heartbeat_prompt_migration"),
             "supervisor_prompt": payload.get("supervisor_prompt"),
             "global_sync": payload.get("global_sync"),

@@ -57,7 +57,7 @@ def _remote_status_ok(alias: str, *, timeout: float = 5.0) -> bool:
                 "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8766/status.json",
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -70,7 +70,7 @@ def _start_remote_status(alias: str) -> None:
         ["ssh", "-o", "ConnectTimeout=5", alias, _REMOTE_BOOTSTRAP],
         check=True,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=25,
     )
 

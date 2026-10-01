@@ -45,7 +45,9 @@ def _recent_outcomes(quota_decision: Mapping[str, Any]) -> list[str]:
         ]
     )
     handoff = _mapping(quota_decision.get("handoff_readiness"))
-    candidates.append(_mapping(handoff.get("post_handoff_latest_run")).get("classification"))
+    candidates.append(
+        _mapping(handoff.get("post_handoff_latest_run")).get("classification")
+    )
     result: list[str] = []
     for value in candidates:
         text = _compact(value, limit=180)
@@ -121,9 +123,7 @@ def build_agent_turn_situation(
         "decision": _compact(quota_decision.get("decision"), limit=80),
         "selected_todo": selected,
         "recent_outcomes": _recent_outcomes(quota_decision),
-        "next_intent": _compact(
-            quota_decision.get("recommended_action"), limit=320
-        ),
+        "next_intent": _compact(quota_decision.get("recommended_action"), limit=320),
         "conflict_state": conflict_state,
         "status_health_ok": status_health_ok,
         "user_prompt_included": False,
@@ -231,6 +231,9 @@ def run_agent_turn_recall(
                 "candidate_ref": item.candidate_ref,
                 "target_class": item.target_class,
                 "content_summary": item.content_summary,
+                "experience": (
+                    dict(item.experience) if item.experience is not None else None
+                ),
             }
             for item in items
         ]

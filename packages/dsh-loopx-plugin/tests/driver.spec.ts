@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, UserMessage } from '@deepseek-ai/dsh-session'
 import type { FileRunner } from '../src/cli.ts'
 import {
@@ -61,29 +62,29 @@ function fakeAgent(id = sessionId): FakeAgent {
       return false
     },
   }
-  let session: {
+  interface FixtureHeader {
+    version: number
     id: string
-    header: {
-      version: number
-      id: string
-      createdAt: number
-      cwd: string
-      seedLength: number
-    }
-    events: SessionEvent[]
-    surface: { nodes: never[] }
-  } = {
-    id,
-    header: {
-      version: 0,
-      id,
-      createdAt: 1,
-      cwd: '/fixture/project',
-      seedLength: 0,
-    },
-    events: [],
-    surface: { nodes: [] },
+    createdAt: number
+    cwd: string
+    seedLength: number
   }
+  // The installed generation exposes one `snapshotEvents()` reader instead of
+  // the retired `events` property, so the fixture owns the log and hands it out.
+  let sessionEvents: SessionEvent[] = []
+  const fixtureSession = (header: FixtureHeader) => ({
+    id,
+    header,
+    snapshotEvents: () => sessionEvents,
+    surface: { nodes: [] as never[] },
+  })
+  let session = fixtureSession({
+    version: 0,
+    id,
+    createdAt: 1,
+    cwd: '/fixture/project',
+    seedLength: 0,
+  })
   const agent = {
     id,
     options: {},
@@ -110,16 +111,13 @@ function fakeAgent(id = sessionId): FakeAgent {
     get maintenanceCalls() { return maintenanceCalls },
     nextTurn,
     nextStep,
-    appendEvent(event) { session.events.push(event) },
-    replaceSession(headerId, events = [...session.events]) {
-      session = {
-        ...session,
-        events,
-        header: {
-          ...session.header,
-          ...(headerId === undefined ? {} : { id: headerId }),
-        },
-      }
+    appendEvent(event) { sessionEvents.push(event) },
+    replaceSession(headerId, events = [...sessionEvents]) {
+      sessionEvents = events
+      session = fixtureSession({
+        ...session.header,
+        ...(headerId === undefined ? {} : { id: headerId }),
+      })
     },
     setStatus(value) { status = value },
   }
@@ -138,7 +136,7 @@ function turnEndEvent(
 ): SessionEvent<'turn/end'> {
   return {
     type: 'turn/end',
-    seq,
+    seq: SessionSeq(seq),
     time: 1,
     data: {
       turn: 0,
@@ -282,6 +280,7 @@ function runnerFixture(options: {
   readonly quotaTurnInstanceId?: string
   readonly heartbeatTurnInstanceId?: string
   readonly heartbeatTaskBody?: string
+  readonly rewardMemoryGuidance?: string
   readonly typedQuotaFailure?: boolean
   readonly bindingStatus?: 'bound' | 'missing' | (() => 'bound' | 'missing')
 } = {}): RunnerFixture {
@@ -386,6 +385,20 @@ function runnerFixture(options: {
               },
             } : {}),
             scheduler_hint: schedulerHint,
+            ...(options.rewardMemoryGuidance === undefined ? {} : {
+              reward_memory_recall: {
+                schema_version: 'agent_turn_recall_v0',
+                status: 'applied',
+                context: {
+                  schema_version: 'agent_turn_recall_context_v0',
+                  guidance: [{
+                    candidate_ref: 'candidate:reviewed',
+                    target_class: 'soft_preference',
+                    content_summary: options.rewardMemoryGuidance,
+                  }],
+                },
+              },
+            }),
           }),
           stderr: '',
         }
@@ -403,7 +416,7 @@ function runnerFixture(options: {
           exitCode: 0,
           stdout: JSON.stringify({
             ok: true,
-            schema_version: 'loopx_heartbeat_prompt_v0',
+            schema_version: 'heartbeat_agent_input_v1',
             goal_id: goalId,
             agent_id: agentId,
             turn_instance_id: turnInstanceId,
@@ -554,6 +567,25 @@ describe('same-session LoopX driver', () => {
     await waitFor(() => host.nextTurn.length === 1)
 
     expect(fixture.heartbeatCalls).toBe(1)
+    await driver.dispose()
+  })
+
+  it('injects reviewed Reward Memory guidance into the admitted task body', async () => {
+    const fixture = runnerFixture({
+      rewardMemoryGuidance: 'Reuse the verified exact-readback sequence.',
+    })
+    const host = fakeAgent()
+    const driver = makeDriver(fixture)
+
+    observeActivated(driver, host)
+    await waitFor(() => host.nextTurn.length === 1)
+
+    const content = host.nextTurn[0]?.content
+    expect(Array.isArray(content)).toBe(true)
+    const text = (content?.[0] as { text?: string } | undefined)?.text ?? ''
+    expect(text).toContain('LoopX private Reward Memory context:')
+    expect(text).toContain('Reuse the verified exact-readback sequence.')
+    expect(text).toContain('guidance_only')
     await driver.dispose()
   })
 

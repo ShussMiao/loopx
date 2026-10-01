@@ -30,9 +30,7 @@ from typing import Any
 from .local_authority_shadow_projection import (
     PARTITIONS,
     TODO_PARTITION,
-    ProjectionValueError,
     canonical_value,
-    lease_partition_projection,
     partition_digest,
     sha256_digest,
     text_digest,
@@ -44,6 +42,7 @@ from .coordination_state_contract_generated import (
     LOCAL_AUTHORITY_SHADOW_READ_REQUEST_SCHEMA,
     LOCAL_AUTHORITY_SHADOW_READ_RESULT_SCHEMA,
 )
+from ..content_digest import ENVELOPED_SHA256_PATTERN
 from .shadow_management import (
     read_shadow_capture_binding,
     shadow_maintenance_lock_target,
@@ -262,7 +261,6 @@ def _index_entry_files(
 
 _WRITER_RUNTIMES = frozenset({WRITER_RUNTIME_PYTHON, WRITER_RUNTIME_TYPESCRIPT})
 _SOURCE_KINDS = frozenset({SOURCE_MARKDOWN, SOURCE_STATE_EVENT_LOG, SOURCE_TASK_LEASE})
-_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def _load_prepared_record(
@@ -301,7 +299,7 @@ def _load_prepared_record(
         and bool(writer.get("write_class"))
         and source.get("kind") in _SOURCE_KINDS
         and isinstance(root_digest, str)
-        and _DIGEST_PATTERN.match(root_digest) is not None
+        and ENVELOPED_SHA256_PATTERN.match(root_digest) is not None
         and isinstance(lineage_id, str)
         and bool(lineage_id)
         and source_ref is not None
@@ -376,16 +374,21 @@ def raw_bytes_digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def reclaim_verified_files(files: Iterable[tuple[Path, str]]) -> int:
-    """Remove only exact bytes proved against receipts under maintenance/primary locks.
-
-    Validate the complete batch before the first unlink. A watermark alone is
-    deliberately not accepted by this interface.
-    """
-    batch = list(files)
-    for path, expected_digest in batch:
+def verify_observed_files(files: Iterable[tuple[Path, str]]) -> None:
+    """Recheck the complete observed byte batch before checkpoint or unlink effects."""
+    for path, expected_digest in files:
         if raw_bytes_digest(path.read_bytes()) != expected_digest:
             raise OutboxError("outbox_file_changed", "verified outbox bytes changed")
+
+
+def reclaim_verified_files(files: Iterable[tuple[Path, str]]) -> int:
+    """Remove only exact receipt-proven bytes under maintenance/primary locks.
+
+    A watermark alone never authorizes deletion. Recheck the whole batch before
+    the first unlink, including when the caller just wrote its checkpoint.
+    """
+    batch = list(files)
+    verify_observed_files(batch)
     for path, _digest in batch:
         path.unlink()
         _fsync_directory(path.parent)
@@ -505,7 +508,8 @@ def decode_cursor(value: object, *, partition: str) -> dict[str, Any]:
         or (
             digest is not None
             and (
-                not isinstance(digest, str) or _DIGEST_PATTERN.fullmatch(digest) is None
+                not isinstance(digest, str)
+                or ENVELOPED_SHA256_PATTERN.fullmatch(digest) is None
             )
         )
         or any(
@@ -560,7 +564,38 @@ def write_cursor(
     )
 
 
-def _proved_sequence(runtime_root: Path, goal_id: str, partition: str) -> int:
+def _require_binding_goal_ref(
+    binding: Mapping[str, Any],
+    *,
+    goal_id: str,
+    goal_ref: Mapping[str, str] | None,
+) -> None:
+    bound = binding.get("goal_ref")
+    if goal_ref is None:
+        if bound is not None:
+            raise OutboxError(
+                "goal_instance_id_missing",
+                "exact shadow operation requires the source GoalRef",
+            )
+        return
+    if bound is None:
+        raise OutboxError(
+            "legacy_goal_binding",
+            "exact shadow operation cannot infer a legacy binding",
+        )
+    if bound != dict(goal_ref) or bound.get("goal_id") != goal_id:
+        raise OutboxError(
+            "stale_goal_instance",
+            "shadow operation belongs to another Goal instance",
+        )
+
+
+def _proved_sequence(
+    runtime_root: Path,
+    goal_id: str,
+    partition: str,
+    goal_ref: Mapping[str, str] | None,
+) -> int:
     """Read settled progress while the primary lock prevents management changes.
 
     This exceptional missing-cursor path owns neither M nor cursor writes. The
@@ -574,13 +609,17 @@ def _proved_sequence(runtime_root: Path, goal_id: str, partition: str) -> int:
         raise OutboxError(
             "bootstrap_required", "sequence recovery needs an active lineage"
         )
+    _require_binding_goal_ref(
+        binding["binding"], goal_id=goal_id, goal_ref=goal_ref
+    )
     view = effect_runtime_result(
         "coordination.runtime_shadow.outbox_read",
         {
             "schema_version": LOCAL_AUTHORITY_SHADOW_READ_REQUEST_SCHEMA,
             "runtime_root": str(runtime_root),
             "goal_id": goal_id,
-            "scan_limit": 10_000,
+            "scan_limit": 0,
+            "read_model": "proof",
         },
         timeout=15.0,
     )
@@ -607,7 +646,11 @@ def _proved_sequence(runtime_root: Path, goal_id: str, partition: str) -> int:
 
 
 def next_seq(
-    directory: Path, *, runtime_root: Path | None = None, goal_id: str | None = None
+    directory: Path,
+    *,
+    runtime_root: Path | None = None,
+    goal_id: str | None = None,
+    goal_ref: Mapping[str, str] | None = None,
 ) -> int:
     """Allocate after visible files and the cursor hint; drain proves continuity."""
 
@@ -621,18 +664,27 @@ def next_seq(
     if cursor is not None:
         highest = max(highest, int(cursor.get("last_seq") or 0))
     elif runtime_root is not None and goal_id is not None:
-        highest = max(highest, _proved_sequence(runtime_root, goal_id, directory.name))
+        highest = max(
+            highest,
+            _proved_sequence(
+                runtime_root,
+                goal_id,
+                directory.name,
+                goal_ref,
+            ),
+        )
     if highest >= MAX_OUTBOX_SEQUENCE:
         raise OutboxError("outbox_sequence_exhausted", "outbox sequence is exhausted")
     return highest + 1
 
 
 def runtime_root_digest(runtime_root: Path) -> str:
-    """Digest of the absolute, dot-normalized root; must match the TypeScript writer.
+    """Digest of the absolute, dot-normalized root as this process spells it.
 
-    Symlinks are deliberately not resolved: both runtimes normalize the string
-    they were given, so a root passed through the effect runtime hashes the
-    same on either side.
+    Diagnostic only (drain evidence). Outbox entries and receipts carry the
+    active binding's ``source_root_digest`` instead, which the TypeScript owner
+    derives from the resolved root, so a root reached through a symlink hashes
+    differently from this lexical spelling (#4892).
     """
 
     return text_digest(os.path.abspath(str(runtime_root)))
@@ -671,34 +723,6 @@ def read_lease_records(directory: Path) -> list[tuple[str, dict[str, Any]]]:
         if isinstance(raw, dict):
             records.append((path.stem, raw))
     return records
-
-
-def compact_lease_projection(
-    raw_projection: Mapping[str, Any], *, goal_id: str
-) -> dict[str, Any]:
-    """Compact the TypeScript-written lease partition (``{leases: [{file_stem, record}]}``)."""
-
-    raw_leases = raw_projection.get("leases")
-    if not isinstance(raw_leases, list):
-        raise OutboxError(
-            "outbox_file_invalid", "lease partition projection must list leases"
-        )
-    records: list[tuple[str, object]] = []
-    for item in raw_leases:
-        if not isinstance(item, dict):
-            raise OutboxError(
-                "outbox_file_invalid", "lease projection item must be an object"
-            )
-        stem = item.get("file_stem")
-        if not isinstance(stem, str) or not stem:
-            raise OutboxError(
-                "outbox_file_invalid", "lease projection item needs a file_stem"
-            )
-        records.append((stem, item.get("record")))
-    try:
-        return lease_partition_projection(records, goal_id=goal_id)
-    except ProjectionValueError as error:
-        raise OutboxError("outbox_file_invalid", str(error)) from error
 
 
 def _writer(
@@ -770,14 +794,17 @@ class TodoPartitionCapture:
         self,
         *,
         enabled: bool,
+        registry_path: Path | None,
         runtime_root: Path | None,
         goal_id: str,
         state_path: Path | None,
         write_class: str,
         original_text: str,
         projector: TodoPartitionProjector | None,
+        goal_ref: Mapping[str, str] | None = None,
     ) -> None:
         self._enabled = enabled
+        self._registry_path = registry_path
         self._runtime_root = runtime_root
         self._goal_id = goal_id
         self._state_path = state_path
@@ -785,6 +812,7 @@ class TodoPartitionCapture:
         self._original_digest = text_digest(original_text)
         self._original_text = original_text
         self._projector = projector
+        self._goal_ref = dict(goal_ref) if goal_ref is not None else None
         self._directory = (
             partition_directory(runtime_root, goal_id, TODO_PARTITION)
             if enabled and runtime_root is not None
@@ -792,7 +820,6 @@ class TodoPartitionCapture:
         )
         self._seq: int | None = None
         self._entry_id: str | None = None
-        self._event_id: str | None = None
         self._lineage_id: str | None = None
         self.outcome = CaptureOutcome(partition=TODO_PARTITION if enabled else None)
 
@@ -801,12 +828,14 @@ class TodoPartitionCapture:
         cls,
         *,
         enabled: bool,
+        registry_path: Path | None = None,
         runtime_root: Path | None,
         goal_id: str,
         state_path: Path | None,
         write_class: str,
         original_text: str,
         projector: TodoPartitionProjector | None,
+        goal_ref: Mapping[str, str] | None = None,
     ) -> TodoPartitionCapture:
         """``projector`` maps active-state text to the todos partition projection.
 
@@ -816,17 +845,27 @@ class TodoPartitionCapture:
 
         return cls(
             enabled=enabled,
+            registry_path=registry_path,
             runtime_root=runtime_root,
             goal_id=goal_id,
             state_path=state_path,
             write_class=write_class,
             original_text=original_text,
             projector=projector,
+            goal_ref=goal_ref,
         )
 
     @property
     def enabled(self) -> bool:
         return self._enabled and self._directory is not None
+
+    @property
+    def goal_ref(self) -> dict[str, str] | None:
+        return dict(self._goal_ref) if self._goal_ref is not None else None
+
+    @property
+    def registry_path(self) -> Path | None:
+        return self._registry_path
 
     def skip(self, reason: str) -> None:
         """Record why this writer deliberately did not open a transaction."""
@@ -852,12 +891,8 @@ class TodoPartitionCapture:
             "error_class": error.__class__.__name__,
         }
 
-    def prepare(self, new_text: str, *, event_id: str | None = None) -> None:
-        """Record the prepared entry for the bytes about to be written.
-
-        Event-only writers have no source-owned outbox transaction and return
-        an explicit hold without creating an entry.
-        """
+    def prepare(self, new_text: str) -> None:
+        """Prepare capture for the exact Markdown bytes about to be written."""
 
         if not self.enabled or self._directory is None or self._runtime_root is None:
             self.outcome.skipped_reason = "shadow_disabled"
@@ -868,10 +903,21 @@ class TodoPartitionCapture:
                 binding_view.get("reason_code") or "bootstrap_required"
             )
             return
-        self._lineage_id = str(binding_view["binding"]["capture_lineage_id"])
-        if event_id is not None:
-            self.outcome.skipped_reason = "event_log_writer_not_bound"
+        binding = binding_view["binding"]
+        try:
+            _require_binding_goal_ref(
+                binding,
+                goal_id=self._goal_id,
+                goal_ref=self._goal_ref,
+            )
+        except OutboxError as error:
+            self._fail(
+                error.reason_code,
+                error,
+            )
             return
+        self._lineage_id = str(binding["capture_lineage_id"])
+        source_root_digest = str(binding["source_root_digest"])
         try:
             projection = self._project(new_text)
             digest = partition_digest(projection)
@@ -883,7 +929,10 @@ class TodoPartitionCapture:
             bytes_digest = source_ref
             source_kind = SOURCE_MARKDOWN
             seq = next_seq(
-                self._directory, runtime_root=self._runtime_root, goal_id=self._goal_id
+                self._directory,
+                runtime_root=self._runtime_root,
+                goal_id=self._goal_id,
+                goal_ref=self._goal_ref,
             )
             entry_id = entry_identity(
                 goal_id=self._goal_id,
@@ -891,7 +940,7 @@ class TodoPartitionCapture:
                 seq=seq,
                 source_ref=source_ref,
                 capture_lineage_id=self._lineage_id,
-                source_root_digest=runtime_root_digest(self._runtime_root),
+                source_root_digest=source_root_digest,
             )
             record = _entry_record(
                 goal_id=self._goal_id,
@@ -901,7 +950,7 @@ class TodoPartitionCapture:
                 writer=_writer(
                     self._write_class,
                     runtime=WRITER_RUNTIME_PYTHON,
-                    operation_id=event_id,
+                    operation_id=None,
                 ),
                 source={
                     "kind": source_kind,
@@ -909,9 +958,9 @@ class TodoPartitionCapture:
                     "previous_partition_digest": previous_digest,
                     "bytes_digest": bytes_digest,
                     "lease": None,
-                    "event_id": event_id,
+                    "event_id": None,
                 },
-                source_root_digest=runtime_root_digest(self._runtime_root),
+                source_root_digest=source_root_digest,
                 capture_lineage_id=self._lineage_id,
                 projection=projection,
                 digest=digest,
@@ -925,7 +974,6 @@ class TodoPartitionCapture:
             return
         self._seq = seq
         self._entry_id = entry_id
-        self._event_id = event_id
         self.outcome.entry_id = entry_id
         self.outcome.seq = seq
         self.outcome.partition_digest = digest
@@ -952,72 +1000,6 @@ class TodoPartitionCapture:
             )
         except Exception as error:  # noqa: BLE001 - the primary write already landed
             self._fail("outbox_commit_marker_failed", error)
-
-
-SourceProbe = Callable[[OutboxEntry], str]
-"""Return ``committed``, ``abandoned`` or ``unproved`` for a prepared-only entry."""
-
-
-def _resolve_markdown_source(
-    source: Mapping[str, Any], reader: Callable[[], str]
-) -> str:
-    current_digest = text_digest(reader())
-    if current_digest == source.get("bytes_digest"):
-        return "committed"
-    if current_digest == source.get("previous_bytes_digest"):
-        return "abandoned"
-    return "unproved"
-
-
-def _resolve_lease_source(
-    source: Mapping[str, Any],
-    reader: Callable[[str], bytes | None],
-) -> str:
-    planned = _as_object(source.get("lease"))
-    if not planned:
-        return "unproved"
-    current = reader(str(planned.get("todo_id") or ""))
-    digest = raw_bytes_digest(current) if current is not None else None
-    if digest is not None and digest == source.get("bytes_digest"):
-        return "committed"
-    if digest == source.get("previous_bytes_digest"):
-        return "abandoned"
-    return "unproved"
-
-
-def _resolve_event_source(
-    source: Mapping[str, Any], reader: Callable[[str], bool]
-) -> str:
-    event_id = source.get("event_id")
-    if isinstance(event_id, str) and event_id and reader(event_id):
-        # The append landed but the projection was never recorded; only a
-        # fresh full-partition capture can say what the state now is.
-        return "unproved"
-    return "abandoned"
-
-
-def resolve_prepared_only_entry(
-    entry: OutboxEntry,
-    *,
-    markdown_text_reader: Callable[[], str] | None,
-    lease_bytes_reader: Callable[[str], bytes | None] | None,
-    event_presence_reader: Callable[[str], bool] | None,
-) -> str:
-    """Decide what a prepared entry without a committed marker means.
-
-    The caller must hold the partition's primary lock (or have proven it free),
-    otherwise the source may still be mid-write.
-    """
-
-    source = _as_object(entry.prepared.get("source"))
-    kind = source.get("kind")
-    if kind == SOURCE_MARKDOWN and markdown_text_reader is not None:
-        return _resolve_markdown_source(source, markdown_text_reader)
-    if kind == SOURCE_TASK_LEASE and lease_bytes_reader is not None:
-        return _resolve_lease_source(source, lease_bytes_reader)
-    if kind == SOURCE_STATE_EVENT_LOG and event_presence_reader is not None:
-        return _resolve_event_source(source, event_presence_reader)
-    return "unproved"
 
 
 def entries_by_partition(
@@ -1076,7 +1058,6 @@ __all__ = [
     "OutboxError",
     "TodoPartitionCapture",
     "TodoPartitionProjector",
-    "compact_lease_projection",
     "drain_lock_target",
     "durable_write_json",
     "entries_by_partition",
@@ -1094,7 +1075,6 @@ __all__ = [
     "reclaim_verified_files",
     "raw_bytes_digest",
     "record_source_ref",
-    "resolve_prepared_only_entry",
     "retired_residue",
     "runtime_root_digest",
     "utc_now_text",

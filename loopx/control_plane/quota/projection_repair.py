@@ -1,14 +1,15 @@
 from __future__ import annotations
+from .effective_action import EffectiveAction
 
 import fnmatch
 from typing import Any
 
-from ...state_projection import is_user_wait_text
+from ...state_projection import actions_are_projection_aligned, is_user_wait_text
 from ..todos.contract import (
     TODO_TASK_CLASS_ADVANCEMENT,
     normalize_required_write_scopes,
 )
-from ..todos.projection import (
+from ..todos.todo_semantics import (
     todo_item_is_actionable_open,
     todo_item_task_class,
 )
@@ -98,6 +99,37 @@ def build_state_projection_gap_repair_hint(
         return None
     if open_todo_count(user_todo_summary) > 0 or open_todo_count(agent_todo_summary) > 0:
         return None
+    # A deferred advancement Todo with a pending dated resume is already the
+    # concrete projection of Next Action.  It is temporarily unrunnable, not
+    # missing, so asking for Todo expansion would defeat its bounded wait.
+    evidence = gap.get("first_evidence")
+    deferred = (
+        agent_todo_summary.get("deferred_items")
+        if isinstance(agent_todo_summary, dict)
+        else None
+    )
+    if (
+        isinstance(evidence, list)
+        and evidence
+        and gap.get("evidence_count") == len(evidence)
+        and isinstance(deferred, list)
+        and all(
+            isinstance(entry, dict)
+            and entry.get("kind") == "next_action_executable_without_agent_todo"
+            and entry.get("target_role") == "agent"
+            and any(
+                isinstance(item, dict)
+                and item.get("task_class") == TODO_TASK_CLASS_ADVANCEMENT
+                and item.get("status") == "deferred"
+                and item.get("resume_ready") is False
+                and str(item.get("resume_when") or "").startswith("resume_at:")
+                and actions_are_projection_aligned(entry.get("text"), item.get("text"))
+                for item in deferred
+            )
+            for entry in evidence
+        )
+    ):
+        return None
     must_attempt = bool(
         work_lane_contract
         and work_lane_contract.get("must_attempt_work") is True
@@ -108,7 +140,7 @@ def build_state_projection_gap_repair_hint(
         "source": "quota.should-run",
         "trigger": "state_projection_gap",
         "recommended_mode": "repair_state_projection_gap",
-        "effective_action": "state_projection_gap_repair",
+        "effective_action": EffectiveAction.STATE_PROJECTION_GAP_REPAIR.value,
         "allowed": True,
         "notify": "DONT_NOTIFY",
         "reason": (
@@ -204,7 +236,7 @@ def build_boundary_projection_repair_hint(
         "source": "quota.should-run",
         "trigger": "required_write_scope_missing_from_goal_boundary",
         "recommended_mode": "repair_boundary_projection",
-        "effective_action": "boundary_projection_repair",
+        "effective_action": EffectiveAction.BOUNDARY_PROJECTION_REPAIR.value,
         "blocked_action_scope": "boundary_projection",
         "allowed": True,
         "notify": "DONT_NOTIFY",

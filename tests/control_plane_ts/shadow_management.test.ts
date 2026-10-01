@@ -1,16 +1,28 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, mkdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, readdir, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { FileAuthorityStore } from "../../loopx/control_plane/coordination/file_authority_store.ts";
+import { canonicalAuthoritySha256 } from "../../loopx/control_plane/coordination/authority_store_codec.ts";
 import {
   bootstrapManagedShadow, rollbackManagedShadow, readShadowManagementState,
-  requireShadowPrimaryWriteAllowed, shadowMaintenanceLockPath,
-  ShadowManagementError, readShadowBootstrapSourcePath,
+  readShadowBootstrapSourcePath, requireShadowPrimaryWriteAllowed, shadowMaintenanceLockPath,
+  ShadowManagementError,
 } from "../../loopx/control_plane/coordination/shadow_management.ts";
+import * as schemas from "../../loopx/control_plane/coordination/coordination_state_contract.generated.ts";
+
+const GOAL_A = {
+  goal_id: "goal-a",
+  goal_instance_id: "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+};
+const GOAL_B = {
+  goal_id: "goal-a",
+  goal_instance_id: "ginst_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+};
 
 const primary = {
   withPrimaryLocks: async <T>(fn: () => Promise<T>) => await fn(),
@@ -25,12 +37,102 @@ function bootstrap(root: string, operationId = "bootstrap:initial") {
   };
 }
 
+function exactBootstrap(root: string, goalRef: object, operationId: string) {
+  return {
+    ...bootstrap(root, operationId),
+    schema_version: schemas.COORDINATION_RUNTIME_SHADOW_EXACT_BOOTSTRAP_REQUEST_SCHEMA,
+    goal_ref: goalRef,
+  };
+}
+
 test("existing-only identity reads do not materialize a missing store", async () => {
   const root = await mkdtemp(join(tmpdir(), "loopx-management-existing-"));
   const store = new FileAuthorityStore(join(root, "missing"), "goal-a", { existingOnly: true });
   assert.equal((await store.storeIdentity()).status, "unavailable");
   assert.equal((await store.loadAuthority()).status, "missing");
   assert.deepEqual(await readdir(root), []);
+});
+
+test("runtime-root aliases survive restart and retain legacy shadow bindings", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "loopx-management-root-alias-"));
+  const root = join(parent, "runtime");
+  const alias = join(parent, "runtime-alias");
+  await mkdir(root);
+  await symlink(root, alias, process.platform === "win32" ? "junction" : "dir");
+  const applied = await bootstrapManagedShadow(bootstrap(alias), primary);
+  assert.equal(applied.status, "applied", JSON.stringify(applied));
+  assert.deepEqual(await requireShadowPrimaryWriteAllowed(root, "goal-a"), {
+    capture_profile: applied.capture_profile,
+    capture_lineage_id: applied.capture_lineage_id,
+    source_root_digest: applied.source_root_digest,
+    store_identity: applied.store_identity,
+    bootstrap_operation_id: applied.bootstrap_operation_id,
+    bootstrap_provider_revision: applied.bootstrap_provider_revision,
+  });
+
+  // Releases before canonical-root hashing persisted the lexical alias. Keep
+  // those active lineages readable only when their immutable manifest proves
+  // that the old path resolves to this exact runtime root.
+  const statePath = join(shadowMaintenanceLockPath(root, "goal-a"), "..", "state.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const operations = join(shadowMaintenanceLockPath(root, "goal-a"), "..", "operations");
+  const [operation] = await readdir(operations);
+  const manifestPath = join(operations, operation, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const legacyDigest = `sha256:${createHash("sha256").update(resolve(alias), "utf8").digest("hex")}`;
+  manifest.source_root_digest = legacyDigest;
+  state.source_root_digest = legacyDigest;
+  state.binding.source_root_digest = legacyDigest;
+  state.result.source_root_digest = legacyDigest;
+  state.operation.manifest_digest = `sha256:${canonicalAuthoritySha256(manifest)}`;
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  await writeFile(statePath, JSON.stringify(state));
+  const legacyBinding = await requireShadowPrimaryWriteAllowed(root, "goal-a");
+  assert.equal(legacyBinding?.source_root_digest, legacyDigest);
+  assert.ok(legacyBinding);
+  assert.equal(await readShadowBootstrapSourcePath(root, "goal-a", legacyBinding), join(alias, "state.md"));
+});
+
+test("rollback preserves Goal A attribution before Goal B starts a fresh lineage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "loopx-management-goal-ref-"));
+  const first = await bootstrapManagedShadow(
+    exactBootstrap(root, GOAL_A, "bootstrap:goal-a"),
+    primary,
+  );
+  assert.equal(first.status, "applied");
+  assert.deepEqual(first.goal_ref, GOAL_A);
+  const activeA = await readShadowManagementState(root, "goal-a");
+  assert.equal(activeA?.schema_version, schemas.SHADOW_MANAGEMENT_EXACT_STATE_SCHEMA);
+  assert.deepEqual(activeA?.binding?.goal_ref, GOAL_A);
+
+  const retired = await rollbackManagedShadow({
+    runtime_root: root,
+    goal_id: "goal-a",
+    operation_id: "rollback:goal-a",
+    expected_provider_revision: first.provider_revision,
+  }, primary);
+  assert.equal(retired.status, "applied");
+  assert.deepEqual(retired.goal_ref, GOAL_A);
+  const archivedManifest = JSON.parse(
+    await readFile(join(String(retired.outbox_archive_path), "manifest.json"), "utf8"),
+  );
+  assert.equal(
+    archivedManifest.schema_version,
+    schemas.SHADOW_EXACT_OUTBOX_MANIFEST_SCHEMA,
+  );
+  assert.deepEqual(archivedManifest.goal_ref, GOAL_A);
+
+  const second = await bootstrapManagedShadow(
+    exactBootstrap(root, GOAL_B, "bootstrap:goal-b"),
+    primary,
+  );
+  assert.equal(second.status, "applied");
+  assert.deepEqual(second.goal_ref, GOAL_B);
+  assert.notEqual(second.capture_lineage_id, first.capture_lineage_id);
+  assert.deepEqual(
+    (await requireShadowPrimaryWriteAllowed(root, "goal-a"))?.goal_ref,
+    GOAL_B,
+  );
 });
 
 async function killAt(kind: "bootstrap" | "rollback", request: object, phase: string): Promise<void> {

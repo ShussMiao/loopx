@@ -13,6 +13,10 @@ from .attribution import (
     replay_finance_beta_attribution,
 )
 from .contract import FINANCE_CASE_INPUT_SCHEMA_VERSION
+from .contract_liquidity import (
+    FINANCE_CONTRACT_LIQUIDITY_INPUT_SCHEMA_VERSION,
+    evaluate_finance_contract_liquidity,
+)
 from .metric_packs import (
     FINANCE_METRIC_PACK_INPUT_SCHEMA_VERSION,
     build_finance_metric_pack_evaluation,
@@ -29,6 +33,10 @@ from .replay import (
     replay_finance_case_evaluation,
 )
 from .presentation_compat import presentation_api_error
+from .operation_request import (
+    FINANCE_TRANSACTION_APPROVAL_INPUT_SCHEMA_VERSION,
+    build_finance_transaction_approval_packet,
+)
 
 
 FINANCE_RESEARCH_DASHBOARD_INPUT_SCHEMA_VERSION = "finance_research_dashboard_input_v0"
@@ -120,7 +128,37 @@ def _direct_parser() -> argparse.ArgumentParser:
     )
     pack_replay_parser.add_argument("--input-json", required=True)
     pack_replay_parser.add_argument("--expected-json", required=True)
+    operation_parser = sub.add_parser(
+        "build-operation-request",
+        help=(
+            "Build one simulation-only finance request for LoopX Goal Channel "
+            "confirmation."
+        ),
+    )
+    operation_parser.add_argument("--input-json", required=True)
+    operation_parser.add_argument(
+        "--request-only",
+        action="store_true",
+        help="Print only the canonical loopx_operation_request_v0 object.",
+    )
+    liquidity_parser = sub.add_parser(
+        "evaluate-contract-liquidity",
+        help=(
+            "Evaluate amount- and direction-specific derivatives exit "
+            "liquidity from frozen provider measurements."
+        ),
+    )
+    liquidity_parser.add_argument("--input-json", required=True)
     sub.add_parser("list-packs", help="List bundled industry metric packs.")
+    lark_parser = sub.add_parser(
+        "render-lark-card",
+        help="Render source-period evidence from the canonical dashboard view.",
+    )
+    lark_parser.add_argument(
+        "--input-json",
+        required=True,
+        help=f"Path to a {FINANCE_RESEARCH_DASHBOARD_INPUT_SCHEMA_VERSION} object.",
+    )
     return parser
 
 
@@ -142,6 +180,10 @@ def run(argv: Sequence[str] | None = None) -> int:
                 from .dashboard import build_finance_research_dashboard_packet
 
                 packet = build_finance_research_dashboard_packet(payload)
+            elif schema_version == FINANCE_TRANSACTION_APPROVAL_INPUT_SCHEMA_VERSION:
+                packet = build_finance_transaction_approval_packet(payload)
+            elif schema_version == FINANCE_CONTRACT_LIQUIDITY_INPUT_SCHEMA_VERSION:
+                packet = evaluate_finance_contract_liquidity(payload)
             else:
                 packet = build_finance_value_discovery_packet(payload)
         except Exception as exc:
@@ -180,17 +222,39 @@ def run(argv: Sequence[str] | None = None) -> int:
                 _load_json(args.input_json),
                 _load_json(args.expected_json),
             )
+        elif args.command == "build-operation-request":
+            packet = build_finance_transaction_approval_packet(
+                _load_json(args.input_json)
+            )
+        elif args.command == "evaluate-contract-liquidity":
+            packet = evaluate_finance_contract_liquidity(
+                _load_json(args.input_json)
+            )
         elif args.command == "list-packs":
             packet = list_finance_metric_packs()
+        elif args.command == "render-lark-card":
+            from .dashboard import build_finance_research_dashboard_packet
+            from .lark_projection import build_source_period_metrics_lark_card
+
+            dashboard = build_finance_research_dashboard_packet(
+                _load_json(args.input_json)
+            )
+            packet = build_source_period_metrics_lark_card(
+                dashboard["presentation_projection"]["view"]
+            )
         else:
             raise ValueError(
                 "use --doctor, reduce, evaluate, replay, attribute-beta, "
-                "replay-beta, evaluate-pack, replay-pack, or list-packs"
+                "replay-beta, evaluate-pack, replay-pack, list-packs, "
+                "render-lark-card, build-operation-request, or "
+                "evaluate-contract-liquidity"
             )
     except Exception as exc:
         print(json.dumps(_error_packet(exc), indent=2, sort_keys=True))
         return 1
-    if args.command != "reduce" or args.format == "json":
+    if args.command == "build-operation-request" and args.request_only:
+        print(json.dumps(packet["operation_request"], indent=2, sort_keys=True))
+    elif args.command != "reduce" or args.format == "json":
         print(json.dumps(packet, indent=2, sort_keys=True))
     else:
         print(render_finance_value_discovery_markdown(packet), end="")

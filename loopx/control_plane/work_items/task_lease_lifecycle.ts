@@ -1,6 +1,11 @@
+import {leaseOwnerRejection as ownerRejection} from "./task_lease_eligibility.ts";
+import {mutateCanonicalTaskLease} from "./canonical_task_lease_lifecycle.ts";
+import {taskLeaseStableValue as stableValue, taskLeaseDigest as digest,
+  taskLeaseOperationIdentity as operationIdentity,
+  taskLeaseOperationRequestDigest as operationRequestDigest} from "./task_lease_operation_identity.ts";
 import { ShadowManagementError, requireShadowPrimaryWriteAllowed } from "../coordination/shadow_management.ts";
 import { LegacyCoordinationWriteError, requireLegacyCoordinationPrimaryWriteAllowed } from "../coordination/legacy_writer_fence.ts";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -30,7 +35,6 @@ import {
 } from "../effect_program.ts";
 import { requireJsonObject } from "../runtime_decode.ts";
 import {
-  decodeTaskLeaseAuthority,
   leaseEpoch,
   leaseInteger,
   leaseIsActive,
@@ -40,7 +44,6 @@ import {
   normalizeIdempotencyKey,
   normalizeOwner,
   normalizeTodoId,
-  normalizeTtl,
   readLease,
   revalidateAuthoritySources,
   TaskLeaseAcquireError,
@@ -55,433 +58,34 @@ import {
 } from "./task_lease_acquire.ts";
 import {
   decideTaskLeaseLifecycle,
+  materializeTaskLeaseLifecycle,
+  releasedTaskLeaseRecord as releasedLease,
   type TaskLeaseLifecycleDecision,
   type TaskLeaseLifecycleDecisionInput,
 } from "./task_lease_lifecycle_decision.ts";
 import {
   beginLeaseOutboxEntry,
-  decodeLocalAuthorityShadowBinding,
   type LeaseOutboxCapture,
-  type LocalAuthorityShadowBinding,
 } from "../coordination/local_authority_shadow_outbox.ts";
-import { TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA } from "../coordination/coordination_state_contract.generated.ts";
+import {decodeTaskLeaseLifecycleRequest, TaskLeaseLifecycleError, TASK_LEASE_LIFECYCLE_OPERATIONS,
+  type LifecycleRequest, type CanonicalLifecycleRequest, type LifecycleErrorInfo, type LifecycleStage,
+  type TaskLeaseLifecycleOperation} from "./task_lease_lifecycle_request.ts";
+import { BARE_SHA256_PATTERN } from "../content_digest.ts";
 
-export const TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA_VERSION =
-  TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA;
-export const TASK_LEASE_LIFECYCLE_RECEIPT_SCHEMA =
-  "task_lease_lifecycle_receipt_v0";
+
+// These exported names have existing direct callers; implementation is owned
+// by the request boundary rather than the legacy held-fence executor.
+export {TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA_VERSION, TASK_LEASE_LIFECYCLE_OPERATIONS,
+  type TaskLeaseLifecycleOperation} from "./task_lease_lifecycle_request.ts";
+export const TASK_LEASE_LIFECYCLE_RECEIPT_SCHEMA = "task_lease_lifecycle_receipt_v0";
 export const TASK_LEASE_FENCE_RECEIPT_SCHEMA = "task_lease_fence_receipt_v0";
-export const TASK_LEASE_LIFECYCLE_OPERATIONS = [
-  "renew",
-  "transfer",
-  "release",
-  "terminal_verify",
-  "holder_verify",
-  "fence_close",
-] as const;
-export type TaskLeaseLifecycleOperation =
-  (typeof TASK_LEASE_LIFECYCLE_OPERATIONS)[number];
-
-type LifecycleStage = "validation" | "durable_writeback";
-
-interface LifecycleRequest {
-  schema_version: typeof TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA_VERSION;
-  operation: TaskLeaseLifecycleOperation;
-  runtime_root: string;
-  goal_id: string;
-  todo_id: string;
-  owner: string | null;
-  idempotency_key: string | null;
-  expected_version: number | null;
-  ttl_seconds: number | null;
-  new_owner: string | null;
-  new_idempotency_key: string | null;
-  authority: AuthorityFacts | null;
-  todo: TodoFact | null;
-  delegated_authority: boolean;
-  allow_user_gate_auto_acquire: boolean;
-  require_active_when_fence_supplied: boolean;
-  lock_token: string | null;
-  committed: boolean;
-  release_lease: boolean;
-  fence_owner: string | null;
-  fence_idempotency_key: string | null;
-  fence_expected_version: number | null;
-  fence_expected_lease_epoch: number | null;
-  fence_operation_id: string | null;
-  current_time: Date | null;
-  owner_pid: number | null;
-  runtime_shadow: LocalAuthorityShadowBinding | null;
-}
 
 interface LifecycleDependencies {
   now?: () => Date;
   beforeWrite?: (lease: JsonObject) => void | Promise<void>;
+  authorityProvider?: import("../coordination/local_authority_provider.ts").LocalAuthorityProviderDependencies;
 }
 
-interface LifecycleErrorInfo {
-  code: string;
-  message: string;
-  payload: JsonObject;
-  stage: LifecycleStage;
-}
-
-class TaskLeaseLifecycleError extends Error {
-  readonly code: string;
-  readonly payload: JsonObject;
-  readonly stage: LifecycleStage;
-
-  constructor(
-    message: string,
-    code: string,
-    payload: JsonObject = {},
-    stage: LifecycleStage = "validation",
-  ) {
-    super(message);
-    this.name = "TaskLeaseLifecycleError";
-    this.code = code;
-    this.payload = payload;
-    this.stage = stage;
-  }
-}
-
-function compact(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  const raw = typeof value === "string"
-    ? value
-    : typeof value === "number" || typeof value === "boolean"
-      ? String(value)
-      : "";
-  return raw.trim().split(/\s+/u).filter(Boolean).join(" ");
-}
-
-function optionalInteger(value: unknown, label: string): number | null {
-  if (value === null || value === undefined) return null;
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < 0
-  ) {
-    throw new TaskLeaseLifecycleError(
-      `${label} must be a non-negative safe integer or null`,
-      "invalid_request",
-    );
-  }
-  return value;
-}
-
-function optionalExpectedVersion(value: unknown): number | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-    throw new TaskLeaseLifecycleError(
-      "expected_version must be a safe integer or null",
-      "invalid_request",
-    );
-  }
-  return value;
-}
-
-function optionalBoolean(
-  value: unknown,
-  label: string,
-  defaultValue: boolean,
-): boolean {
-  if (value === undefined) return defaultValue;
-  if (typeof value !== "boolean") {
-    throw new TaskLeaseLifecycleError(
-      `${label} must be a boolean when provided`,
-      "invalid_request",
-    );
-  }
-  return value;
-}
-
-function optionalPositiveInteger(value: unknown, label: string): number | null {
-  if (value === undefined || value === null) return null;
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value <= 0
-  ) {
-    throw new TaskLeaseLifecycleError(
-      `${label} must be a positive safe integer or null`,
-      "invalid_request",
-    );
-  }
-  return value;
-}
-
-function optionalDate(value: unknown, label: string): Date | null {
-  if (value === null || value === undefined || value === "") return null;
-  if (typeof value !== "string") {
-    throw new TaskLeaseLifecycleError(
-      `${label} must be an ISO-8601 string or null`,
-      "invalid_clock",
-    );
-  }
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.valueOf())) {
-    throw new TaskLeaseLifecycleError(
-      `${label} must be a valid ISO-8601 timestamp`,
-      "invalid_clock",
-    );
-  }
-  return parsed;
-}
-
-function optionalOwner(value: unknown, label: string): string | null {
-  if (value === null || value === undefined || value === "") return null;
-  try {
-    return normalizeOwner(value);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : `${label} is invalid`;
-    throw new TaskLeaseLifecycleError(message, "invalid_owner");
-  }
-}
-
-function optionalKey(value: unknown, label: string): string | null {
-  if (value === null || value === undefined || value === "") return null;
-  try {
-    return normalizeIdempotencyKey(value);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : `${label} is invalid`;
-    throw new TaskLeaseLifecycleError(message, "invalid_idempotency_key");
-  }
-}
-
-function optionalFenceOperationId(value: unknown): string | null {
-  if (value === null || value === undefined || value === "") return null;
-  if (
-    typeof value !== "string" ||
-    !/^[a-f0-9]{64}$/u.test(value.trim())
-  ) {
-    throw new TaskLeaseLifecycleError(
-      "fence_operation_id must be a 64-character lowercase hexadecimal token",
-      "invalid_fence_operation_id",
-    );
-  }
-  return value.trim();
-}
-
-function requiredOwner(value: unknown): string {
-  const owner = optionalOwner(value, "owner");
-  if (owner === null) {
-    throw new TaskLeaseLifecycleError(
-      "owner must be a public-safe agent id",
-      "invalid_owner",
-    );
-  }
-  return owner;
-}
-
-function requiredKey(value: unknown): string {
-  const key = optionalKey(value, "idempotency_key");
-  if (key === null) {
-    throw new TaskLeaseLifecycleError(
-      "idempotency key must be a public-safe token",
-      "invalid_idempotency_key",
-    );
-  }
-  return key;
-}
-
-function decodeTodo(
-  value: unknown,
-  fallback: TodoFact | null,
-  expectedTodoId: string,
-): TodoFact | null {
-  if (value === null || value === undefined) return fallback;
-  const record = requireJsonObject(value, "todo");
-  let todoId: string;
-  try {
-    todoId = normalizeTodoId(record.todo_id);
-  } catch (error) {
-    throw new TaskLeaseLifecycleError(
-      error instanceof Error ? error.message : "todo id is invalid",
-      "invalid_todo_id",
-    );
-  }
-  if (todoId !== expectedTodoId) {
-    // A caller-supplied snapshot is only an elaboration of the authority
-    // projection for this lease; it cannot silently authorize a sibling todo.
-    throw new TaskLeaseLifecycleError(
-      "todo does not match the task-lease identity",
-      "todo_identity_mismatch",
-      { expected_todo_id: expectedTodoId, actual_todo_id: todoId },
-    );
-  }
-  const excludedRaw = record.excluded_agents;
-  const excluded = Array.isArray(excludedRaw)
-    ? excludedRaw
-    : typeof excludedRaw === "string" ? excludedRaw.split(",") : [];
-  // The legacy Python callers pass the active-state row, which can be a
-  // partial compatibility view (for example it has no derived
-  // ``task_class``). Preserve which fields were actually present so the
-  // canonical projection can fill omitted metadata without turning an
-  // otherwise valid request into a false authority mismatch. Explicitly
-  // supplied fields remain strict below.
-  const providedFields = [
-    "status",
-    "claimed_by",
-    "excluded_agents",
-    "role",
-    "task_class",
-    "bound_agent",
-    "blocks_agent",
-  ] as TodoFactField[];
-  const presentFields = providedFields.filter((field) =>
-    Object.hasOwn(record, field)
-  );
-  return {
-    todo_id: todoId,
-    status: compact(record.status).toLowerCase(),
-    claimed_by: normalizeAgent(record.claimed_by),
-    excluded_agents: [...new Set(
-      excluded.map(normalizeAgent).filter((item): item is string => item !== null),
-    )].sort((left, right) => left.localeCompare(right)),
-    role: typeof record.role === "string" ? compact(record.role).toLowerCase() : undefined,
-    task_class: typeof record.task_class === "string"
-      ? compact(record.task_class).toLowerCase()
-      : null,
-    bound_agent: normalizeAgent(record.bound_agent),
-    blocks_agent: normalizeAgent(record.blocks_agent),
-    provided_fields: presentFields,
-  };
-}
-
-function decodeOperation(value: unknown): TaskLeaseLifecycleOperation {
-  if (
-    typeof value !== "string" ||
-    !TASK_LEASE_LIFECYCLE_OPERATIONS.includes(
-      value as TaskLeaseLifecycleOperation,
-    )
-  ) {
-    throw new TaskLeaseLifecycleError(
-      "task-lease lifecycle operation is unsupported",
-      "invalid_operation",
-    );
-  }
-  return value as TaskLeaseLifecycleOperation;
-}
-
-function decodeRequest(value: unknown): LifecycleRequest {
-  const input = requireJsonObject(value, "task lease lifecycle request");
-  if (input.schema_version !== TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA_VERSION) {
-    throw new TaskLeaseLifecycleError(
-      "Task-lease lifecycle request schema mismatch",
-      "schema_mismatch",
-    );
-  }
-  const operation = decodeOperation(input.operation);
-  let goalId: string;
-  let todoId: string;
-  try {
-    goalId = normalizeGoalId(input.goal_id);
-    todoId = normalizeTodoId(input.todo_id);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "lease identity is invalid";
-    const code = message.includes("todo id") ? "invalid_todo_id" : "invalid_goal_id";
-    throw new TaskLeaseLifecycleError(message, code);
-  }
-
-  const ordinary = operation === "renew" || operation === "transfer" || operation === "release";
-  const needsOwner = operation === "renew" || operation === "transfer" || operation === "release" || operation === "holder_verify";
-  const owner = needsOwner ? requiredOwner(input.owner) : optionalOwner(input.owner, "owner");
-  const idempotencyKey = ordinary ? requiredKey(input.idempotency_key) : optionalKey(input.idempotency_key, "idempotency_key");
-  const expectedVersion = optionalExpectedVersion(input.expected_version);
-  const ttlSeconds = operation === "renew" || operation === "transfer"
-    ? normalizeTtl(input.ttl_seconds)
-    : null;
-  const newOwner = operation === "transfer" ? requiredOwner(input.new_owner) : optionalOwner(input.new_owner, "new_owner");
-  const newKey = operation === "transfer" ? requiredKey(input.new_idempotency_key) : optionalKey(input.new_idempotency_key, "new_idempotency_key");
-
-  let authority: AuthorityFacts | null = null;
-  if (input.authority !== undefined && input.authority !== null) {
-    authority = decodeTaskLeaseAuthority(input.authority);
-  }
-  if (
-    (operation === "renew" || operation === "transfer" || operation === "terminal_verify" || operation === "holder_verify") &&
-    authority === null
-  ) {
-    throw new TaskLeaseLifecycleError(
-      "authority is required for this task-lease lifecycle operation",
-      "authority_required",
-    );
-  }
-  const fallbackTodo = authority?.todos.get(todoId) ?? null;
-  const todo = decodeTodo(input.todo, fallbackTodo, todoId);
-  if (
-    (operation === "terminal_verify" || operation === "holder_verify") &&
-    todo === null
-  ) {
-    throw new TaskLeaseLifecycleError(
-      "todo is required for this task-lease fence operation",
-      "todo_not_found",
-    );
-  }
-  const fenceOwner = optionalOwner(input.fence_owner, "fence_owner");
-  const fenceKey = optionalKey(input.fence_idempotency_key, "fence_idempotency_key");
-  const fenceExpectedVersion = optionalInteger(
-    input.fence_expected_version,
-    "fence_expected_version",
-  );
-  const fenceExpectedLeaseEpoch = optionalInteger(
-    input.fence_expected_lease_epoch,
-    "fence_expected_lease_epoch",
-  );
-  const requestedFenceOperationId = optionalFenceOperationId(input.fence_operation_id);
-  // Holder gates are lock-scoped proofs rather than caller-idempotent
-  // mutations. A fresh native id prevents a later ownership update in the
-  // same lease generation from colliding with an already closed gate receipt.
-  const fenceOperationId = requestedFenceOperationId ?? (
-    operation === "holder_verify"
-      ? createHash("sha256").update(randomUUID(), "utf8").digest("hex")
-      : null
-  );
-  const lockToken = input.lock_token === null || input.lock_token === undefined
-    ? null
-    : typeof input.lock_token === "string" &&
-        input.lock_token.trim().length > 0 &&
-        input.lock_token.length <= 256
-      ? input.lock_token.trim()
-      : (() => {
-          throw new TaskLeaseLifecycleError(
-            "lock_token must be a non-empty string of at most 256 characters",
-            "invalid_lock_token",
-          );
-        })();
-  return {
-    schema_version: TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA_VERSION,
-    operation,
-    runtime_root: typeof input.runtime_root === "string" ? input.runtime_root : (() => {
-      throw new TaskLeaseLifecycleError("runtime_root must be a string", "invalid_runtime_root");
-    })(),
-    goal_id: goalId,
-    todo_id: todoId,
-    owner,
-    idempotency_key: idempotencyKey,
-    expected_version: expectedVersion,
-    ttl_seconds: ttlSeconds,
-    new_owner: newOwner,
-    new_idempotency_key: newKey,
-    authority,
-    todo,
-    delegated_authority: optionalBoolean(input.delegated_authority, "delegated_authority", false),
-    allow_user_gate_auto_acquire: optionalBoolean(input.allow_user_gate_auto_acquire, "allow_user_gate_auto_acquire", false),
-    require_active_when_fence_supplied: optionalBoolean(input.require_active_when_fence_supplied, "require_active_when_fence_supplied", true),
-    lock_token: lockToken,
-    committed: optionalBoolean(input.committed, "committed", false),
-    release_lease: optionalBoolean(input.release_lease, "release_lease", false),
-    fence_owner: fenceOwner,
-    fence_idempotency_key: fenceKey,
-    fence_expected_version: fenceExpectedVersion,
-    fence_expected_lease_epoch: fenceExpectedLeaseEpoch,
-    fence_operation_id: fenceOperationId,
-    current_time: optionalDate(input.current_time, "current_time"),
-    owner_pid: optionalPositiveInteger(input.owner_pid, "owner_pid"),
-    runtime_shadow: decodeLocalAuthorityShadowBinding(input.runtime_shadow),
-  };
-}
 
 async function captureLeaseWrite(
   request: LifecycleRequest,
@@ -491,6 +95,9 @@ async function captureLeaseWrite(
 ): Promise<Awaited<ReturnType<typeof beginLeaseOutboxEntry>> | null> {
   if (request.runtime_shadow === null &&
       await requireShadowPrimaryWriteAllowed(request.runtime_root, request.goal_id) === null) return null;
+  if (request.operation === "fence_close" && request.authority !== null) {
+    await revalidateAuthoritySources(request.authority.source_receipts);
+  }
   const capture = await beginLeaseOutboxEntry({
     runtime_root: request.runtime_root,
     goal_id: request.goal_id,
@@ -499,6 +106,14 @@ async function captureLeaseWrite(
     operation_id: request.idempotency_key ?? request.fence_operation_id,
     previous_lease: previous,
     planned_lease: next,
+    // Lifecycle requests may omit authority facts; absent authority keeps the
+    // strict pre-existing capture instead of guessing a Todo graph.
+    active_todo_ids: request.authority === null
+      ? null
+      : [...request.authority.todos.keys()],
+    goal_ref: request.runtime_shadow !== null && "goal_ref" in request.runtime_shadow
+      ? request.runtime_shadow.goal_ref
+      : undefined,
   });
   if (capture.failure && await requireShadowPrimaryWriteAllowed(request.runtime_root, request.goal_id) !== null) {
     throw new ShadowManagementError("shadow_capture_prepare_failed", "durable shadow preparation failed; the primary lease was not changed");
@@ -524,7 +139,7 @@ function attachRuntimeShadowCapture(
 }
 
 function lifecycleNow(
-  request: LifecycleRequest,
+  request: Pick<LifecycleRequest, "current_time">,
   dependencies: LifecycleDependencies,
 ): Date {
   const at = dependencies.now?.() ?? request.current_time ?? new Date();
@@ -545,7 +160,7 @@ function lockPathFor(request: Pick<LifecycleRequest, "runtime_root" | "goal_id">
   return taskLeaseLockPath(request);
 }
 
-function effectIdFor(request: LifecycleRequest): string | null {
+function effectIdFor(request: Pick<LifecycleRequest, "goal_id" | "todo_id" | "owner" | "idempotency_key">): string | null {
   if (!request.owner || !request.idempotency_key) return null;
   return settlementIdentity({
     goal_id: request.goal_id,
@@ -553,51 +168,6 @@ function effectIdFor(request: LifecycleRequest): string | null {
     todo_id: request.todo_id,
     turn_instance_id: request.idempotency_key,
   }).effect_id;
-}
-
-function stableValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stableValue);
-  if (typeof value !== "object" || value === null) return value;
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => [key, stableValue(child)]),
-  );
-}
-
-function digest(value: unknown): string {
-  return createHash("sha256")
-    .update(JSON.stringify(stableValue(value)), "utf8")
-    .digest("hex");
-}
-
-function operationIdentity(request: LifecycleRequest): string | null {
-  if (!request.idempotency_key) return null;
-  return digest({
-    schema_version: TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA_VERSION,
-    operation: request.operation,
-    goal_id: request.goal_id,
-    todo_id: request.todo_id,
-    owner: request.owner,
-    idempotency_key: request.idempotency_key,
-    expected_version: request.expected_version,
-  });
-}
-
-function operationRequestDigest(request: LifecycleRequest): string | null {
-  if (!request.idempotency_key) return null;
-  return digest({
-    schema_version: TASK_LEASE_LIFECYCLE_REQUEST_SCHEMA_VERSION,
-    operation: request.operation,
-    goal_id: request.goal_id,
-    todo_id: request.todo_id,
-    owner: request.owner,
-    idempotency_key: request.idempotency_key,
-    expected_version: request.expected_version,
-    ttl_seconds: request.ttl_seconds,
-    new_owner: request.new_owner,
-    new_idempotency_key: request.new_idempotency_key,
-  });
 }
 
 function operationReceiptPath(request: LifecycleRequest): string | null {
@@ -698,13 +268,13 @@ async function readFenceReceipt(
     if (
       record.schema_version !== TASK_LEASE_FENCE_RECEIPT_SCHEMA ||
       typeof record.operation_id !== "string" ||
-      !/^[a-f0-9]{64}$/u.test(record.operation_id) ||
+      !BARE_SHA256_PATTERN.test(record.operation_id) ||
       typeof record.request_digest !== "string" ||
-      !/^[a-f0-9]{64}$/u.test(record.request_digest) ||
+      !BARE_SHA256_PATTERN.test(record.request_digest) ||
       (record.close_request_digest !== undefined &&
         record.close_request_digest !== null &&
         (typeof record.close_request_digest !== "string" ||
-          !/^[a-f0-9]{64}$/u.test(record.close_request_digest))) ||
+          !BARE_SHA256_PATTERN.test(record.close_request_digest))) ||
       !["acquired", "held", "closed"].includes(state as string) ||
       typeof record.goal_id !== "string" ||
       typeof record.todo_id !== "string" ||
@@ -1137,10 +707,10 @@ async function readOperationReceipt(
     if (
       record.schema_version !== TASK_LEASE_LIFECYCLE_RECEIPT_SCHEMA ||
       typeof record.operation_id !== "string" ||
-      !/^[a-f0-9]{64}$/u.test(record.operation_id) ||
+      !BARE_SHA256_PATTERN.test(record.operation_id) ||
       record.operation_id !== expectedOperationId ||
       typeof record.request_digest !== "string" ||
-      !/^[a-f0-9]{64}$/u.test(record.request_digest) ||
+      !BARE_SHA256_PATTERN.test(record.request_digest) ||
       (record.state !== "prepared" && record.state !== "committed") ||
       (record.planned_lease !== null &&
         (typeof record.planned_lease !== "object" ||
@@ -1220,7 +790,7 @@ async function readOperationReceipt(
 }
 
 function lifecycleSettlement(
-  request: LifecycleRequest,
+  request: Pick<LifecycleRequest, "goal_id" | "todo_id" | "owner" | "idempotency_key">,
   status: "committed" | "replayed",
   failure?: LifecycleErrorInfo,
 ): JsonObject {
@@ -1396,20 +966,6 @@ function todoFactsMatch(left: TodoFact, right: TodoFact): boolean {
     matchesOptional("blocks_agent", left.blocks_agent === right.blocks_agent);
 }
 
-function ownerRejection(
-  todo: TodoFact | null,
-  owner: string | null,
-  registered: readonly string[],
-): string | null {
-  if (!todo) return "todo_not_found";
-  if (todo.status !== "open") return "todo_not_open";
-  if (!owner) return "invalid_owner";
-  if (!registered.includes(owner)) return "owner_not_registered";
-  if (todo.excluded_agents.includes(owner)) return "owner_excluded_from_todo";
-  if (todo.claimed_by && todo.claimed_by !== owner) return "owner_conflicts_with_claim";
-  return null;
-}
-
 function ownerError(
   request: LifecycleRequest,
   code: string,
@@ -1476,16 +1032,6 @@ function transitionError(
     message = `task lease ${request.operation} rejected by authority core: ${code}`;
   }
   return new TaskLeaseLifecycleError(message, code, payload, "validation");
-}
-
-function releasedLease(lease: LeaseRecord, at: Date): LeaseRecord {
-  return {
-    ...lease,
-    lease_epoch: leaseEpoch(lease),
-    status: "released",
-    released_at: utcIsoformat(at),
-    updated_at: utcIsoformat(at),
-  };
 }
 
 function responseForOrdinary(
@@ -1736,20 +1282,12 @@ async function ordinaryOperation(
   if (existing === null || decision.next_lease === null) {
     throw transitionError(request, "invalid_lease_snapshot", existing, leasePath);
   }
-  const decidedLease = decision.next_lease;
-  const next: LeaseRecord = {
-    ...existing,
-    ...(request.operation === "transfer"
-      ? {
-          owner: decidedLease.owner,
-          idempotency_key: decidedLease.idempotency_key,
-          lease_epoch: decidedLease.lease_epoch,
-        }
-      : {}),
-    version: decidedLease.version,
-    updated_at: utcIsoformat(at),
-    expires_at: utcIsoformat(new Date(at.valueOf() + (request.ttl_seconds ?? 0) * 1_000)),
-  };
+  const next = materializeTaskLeaseLifecycle(existing, {
+    operation: request.operation as "renew" | "transfer", owner: request.owner!,
+    idempotency_key: request.idempotency_key!, expected_version: request.expected_version,
+    ttl_seconds: request.ttl_seconds, new_owner: request.new_owner,
+    new_idempotency_key: request.new_idempotency_key,
+  }, decision, at);
   const response = responseForOrdinary(
     request,
     leasePath,
@@ -2527,6 +2065,19 @@ async function replayClosedFenceClose(
   }
 }
 
+/**
+ * Whether a failure is the source-snapshot mismatch the caller retries.
+ *
+ * `revalidateAuthoritySources` re-reads the canonical registry before a write
+ * commits.  The adapter answers this exact code by re-reading the graph and
+ * re-sending the same held fence, so it must stay distinguishable from the
+ * conflicts that genuinely end a fence.
+ */
+function isRetryableAuthoritySourceMismatch(error: unknown): boolean {
+  return error instanceof TaskLeaseAcquireError &&
+    error.code === "authority_source_changed";
+}
+
 async function fenceClose(
   request: LifecycleRequest,
   dependencies: LifecycleDependencies,
@@ -2732,6 +2283,21 @@ async function fenceClose(
       closeRequestDigest: fenceCloseRequestDigest(request),
     });
     return attachRuntimeShadowCapture(response, shadowCapture);
+  } catch (error) {
+    // A changed authority source is a retryable precondition, not a lost
+    // fence: the lease write never ran and the caller still holds this token.
+    // Releasing the lock here would answer the caller's retry with
+    // `fence_token_invalid` and strand the completed Todo's active lease, so
+    // drop only this attempt's claim and leave the fence held.
+    if (claim && isRetryableAuthoritySourceMismatch(error)) {
+      try {
+        await releaseFileMutationLockClaim(claim);
+      } catch {
+        // Claim cleanup is best effort; never replace the original error.
+      }
+      claim = null;
+    }
+    throw error;
   } finally {
     if (claim) {
       await releaseFileMutationLock(
@@ -2746,13 +2312,46 @@ async function fenceClose(
   }
 }
 
+function canonicalLifecycleEnvelope(request: CanonicalLifecycleRequest, result: JsonObject): JsonObject {
+  const evidence = Object.fromEntries(["source_authority", "decision_read_from_provider", "legacy_fallback_used",
+    "provider_revision", "cursor", "current_provider_revision", "current_cursor", "handoff_mode",
+    "operation_id", "recovery", "commit_status", "receipt_status", "expected_version", "actual_version", "todo_status", "claimed_by", "excluded_agents"].filter(key => result[key] !== undefined)
+    .map(key => [key, result[key]]));
+  if (result.status === "applied" || result.status === "no_change" || result.status === "replayed" || result.status === "recovered") {
+    const replayed = result.status === "replayed" || result.status === "recovered";
+    const idempotent = replayed || result.status === "no_change";
+    return {ok: true, schema_version: "task_lease_v0", action: request.operation, status: result.status,
+      ...Object.fromEntries(["renewed", "transferred", "released", "missing", "lease"].filter(key => result[key] !== undefined).map(key => [key, result[key]])),
+      idempotent, original_receipt: result.original_receipt,
+      ...(request.transfer_claim ? {transfer_claim: true, todo_id: result.todo_id,
+        todo_changed: result.todo_changed, projection_delivery: result.projection_delivery,
+        projection_source: result.projection_source} : {}),
+      ...evidence, settlement: lifecycleSettlement(request, replayed ? "replayed" : "committed")};
+  }
+  const envelope = failureEnvelope(request, {code: String(result.reason_code ?? result.conflict_kind ?? "canonical_lease_failed"),
+    message: String(result.reason ?? "canonical lease mutation could not complete; inspect the result before retrying"),
+    payload: {...evidence, status: result.status}, stage: result.failure_stage === "durable_writeback" ? "durable_writeback" : "validation"});
+  delete envelope.lease_path;
+  return envelope;
+}
+
 export async function executeTaskLeaseLifecycle(
   value: unknown,
   dependencies: LifecycleDependencies = {},
 ): Promise<JsonObject> {
-  let request: LifecycleRequest | null = null;
+  let context: Partial<LifecycleRequest> | null = null;
   try {
-    request = decodeRequest(value);
+    const decoded = decodeTaskLeaseLifecycleRequest(value);
+    context = decoded.request;
+    if (decoded.kind === "canonical") {
+      const request = decoded.request;
+      const result = await mutateCanonicalTaskLease(request, {
+        now: () => lifecycleNow(request, dependencies), beforeWrite: dependencies.beforeWrite,
+        authorityProvider: dependencies.authorityProvider,
+      });
+      return canonicalLifecycleEnvelope(request, result);
+    }
+    const request = decoded.request;
     if (request.operation === "fence_close") return await fenceClose(request, dependencies);
     if (request.operation === "terminal_verify" || request.operation === "holder_verify") {
       const fence = await fenceVerify(request, dependencies);
@@ -2778,6 +2377,6 @@ export async function executeTaskLeaseLifecycle(
     );
   } catch (error) {
     const info = errorInfo(error);
-    return failureEnvelope(request ?? failureRequestContext(value), info);
+    return failureEnvelope(context ?? failureRequestContext(value), info);
   }
 }

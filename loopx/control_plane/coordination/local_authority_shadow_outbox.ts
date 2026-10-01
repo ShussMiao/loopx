@@ -1,19 +1,27 @@
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
 import type { JsonObject } from "../effect_program.ts";
 import { durableWriteJson } from "../effect_runtime_io.ts";
 import { authorityUnicodeCompare, canonicalAuthorityBytes } from "./authority_store_codec.ts";
-import { requireShadowCaptureBinding, ShadowManagementError } from "./shadow_management.ts";
+import {
+  requireShadowBindingGoalRef,
+  requireShadowCaptureBinding,
+  shadowBindingGoalRef,
+  ShadowManagementError,
+} from "./shadow_management.ts";
+import { parseExactGoalRef } from "../goals/goal_instance_identity.ts";
 import { outboxEntryIdentity, OUTBOX_ENTRY_FILE_PATTERN } from "./local_authority_shadow_identity.ts";
 import { readProvenShadowSequence } from "./local_authority_shadow.ts";
 import {
   LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA,
+  LOCAL_AUTHORITY_SHADOW_EXACT_BINDING_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_DRAIN_CURSOR_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_OUTBOX_COMMIT_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_OUTBOX_ENTRY_SCHEMA,
 } from "./coordination_state_contract.generated.ts";
+import { ENVELOPED_SHA256_PATTERN } from "../content_digest.ts";
 
 /**
  * Lease-partition side of the local authority shadow outbox.
@@ -28,6 +36,7 @@ import {
 export {
   outboxEntryIdentity,
   LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA,
+  LOCAL_AUTHORITY_SHADOW_EXACT_BINDING_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_DRAIN_CURSOR_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_OUTBOX_COMMIT_SCHEMA,
   LOCAL_AUTHORITY_SHADOW_OUTBOX_ENTRY_SCHEMA,
@@ -36,10 +45,18 @@ export const LEASE_PARTITION = "leases";
 const LEASE_FILE = /^[A-Za-z0-9_.-]+\.json$/u;
 const LEASE_SOURCE_FIELDS = ["todo_id", "version", "lease_epoch", "status", "updated_at"] as const;
 
-export interface LocalAuthorityShadowBinding {
+export interface LegacyLocalAuthorityShadowBinding {
   schema_version: typeof LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA;
   provider: "file_v0";
 }
+export interface ExactLocalAuthorityShadowBinding {
+  schema_version: typeof LOCAL_AUTHORITY_SHADOW_EXACT_BINDING_SCHEMA;
+  provider: "file_v0";
+  goal_ref: JsonObject;
+}
+export type LocalAuthorityShadowBinding =
+  | LegacyLocalAuthorityShadowBinding
+  | ExactLocalAuthorityShadowBinding;
 
 /** Decode the optional per-request binding; anything but the exact contract is "absent". */
 export function decodeLocalAuthorityShadowBinding(
@@ -50,14 +67,28 @@ export function decodeLocalAuthorityShadowBinding(
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
+  if (record.schema_version === LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA) {
+    return keys.length === 2 && record.provider === "file_v0"
+      ? { schema_version: LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA, provider: "file_v0" }
+      : null;
+  }
+  const goalRef = parseExactGoalRef(record.goal_ref);
   if (
-    keys.length !== 2 ||
-    record.schema_version !== LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA ||
-    record.provider !== "file_v0"
+    keys.length !== 3 ||
+    record.schema_version !== LOCAL_AUTHORITY_SHADOW_EXACT_BINDING_SCHEMA ||
+    record.provider !== "file_v0" ||
+    goalRef.kind !== "parsed"
   ) {
     return null;
   }
-  return { schema_version: LOCAL_AUTHORITY_SHADOW_BINDING_SCHEMA, provider: "file_v0" };
+  return {
+    schema_version: LOCAL_AUTHORITY_SHADOW_EXACT_BINDING_SCHEMA,
+    provider: "file_v0",
+    goal_ref: {
+      goal_id: goalRef.value.goalId.value,
+      goal_instance_id: goalRef.value.goalInstanceId.value,
+    },
+  };
 }
 
 export function sha256Digest(input: Uint8Array | string): string {
@@ -128,7 +159,7 @@ export function decodeOutboxCursor(value: unknown, partition: string): JsonObjec
       typeof record.last_entry_id !== "string" ||
       !/^local-shadow-tx-[0-9a-f]{64}$/u.test(record.last_entry_id) ||
       (record.last_partition_digest !== null &&
-       (typeof record.last_partition_digest !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(record.last_partition_digest))) ||
+       (typeof record.last_partition_digest !== "string" || !ENVELOPED_SHA256_PATTERN.test(record.last_partition_digest))) ||
       [record.last_cursor, record.last_provider_revision].some((part) => typeof part !== "string" || part.trim().length === 0)) {
     throw invalid();
   }
@@ -141,7 +172,13 @@ export function decodeOutboxCursor(value: unknown, partition: string): JsonObjec
   return record;
 }
 
-async function nextSeq(directory: string, runtimeRoot: string, goalId: string, lineageId: string): Promise<number> {
+async function nextSeq(
+  directory: string,
+  runtimeRoot: string,
+  goalId: string,
+  lineageId: string,
+  goalRef: unknown,
+): Promise<number> {
   let highest = 0;
   try {
     for (const name of await readdir(directory)) {
@@ -153,17 +190,32 @@ async function nextSeq(directory: string, runtimeRoot: string, goalId: string, l
   }
   const cursor = await readOutboxCursor(directory, LEASE_PARTITION);
   const proved = cursor === null
-    ? await readProvenShadowSequence(runtimeRoot, goalId, LEASE_PARTITION, lineageId)
+    ? await readProvenShadowSequence(runtimeRoot, goalId, LEASE_PARTITION, lineageId, goalRef)
     : cursor.last_seq as number;
   highest = Math.max(highest, proved);
   if (highest >= MAX_OUTBOX_SEQUENCE) throw new Error("outbox sequence exhausted");
   return highest + 1;
 }
 
+/**
+ * Read the lease partition for one capture.
+ *
+ * The legacy lease directory is append-retained history: archiving a Todo
+ * leaves its released lease file on disk. The source projection models only
+ * the current Todo graph, so it drops a lease whose Todo is no longer part of
+ * that graph (see `build_todo_runtime_shadow_projection`). Capture must apply
+ * the same rule, or archiving a Todo after a released lease writes an orphan
+ * edge into the candidate head and parity reports `shadow_projection_drift`.
+ *
+ * `activeTodoIds` is the current Todo graph supplied by the caller; `null`
+ * means the caller could not read it, and the capture stays strict rather
+ * than guessing a projection.
+ */
 async function readLeasePartition(
   leaseDirectory: string,
   plannedStem: string,
   plannedLease: JsonObject | null,
+  activeTodoIds: ReadonlySet<string> | null,
 ): Promise<JsonObject[]> {
   const records = new Map<string, JsonObject>();
   let names: string[] = [];
@@ -176,6 +228,7 @@ async function readLeasePartition(
     if (!LEASE_FILE.test(name) || name.startsWith(".")) continue;
     const stem = name.slice(0, -".json".length);
     if (stem === plannedStem) continue;
+    if (activeTodoIds !== null && !activeTodoIds.has(stem)) continue;
     const raw: unknown = JSON.parse(await readFile(join(leaseDirectory, name), "utf8"));
     if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
       records.set(stem, raw as JsonObject);
@@ -208,6 +261,13 @@ export interface LeaseOutboxCaptureInput {
   operation_id: string | null;
   previous_lease: JsonObject | null;
   planned_lease: JsonObject;
+  /**
+   * Current Todo graph for the goal, used to drop leases orphaned by an
+   * archived Todo exactly as the source projection does. `null` keeps the
+   * strict pre-existing behavior.
+   */
+  active_todo_ids: readonly string[] | null;
+  goal_ref?: unknown;
 }
 
 export interface LeaseOutboxCapture {
@@ -253,12 +313,22 @@ export async function beginLeaseOutboxEntry(
   const directory = outboxPartitionDirectory(input.runtime_root, input.goal_id, LEASE_PARTITION);
   try {
     const binding = await requireShadowCaptureBinding(input.runtime_root, input.goal_id);
+    const boundGoalRef = shadowBindingGoalRef(binding);
+    if (boundGoalRef === null && input.goal_ref !== undefined && input.goal_ref !== null) {
+      throw new ShadowManagementError("legacy_goal_binding");
+    }
+    if (boundGoalRef !== null) {
+      requireShadowBindingGoalRef(binding, input.goal_ref, input.goal_id);
+    }
     if (input.previous_lease !== null &&
         canonicalAuthorityBytes(input.previous_lease).equals(canonicalAuthorityBytes(input.planned_lease))) {
       return { ...inert, skipped_reason: "partition_unchanged" };
     }
-    const projection = { leases: await readLeasePartition(input.lease_directory, plannedStem, input.planned_lease) };
-    const previousRecords = await readLeasePartition(input.lease_directory, plannedStem, input.previous_lease);
+    const activeTodoIds = input.active_todo_ids === null
+      ? null
+      : new Set(input.active_todo_ids);
+    const projection = { leases: await readLeasePartition(input.lease_directory, plannedStem, input.planned_lease, activeTodoIds) };
+    const previousRecords = await readLeasePartition(input.lease_directory, plannedStem, input.previous_lease, activeTodoIds);
     for (const item of [...previousRecords, ...projection.leases]) {
       const record = item.record as JsonObject;
       if (record.goal_id !== input.goal_id || record.todo_id !== item.file_stem) {
@@ -269,8 +339,14 @@ export async function beginLeaseOutboxEntry(
       leases: previousRecords.map((item) => item.record),
     }));
     const bytesDigest = leaseRecordDigest(input.planned_lease);
-    const seq = await nextSeq(directory, input.runtime_root, input.goal_id, binding.capture_lineage_id);
-    const sourceRootDigest = sha256Digest(resolve(input.runtime_root));
+    const seq = await nextSeq(
+      directory,
+      input.runtime_root,
+      input.goal_id,
+      binding.capture_lineage_id,
+      input.goal_ref ?? null,
+    );
+    const sourceRootDigest = binding.source_root_digest;
     const entryId = outboxEntryIdentity(input.goal_id, LEASE_PARTITION, seq, bytesDigest,
       binding.capture_lineage_id, sourceRootDigest);
     const entry: JsonObject = {
@@ -330,6 +406,9 @@ export async function beginLeaseOutboxEntry(
   } catch (error) {
     if (error instanceof ShadowManagementError && error.code === "bootstrap_required") {
       return { ...inert, skipped_reason: "bootstrap_required" };
+    }
+    if (error instanceof ShadowManagementError) {
+      return { ...inert, failure: failureOf(error.code, error) };
     }
     return { ...inert, failure: failureOf("outbox_prepare_failed", error) };
   }

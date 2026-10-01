@@ -120,6 +120,7 @@ def test_python_facade_sends_explicit_boundary_context(monkeypatch) -> None:
         "todo_id": "todo_current001",
         "completion_todo_id": None,
         "autonomous_replan_recorded": False,
+        "blocked_retry": None,
     }
 
 

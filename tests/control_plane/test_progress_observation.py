@@ -196,6 +196,24 @@ def test_new_probe_family_is_a_semantic_delta_but_new_evidence_alone_is_not() ->
         "new_probe_family"
     ]
     assert semantic_progress_delta(evidence_only, baseline=baseline)["accepted"] is False
+    # The codec also states whether any evidence id is absent from the baseline;
+    # obligation sources that require it behind a renamed identifier read it.
+    assert semantic_progress_delta(new_probe, baseline=baseline)["evidence_novel"] is False
+    assert semantic_progress_delta(evidence_only, baseline=baseline)["evidence_novel"] is True
+    assert semantic_progress_delta(new_probe, baseline=None)["evidence_novel"] is True
+    # With an obligation window, novelty is judged against every claim in it
+    # and a replayed claim is reported as such.
+    windowed = semantic_progress_delta(evidence_only, baseline=baseline, window=[evidence_only, new_probe])
+    assert windowed["evidence_novel"] is False
+    assert windowed["observation_repeated"] is True
+    assert windowed["window_size"] == 2
+    fresh = semantic_progress_delta(
+        normalize_progress_observation(_observation(result_class="advanced", evidence_ids=["evidence-unseen"])),
+        baseline=baseline, window=[evidence_only, new_probe],
+    )
+    assert fresh["evidence_novel"] is True and fresh["observation_repeated"] is False
+    # Malformed window entries are ignored rather than failing the writeback.
+    assert semantic_progress_delta(new_probe, baseline=baseline, window=[{"bogus": True}, "text"])["window_size"] == 0
 
 
 def test_repeated_blocker_cannot_close_replan() -> None:
@@ -435,7 +453,13 @@ def test_host_projects_evidence_context_and_minimal_action_packet() -> None:
         "required_outcome",
         "writeback_contract",
         "allowed_terminal",
+        "planning_guidance",
     }
+    assert len(packet["planning_guidance"]) == 2
+    assert all(
+        isinstance(instruction, str) and instruction
+        for instruction in packet["planning_guidance"]
+    )
     assert packet["writeback_contract"] == {}
     assert packet["allowed_terminal"] == [
         "exploration_exhausted",

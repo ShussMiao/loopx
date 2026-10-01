@@ -456,12 +456,14 @@ def assert_completed_successor_keeps_old_gate_cleared() -> None:
     assert summary["current_agent_cleared_without_successor_handoff_count"] == 0, payload
 
 
-def assert_superseded_completed_blocker_does_not_wake_agent() -> None:
+def assert_resolved_supersession_does_not_wake_agent() -> None:
     payload = build_quota_should_run(
         status_payload(
             [
                 primary_owned_todo(),
                 handoff_review(status="done", superseded_by="todo_value_successor"),
+                todo_item(todo_id="todo_value_successor", text="Verified replacement",
+                          status="done", no_followup=True),
             ],
             recommended_action="Wait for main-control after superseded handoff.",
         ),
@@ -503,7 +505,7 @@ def main() -> int:
     assert_archived_completed_blocker_does_not_wake_agent()
     assert_existing_successor_runs_normally()
     assert_completed_successor_keeps_old_gate_cleared()
-    assert_superseded_completed_blocker_does_not_wake_agent()
+    assert_resolved_supersession_does_not_wake_agent()
     assert_no_followup_completed_blocker_does_not_wake_agent()
     print("quota-cleared-blocker-successor-gate-smoke ok")
     return 0

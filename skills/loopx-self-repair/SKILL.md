@@ -12,25 +12,22 @@ not only an apology or a one-off explanation.
 
 1. **Pause delivery selection.** Do not spend quota or continue adapter work
    until the control-plane facts explain why that work is valid.
-2. **Build a compact evidence packet.** Prefer structured surfaces:
-
-   ```bash
-   git status --short --branch
-   loopx --format json diagnose --goal-id <goal-id>
-   loopx --format json status --goal-id <goal-id> --limit 20
-   loopx --format json quota should-run --goal-id <goal-id> [--agent-id <agent-id>]
-   loopx --format json history --goal-id <goal-id> --limit 5
-   ```
-
-   `status` defaults to the registry/dashboard view, but accepts `--goal-id`
-   when the repair needs one goal-focused projection. Use
-   `diagnose --goal-id` for the richer goal-specific agent reasoning packet.
-   Also inspect the project-local registry and the registry-declared active
-   state file when relevant. Use the shared global registry for heartbeat/quota
-   truth.
-3. **Classify the failure.** Read
-   `references/repair-patterns.md` and match the symptoms to a known pattern.
-   If no pattern fits, add one after the fix.
+2. **Reuse evidence before collecting more.** Start with the current failed
+   command's structured response, error code and operation identity. An already
+   loaded packet is evidence for that observation, not permission for a later
+   write. Fetch fresh authority when required by its admission/lease contract.
+   Read [targeted diagnostics](references/targeted-diagnostics.md) when deciding
+   which missing fact to collect or investigating slow commands. Do not run
+   diagnose, status, quota and history as a fixed preflight: diagnose already
+   composes status and quota work. Recording an already-understood repair Todo
+   does not require rediscovering the incident.
+3. **Look up the symptom.** Run `python3 scripts/find_pattern.py --query
+   '<error code or symptom terms>'` from this skill directory, or invoke its
+   absolute path. Use `--id <returned-id>` to read the relevant full guidance.
+   [Search instructions](references/pattern-lookup.md) explain pagination and
+   fallback. Do not load the complete catalog, paginate it into context, or
+   reread unchanged references already available in this task. If no pattern
+   fits, diagnose from current facts and add one after the fix.
 4. **Assign the responsible layer.** Separate:
    - agent behavior mistake;
    - state projection or quota payload bug;
@@ -39,7 +36,7 @@ not only an apology or a one-off explanation.
    - docs/process hygiene gap.
 5. **Repair at the lowest durable layer.**
    - If it is a one-off agent mistake, write back the correct state/todo and
-     continue with a larger bounded batch.
+     size the next scoped effort to its verifiable result, evidence and risk.
    - If the machine projection misled the agent, fix CLI/status/quota
      projection and add a focused smoke.
    - If the user correction changes the goal acceptance, says the agent missed
@@ -138,14 +135,17 @@ replan, or terminal closeout must return to the strict semantic checkpoint.
 - Do not let fallback work hide the primary blocker. When a higher-priority
   path is gated but safe fallback is valid, report both the concrete gate and
   the fallback progress.
-- Do not let tiny safe steps become the default. If several recent turns are
-  short or surface-only, run a steering audit and increase the next bounded
-  batch size unless a real gate blocks it.
+- Do not equate bounded work with a small operation. If turns repeatedly stop
+  after setup or surface-only edits, check whether a verifiable result could
+  have been reached within scope and budget. Repair the premature stop, not by
+  imposing a minimum number of calls/files or ignoring explicit stop conditions.
 
 ## Reference Routes
 
-- For known symptom-to-repair mappings, read
-  `references/repair-patterns.md`.
+- For known symptom-to-repair mappings, search with `scripts/find_pattern.py`;
+  `references/pattern-lookup.md` explains the lookup, not a required full read.
+- For missing facts, slow commands and response truncation, read
+  `references/targeted-diagnostics.md`.
 - For guarded public GitHub issue escalation, read
   `references/upstream-issue-escalation.md`.
 - For user/agent/state channel semantics, read

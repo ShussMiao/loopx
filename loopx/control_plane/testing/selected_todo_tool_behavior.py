@@ -133,7 +133,7 @@ def _build_fixture(
         cwd=project_root,
         check=True,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=10,
     )
     decoy_action = (
@@ -774,7 +774,7 @@ def _execute_read_plan(
             cwd=fixture.project_root,
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
         )
         status = completed.returncode
@@ -818,7 +818,7 @@ def _execute_workspace_read(
         cwd=fixture.project_root,
         check=False,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=10,
     )
     if completed.returncode != 0:

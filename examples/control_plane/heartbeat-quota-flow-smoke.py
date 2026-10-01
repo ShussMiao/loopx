@@ -739,7 +739,7 @@ def main() -> int:
         interaction = follow_up["interaction_contract"]
         assert interaction["agent_channel"]["primary_action"] == EXPECTED_AGENT_TODO_ACTION, interaction
         assert "state_action_projection_warning" not in follow_up, follow_up
-        assert "agent_action=" + EXPECTED_AGENT_TODO_ACTION in follow_up["protocol_action_packet"]["summary"], follow_up
+        assert "protocol_action_packet" not in follow_up, follow_up
         assert registry_path.read_text(encoding="utf-8") == registry_before
 
     with tempfile.TemporaryDirectory(prefix="loopx-heartbeat-operator-gate-") as tmp:
@@ -806,13 +806,14 @@ def main() -> int:
             "FREQ=MINUTELY;INTERVAL=15"
         ), first_guard
         reset = first_guard["scheduler_hint"]["reset_policy"]
-        assert reset["codex_app_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=15", reset
+        assert reset["app_automation_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=15", reset
         assert "reset_condition_summary" not in reset, reset
         frontier = first_guard["goal_frontier_projection"]
         assert frontier["monitor_only_lanes"]["present"] is True, frontier
         assert frontier["monitor_only_lanes"]["quiet_until_material_transition"] is True, frontier
         assert frontier["replan_required"] is False, frontier
-        assert "automation=keep_active_quiet" in first_guard["protocol_action_packet"]["summary"], first_guard
+        assert first_guard["automation_liveness"]["automation_action"] == "keep_active_quiet", first_guard
+        assert "protocol_action_packet" not in first_guard, first_guard
         assert count_events(runtime, "quota_monitor_poll") == 0, first_guard
         interaction = first_guard["interaction_contract"]
         assert interaction["mode"] == "monitor_quiet_skip", interaction

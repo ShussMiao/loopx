@@ -1,36 +1,43 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 from collections.abc import Callable, Sequence
+from operator import itemgetter
 from pathlib import Path
 
-from ..control_plane.coordination.local_authority import read_canonical_todo_fields_if_promoted
+from ..control_plane.coordination.local_authority import (
+    local_authority_is_promoted,
+    read_canonical_todo_fields_if_promoted,
+)
+from ..control_plane.effect_runtime import effect_runtime_result
+from ..control_plane.agents.workspace_guard import capture_delivery_workspace
 from ..control_plane.todos.contract import (
-    TODO_TASK_CLASS_ADVANCEMENT,
-    normalize_todo_continuation_policy,
-    normalize_todo_task_class,
     replan_successor_semantic_binding,
 )
 from ..control_plane.capability_hooks import PostWritebackHookRegistration
 from ..control_plane.quota.settlement import (
     QuotaSettlementReadback,
+    SettlementIdentity,
+    build_turn_scoped_cli_settlement_plan,
     read_heartbeat_settlement,
     settlement_result_payload,
 )
+from ..control_plane.runtime.time import chronology_key
 from ..control_plane.todos.markdown import render_todo_markdown
 from ..control_plane.todos.provider_projection import (
     project_current_canonical_todos,
 )
+from ..control_plane.todos.completion_result import read_completion_result
 from ..history import load_index, load_registry
 from ..paths import resolve_runtime_root
 from ..registry import registry_goals
 from ..control_plane.work_items.semantic_replan_writeback import (
     qualify_replan_writeback,
 )
-from ..todo_followups import capture_followup_todos
-from ..todo_suggestion_prompt import (
-    build_todo_suggestion_prompt_packet,
-    render_todo_suggestion_prompt_markdown,
+from ..control_plane.goals.task_planning import (
+    build_task_planning_packet,
+    render_task_planning_packet,
 )
 from ..todos import (
     add_goal_todo,
@@ -46,12 +53,13 @@ from .todo_argument_validation import (
     validate_shared_todo_options,
     validate_todo_add_options,
     validate_todo_archive_completed_options,
-    validate_todo_capture_followups_options,
     validate_todo_claim_options,
     validate_todo_complete_options,
     validate_todo_list_options,
+    validate_todo_receipt_options,
+    validate_todo_result_read_options,
     validate_todo_project_markdown_options,
-    validate_todo_suggest_options,
+    validate_todo_plan_options,
     validate_todo_supersede_options,
     validate_todo_update_options,
 )
@@ -78,46 +86,66 @@ PrintPayload = Callable[
 ]
 
 
-def _completion_settlement_requirement(
-    todo: dict[str, object],
-    *,
-    no_follow_up: bool,
-) -> str | None:
-    if no_follow_up:
-        return "terminal no-follow-up closeout"
-    task_class = normalize_todo_task_class(
-        todo.get("task_class"),
-        text=str(todo.get("text") or ""),
-        action_kind=todo.get("action_kind"),
+def _read_todo_turn_settlement(
+    args: argparse.Namespace, *, runtime_root: Path,
+) -> QuotaSettlementReadback:
+    """Transport the original lifecycle tuple to the TS identity owner."""
+    readback = read_heartbeat_settlement(
+        runtime_root,
+        goal_id=args.goal_id, agent_id=args.agent_id, todo_id=args.todo_id,
+        turn_instance_id=args.turn_instance_id,
     )
-    continuation_policy = normalize_todo_continuation_policy(
-        todo.get("continuation_policy")
-    )
-    if (
-        str(todo.get("role") or "") == "agent"
-        and task_class == TODO_TASK_CLASS_ADVANCEMENT
-        and continuation_policy != "same_agent_non_delivery"
-    ):
-        return "turn-scoped advancement completion"
-    return None
+    if readback is None:
+        raise RuntimeError("exact settlement readback unexpectedly returned not-found")
+    if readback.identity.failure is not None:
+        raise ValueError(readback.identity.failure.reason)
+    if readback.identity.value is None:
+        operation = "completion" if args.todo_command == "complete" else "supersede"
+        raise ValueError(f"turn-scoped Todo {operation} has no identity")
+    return readback
 
 
 def _completion_settlement_error(
-    todo: dict[str, object],
     settlement_readback: QuotaSettlementReadback,
     *,
     no_follow_up: bool,
 ) -> str | None:
-    requirement = _completion_settlement_requirement(
-        todo,
-        no_follow_up=no_follow_up,
-    )
-    if requirement is None or settlement_readback.settlement.failure is None:
+    # Todo acceptance and Turn settlement are distinct facts. Ordinary
+    # completion can precede accounting (including controller validation).
+    # Only terminal intent requires the full chain before closing out.
+    if not no_follow_up or settlement_readback.settlement.failure is None:
         return None
     return (
-        f"{requirement} requires matching writeback and quota spend receipts: "
+        "terminal no-follow-up closeout requires matching writeback and quota spend receipts: "
         + settlement_readback.settlement.failure.reason
     )
+
+
+def _completion_settlement_plan(
+    identity: SettlementIdentity, *, args: argparse.Namespace,
+    registry_path: Path, runtime_root: Path,
+) -> dict[str, object]:
+    """Render the native plan with the original route and supplied lease facts."""
+    actor_args = ""
+    path_args = ""
+    for name, option in (
+        ("project", "--project"), ("state_file", "--state-file"),
+        ("task_lease_idempotency_key", "--task-lease-idempotency-key"),
+        ("task_lease_expected_version", "--task-lease-expected-version"),
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            argument = f" {option} {shlex.quote(str(value))}"
+            actor_args += argument
+            if name in {"project", "state_file"}:
+                path_args += argument
+    prefix = (f"loopx --registry {shlex.quote(str(registry_path))}"
+              f" --runtime-root {shlex.quote(str(runtime_root))}")
+    return build_turn_scoped_cli_settlement_plan(
+        goal_id=identity.goal_id, agent_id=identity.agent_id, todo_id=identity.todo_id,
+        turn_instance_id=identity.turn_instance_id, command_prefix=prefix,
+        scoped_cli_args="", lifecycle_actor_args=actor_args, writeback_path_args=path_args,
+    ).as_dict()
 
 
 def _validated_replan_successor_obligation(
@@ -167,7 +195,7 @@ def _validated_replan_successor_obligation(
         for _, run in sorted(
             enumerate(existing_runs),
             key=lambda item: (
-                str(item[1].get("generated_at") or ""),
+                *chronology_key(item[1].get("generated_at")),
                 item[0],
             ),
             reverse=True,
@@ -211,6 +239,23 @@ def _todo_path_args(args: argparse.Namespace) -> dict[str, Path | None]:
     }
 
 
+def _render_todo_receipt(payload: dict[str, object]) -> str:
+    lines = [
+        "# LoopX Canonical Operation Receipt",
+        "",
+        f"- status: `{payload.get('status')}`",
+        f"- goal_id: `{payload.get('goal_id')}`",
+        f"- operation_id: `{payload.get('operation_id')}`",
+        f"- source_authority: `{payload.get('source_authority')}`",
+        f"- provider_revision: `{payload.get('provider_revision')}`",
+        f"- cursor: `{payload.get('cursor')}`",
+        "- note: Historical readback only; it does not grant a current lease or a retry.",
+    ]
+    if payload.get("error") or payload.get("reason"):
+        lines.append(f"- error: `{payload.get('error') or payload.get('reason')}`")
+    return "\n".join(lines)
+
+
 def handle_todo_command(
     args: argparse.Namespace,
     *,
@@ -222,11 +267,13 @@ def handle_todo_command(
     post_writeback_hooks: Sequence[PostWritebackHookRegistration] | None = None,
     post_writeback_projection_builder: PostWritebackProjectionBuilder | None = None,
 ) -> int:
-    renderer = (
-        render_todo_suggestion_prompt_markdown
-        if args.todo_command == "suggest"
-        else render_todo_markdown
-    )
+    renderer = render_todo_markdown
+    if args.todo_command == "plan":
+        renderer = render_task_planning_packet
+    elif args.todo_command == "receipt":
+        renderer = _render_todo_receipt
+    elif args.todo_command == "result-read":
+        renderer = itemgetter("text")
     try:
         if args.todo_command is None:
             raise ValueError(
@@ -236,7 +283,14 @@ def handle_todo_command(
             )
         validate_shared_todo_options(args)
         validate_capability_gap_options(args)
-        if args.todo_command == "list":
+        if args.todo_command == "plan":
+            validate_todo_plan_options(args)
+            payload = build_task_planning_packet(
+                registry_path=registry_path, runtime_root_arg=runtime_root_arg,
+                goal_id=args.goal_id, agent_id=args.agent_id, text=args.text,
+                project=Path(args.project).expanduser() if args.project else None,
+            )
+        elif args.todo_command == "list":
             validate_todo_list_options(args)
             payload = list_goal_todos(
                 registry_path=registry_path,
@@ -249,6 +303,30 @@ def handle_todo_command(
                 thin=bool(args.todo_thin),
                 **_todo_path_args(args),
                 runtime_root_arg=runtime_root_arg,
+            )
+        elif args.todo_command == "receipt":
+            validate_todo_receipt_options(args)
+            runtime_root = resolve_runtime_root(load_registry(registry_path), runtime_root_arg)
+            if not local_authority_is_promoted(runtime_root=runtime_root, goal_id=args.goal_id):
+                raise ValueError("todo receipt requires promoted canonical authority; no legacy fallback")
+            result = effect_runtime_result(
+                "coordination.local_authority.operation_receipt",
+                {"schema_version": "loopx_local_coordination_operation_receipt_request_v0",
+                 "runtime_root": str(runtime_root.expanduser().resolve(strict=False)),
+                 "goal_id": args.goal_id, "operation_id": args.operation_id},
+                timeout=15.0,
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("canonical operation receipt returned an invalid result")
+            payload = {"ok": result.get("status") in {"found", "missing"},
+                       "command": "receipt", **result}
+        elif args.todo_command == "result-read":
+            validate_todo_result_read_options(args)
+            registry = load_registry(registry_path)
+            payload = read_completion_result(
+                registry_path=registry_path,
+                runtime_root=resolve_runtime_root(registry, runtime_root_arg),
+                goal_id=args.goal_id, todo_id=args.todo_id,
             )
         elif args.todo_command == "project-markdown":
             validate_todo_project_markdown_options(args)
@@ -276,11 +354,13 @@ def handle_todo_command(
                 runtime_root_arg=runtime_root_arg,
             )
             payload = add_goal_todo(
+                operation_id=args.operation_id,
                 registry_path=registry_path,
                 runtime_root_arg=runtime_root_arg,
                 goal_id=args.goal_id,
                 role=args.role,
                 text=args.text,
+                priority=args.priority,
                 status=args.status,
                 note=args.note,
                 task_class=args.task_class,
@@ -359,9 +439,15 @@ def handle_todo_command(
                 goal_id=args.goal_id,
                 todo_id=args.todo_id,
                 text=args.text,
+                priority=args.priority,
+                clear_priority=args.clear_priority,
                 status=args.status,
                 role=args.role,
                 note=args.note,
+                validation_command=args.validation_command,
+                validation_command_json=args.validation_command_json,
+                validation_label=args.validation_label,
+                validation_timeout_seconds=args.validation_timeout_seconds,
                 evidence=args.evidence,
                 reason=args.reason,
                 task_class=args.task_class,
@@ -407,6 +493,10 @@ def handle_todo_command(
                     if value is not None
                 },
                 clear_claim=bool(args.clear_claim),
+                update_operation_id=args.update_operation_id,
+                update_expected_provider_revision=args.update_expected_provider_revision,
+                task_lease_idempotency_key=args.task_lease_idempotency_key,
+                task_lease_expected_version=args.task_lease_expected_version,
                 **_todo_path_args(args),
                 dry_run=bool(args.dry_run),
             )
@@ -415,31 +505,17 @@ def handle_todo_command(
             settlement_result = None
             settlement_identity = None
             settlement_readback = None
-            completion_requires_settlement = False
             completion_error = None
             completion_turn_key = None
             completion_identity_source = None
+            completion_delivery_workspace = None
             if getattr(args, "turn_instance_id", None):
-                runtime_root = resolve_runtime_root(
-                    load_registry(registry_path),
-                    runtime_root_arg,
+                runtime_root = resolve_runtime_root(load_registry(registry_path), runtime_root_arg)
+                settlement_readback = _read_todo_turn_settlement(
+                    args, runtime_root=runtime_root,
                 )
-                settlement_readback = read_heartbeat_settlement(
-                    runtime_root,
-                    goal_id=args.goal_id,
-                    agent_id=args.agent_id,
-                    todo_id=args.todo_id,
-                    turn_instance_id=getattr(args, "turn_instance_id", None),
-                )
-                if settlement_readback is None:
-                    raise RuntimeError(
-                        "exact settlement readback unexpectedly returned not-found"
-                    )
                 settlement_result = settlement_readback.identity
-                if settlement_result.failure is not None:
-                    raise ValueError(settlement_result.failure.reason)
-                if settlement_result.value is None:
-                    raise ValueError("turn-scoped Todo completion has no identity")
+                assert settlement_result.value is not None
                 identity = settlement_result.value
                 settlement_identity = identity
                 todo_payload = list_goal_todos(
@@ -463,13 +539,7 @@ def handle_todo_command(
                     raise ValueError(
                         "turn-scoped Todo completion requires one durable Todo"
                     )
-                completion_requirement = _completion_settlement_requirement(
-                    todo,
-                    no_follow_up=bool(args.no_follow_up),
-                )
-                completion_requires_settlement = completion_requirement is not None
                 completion_error = _completion_settlement_error(
-                    todo,
                     settlement_readback=settlement_readback,
                     no_follow_up=bool(args.no_follow_up),
                 )
@@ -487,10 +557,31 @@ def handle_todo_command(
                         "settlement_result": settlement_result_payload(
                             settlement_result
                         ),
+                        "settlement_plan": _completion_settlement_plan(
+                            identity, args=args, registry_path=registry_path, runtime_root=runtime_root,
+                        ),
                         "error": completion_error,
                     }
                 completion_turn_key = identity.effect_id
                 completion_identity_source = "turn_settlement"
+                writeback_run = settlement_readback.writeback_run
+                if isinstance(writeback_run, dict) and isinstance(
+                    writeback_run.get("delivery_workspace"), dict
+                ):
+                    completion_delivery_workspace = dict(
+                        writeback_run["delivery_workspace"]
+                    )
+                elif todo.get("task_repository"):
+                    # Completion validation precedes accountable refresh, so
+                    # the exact Turn can legitimately have no writeback row
+                    # yet. Bind a freshly verified current-worktree snapshot
+                    # to this already-read settlement identity rather than
+                    # introducing an arbitrary cwd option or a circular gate.
+                    completion_delivery_workspace = capture_delivery_workspace(
+                        Path.cwd(),
+                        peer_independent_worktree_required=True,
+                        repository_source="todo.complete.turn_settlement",
+                    )
             elif getattr(args, "completion_identity_key", None):
                 completion_turn_key = str(args.completion_identity_key)
                 completion_identity_source = "lifecycle_reentry"
@@ -503,8 +594,11 @@ def handle_todo_command(
                     role=args.role,
                     decision_outcome=args.decision_outcome,
                     evidence=args.evidence,
+                    completion_result_file=Path(args.result_file).expanduser() if args.result_file else None,
                     completion_turn_key=completion_turn_key,
                     completion_identity_source=completion_identity_source,
+                    completion_delivery_workspace=completion_delivery_workspace,
+                    completion_validation_workspace_path=Path.cwd(),
                     task_lease_idempotency_key=args.task_lease_idempotency_key,
                     task_lease_expected_version=args.task_lease_expected_version,
                     note=args.note,
@@ -535,6 +629,11 @@ def handle_todo_command(
                     )
         elif args.todo_command == "supersede":
             validate_todo_supersede_options(args)
+            supersede_readback = (
+                _read_todo_turn_settlement(
+                    args, runtime_root=resolve_runtime_root(load_registry(registry_path), runtime_root_arg),
+                ) if args.turn_instance_id else None
+            )
             payload = supersede_goal_todo(
                 registry_path=registry_path,
                 runtime_root_arg=runtime_root_arg,
@@ -559,6 +658,11 @@ def handle_todo_command(
                 **_todo_path_args(args),
                 dry_run=bool(args.dry_run),
             )
+            if supersede_readback is not None:
+                retirement_identity = supersede_readback.identity.value
+                assert retirement_identity is not None
+                payload["settlement_identity"] = retirement_identity.as_dict()
+                payload["settlement_result"] = settlement_result_payload(supersede_readback.identity)
         elif args.todo_command == "archive-completed":
             validate_todo_archive_completed_options(args)
             payload = archive_completed_todos(
@@ -570,40 +674,11 @@ def handle_todo_command(
                 **_todo_path_args(args),
                 dry_run=not bool(args.execute),
             )
-        elif args.todo_command == "suggest":
-            validate_todo_suggest_options(args)
-            payload = build_todo_suggestion_prompt_packet(
-                goal_id=args.goal_id,
-                project=Path(args.project).expanduser() if args.project else None,
-                agent_id=args.agent_id,
-                sources=args.suggestion_sources,
-                limit=args.todo_limit,
-                trigger=args.suggestion_trigger,
-            )
-            payload["dry_run"] = True
-        elif args.todo_command == "capture-followups":
-            validate_todo_capture_followups_options(args)
-            followups = list(args.followups or [])
-            if args.text:
-                followups.append(args.text)
-            payload = capture_followup_todos(
-                registry_path=registry_path,
-                runtime_root_arg=runtime_root_arg,
-                goal_id=args.goal_id,
-                followups=followups,
-                evidence=args.evidence or "",
-                task_class=args.task_class,
-                action_kind=args.action_kind,
-                required_write_scopes=args.required_write_scopes,
-                required_capabilities=args.required_capabilities,
-                target_capabilities=args.target_capabilities,
-                required_decision_scopes=args.required_decision_scopes,
-                **_todo_path_args(args),
-                dry_run=bool(args.dry_run),
-            )
         else:
             raise ValueError("unsupported todo command")
     except Exception as exc:
+        from ..usage_ping import capture_failure
+        capture_failure(exc)
         payload = todo_error_payload(args, exc)
     append_todo_rollout_event(
         payload,
@@ -635,8 +710,6 @@ def handle_todo_command(
         settlement_result = (
             settlement_readback.terminal_settlement
             if args.no_follow_up and settlement_identity is not None
-            else settlement_readback.settlement
-            if completion_requires_settlement
             else settlement_readback.identity
         )
         payload["settlement_result"] = settlement_result_payload(

@@ -32,6 +32,27 @@ def _items(count: int, *, prefix: str) -> list[dict[str, object]]:
     ]
 
 
+def test_markdown_distinguishes_peer_blockers_from_native_admission() -> None:
+    peer = {"mode": "task_scoped_peer", "execution_scope": "peer_agent_activation",
+            "execution_state": "blocked", "task_selection": "canonical_claimed_candidates",
+            "activation_allowed": False, "eligible_peer_lanes": [],
+            "blocked_peer_lanes": [{"todo_id": "todo-peer", "reason_codes": ["peer_agent_activation_unavailable"]}]}
+    for contract in [peer, {"mode": "adaptive", "execution_state": "ready", "peer_activation_diagnostic": peer}]:
+        rendered = render_quota_should_run_markdown({"task_orchestration_contract": contract})
+        assert "execution_scope=peer_agent_activation" in rendered
+        assert "execution_state=blocked" in rendered
+        assert "task_selection=canonical_claimed_candidates" in rendered
+        assert "peer_agent_activation_unavailable" in rendered
+        if contract["mode"] == "adaptive":
+            assert "peer_activation_diagnostic_admission:" in rendered
+            assert "execution_state=ready" in rendered
+    projected = {**peer, "blocked_peer_lanes": [], "blocked_peer_count": 50,
+                 "read_required": True, "detail_ref": "full_decision.task_orchestration_contract"}
+    rendered = render_quota_should_run_markdown({"task_orchestration_contract": projected})
+    assert "blocked_lanes=50" in rendered
+    assert "task_orchestration_required_detail: full_decision.task_orchestration_contract" in rendered
+
+
 def test_compact_quota_should_run_cli_payload_keeps_decision_lanes_and_counts() -> None:
     backlog = _items(40, prefix="backlog")
     first_open = _items(5, prefix="open")

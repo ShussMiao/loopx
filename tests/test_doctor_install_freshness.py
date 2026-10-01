@@ -12,11 +12,10 @@ from loopx.doctor import (
     REQUIRED_INSTALLED_SKILL_PHRASES,
     build_install_freshness,
     current_script_invocation_path,
-    git_revision_relation,
     installed_skill_summary,
     python_distribution_install,
-    trusted_release_ref_for_root,
 )
+from loopx.doctor_git import git_revision_relation, trusted_release_ref_for_root
 
 
 class _FakeDistributionFile:
@@ -210,7 +209,7 @@ def test_main_channel_upgrade_command_preserves_source_ref(tmp_path: Path) -> No
         assert "install-windows.ps1" in command
     else:
         assert (
-            "curl -fsSL https://huangruiteng.github.io/loopx/install.sh "
+            "curl -fsSL https://loopx-project.github.io/loopx/install.sh "
             "| env LOOPX_REF=main bash"
         ) in command
     assert freshness["upgrade_command"] == command
@@ -233,7 +232,7 @@ def test_stable_channel_upgrade_command_keeps_public_default(tmp_path: Path) -> 
     if os.name == "nt":
         assert "install-windows.ps1" in command
     else:
-        assert "huangruiteng.github.io/loopx/install.sh | bash" in command
+        assert "loopx-project.github.io/loopx/install.sh | bash" in command
     assert freshness["upgrade_command"] == command
 
 
@@ -358,7 +357,7 @@ def test_python_distribution_uses_pip_native_upgrade_path(tmp_path: Path) -> Non
     if os.name == "nt":
         assert "install-windows.ps1" in str(freshness["no_clone_upgrade_command"])
     else:
-        assert "huangruiteng.github.io" in str(freshness["no_clone_upgrade_command"])
+        assert "loopx-project.github.io" in str(freshness["no_clone_upgrade_command"])
 
 
 def test_pipx_distribution_preserves_the_pipx_owner(tmp_path: Path) -> None:

@@ -5,8 +5,14 @@ from __future__ import annotations
 from typing import Any
 
 from .control_plane.goals.configure_goal_service import configure_goal_with_global_sync
+from .capabilities.multi_subagent import (
+    apply_codex_subagent_capacity,
+    plan_codex_subagent_capacity,
+    public_codex_host_capacity,
+)
 from .control_plane.todos.contract import normalize_todo_task_domain
 from .status_server import configure_goal_preview_id
+from .orchestration import subagent_model_configuration_options
 
 
 CHAT_GOAL_SUBAGENT_DRY_RUN_PATH = "/api/chat/goal-subagents/dry-run"
@@ -33,11 +39,11 @@ def add_goal_subagent_routes(
     handler: Any,
 ) -> None:
     if goal_subagent_configuration_enabled(handler.server):
-        routes[CHAT_GOAL_SUBAGENT_DRY_RUN_PATH] = (
-            lambda: handler._goal_subagent_configuration(apply=False)
+        routes[CHAT_GOAL_SUBAGENT_DRY_RUN_PATH] = lambda: (
+            handler._goal_subagent_configuration(apply=False)
         )
-        routes[CHAT_GOAL_SUBAGENT_APPLY_PATH] = (
-            lambda: handler._goal_subagent_configuration(apply=True)
+        routes[CHAT_GOAL_SUBAGENT_APPLY_PATH] = lambda: (
+            handler._goal_subagent_configuration(apply=True)
         )
 
 
@@ -64,7 +70,15 @@ class GoalSubagentConfigurationRequestMixin:
         *,
         apply: bool,
     ) -> dict[str, Any]:
-        allowed = {"goal_id", "enabled", "max_children", "allowed_domains"}
+        allowed = {
+            "goal_id",
+            "enabled",
+            "max_children",
+            "allowed_domains",
+            "model_config",
+            "execution_config",
+            "align_codex_host_capacity",
+        }
         if apply:
             allowed.add("preview_id")
         unknown = sorted(set(body) - allowed)
@@ -80,6 +94,14 @@ class GoalSubagentConfigurationRequestMixin:
         if not isinstance(body.get("enabled"), bool):
             raise ValueError("enabled must be a boolean")
         enabled = body["enabled"]
+        if "execution_config" in body and not isinstance(
+            body.get("execution_config"), str
+        ):
+            raise ValueError("execution_config must be a string")
+        if "align_codex_host_capacity" in body and not isinstance(
+            body["align_codex_host_capacity"], bool
+        ):
+            raise ValueError("align_codex_host_capacity must be a boolean")
 
         if enabled:
             max_children = body.get("max_children")
@@ -121,6 +143,26 @@ class GoalSubagentConfigurationRequestMixin:
             "multi_subagent_feature": "enabled" if enabled else "off",
             "max_children": max_children,
             "allowed_domains": allowed_domains,
+            "align_codex_subagent_capacity": bool(
+                body.get("align_codex_host_capacity", False)
+            ),
+            **(
+                {
+                    "subagent_execution_config": str(
+                        body.get("execution_config") or ""
+                    ).strip()
+                }
+                if "execution_config" in body
+                and str(body.get("execution_config") or "").strip()
+                else {"clear_subagent_execution_config": True}
+                if "execution_config" in body
+                else {}
+            ),
+            **(
+                subagent_model_configuration_options(body["model_config"])
+                if "model_config" in body
+                else {}
+            ),
         }
 
     def _goal_subagent_configuration_payload(
@@ -138,8 +180,33 @@ class GoalSubagentConfigurationRequestMixin:
             multi_subagent_feature=values["multi_subagent_feature"],
             max_children=values["max_children"],
             allowed_domains=values["allowed_domains"],
+            align_codex_subagent_capacity=values[
+                "align_codex_subagent_capacity"
+            ],
+            codex_home_override=getattr(
+                getattr(self.server, "runtime_controller", None),
+                "codex_home",
+                None,
+            ),
+            codex_host_capacity_planner=plan_codex_subagent_capacity,
+            codex_host_capacity_applier=apply_codex_subagent_capacity,
+            **{
+                key: values[key]
+                for key in (
+                    "subagent_model",
+                    "subagent_reasoning_effort",
+                    "clear_subagent_model_config",
+                    "subagent_execution_config",
+                    "clear_subagent_execution_config",
+                )
+                if key in values
+            },
             execute=execute,
         )
+
+    @staticmethod
+    def _public_codex_host_capacity(payload: dict[str, Any]) -> dict[str, Any]:
+        return public_codex_host_capacity(payload)
 
     @staticmethod
     def _compact_goal_subagent_configuration(
@@ -158,6 +225,14 @@ class GoalSubagentConfigurationRequestMixin:
             "preview_id": configure_goal_preview_id(payload),
             "orchestration_summary": payload.get("orchestration_summary"),
             "feature_summary": payload.get("feature_summary"),
+            "goal_configuration_changed": payload.get(
+                "goal_configuration_changed"
+            ),
+            "codex_host_capacity": (
+                GoalSubagentConfigurationRequestMixin._public_codex_host_capacity(
+                    payload
+                )
+            ),
             "global_sync": payload.get("global_sync"),
             "partial_write": bool(payload.get("partial_write")),
             "error": payload.get("error"),

@@ -1,8 +1,9 @@
-import { readFile } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
-
 import type { JsonObject } from "../effect_program.ts";
 import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
+import {
+  goalPathSegment,
+  readGoalHeartbeatReceipts,
+} from "../rollout_receipt_log.ts";
 import {
   jsonObject,
   requireBoolean,
@@ -24,7 +25,6 @@ export const SCHEDULER_HEARTBEAT_FOLLOWUP_RESULT_SCHEMA =
 export const SCHEDULER_HEARTBEAT_FOLLOWUP_ERROR_SCHEMA =
   "loopx_scheduler_host_followup_error_v0";
 
-const ROLLOUT_EVENT_SCHEMA = "loopx_rollout_event_v0";
 const ACK_CLASSIFICATION = "quota_scheduler_ack";
 const FAILURE_CLASSIFICATION = "quota_scheduler_host_update_failure";
 
@@ -50,17 +50,6 @@ type ReceiptStatus = "fresh" | "missing" | "stale";
 function optionalText(value: unknown): string | null {
   if (value === undefined || value === null || value === "") return null;
   return requireNonEmptyString(value, "scheduler follow-up optional text").trim();
-}
-
-function pathSegment(value: unknown, label: string): string {
-  const result = requireNonEmptyString(value, label).trim();
-  if (result === "." || result === ".." || result.includes("/") || result.includes("\\")) {
-    throw new EffectRuntimeRequestError(
-      `${label} must be a single path segment`,
-      `invalid_${label}`,
-    );
-  }
-  return result;
 }
 
 function followupOperation(facts: JsonObject): FollowupOperation {
@@ -89,7 +78,7 @@ function requestObject(value: unknown): SchedulerHeartbeatFollowupRequest {
       "scheduler_host_facts_schema_mismatch",
     );
   }
-  pathSegment(hostFacts.goal_id, "goal_id");
+  goalPathSegment(hostFacts.goal_id);
   requireNonEmptyString(hostFacts.agent_id, "agent_id");
   followupOperation(hostFacts);
   const turnInstanceId = optionalText(input.turn_instance_id);
@@ -138,18 +127,6 @@ function compactBefore(value: JsonObject): JsonObject {
   };
 }
 
-function receiptLogPath(runtimeRoot: string, goalId: string): string {
-  const root = resolve(runtimeRoot);
-  const path = resolve(root, "goals", pathSegment(goalId, "goal_id"), "rollout-event-log.jsonl");
-  const child = relative(root, path);
-  if (child === "" || child === ".." || child.startsWith(`..${sep}`)) {
-    throw new EffectRuntimeRequestError(
-      "scheduler follow-up receipt path escapes runtime_root",
-      "invalid_scheduler_receipt_path",
-    );
-  }
-  return path;
-}
 
 async function heartbeatReceiptStatus(
   runtimeRoot: string,
@@ -157,29 +134,8 @@ async function heartbeatReceiptStatus(
   agentId: string,
   turnInstanceId: string,
 ): Promise<ReceiptStatus> {
-  let text: string;
-  try {
-    text = await readFile(receiptLogPath(runtimeRoot, goalId), "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
-    throw error;
-  }
-  const receipts: JsonObject[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try {
-      const event = jsonObject(JSON.parse(line));
-      if (
-        event?.schema_version === ROLLOUT_EVENT_SCHEMA &&
-        event.event_kind === "quota_should_run" &&
-        event.goal_id === goalId &&
-        event.agent_id === agentId
-      ) receipts.push(event);
-    } catch {
-      // Match the established non-strict rollout-event reader: unrelated
-      // malformed lines do not manufacture or erase a valid receipt.
-    }
-  }
+  const receipts = await readGoalHeartbeatReceipts(runtimeRoot, goalId, agentId);
+  if (receipts === null) return "missing";
   const firstMatch = receipts.findIndex((event) => event.run_id === turnInstanceId);
   if (firstMatch < 0) return "missing";
   return receipts.slice(firstMatch + 1).some((event) => event.run_id !== turnInstanceId)
@@ -247,7 +203,7 @@ function compatibilityFailure(
     goal_id: facts.goal_id,
     agent_id: facts.agent_id,
     surface: facts.surface ?? "codex_app",
-    state_key: facts.state_key ?? "scheduler_hint.codex_app.stateful_backoff",
+    state_key: facts.state_key ?? "scheduler_hint.app_automation.stateful_backoff",
     applied_rrule: applied,
     appended: false,
     registry_mutated: false,
@@ -281,7 +237,7 @@ function ackResult(
   const event: JsonObject = {
     event_type: ACK_CLASSIFICATION,
     surface: facts.surface ?? "codex_app",
-    state_key: facts.state_key ?? "scheduler_hint.codex_app.stateful_backoff",
+    state_key: facts.state_key ?? "scheduler_hint.app_automation.stateful_backoff",
     applied_rrule: appliedRrule,
     before: compact,
     scheduler_state: state,
@@ -301,7 +257,7 @@ function ackResult(
     goal_id: facts.goal_id,
     agent_id: facts.agent_id,
     surface: facts.surface ?? "codex_app",
-    state_key: facts.state_key ?? "scheduler_hint.codex_app.stateful_backoff",
+    state_key: facts.state_key ?? "scheduler_hint.app_automation.stateful_backoff",
     applied_rrule: appliedRrule,
     classification: ACK_CLASSIFICATION,
     generated_at: facts.generated_at,
@@ -354,7 +310,7 @@ function failureResult(
     goal_id: facts.goal_id,
     agent_id: facts.agent_id,
     surface: facts.surface ?? "codex_app",
-    state_key: facts.state_key ?? "scheduler_hint.codex_app.stateful_backoff",
+    state_key: facts.state_key ?? "scheduler_hint.app_automation.stateful_backoff",
     failed_rrule: targetRrule,
     observed_host_rrule: observedRrule,
     failure_kind: facts.failure_kind ?? "host_tool_failure",
@@ -367,7 +323,7 @@ function failureResult(
     scheduler_failure_event: {
       event_type: FAILURE_CLASSIFICATION,
       surface: facts.surface ?? "codex_app",
-      state_key: facts.state_key ?? "scheduler_hint.codex_app.stateful_backoff",
+      state_key: facts.state_key ?? "scheduler_hint.app_automation.stateful_backoff",
       before: compact,
       scheduler_state: state,
       host_update_failure: failure,

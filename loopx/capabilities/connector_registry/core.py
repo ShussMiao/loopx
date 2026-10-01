@@ -146,7 +146,7 @@ def load_connector_registry(path: Path | None = None) -> dict[str, Any]:
 def save_connector_registry(state: Mapping[str, Any], path: Path | None = None) -> Path:
     state_path = path or default_registry_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2))
+    state_path.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2), encoding="utf-8")
     return state_path
 
 

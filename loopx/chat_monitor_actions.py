@@ -12,19 +12,117 @@ from .todos import complete_goal_todo, update_goal_todo
 class ChatMonitorActionMixin:
     """Keep monitor execution policy separate from the general action service."""
 
+    def _run_monitor_update(
+        self, parameters: dict[str, Any], *, dry_run: bool,
+        basis: dict[str, Any] | None = None, operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        from .chat_actions import _monitor_metadata, _monitor_text
+
+        goal_id = str(parameters["goal_id"])
+        operation = str(parameters["operation"])
+        if operation == "stop":
+            result = complete_goal_todo(
+                registry_path=self.registry_path,
+                goal_id=goal_id,
+                todo_id=str(parameters["todo_id"]),
+                evidence="Owner stopped the continuous monitor from typed Chat action.",
+                **self._reviewed_terminal_options(basis, operation_id),
+                no_followup=True,
+                claimed_by=str(parameters["agent_id"]),
+                agent_id=str(parameters["agent_id"]),
+                authority_reason="owner-confirmed typed Chat action",
+                dry_run=dry_run,
+            )
+        else:
+            kwargs: dict[str, Any] = {
+                "registry_path": self.registry_path,
+                "goal_id": goal_id,
+                "todo_id": str(parameters["todo_id"]),
+                "agent_id": str(parameters["agent_id"]),
+                "authority_reason": "owner-confirmed typed Chat action",
+                "dry_run": dry_run,
+                **self._reviewed_update_options(basis, operation_id),
+            }
+            if operation == "pause":
+                kwargs.update(
+                    status="blocked",
+                    note="Owner paused this continuous monitor from typed Chat action.",
+                )
+            elif operation == "resume":
+                kwargs.update(status="open")
+            else:
+                stop_condition_raw = parameters.get("stop_condition")
+                # Canonical intent contains the cadence, not a fresh timestamp
+                # on every retry. The TS planner derives the due date exactly
+                # once when a new operation commits; receipt recovery skips it.
+                base_metadata = _monitor_metadata(parameters, schedule=basis is None)
+                if stop_condition_raw is not None:
+                    stop_condition = str(stop_condition_raw).strip()
+                    if parse_timestamp(stop_condition) is not None:
+                        kwargs.update(
+                            text=_monitor_text(parameters),
+                            resume_when=None,
+                            clear_resume_when=True,
+                            monitor_metadata={
+                                **base_metadata,
+                                "expires_at": stop_condition,
+                                "watch_only": None,
+                            },
+                        )
+                    elif stop_condition.lower() in {"watch_only", "watch-only", "watch", "continuous", "never"}:
+                        kwargs.update(
+                            text=_monitor_text(parameters),
+                            resume_when=None,
+                            clear_resume_when=True,
+                            monitor_metadata={
+                                **base_metadata,
+                                "expires_at": None,
+                                "watch_only": "true",
+                            },
+                        )
+                    elif stop_condition:
+                        kwargs.update(
+                            text=_monitor_text(parameters),
+                            resume_when=stop_condition,
+                            clear_resume_when=False,
+                            monitor_metadata={
+                                **base_metadata,
+                                "expires_at": None,
+                                "watch_only": None,
+                            },
+                        )
+                    else:
+                        kwargs.update(
+                            text=_monitor_text(parameters),
+                            resume_when=None,
+                            clear_resume_when=True,
+                            monitor_metadata={
+                                **base_metadata,
+                                "expires_at": None,
+                                "watch_only": "true",
+                            },
+                        )
+                else:
+                    kwargs.update(
+                        text=_monitor_text(parameters),
+                        monitor_metadata=base_metadata,
+                    )
+            result = update_goal_todo(**kwargs)
+        return result
+
     def _apply_monitor_update(
         self, proposal_id: str, proposal: dict[str, Any], parameters: dict[str, Any]
     ) -> dict[str, Any]:
         from .chat_actions import (
             ProtectedActionGate,
             _digest,
-            _monitor_metadata,
-            _monitor_text,
             _opaque,
         )
 
         goal_id = str(parameters["goal_id"])
         operation = str(parameters["operation"])
+        if proposal.get("canonical_update_basis") is not None:
+            return self._apply_reviewed_todo_edit(proposal_id, proposal, parameters)
         current_fingerprint = self._goal_state_fingerprint(goal_id)
         if operation == "run_now":
             if self.runtime_controller is None or self.chat_store is None:
@@ -113,94 +211,9 @@ class ChatMonitorActionMixin:
                 proposal_id, current_state_fingerprint=current_fingerprint, receipt={}
             )
             return {"proposal": stale, "turn": None}
-        if operation == "stop":
-            result = complete_goal_todo(
-                registry_path=self.registry_path,
-                goal_id=goal_id,
-                todo_id=str(parameters["todo_id"]),
-                evidence="Owner stopped the continuous monitor from typed Chat action.",
-                completion_turn_key=f"action-{proposal_id}",
-                no_followup=True,
-                claimed_by=str(parameters["agent_id"]),
-                agent_id=str(parameters["agent_id"]),
-                authority_reason="owner-confirmed typed Chat action",
-                dry_run=False,
-            )
-            outcome = "monitor_stopped"
-        else:
-            kwargs: dict[str, Any] = {
-                "registry_path": self.registry_path,
-                "goal_id": goal_id,
-                "todo_id": str(parameters["todo_id"]),
-                "agent_id": str(parameters["agent_id"]),
-                "authority_reason": "owner-confirmed typed Chat action",
-                "dry_run": False,
-            }
-            if operation == "pause":
-                kwargs.update(
-                    status="blocked",
-                    note="Owner paused this continuous monitor from typed Chat action.",
-                )
-                outcome = "monitor_paused"
-            elif operation == "resume":
-                kwargs.update(status="open")
-                outcome = "monitor_resumed"
-            else:
-                stop_condition_raw = parameters.get("stop_condition")
-                base_metadata = _monitor_metadata(parameters)
-                if stop_condition_raw is not None:
-                    stop_condition = str(stop_condition_raw).strip()
-                    if parse_timestamp(stop_condition) is not None:
-                        kwargs.update(
-                            text=_monitor_text(parameters),
-                            resume_when=None,
-                            clear_resume_when=True,
-                            monitor_metadata={
-                                **base_metadata,
-                                "expires_at": stop_condition,
-                                "watch_only": None,
-                            },
-                        )
-                    elif stop_condition.lower() in {"watch_only", "watch-only", "watch", "continuous", "never"}:
-                        kwargs.update(
-                            text=_monitor_text(parameters),
-                            resume_when=None,
-                            clear_resume_when=True,
-                            monitor_metadata={
-                                **base_metadata,
-                                "expires_at": None,
-                                "watch_only": "true",
-                            },
-                        )
-                    elif stop_condition:
-                        kwargs.update(
-                            text=_monitor_text(parameters),
-                            resume_when=stop_condition,
-                            clear_resume_when=False,
-                            monitor_metadata={
-                                **base_metadata,
-                                "expires_at": None,
-                                "watch_only": None,
-                            },
-                        )
-                    else:
-                        kwargs.update(
-                            text=_monitor_text(parameters),
-                            resume_when=None,
-                            clear_resume_when=True,
-                            monitor_metadata={
-                                **base_metadata,
-                                "expires_at": None,
-                                "watch_only": "true",
-                            },
-                        )
-                else:
-                    kwargs.update(
-                        text=_monitor_text(parameters),
-                        monitor_metadata=base_metadata,
-                    )
-                outcome = "monitor_updated"
-            result = update_goal_todo(**kwargs)
+        result = self._run_monitor_update(parameters, dry_run=False, operation_id=f"action-{proposal_id}")
+        outcome = {"stop": "monitor_stopped", "pause": "monitor_paused",
+                   "resume": "monitor_resumed", "edit": "monitor_updated"}[operation]
         todo_id = _opaque(result.get("todo_id"), field="todo_id")
         receipt = {
             "receipt_id": _digest(

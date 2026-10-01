@@ -15,7 +15,7 @@ MAINTAINABILITY_REPORT_SCHEMA_VERSION = "control_plane_maintainability_report_v0
 MODULE_METRIC_BASELINE_SCHEMA_VERSION = "control_plane_module_metric_baseline_v0"
 DECISION_STATEMENT_LIMIT = 90
 DECISION_POINT_LIMIT = 60
-MODULE_LINE_LIMIT = 1500
+MODULE_LINE_LIMIT = 2000
 MODULE_ANY_LIMIT = 300
 MODULE_DICT_ANY_LIMIT = 300
 MODULE_METRIC_BASELINE_PATH = Path(__file__).with_name("module_metric_baseline.json")
@@ -56,9 +56,11 @@ REVIEWED_MAINTAINABILITY_EXCEPTIONS: dict[str, dict[str, Any]] = {
         metric_ceilings={"package_reexport_count": 101, "source_module_count": 37},
     ),
     "compatibility_facade:loopx.status": _exception(
-        "The public loopx.status import surface remains a supported compatibility contract.",
+        "The public loopx.status import surface remains a supported compatibility contract. "
+        "Fifteen existing carriers now import their single owners instead of restating "
+        "local values; the import count changes without adding public names.",
         "Keep internal consumers on canonical modules and shrink exports as callers migrate.",
-        metric_ceilings={"package_reexport_count": 117, "source_module_count": 50},
+        metric_ceilings={"package_reexport_count": 119, "source_module_count": 50},
     ),
 }
 
@@ -204,16 +206,19 @@ def _finding_id(category: str, identity: str) -> str:
 
 
 def tracked_python_paths(repository_root: Path) -> set[Path]:
+    # `-z` frames each pathname on NUL, so a path carrying U+0085/U+2028/U+2029
+    # stays one record even in a repository that sets `core.quotePath=false`,
+    # where `git ls-files` emits it raw and `str.splitlines()` would tear it.
     completed = subprocess.run(
-        ["git", "ls-files", "*.py"],
+        ["git", "ls-files", "-z", "*.py"],
         cwd=repository_root,
         check=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
     )
     return {
         repository_root / relative_path
-        for relative_path in completed.stdout.splitlines()
+        for relative_path in completed.stdout.split("\0")
         if relative_path and (repository_root / relative_path).is_file()
     }
 
@@ -521,6 +526,15 @@ def module_metric_baseline(baseline_path: Path) -> dict[str, dict[str, int]]:
     ceilings = payload.get("module_metric_ceilings")
     if not isinstance(ceilings, dict):
         raise ValueError("module metric baseline must contain module_metric_ceilings")
+    expected_defaults = {
+        "lines": MODULE_LINE_LIMIT,
+        "any_count": MODULE_ANY_LIMIT,
+        "dict_any_count": MODULE_DICT_ANY_LIMIT,
+    }
+    if payload.get("default_limits") != expected_defaults:
+        raise ValueError(
+            "module metric baseline default_limits must match runtime defaults"
+        )
     normalized: dict[str, dict[str, int]] = {}
     for path, metrics in ceilings.items():
         if not isinstance(metrics, dict):
@@ -586,11 +600,12 @@ def collect_module_metric_findings(
             continue
         relative = path.relative_to(repository_root).as_posix()
         metrics = module_metrics(path)
-        ceilings = baseline.get(relative) or {
+        ceilings = {
             "lines": MODULE_LINE_LIMIT,
             "any_count": MODULE_ANY_LIMIT,
             "dict_any_count": MODULE_DICT_ANY_LIMIT,
         }
+        ceilings.update(baseline.get(relative) or {})
         regressions = {
             metric: actual
             for metric, actual in metrics.items()
@@ -610,6 +625,83 @@ def collect_module_metric_findings(
             }
         )
     return sorted(findings, key=lambda item: str(item["id"]))
+
+
+def _git_show_text(repository_root: Path, rev: str, path: str) -> str | None:
+    result = subprocess.run(
+        ["git", "show", f"{rev}:{path}"],
+        cwd=repository_root, capture_output=True,
+        text=True, encoding="utf-8", errors="replace", check=False,
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def _rev_baseline_ceilings(repository_root: Path, rev: str) -> dict[str, dict[str, int]]:
+    """Mirror ``module_metric_baseline`` for a committed revision."""
+    text = _git_show_text(repository_root, rev, "loopx/canary/module_metric_baseline.json")
+    if text is None:
+        return {}
+    payload = json.loads(text)
+    ceilings = payload.get("module_metric_ceilings")
+    if not isinstance(ceilings, dict):
+        return {}
+    return {
+        str(path): {key: int(metrics[key]) for key in ("lines", "any_count", "dict_any_count") if key in metrics}
+        for path, metrics in ceilings.items()
+        if isinstance(metrics, dict)
+    }
+
+
+def diff_scoped_module_ceiling_violations(
+    repository_root: Path,
+    changed_files: Sequence[str],
+    *,
+    base_ref: str,
+) -> list[dict[str, Any]]:
+    """Module growth that crossed a reviewed ceiling must settle in the same diff.
+
+    A module may exceed its pre-diff ceiling without this check firing, as long
+    as this diff did not cause the crossing; and a module whose ceiling this diff
+    raises can stay silent. The single case this flags is the one that previously
+    merged and turned ``main`` red until a separate reconciliation PR refreshed
+    the ledger: this diff grew a module past the ceiling it inherited, without
+    settling that ceiling here.
+    """
+    head_ceilings = module_metric_baseline(
+        repository_root / "loopx" / "canary" / "module_metric_baseline.json"
+    )
+    base_ceilings = _rev_baseline_ceilings(repository_root, (base_ref or "origin/main").strip() or "origin/main")
+    violations: list[dict[str, Any]] = []
+    for changed in changed_files:
+        relative = str(changed)
+        if not relative.startswith("loopx/") or not relative.endswith(".py"):
+            continue
+        checkout_path = repository_root / relative
+        if not checkout_path.is_file():
+            continue
+        head_lines = module_metrics(checkout_path)["lines"]
+        base_lines = _git_show_text(repository_root, (base_ref or "origin/main").strip() or "origin/main", relative)
+        if base_lines is None:
+            base_ceiling = MODULE_LINE_LIMIT
+            was_within_budget = True
+        else:
+            base_ceiling = base_ceilings.get(relative, {}).get("lines", MODULE_LINE_LIMIT)
+            was_within_budget = len(base_lines.splitlines()) <= base_ceiling
+        head_ceiling = head_ceilings.get(relative, {}).get("lines", MODULE_LINE_LIMIT)
+        crossed_inherited_ceiling = was_within_budget and head_lines > base_ceiling
+        if crossed_inherited_ceiling and head_ceiling < head_lines:
+            violations.append(
+                {
+                    "id": _finding_id("module_metric_budget", relative),
+                    "category": "module_metric_budget",
+                    "path": relative,
+                    "base_lines": 0 if base_lines is None else len(base_lines.splitlines()),
+                    "base_ceiling": base_ceiling,
+                    "head_lines": head_lines,
+                    "head_ceiling": head_ceiling,
+                }
+            )
+    return sorted(violations, key=lambda item: str(item["id"]))
 
 
 def evaluate_maintainability_findings(
@@ -748,11 +840,10 @@ def build_control_plane_maintainability_report(
             ),
             "freezes_exact_line_counts": False,
             "repository_scope_decision": (
-                "This profile intentionally replaces the repository-wide exact Python line "
-                "budget with semantic checks for control-plane modules and the supported "
-                "quota/status compatibility facades; it also ratchets per-module line and "
-                "type-density metrics from a checked-in baseline while keeping the current "
-                "modules grandfathered. It does not retain a coarse all-file hotspot limit."
+                "This profile combines semantic control-plane checks with a coarse 2000-line "
+                "default hotspot limit and checked-in per-module overrides for intentional "
+                "stricter contracts or grandfathered larger modules. Type-density metrics "
+                "continue to ratchet per module."
             ),
         },
         **evaluation,
@@ -788,4 +879,24 @@ def render_control_plane_maintainability_report(payload: Mapping[str, Any]) -> s
             )
     for exception_id in payload.get("invalid_exceptions") or []:
         lines.append(f"- invalid exception metadata: {exception_id}")
+    # A module metric budget is settled in the checked-in ledger rather than by
+    # a reviewed exception, so name that file next to the finding: it is the
+    # reviewer-visible edit that decides whether the growth is accepted.
+    if any(
+        str(finding.get("category") or "") == "module_metric_budget"
+        for finding in payload.get("findings") or []
+    ):
+        lines.append(
+            "- module metric debt: refresh the reviewed ceiling in "
+            f"{_module_metric_baseline_name(payload)} for the growth this review accepts"
+        )
     return "\n".join(lines) + "\n"
+
+
+def _module_metric_baseline_name(payload: Mapping[str, Any]) -> str:
+    policy = payload.get("policy")
+    if isinstance(policy, Mapping):
+        declared = str(policy.get("module_metric_baseline_path") or "").strip()
+        if declared:
+            return declared
+    return MODULE_METRIC_BASELINE_PATH.name

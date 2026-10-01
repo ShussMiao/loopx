@@ -10,6 +10,12 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from loopx.control_plane.testing.continuation_verb_guard import (  # noqa: E402
+    assert_no_continuation_verb,
+)
 
 
 def run_json(*args: str, env: dict[str, str] | None = None) -> dict[str, object]:
@@ -175,7 +181,6 @@ def test_missing_project_stops_before_mutation() -> None:
         assert isinstance(next_step, dict)
         assert next_step["requires_user_confirmation"] is True
         assert "--dry-run" in str(next_step["dry_run_command"])
-        assert "--codex-app-heartbeat ask" in str(next_step["dry_run_command"])
         assert "--dry-run" not in str(next_step["after_confirmation_command"])
         assert "/loopx-summary-all" not in json.dumps(payload)
 
@@ -223,7 +228,7 @@ def test_goal_text_invocation_plans_ranked_todos_before_activation() -> None:
         assert "--objective 'Ship the lightweight issue triage workflow'" in str(
             next_step["connect_command_if_needed"]
         )
-        assert "--no-onboarding-scan" in str(next_step["connect_command_if_needed"])
+        assert "--no-onboarding-scan" not in str(next_step["connect_command_if_needed"])
 
         goal_start = payload["goal_start_contract"]
         assert isinstance(goal_start, dict)
@@ -419,6 +424,220 @@ def test_start_goal_guided_previews_transaction_without_mutation() -> None:
         assert "--include-command-pack-detail" in str(command_pack["detail_command"])
         assert command_pack["goal_start_contract"]["planner"]["required_before_todo_write"] is True
         assert_fixture_unchanged(snapshot)
+
+
+def test_start_goal_guided_blocks_orphaned_goal_state() -> None:
+    """A reset that deleted the registry entry must not reopen the same goal."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "reset-project"
+        project.mkdir()
+        goal_id = "reset-goal"
+        snapshot = write_connected_goal_fixture(
+            project, goal_id=goal_id, agent_id="codex-retired"
+        )
+        state_file = project / ".codex" / "goals" / goal_id / "ACTIVE_GOAL_STATE.md"
+        registry = project / ".loopx" / "registry.json"
+        registry.write_text(
+            json.dumps({"schema_version": "0.1", "goals": []}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        payload = run_json(
+            "start-goal",
+            "--guided",
+            "--project",
+            str(project),
+            "--goal-id",
+            goal_id,
+            "--host-surface",
+            "codex-app",
+            "--goal-text",
+            "Continue the interrupted refactor",
+        )
+
+        connection = payload["project_connection"]
+        assert connection["connection_state"] == "orphaned_goal_state", connection
+        assert connection["goal_found"] is False, connection
+        assert connection["bootstrap_continuation_allowed"] is False, connection
+        assert connection["orphaned_goal_state"]["state_file_routes"] == [
+            f".codex/goals/{goal_id}/ACTIVE_GOAL_STATE.md"
+        ], connection
+
+        transaction = payload["guided_transaction"]
+        assert transaction["blocked_by"] == "orphaned_goal_state", transaction
+        assert [step["id"] for step in transaction["ordered_steps"]] == [
+            "inspect_connection",
+            "resolve_orphaned_goal_state",
+        ], transaction
+
+        gate = transaction["orphaned_goal_state_gate"]
+        assert gate["schema_version"] == "loopx_orphaned_goal_state_gate_v0", gate
+        assert gate["forbidden_until_resolved"] == [
+            "bootstrap",
+            "agent_registration",
+            "todo_write",
+            "quota_spend",
+            "host_loop_activation",
+        ], gate
+        for route in gate["resolution_routes"]:
+            assert route["mutates"] is False, route
+            assert "--execute" not in route["command"], route
+            assert route["command"].splitlines()[-1].startswith("loopx "), route
+
+        commands = payload["command_pack"]["commands"]
+        for key in (
+            "goal_start_connect_if_needed",
+            "bootstrap_after_user_confirmation",
+            "goal_start_plan_prompt",
+        ):
+            assert commands[key] is None, key
+
+        safety = payload["safety_contract"]
+        assert safety["force_bootstrap_allowed"] is False, safety
+        assert safety["writes_state_file"] is False, safety
+        assert safety["orphaned_goal_state_blocks_continuation"] is True, safety
+        assert_packet_summary_refs(
+            payload,
+            packet_kind="guided_start_goal",
+            compact_projection_default=True,
+        )
+        assert_fixture_unchanged({registry: registry.read_text(), state_file: snapshot[state_file]})
+
+
+def test_start_goal_guided_fences_orphaned_state_for_every_absence_route() -> None:
+    """No registry authority plus surviving state must fence, however that came about.
+
+    One real CLI run per absence shape: a deleted registry file, a registry that
+    declares no goal, and a registry that no longer parses each reach the fence
+    through a different return in the inspection.
+    """
+
+    for shape, registry_text, absence in (
+        ("missing", None, "not_connected"),
+        ("empty", '{"schema_version": "0.1", "goals": []}\n', "registry_without_goal"),
+        ("invalid", '{"schema_version": "0.1", "goals": [', "registry_invalid"),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "reset-project"
+            state_file = project / ".codex" / "goals" / "reset-goal" / "ACTIVE_GOAL_STATE.md"
+            state_file.parent.mkdir(parents=True)
+            state_text = "# Orphaned goal state written by a retired lane\n"
+            state_file.write_text(state_text, encoding="utf-8")
+            if registry_text is not None:
+                registry = project / ".loopx" / "registry.json"
+                registry.parent.mkdir(parents=True)
+                registry.write_text(registry_text, encoding="utf-8")
+
+            payload = run_json(
+                "start-goal",
+                "--guided",
+                "--project",
+                str(project),
+                "--goal-id",
+                "reset-goal",
+                "--host-surface",
+                "codex-app",
+                "--goal-text",
+                "Continue the interrupted refactor",
+            )
+
+            connection = payload["project_connection"]
+            assert connection["connection_state"] == "orphaned_goal_state", (shape, connection)
+            assert connection["absent_connection_state"] == absence, (shape, connection)
+            transaction = payload["guided_transaction"]
+            assert transaction["blocked_by"] == "orphaned_goal_state", (shape, transaction)
+            assert [step["id"] for step in transaction["ordered_steps"]] == [
+                "inspect_connection",
+                "resolve_orphaned_goal_state",
+            ], (shape, transaction)
+            commands = payload["command_pack"]["commands"]
+            for key in (
+                "goal_start_connect_if_needed",
+                "goal_start_refresh_state",
+                "goal_start_host_loop_activation",
+                "goal_start_quota_should_run",
+                "goal_start_plan_prompt",
+            ):
+                assert commands[key] is None, (shape, key)
+            assert state_file.read_text(encoding="utf-8") == state_text, shape
+
+
+def test_unparseable_registry_without_orphaned_state_keeps_onboarding() -> None:
+    """A broken registry is its own repair action; the fence must not stand in for it."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "reset-project"
+        registry = project / ".loopx" / "registry.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text('{"schema_version": "0.1", "goals": [', encoding="utf-8")
+
+        payload = run_json(
+            "start-goal",
+            "--guided",
+            "--project",
+            str(project),
+            "--goal-id",
+            "reset-goal",
+            "--host-surface",
+            "codex-app",
+            "--goal-text",
+            "Continue the interrupted refactor",
+        )
+
+        connection = payload["project_connection"]
+        assert connection["connection_state"] == "registry_invalid", connection
+        assert "orphaned_goal_state" not in connection, connection
+        assert connection["reason"], connection
+        assert payload["command_pack"]["commands"]["goal_start_connect_if_needed"], payload
+
+
+def test_fenced_project_surfaces_offer_no_continuation() -> None:
+    """No real CLI surface over orphaned state may spell out a runnable mutation.
+
+    The guided packet with its full command pack, and the standalone command pack
+    with its rendered message, are both executed by hosts. Each carried
+    ``register-agent --execute`` in nested fields the top-level fence never read.
+    """
+
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp) / "reset-project"
+        state_file = project / ".codex" / "goals" / "reset-goal" / "ACTIVE_GOAL_STATE.md"
+        state_file.parent.mkdir(parents=True)
+        state_file.write_text(
+            "# Orphaned goal state written by a retired lane\n", encoding="utf-8"
+        )
+        guided = run_json(
+            "start-goal",
+            "--guided",
+            "--include-command-pack-detail",
+            "--project",
+            str(project),
+            "--goal-id",
+            "reset-goal",
+            "--host-surface",
+            "codex-app",
+            "--goal-text",
+            "Continue the interrupted refactor",
+        )
+        standalone = run_json(
+            "bootstrap-command-pack",
+            "--project",
+            str(project),
+            "--goal-id",
+            "reset-goal",
+            "--host-surface",
+            "codex-app",
+        )
+
+        assert guided["project_connection"]["connection_state"] == "orphaned_goal_state"
+        assert standalone["project_connection"]["connection_state"] == "orphaned_goal_state"
+        assert_no_continuation_verb(guided, source="guided with command pack detail")
+        assert_no_continuation_verb(standalone, source="standalone command pack")
+        # Without a surviving read-only route the guard above could pass on a
+        # packet that tells the operator nothing at all.
+        assert guided["command_pack"]["commands"]["status"]
+        assert state_file.is_file()
 
 
 def test_start_goal_guided_requires_explicit_goal_for_multi_goal_project() -> None:
@@ -711,15 +930,18 @@ def test_skill_slash_fallback_contract() -> None:
     assert "Do not handle `/loopx-pr-review` from this broader project skill" in normalized
     assert "do not route it to `loopx-pr-merge` unless" in normalized
     assert "loopx --format json pr-review --state all" not in skill_text
-    assert "loopx --format json pr-review --state all" in pr_review_skill_text
+    assert "keeps ordinary queue discovery open-only" in pr_review_skill_text
+    assert "explicit `--state merged|all`" in pr_review_skill_text
     assert "Save the full first JSON packet before printing a compact projection" in pr_review_normalized
     assert "agent_response_contract" in pr_review_skill_text
-    assert "pull_requests[].review_template" in pr_review_skill_text
-    assert "pull_requests[].evidence_commands" in pr_review_skill_text
+    assert "pull_requests[review_action_kind!=null].review_template" in pr_review_skill_text
+    assert "pull_requests[review_action_kind!=null].evidence_commands" in pr_review_skill_text
     assert "Do not pipe the only copy through `jq`" in pr_review_skill_text
-    assert "review_groups.unmerged" in pr_review_skill_text
-    assert "review_groups.merged" in pr_review_skill_text
-    assert "The five sections are output structure, while the execution contract is the evidence authority" in pr_review_normalized
+    assert "`review_groups`" in pr_review_skill_text
+    assert "ranked actionable `review_sequence`" in pr_review_skill_text
+    assert "must not appear in `review_sequence`" in pr_review_skill_text
+    assert "complete Chinese five-block review" in pr_review_normalized
+    assert "capability owns review depth, evidence requirements" in pr_review_normalized
 
 
 def test_start_goal_guided_derives_display_name_from_goal_text() -> None:
@@ -757,7 +979,6 @@ def test_start_goal_guided_derives_display_name_from_goal_text() -> None:
             "derived-display-goal",
             "--objective",
             "修复 scheduler state path 覆盖问题",
-            "--no-onboarding-scan",
             "--no-global-sync",
         )
         registry = json.loads(
@@ -817,6 +1038,10 @@ def main() -> int:
     test_missing_project_stops_before_mutation()
     test_goal_text_invocation_plans_ranked_todos_before_activation()
     test_start_goal_guided_previews_transaction_without_mutation()
+    test_start_goal_guided_blocks_orphaned_goal_state()
+    test_start_goal_guided_fences_orphaned_state_for_every_absence_route()
+    test_unparseable_registry_without_orphaned_state_keeps_onboarding()
+    test_fenced_project_surfaces_offer_no_continuation()
     test_start_goal_guided_requires_explicit_goal_for_multi_goal_project()
     test_connected_project_reuses_existing_state()
     test_linked_git_worktree_reuses_canonical_source_registry()

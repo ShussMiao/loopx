@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -99,11 +101,15 @@ def assert_wrapper_parity(registry_path: Path, runtime_root: Path, scan_root: Pa
         "goal_id": GOAL_ID,
         "available_capabilities": ["network", "material_lifecycle"],
     }
-    wrapper = status_module.collect_status(**kwargs)
-    direct = collection_read_model.collect_status(
-        **kwargs,
-        context=status_module.build_status_collection_context(),
-    )
+    # Compare one observation time without hiding freshness or coverage fields.
+    with patch.object(
+        collection_read_model, "now_utc_iso", return_value="2026-01-01T00:00:00Z"
+    ):
+        wrapper = status_module.collect_status(**kwargs)
+        direct = collection_read_model.collect_status(
+            **kwargs,
+            context=status_module.build_status_collection_context(),
+        )
 
     assert scrub_volatile(wrapper) == scrub_volatile(direct), (wrapper, direct)
     assert wrapper["ok"] is True, wrapper
@@ -117,6 +123,7 @@ def assert_wrapper_parity(registry_path: Path, runtime_root: Path, scan_root: Pa
 def assert_context_orchestration() -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
     runtime_root = Path("/tmp/status-collection-runtime")
+    history_audit = object()
 
     def record(name: str, value: Any) -> Any:
         calls.append((name, value if isinstance(value, dict) else {"value": value}))
@@ -136,12 +143,12 @@ def assert_context_orchestration() -> None:
         assert registry_path == Path("registry.json"), registry_path
         return runtime_root
 
-    def collect_history(**kwargs: Any) -> dict[str, Any]:
+    def collect_status_history(**kwargs: Any) -> SimpleNamespace:
         assert kwargs["limit"] == 20, kwargs
         assert kwargs["goal_id"] == GOAL_ID, kwargs
-        assert kwargs["include_runtime_goals"] is True, kwargs
-        return record(
-            "collect_history",
+        assert kwargs["status_include_runtime_goals"] is True, kwargs
+        history = record(
+            "collect_status_history",
             {
                 "goal_count": 1,
                 "run_count": 0,
@@ -149,10 +156,15 @@ def assert_context_orchestration() -> None:
                 "activation_state_filter": kwargs.get("activation_state_filter"),
             },
         )
+        return SimpleNamespace(
+            status_history=history,
+            contract_audit=history_audit,
+        )
 
     def check_contract(**kwargs: Any) -> dict[str, Any]:
         assert kwargs["limit"] == 2, kwargs
         assert kwargs["goal_id_filter"] == GOAL_ID, kwargs
+        assert kwargs["history_audit"] is history_audit, kwargs
         return record(
             "check_contract",
             {
@@ -186,7 +198,7 @@ def assert_context_orchestration() -> None:
             "collect_global_registry_health",
             {"ok": True, "current_registry_is_global": True},
         ),
-        collect_history=collect_history,
+        collect_status_history=collect_status_history,
         check_contract=check_contract,
         build_attention_queue=build_attention_queue,
         build_runtime_summaries=lambda **kwargs: record(
@@ -229,7 +241,9 @@ def assert_context_orchestration() -> None:
         context=context,
     )
 
-    history_call = next(call for call in calls if call[0] == "collect_history")
+    history_call = next(
+        call for call in calls if call[0] == "collect_status_history"
+    )
     assert history_call[1]["activation_state_filter"] == "active", history_call
     contract_call = next(call for call in calls if call[0] == "check_contract")
     assert contract_call[1]["activation_state_filter"] == "active", contract_call
@@ -257,7 +271,7 @@ def assert_context_orchestration() -> None:
     assert [name for name, _ in calls][:4] == [
         "load_registry",
         "collect_global_registry_health",
-        "collect_history",
+        "collect_status_history",
         "check_contract",
     ], calls
 

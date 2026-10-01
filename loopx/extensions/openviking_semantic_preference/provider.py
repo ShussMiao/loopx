@@ -57,7 +57,7 @@ def _run_ov(
             capture_output=True,
             check=False,
             env=_environment(cli_config),
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout_seconds,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

@@ -109,10 +109,10 @@ def provision_mcp_python(dry: bool, allow_system_pip: bool = False) -> str:
         return str(vpy)
     print(f"[deps] creating mcp venv {MCP_VENV} …")
     MCP_VENV.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run([sys.executable, "-m", "venv", str(MCP_VENV)], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, "-m", "venv", str(MCP_VENV)], capture_output=True, text=True, encoding="utf-8", errors="replace",)
     if r.returncode == 0:
-        subprocess.run([str(vpy), "-m", "pip", "install", "-q", "--upgrade", "pip"], capture_output=True, text=True)
-        pip = subprocess.run([str(vpy), "-m", "pip", "install", "-q", MCP_REQUIREMENT], capture_output=True, text=True)
+        subprocess.run([str(vpy), "-m", "pip", "install", "-q", "--upgrade", "pip"], capture_output=True, text=True, encoding="utf-8", errors="replace",)
+        pip = subprocess.run([str(vpy), "-m", "pip", "install", "-q", MCP_REQUIREMENT], capture_output=True, text=True, encoding="utf-8", errors="replace",)
         if pip.returncode == 0 and _has_mcp(vpy):
             print(f"[deps] mcp installed into {MCP_VENV}")
             return str(vpy)
@@ -124,7 +124,7 @@ def provision_mcp_python(dry: bool, allow_system_pip: bool = False) -> str:
     if allow_system_pip:
         print("[deps] --allow-system-pip: pip install --break-system-packages mcp")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", MCP_REQUIREMENT],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace",)
         if _has_mcp(sys.executable):
             return sys.executable
     print("[deps] WARNING: could not provision `mcp` into a dedicated venv, and we will\n"
@@ -162,13 +162,13 @@ def install_mcp(
     subprocess.run(
         [claude, "mcp", "remove", "--scope", scope, "loopx"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         cwd=cwd_run,
     )
     has_gh = subprocess.run(
         [claude, "mcp", "get", "goal-harness"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         cwd=cwd_run,
     ).returncode == 0
     if has_gh:
@@ -177,7 +177,7 @@ def install_mcp(
             subprocess.run(
                 [claude, "mcp", "remove", "--scope", scope, "goal-harness"],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 cwd=cwd_run,
             )
         else:
@@ -187,7 +187,7 @@ def install_mcp(
     r = subprocess.run(
         [claude, *add],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         cwd=cwd_run,
     )
     if r.returncode != 0:

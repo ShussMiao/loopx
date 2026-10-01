@@ -156,13 +156,34 @@ def _public_contract_evidence() -> dict[tuple[str, str], set[str]]:
     for root in PUBLIC_CONTRACT_ROOTS:
         for path in root.rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            # Aliases such as ``from loopx import status as status_module`` are a
+            # real consumer of a facade export, reached by attribute access
+            # rather than a from-import. Without this map the audit would report
+            # a live consumer as missing evidence.
+            module_aliases: dict[str, str] = {}
             for node in ast.walk(tree):
-                if not isinstance(node, ast.ImportFrom):
+                if not isinstance(node, ast.ImportFrom) or node.level:
                     continue
-                if node.module not in PUBLIC_COMPAT_FACADES:
-                    continue
+                module = node.module or ""
                 for alias in node.names:
-                    evidence.setdefault((node.module, alias.name), set()).add(
+                    # ``from loopx import status`` binds the facade itself; a
+                    # from-import of a facade also binds the facade's exports.
+                    candidate = alias.name if not module else f"{module}.{alias.name}"
+                    if candidate in PUBLIC_COMPAT_FACADES:
+                        module_aliases[alias.asname or alias.name] = candidate
+                        continue
+                    if module in PUBLIC_COMPAT_FACADES:
+                        evidence.setdefault((module, alias.name), set()).add(
+                            str(path.relative_to(REPOSITORY_ROOT))
+                        )
+            if not module_aliases:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
+                    continue
+                facade_name = module_aliases.get(getattr(node.value, "id", ""))
+                if facade_name is not None:
+                    evidence.setdefault((facade_name, node.attr), set()).add(
                         str(path.relative_to(REPOSITORY_ROOT))
                     )
     for path in (REPOSITORY_ROOT / "docs").rglob("*.md"):
@@ -222,6 +243,23 @@ def test_periodic_report_hook_does_not_break_cold_imports() -> None:
             capture_output=True,
             check=False,
             text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+
+def test_read_adapters_do_not_load_writeback_facades_for_leaf_helpers() -> None:
+    # Run independently: an earlier test importing a writer must not hide an
+    # accidental cold-start dependency of a read-only entrypoint.
+    for module, unrelated in (
+        ("loopx.control_plane.coordination.local_authority", "loopx.history"),
+        ("loopx.cli_commands.status", "loopx.state_refresh"),
+    ):
+        completed = subprocess.run(
+            [sys.executable, "-c", (
+                f"import sys; import {module}; "
+                f"assert {unrelated!r} not in sys.modules, {unrelated!r}"
+            )],
+            cwd=REPOSITORY_ROOT, capture_output=True, check=False, text=True,
         )
         assert completed.returncode == 0, completed.stderr
 

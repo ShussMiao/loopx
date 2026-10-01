@@ -18,6 +18,10 @@ def register_heartbeat_control_commands(
     )
     add_subcommand_format(heartbeat_prompt_parser)
     heartbeat_prompt_parser.add_argument(
+        "--bootstrap", action="store_true",
+        help="Generate a stable host entrypoint that reloads installed rules; no persisted Turn identity.",
+    )
+    heartbeat_prompt_parser.add_argument(
         "--goal-id", required=True, help="Stable LoopX goal id."
     )
     heartbeat_prompt_parser.add_argument(
@@ -81,6 +85,14 @@ def register_heartbeat_control_commands(
         ),
     )
     heartbeat_prompt_parser.add_argument(
+        "--trae_app",
+        action="store_true",
+        help=(
+            "Compact explicit alias for --runtime-profile "
+            "trae_app in generated heartbeat commands."
+        ),
+    )
+    heartbeat_prompt_parser.add_argument(
         "--visible-goal-host",
         choices=["traex-cli"],
         help=(
@@ -96,9 +108,11 @@ def register_heartbeat_control_commands(
             "codex_app",
             "codex_app_ssh",
             "codex_cli",
+            "trae_app",
             "generic_cli",
             "claude_code",
             "kunluncode",
+            "kiro_cli",
             "local_scheduler",
         ],
         help="Host surface embedded in the generated quota guard.",

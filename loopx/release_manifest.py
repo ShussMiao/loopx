@@ -76,7 +76,7 @@ def _run_git(source_root: Path, args: list[str]) -> str | None:
             ["git", "-C", str(source_root), *args],
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
     except OSError:
         return None

@@ -25,15 +25,59 @@ from loopx.control_plane.goals.shared_goal_alignment import (
 from loopx.control_plane.todos.active_state_todo_parser import (
     parse_active_state_todos,
 )
-from loopx.event_sourced_state import (
-    AppendOnlyStateEventStore,
-    TODO_ADDED,
-    make_state_event,
-)
 
 GOAL_ID = "goal-stage1"
 AGENTS = ("agent-a", "agent-b")
 EVENT_LOG_NAME = "events.jsonl"
+
+
+def test_excluded_unclaimed_work_is_not_offered_to_the_agent(tmp_path):
+    specs = _default_todo_specs()
+    specs[1]["excluded_agents"] = "agent-a"
+    fixture = _write_fixture(tmp_path, todo_specs=specs)
+    result = project_shared_goal_alignment(goal_id=GOAL_ID, agent_id="agent-a",
+        project=fixture["project"], registry_path=fixture["registry"], runtime_root=fixture["runtime"])
+    assert result["frontier_counts"]["unclaimed_advancement_count"] == 0
+    assert result["unclaimed_eligible_work"] == []
+
+
+def test_corrupt_legacy_lease_only_blocks_a_selected_claim(tmp_path):
+    from loopx.control_plane.work_items.task_lease import task_lease_path
+
+    fixture = _write_fixture(tmp_path, todo_specs=_default_todo_specs())
+    for todo_id in ("todo_blocked", "todo_lane_a"):
+        path = task_lease_path(runtime_root=fixture["runtime"], goal_id=GOAL_ID, todo_id=todo_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{broken")
+        if todo_id == "todo_blocked":
+            result = project_shared_goal_alignment(goal_id=GOAL_ID, agent_id="agent-a",
+                project=fixture["project"], registry_path=fixture["registry"], runtime_root=fixture["runtime"])
+            assert result["frontier_counts"]["current_agent_claimed_advancement_count"] == 1
+        else:
+            with pytest.raises(ValueError, match="cannot read selected claim lease"):
+                project_shared_goal_alignment(goal_id=GOAL_ID, agent_id="agent-a",
+                    project=fixture["project"], registry_path=fixture["registry"], runtime_root=fixture["runtime"])
+
+
+@pytest.mark.parametrize("display", ["missing", "stale", "empty"])
+def test_promoted_alignment_does_not_use_the_display(tmp_path, display):
+    from canonical_authority_fixture import initialize_canonical_authority
+    from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
+
+    fixture = _write_fixture(tmp_path, todo_specs=_default_todo_specs())
+    record = {"schema_version": "todo_item_v0", "todo_id": "todo_canonical", "role": "agent",
+        "status": "open", "done": False, "text": "Canonical work", "task_class": "advancement_task",
+        "archive_state": "active", "source_section": "Agent Todo", "index": 1}
+    projection = build_todo_runtime_shadow_projection(goal_id=GOAL_ID, todos=[record], handoff_mode="soft_claim")
+    initialize_canonical_authority(fixture["runtime"], GOAL_ID, projection, state_path=fixture["state_file"])
+    if display == "missing":
+        fixture["state_file"].unlink()
+    elif display == "empty":
+        fixture["state_file"].write_text("")
+    result = project_shared_goal_alignment(goal_id=GOAL_ID, agent_id="agent-a",
+        project=fixture["project"], registry_path=fixture["registry"], runtime_root=fixture["runtime"])
+    assert result["unclaimed_eligible_work"] == [{"todo_id": "todo_canonical", "claim_required_before_work": True}]
+    assert fixture["state_file"].exists() is (display != "missing")
 
 STATE_HEADER_LINES = [
     "---",
@@ -65,7 +109,6 @@ def _write_fixture(
     root: Path,
     *,
     todo_specs: list[dict[str, str]],
-    events: list[dict[str, str]] | None = None,
     leases: dict[str, dict[str, object]] | None = None,
     agents: tuple[str, ...] = AGENTS,
     goal_id: str = GOAL_ID,
@@ -110,19 +153,7 @@ def _write_fixture(
         encoding="utf-8",
     )
 
-    if events:
-        store = AppendOnlyStateEventStore(state_file.with_name(EVENT_LOG_NAME))
-        for event in events:
-            store.append(
-                make_state_event(
-                    event_id=event["event_id"],
-                    goal_id=goal_id,
-                    event_type=TODO_ADDED,
-                    actor_agent_id=event["actor_agent_id"],
-                    refs={"todo_id": event["todo_id"]},
-                    payload={"text": f"Fixture event for {event['todo_id']}."},
-                )
-            )
+    runtime.mkdir(parents=True, exist_ok=True)
 
     if leases:
         for todo_id, lease in leases.items():
@@ -203,24 +234,6 @@ def _default_todo_specs() -> list[dict[str, str]]:
     ]
 
 
-def _default_events() -> list[dict[str, str]]:
-    return [
-        {
-            "event_id": "evt_stage1_001",
-            "actor_agent_id": "agent-b",
-            "todo_id": "todo_monitor",
-        },
-        {
-            "event_id": "evt_stage1_002",
-            "actor_agent_id": "agent-a",
-            "todo_id": "todo_lane_a",
-        },
-        {
-            "event_id": "evt_stage1_003",
-            "actor_agent_id": "agent-a",
-            "todo_id": "todo_unclaimed",
-        },
-    ]
 
 
 def test_projects_basis_binding_and_unclaimed_work(
@@ -229,7 +242,6 @@ def test_projects_basis_binding_and_unclaimed_work(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
 
     projection = project_shared_goal_alignment(
@@ -243,14 +255,14 @@ def test_projects_basis_binding_and_unclaimed_work(
     assert projection["agent_id"] == "agent-a"
     assert projection["read_only"] is True
     basis = projection["source_basis"]
-    assert basis["revision_basis"] == "state_event_log"
-    assert basis["state_event_basis_sequence"] == 3
+    assert basis["revision_basis"] == "markdown_active_state"
+    assert basis["state_event_basis_sequence"] == 0
     assert basis["source_basis_digest"].startswith("sha256:")
     assert basis["state_updated_at"] == "2026-09-01T00:00:00+00:00"
     frontier = projection["frontier_basis"]
-    assert frontier["based_on_state_event_sequence"] == 3
-    assert frontier["basis_source"] == "state_event_log"
-    assert frontier["last_agent_event_id"] == "evt_stage1_003"
+    assert frontier["based_on_state_event_sequence"] is None
+    assert frontier["basis_source"] == "unbound"
+    assert frontier["last_agent_event_id"] is None
     assert projection["frontier_counts"] == {
         "current_agent_claimed_advancement_count": 1,
         "unclaimed_advancement_count": 1,
@@ -264,7 +276,7 @@ def test_projects_basis_binding_and_unclaimed_work(
         for item in projection["unclaimed_eligible_work"]
     )
     assert projection["drift_facts"] == []
-    assert projection["conflict_facts"] == []
+    assert projection["conflict_facts"] == ["frontier_basis_unverifiable"]
 
 
 def test_a_goal_id_without_the_goal_prefix_projects(
@@ -277,7 +289,6 @@ def test_a_goal_id_without_the_goal_prefix_projects(
         tmp_path,
         goal_id="loopx-meta",
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
 
     projection = project_shared_goal_alignment(
@@ -287,74 +298,13 @@ def test_a_goal_id_without_the_goal_prefix_projects(
     )
 
     assert projection["goal_id"] == "loopx-meta"
-    assert projection["source_basis"]["state_event_basis_sequence"] == 3
+    assert projection["source_basis"]["state_event_basis_sequence"] == 0
     assert projection["drift_facts"] == []
-    assert projection["conflict_facts"] == []
+    assert projection["conflict_facts"] == ["frontier_basis_unverifiable"]
 
 
-def test_peer_events_do_not_advance_another_agents_basis(
-    tmp_path: Path,
-) -> None:
-    paths = _write_fixture(
-        tmp_path,
-        todo_specs=_default_todo_specs(),
-        events=_default_events(),
-    )
-
-    projection = project_shared_goal_alignment(
-        goal_id=GOAL_ID,
-        agent_id="agent-b",
-        project=paths["project"],
-    )
-
-    # agent-a authored events 2 and 3; agent-b's basis stays at its own
-    # latest attributed event (1) and never inherits the peer sequences.
-    assert projection["source_basis"]["state_event_basis_sequence"] == 3
-    assert projection["frontier_basis"]["based_on_state_event_sequence"] == 1
-    assert projection["frontier_basis"]["last_agent_event_id"] == (
-        "evt_stage1_001"
-    )
-    assert projection["drift_facts"] == ["frontier_basis_behind"]
 
 
-def test_appending_one_event_rotates_the_projection_into_frontier_behind(
-    tmp_path: Path,
-) -> None:
-    paths = _write_fixture(
-        tmp_path,
-        todo_specs=_default_todo_specs(),
-        events=_default_events(),
-    )
-    event_log = paths["state_file"].with_name(EVENT_LOG_NAME)
-
-    before = project_shared_goal_alignment(
-        goal_id=GOAL_ID,
-        agent_id="agent-a",
-        project=paths["project"],
-    )
-    assert before["source_basis"]["state_event_basis_sequence"] == 3
-    assert before["frontier_basis"]["based_on_state_event_sequence"] == 3
-    assert before["drift_facts"] == []
-
-    AppendOnlyStateEventStore(event_log).append(
-        make_state_event(
-            event_id="evt_stage1_004",
-            goal_id=GOAL_ID,
-            event_type=TODO_ADDED,
-            actor_agent_id="agent-b",
-            refs={"todo_id": "todo_lane_a"},
-            payload={"text": "Fixture event that moves the state event basis head."},
-        )
-    )
-
-    after = project_shared_goal_alignment(
-        goal_id=GOAL_ID,
-        agent_id="agent-a",
-        project=paths["project"],
-    )
-    assert after["source_basis"]["state_event_basis_sequence"] == 4
-    assert after["frontier_basis"]["based_on_state_event_sequence"] == 3
-    assert after["drift_facts"] == ["frontier_basis_behind"]
 
 
 def test_without_an_event_log_the_basis_is_unverifiable_not_behind(
@@ -363,7 +313,6 @@ def test_without_an_event_log_the_basis_is_unverifiable_not_behind(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=None,
     )
 
     projection = project_shared_goal_alignment(
@@ -391,7 +340,6 @@ def test_next_action_prose_never_changes_the_source_basis_digest(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
 
     first = project_shared_goal_alignment(
@@ -424,7 +372,6 @@ def test_blocked_and_monitor_todos_stay_out_of_unclaimed_work(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
 
     projection = project_shared_goal_alignment(
@@ -447,7 +394,6 @@ def test_lease_owner_mismatch_projects_a_conflict_fact(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
         leases={
             "todo_lane_a": {
                 "schema_version": "task_lease_v0",
@@ -468,7 +414,7 @@ def test_lease_owner_mismatch_projects_a_conflict_fact(
         project=paths["project"],
     )
 
-    assert projection["conflict_facts"] == ["lease_owner_mismatch"]
+    assert projection["conflict_facts"] == ["frontier_basis_unverifiable", "lease_owner_mismatch"]
     assert projection["drift_facts"] == []
 
 
@@ -478,7 +424,6 @@ def test_matching_lease_owner_is_not_a_conflict(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
         leases={
             "todo_lane_a": {
                 "schema_version": "task_lease_v0",
@@ -508,7 +453,6 @@ def test_corrupt_lease_epoch_fails_closed(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
         leases={
             "todo_lane_a": {
                 "schema_version": "task_lease_v0",
@@ -535,7 +479,6 @@ def test_open_lane_replan_obligation_projects_a_conflict_fact(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
 
     projection = project_shared_goal_alignment(
@@ -574,7 +517,6 @@ def test_peer_claimed_bound_todo_projects_a_conflict_fact(
     paths = _write_fixture(
         tmp_path,
         todo_specs=specs,
-        events=_default_events(),
     )
 
     projection = project_shared_goal_alignment(
@@ -590,7 +532,6 @@ def test_unregistered_agent_fails_closed(tmp_path: Path) -> None:
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
 
     with pytest.raises(ValueError, match="not registered"):
@@ -605,7 +546,6 @@ def test_unknown_goal_fails_closed(tmp_path: Path) -> None:
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
 
     with pytest.raises(ValueError, match="not registered"):
@@ -616,64 +556,8 @@ def test_unknown_goal_fails_closed(tmp_path: Path) -> None:
         )
 
 
-def test_registered_agent_without_any_events_projects_an_unbound_basis(
-    tmp_path: Path,
-) -> None:
-    paths = _write_fixture(
-        tmp_path,
-        todo_specs=_default_todo_specs(),
-        events=_default_events(),
-        agents=("agent-a", "agent-b", "agent-c"),
-    )
-
-    projection = project_shared_goal_alignment(
-        goal_id=GOAL_ID,
-        agent_id="agent-c",
-        project=paths["project"],
-    )
-
-    # The state event basis head stays verifiable (the log exists at
-    # sequence 3), but an Agent with zero attributed events must not
-    # fabricate a frontier: the basis is unbound and reported as
-    # unverifiable instead of behind.
-    assert projection["source_basis"]["revision_basis"] == "state_event_log"
-    assert projection["source_basis"]["state_event_basis_sequence"] == 3
-    assert projection["frontier_basis"] == {
-        "based_on_state_event_sequence": None,
-        "basis_source": "unbound",
-        "last_agent_event_id": None,
-    }
-    assert projection["drift_facts"] == []
-    assert projection["conflict_facts"] == ["frontier_basis_unverifiable"]
 
 
-def test_a_corrupt_event_log_falls_back_to_the_markdown_basis(
-    tmp_path: Path,
-) -> None:
-    paths = _write_fixture(
-        tmp_path,
-        todo_specs=_default_todo_specs(),
-        events=None,
-    )
-    event_log = paths["state_file"].with_name(EVENT_LOG_NAME)
-    event_log.write_text("{ this line is not jsonl\n", encoding="utf-8")
-
-    projection = project_shared_goal_alignment(
-        goal_id=GOAL_ID,
-        agent_id="agent-a",
-        project=paths["project"],
-    )
-
-    # A present-but-corrupt log must not fabricate a basis sequence: the
-    # adapter falls back to the markdown active state and reports the
-    # frontier as unverifiable instead of trusting the head.
-    assert projection["source_basis"]["revision_basis"] == (
-        "markdown_active_state"
-    )
-    assert projection["source_basis"]["state_event_basis_sequence"] == 0
-    assert projection["frontier_basis"]["basis_source"] == "unbound"
-    assert projection["drift_facts"] == []
-    assert projection["conflict_facts"] == ["frontier_basis_unverifiable"]
 
 
 def test_non_numeric_lease_epoch_fails_closed(
@@ -682,7 +566,6 @@ def test_non_numeric_lease_epoch_fails_closed(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
         leases={
             "todo_lane_a": {
                 "schema_version": "task_lease_v0",
@@ -709,7 +592,6 @@ def test_released_lease_record_does_not_project_ownership_conflict(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
         leases={
             "todo_lane_a": {
                 "schema_version": "task_lease_v0",
@@ -731,7 +613,7 @@ def test_released_lease_record_does_not_project_ownership_conflict(
     )
 
     assert "lease_owner_mismatch" not in projection["conflict_facts"]
-    assert projection["conflict_facts"] == []
+    assert projection["conflict_facts"] == ["frontier_basis_unverifiable"]
 
 
 def test_expired_lease_record_does_not_project_ownership_conflict(
@@ -740,7 +622,6 @@ def test_expired_lease_record_does_not_project_ownership_conflict(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
         leases={
             "todo_lane_a": {
                 "schema_version": "task_lease_v0",
@@ -762,7 +643,7 @@ def test_expired_lease_record_does_not_project_ownership_conflict(
     )
 
     assert "lease_owner_mismatch" not in projection["conflict_facts"]
-    assert projection["conflict_facts"] == []
+    assert projection["conflict_facts"] == ["frontier_basis_unverifiable"]
 
 
 def test_active_lease_owner_mismatch_projects_conflict_fact(
@@ -771,7 +652,6 @@ def test_active_lease_owner_mismatch_projects_conflict_fact(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
         leases={
             "todo_lane_a": {
                 "schema_version": "task_lease_v0",
@@ -792,7 +672,7 @@ def test_active_lease_owner_mismatch_projects_conflict_fact(
         project=paths["project"],
     )
 
-    assert projection["conflict_facts"] == ["lease_owner_mismatch"]
+    assert projection["conflict_facts"] == ["frontier_basis_unverifiable", "lease_owner_mismatch"]
 
 
 @pytest.mark.parametrize(
@@ -824,7 +704,6 @@ def test_active_lease_without_a_valid_owner_fails_closed(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
         leases={"todo_lane_a": lease},
     )
 
@@ -842,7 +721,6 @@ def test_projection_is_deterministic_across_repeated_calls(
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
 
     first = project_shared_goal_alignment(
@@ -870,7 +748,6 @@ def test_adapter_sends_typed_facts_only(monkeypatch, tmp_path: Path) -> None:
     paths = _write_fixture(
         tmp_path,
         todo_specs=_default_todo_specs(),
-        events=_default_events(),
     )
     captured: dict[str, object] = {}
 
@@ -893,17 +770,13 @@ def test_adapter_sends_typed_facts_only(monkeypatch, tmp_path: Path) -> None:
     assert "prose" not in json.dumps(request)
     assert request["goal_id"] == GOAL_ID
     assert request["agent_id"] == "agent-a"
-    assert request["source_basis"]["state_event_basis_sequence"] == 3
-    assert request["frontier_basis"]["based_on_state_event_sequence"] == 3
-    assert request["claims"] == [
-        {
-            "todo_id": "todo_lane_a",
-            "claimed_by": "agent-a",
-            "lease_epoch": None,
-            "lease_owner": None,
-        }
-    ]
-    assert request["peer_claimed_bound_todo_ids"] == []
+    assert request["source_basis"]["state_event_basis_sequence"] == 0
+    assert request["frontier_basis"]["based_on_state_event_sequence"] is None
+    assert "claims" not in request  # Selection now belongs to TS, not the adapter.
+    own = next(item for item in request["work_items"] if item["todo_id"] == "todo_lane_a")
+    assert own["claimed_by"] == "agent-a"
+    assert own["lease"] is None
+    assert "text" not in own
     assert request["open_lane_replan_obligation_required"] is False
     assert projection["schema_version"] == "shared_goal_alignment_v0"
 

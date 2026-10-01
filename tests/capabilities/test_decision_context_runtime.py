@@ -206,6 +206,19 @@ def append_review_gate_event(
     return append_rollout_event(path, event)
 
 
+def append_unrelated_rollout_events(path: Path, *, count: int = 1001) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        for index in range(count):
+            event = build_rollout_event(
+                goal_id="example-decision-goal",
+                event_kind="quota_monitor_poll",
+                run_id=f"unrelated-{index}",
+                status="observed",
+                recorded_at=OBSERVED_AT,
+            )
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
 def test_profile_runtime_builds_providers_and_returns_private_cursor_proposal(
     tmp_path: Path,
 ) -> None:
@@ -373,6 +386,48 @@ def test_private_host_provider_can_commit_cursor_after_validated_writeback(
     assert receipt["status"] == "committed"
     assert receipt["cursor_state_mutated"] is True
     assert receipt["readback_verified"] is True
+    assert json.loads(cursors.read_text(encoding="utf-8")) == dict(
+        assembly.proposed_cursors
+    )
+
+
+def test_cursor_commit_finds_validated_writeback_before_long_log_tail(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_profile(tmp_path / "profile.json", authority)
+    cursors = tmp_path / "cursors.json"
+    event_log = tmp_path / "rollout-events.jsonl"
+    _activation, assembly = assemble_profile_decision_evidence(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        decision_id="decision:adoption",
+        observed_at=OBSERVED_AT,
+        before=BEFORE,
+        cursor_path=cursors,
+        rebase=semantic_rebase,
+    )
+    assert assembly is not None
+    proposal, outcome = decision_chain(assembly)
+    writeback = append_decision_writeback(event_log, assembly, proposal, outcome)
+    append_unrelated_rollout_events(event_log)
+
+    receipt = commit_profile_decision_cursors(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        cursor_path=cursors,
+        assembly=assembly,
+        proposal=proposal,
+        outcome_receipt=outcome,
+        lifecycle_event_log_path=event_log,
+        lifecycle_event_id=str(writeback["event_id"]),
+    )
+
+    assert receipt["status"] == "committed"
+    assert receipt["lifecycle_event_id"] == writeback["event_id"]
     assert json.loads(cursors.read_text(encoding="utf-8")) == dict(
         assembly.proposed_cursors
     )
@@ -1278,6 +1333,51 @@ def test_review_settlement_commits_consumed_cursor_without_future_outcome(
     )
     assert result["cursor_commit"]["settlement_disposition"] == disposition
     assert result["cursor_commit"]["outcome_receipt_ref"] is None
+    assert json.loads(cursors.read_text(encoding="utf-8")) == dict(
+        assembly.proposed_cursors
+    )
+
+
+def test_review_settlement_finds_gate_event_before_long_log_tail(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_profile(tmp_path / "profile.json", authority)
+    cursors = tmp_path / "cursors.json"
+    event_log = tmp_path / "rollout-events.jsonl"
+    _activation, assembly = assemble_profile_decision_evidence(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        decision_id="decision:adoption",
+        observed_at=OBSERVED_AT,
+        before=BEFORE,
+        cursor_path=cursors,
+        rebase=semantic_rebase,
+    )
+    assert assembly is not None
+    proposal, _legacy_outcome = decision_chain(assembly)
+    gate_event = append_review_gate_event(event_log, proposal, "approve")
+    append_unrelated_rollout_events(event_log)
+
+    result = settle_profile_decision_review(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        cursor_path=cursors,
+        assembly=assembly,
+        lifecycle_event_log_path=event_log,
+        actor_ref="owner:goal",
+        reason_code="owner_approve",
+        summary="Owner recorded approve.",
+        proposal=proposal,
+        source_event_id=str(gate_event["event_id"]),
+        execute=True,
+    )
+
+    assert result["disposition"] == "approve"
+    assert result["cursor_commit"]["status"] == "committed"
     assert json.loads(cursors.read_text(encoding="utf-8")) == dict(
         assembly.proposed_cursors
     )

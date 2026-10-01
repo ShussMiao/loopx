@@ -17,7 +17,8 @@
         "status": false,
         "quota_recovery": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "heartbeat_transport"
@@ -38,7 +39,8 @@
         "status": false,
         "quota_recovery": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "host_control_recovery"
@@ -59,7 +61,8 @@
         "status": false,
         "quota_recovery": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "integration"
@@ -80,7 +83,8 @@
         "source": false,
         "quota_recovery": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "status"
@@ -101,7 +105,8 @@
         "status": false,
         "quota_recovery": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "source"
@@ -122,7 +127,8 @@
         "status": false,
         "quota_recovery": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "normalization"
@@ -143,7 +149,8 @@
         "status": false,
         "quota_recovery": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "snapshot"
@@ -164,7 +171,8 @@
         "source": false,
         "status": false,
         "quota_recovery": false,
-        "tool_transport": false
+        "tool_transport": false,
+        "stream_recovery": false
       },
       "required": [
         "upgrade"
@@ -185,7 +193,8 @@
         "source": false,
         "status": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "desktop_patch"
@@ -206,7 +215,8 @@
         "source": false,
         "status": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "quota_recovery"
@@ -227,7 +237,8 @@
         "snapshot": false,
         "source": false,
         "status": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "tool_transport"
@@ -248,10 +259,33 @@
         "source": false,
         "status": false,
         "tool_transport": false,
-        "upgrade": false
+        "upgrade": false,
+        "stream_recovery": false
       },
       "required": [
         "outage_recovery"
+      ]
+    },
+    {
+      "properties": {
+        "desktop_patch": false,
+        "heartbeat_transport": false,
+        "host_control_recovery": false,
+        "integration": false,
+        "normalization": false,
+        "outage_recovery": false,
+        "quota_recovery": false,
+        "snapshot": false,
+        "source": false,
+        "status": false,
+        "tool_transport": false,
+        "upgrade": false,
+        "operation": {
+          "const": "qualify_stream_recovery"
+        }
+      },
+      "required": [
+        "stream_recovery"
       ]
     }
   ],
@@ -286,6 +320,7 @@
         "qualify_quota_recovery",
         "qualify_snapshot",
         "qualify_tool_transport",
+        "qualify_stream_recovery",
         "reconcile_integration_candidate",
         "upgrade_plan"
       ]
@@ -309,6 +344,9 @@
       "type": "object"
     },
     "upgrade": {
+      "type": "object"
+    },
+    "stream_recovery": {
       "type": "object"
     }
   },

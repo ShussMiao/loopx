@@ -1,8 +1,8 @@
+import {AuthorityJournalScan} from "./authority_journal_scan.ts";
 import type { JsonObject } from "../effect_program.ts";
 import type {
   AuthorityStore,
   AuthorityStoreCommit,
-  AuthorityStoreCommittedTransaction,
   AuthorityStoreCommitResult,
   AuthorityStoreIdentityResult,
   AuthorityStoreLoadResult,
@@ -20,9 +20,9 @@ import {
   requireAuthorityStoreId,
 } from "./authority_store_codec.ts";
 
-const POSTGRESQL_STORE_IDENTITY_PATTERN = /^postgresql:[0-9a-f]{32}$/;
+export const POSTGRESQL_STORE_IDENTITY_PATTERN = /^postgresql:[0-9a-f]{32}$/;
 const POSTGRESQL_PROVIDER_REVISION_PATTERN = /^postgresql:([0-9a-f]{32}):([1-9]\d*)$/;
-const POSTGRESQL_SCHEMA_VERSION = "loopx_postgresql_authority_store_v0";
+export const POSTGRESQL_SCHEMA_VERSION = "loopx_postgresql_authority_store_v0";
 export const DEFAULT_POSTGRESQL_MAX_COMMIT_BYTES = 16 * 1024 * 1024;
 
 /**
@@ -321,7 +321,7 @@ async function beginTenantTransaction(
   tenantId: string,
   options: { readOnly: boolean },
 ): Promise<void> {
-  await connection.query(options.readOnly ? "BEGIN READ ONLY" : "BEGIN");
+  await connection.query(options.readOnly ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" : "BEGIN");
   try {
     const context = oneRow(await connection.query(
       "SELECT set_config('loopx.tenant_id', $1, TRUE) AS tenant_id",
@@ -410,8 +410,138 @@ export async function installPostgreSqlAuthorityStoreSchema(
   }
 }
 
+export type PostgreSqlAuthorityIdentityRotationResult =
+  | {
+    status: "rotated";
+    previous_store_identity: string;
+    store_identity: string;
+  }
+  | {
+    status: "ambiguous";
+    reason_code: "store_identity_rotation_outcome_unknown";
+    reason: string;
+  }
+  | {
+    status: "failed";
+    reason_code:
+      | "invalid_store_identity"
+      | "store_identity_unchanged"
+      | "provider_connection_unavailable"
+      | "store_identity_mismatch"
+      | "provider_protocol_violation"
+      | "provider_transaction_failed";
+    reason: string;
+  };
+
+class PostgreSqlAuthorityIdentityRotationRejected extends Error {
+  readonly reasonCode: "store_identity_mismatch";
+
+  constructor(reason: string) {
+    super(reason);
+    this.name = "PostgreSqlAuthorityIdentityRotationRejected";
+    this.reasonCode = "store_identity_mismatch";
+  }
+}
+
+/**
+ * Rotate the service-managed database incarnation after a restore. Revision
+ * tokens minted before the rotation become unusable because their opaque
+ * identity no longer matches; no Goal or operation state is rewritten.
+ */
+export async function rotatePostgreSqlAuthorityStoreIdentity(
+  database: PostgreSqlAuthorityDatabase,
+  expectedStoreIdentity: string,
+  nextStoreIdentity: string,
+): Promise<PostgreSqlAuthorityIdentityRotationResult> {
+  if (!POSTGRESQL_STORE_IDENTITY_PATTERN.test(expectedStoreIdentity) ||
+      !POSTGRESQL_STORE_IDENTITY_PATTERN.test(nextStoreIdentity)) {
+    return {
+      status: "failed",
+      reason_code: "invalid_store_identity",
+      reason: "PostgreSQL store identities must match postgresql:<32 lowercase hex>",
+    };
+  }
+  if (expectedStoreIdentity === nextStoreIdentity) {
+    return {
+      status: "failed",
+      reason_code: "store_identity_unchanged",
+      reason: "PostgreSQL store identity rotation requires a new incarnation",
+    };
+  }
+
+  let connection: PostgreSqlAuthorityConnection;
+  try {
+    connection = await database.connect();
+  } catch {
+    return {
+      status: "failed",
+      reason_code: "provider_connection_unavailable",
+      reason: "PostgreSQL connection was unavailable before identity rotation",
+    };
+  }
+
+  let commitStarted = false;
+  let releaseError: Error | undefined;
+  try {
+    await connection.query("BEGIN");
+    const metadata = oneRow(await connection.query(
+      `SELECT schema_version, store_identity
+       FROM loopx_control_plane.authority_store_metadata
+       WHERE singleton = TRUE
+       FOR UPDATE`,
+    ), "PostgreSQL store metadata");
+    if (
+      metadata === null || metadata.schema_version !== POSTGRESQL_SCHEMA_VERSION ||
+      !POSTGRESQL_STORE_IDENTITY_PATTERN.test(String(metadata.store_identity)) ||
+      metadata.store_identity !== expectedStoreIdentity
+    ) {
+      throw new PostgreSqlAuthorityIdentityRotationRejected(
+        "PostgreSQL store identity does not match the expected database incarnation",
+      );
+    }
+    await connection.query(
+      `UPDATE loopx_control_plane.authority_store_metadata
+       SET store_identity = $1
+       WHERE singleton = TRUE`,
+      [nextStoreIdentity],
+    );
+    commitStarted = true;
+    await connection.query("COMMIT");
+    return {
+      status: "rotated",
+      previous_store_identity: expectedStoreIdentity,
+      store_identity: nextStoreIdentity,
+    };
+  } catch (error) {
+    if (commitStarted) {
+      releaseError = asError(error);
+      return {
+        status: "ambiguous",
+        reason_code: "store_identity_rotation_outcome_unknown",
+        reason: "PostgreSQL identity rotation outcome is unknown; read store metadata before retrying",
+      };
+    }
+    releaseError = (await rollback(connection)) ?? undefined;
+    if (error instanceof PostgreSqlAuthorityIdentityRotationRejected) {
+      return {status: "failed", reason_code: error.reasonCode, reason: error.message};
+    }
+    return {
+      status: "failed",
+      reason_code: error instanceof AuthorityStoreProtocolError
+        ? "provider_protocol_violation"
+        : "provider_transaction_failed",
+      reason: error instanceof AuthorityStoreProtocolError
+        ? error.message
+        : "PostgreSQL identity rotation failed before COMMIT",
+    };
+  } finally {
+    await connection.release(releaseError);
+  }
+}
+
 /** PostgreSQL Stage 2B store; domain decisions remain in LoopX authority. */
 export class PostgreSqlAuthorityStore implements AuthorityStore {
+  readonly providerKind = "postgresql" as const;
   readonly database: PostgreSqlAuthorityDatabase;
   readonly tenantId: string;
   readonly goalId: string;
@@ -713,19 +843,8 @@ export class PostgreSqlAuthorityStore implements AuthorityStore {
     afterCursor: string | null,
     limit: number,
   ): Promise<AuthorityStoreScanResult> {
-    let offset: bigint;
-    try {
-      offset = parseAuthorityCursor(afterCursor);
-      if (!Number.isSafeInteger(limit) || limit < 1) {
-        throw new AuthorityStoreProtocolError("scan limit must be a positive safe integer");
-      }
-    } catch (error) {
-      return {
-        status: "failed",
-        reason_code: "invalid_scan_request",
-        reason: error instanceof Error ? error.message : "invalid scan request",
-      };
-    }
+    const scan = AuthorityJournalScan.prepare(afterCursor, limit);
+    if (!(scan instanceof AuthorityJournalScan)) return scan;
     try {
       return await this.readInTenantTransaction(async (connection) => {
         const storeIdentity = await requireStoreIdentity(connection);
@@ -733,45 +852,22 @@ export class PostgreSqlAuthorityStore implements AuthorityStore {
           await connection.query(SELECT_HEAD_SQL, [this.tenantId, this.goalId]),
           "PostgreSQL authority head",
         );
-        if (current === null) {
-          return {
-            status: "page",
-            transactions: [],
-            next_cursor: afterCursor,
-            has_more: false,
-          } as const;
-        }
+        if (current === null) return scan.page([], null);
         const head = decodeHeadRow(current);
-        if (offset > BigInt(head.cursor)) {
-          return {
-            status: "failed",
-            reason_code: "scan_cursor_out_of_range",
-            reason: "scan cursor is ahead of the provider head",
-          } as const;
-        }
+        const snapshot = head.head === null ? null : {cursor: head.cursor,
+          provider_revision: providerRevisionToken(storeIdentity, head.provider_revision), head: head.head};
+        const range = scan.rangeFailure(snapshot?.cursor ?? null);
+        if (range) return range;
         const result = rows(await connection.query(
           `${SELECT_TRANSACTION_COLUMNS_SQL}
            WHERE commit.tenant_id = $1 AND commit.goal_id = $2 AND commit.cursor > $3::bigint
            ORDER BY commit.cursor
            LIMIT $4`,
-          [this.tenantId, this.goalId, offset.toString(), (BigInt(limit) + 1n).toString()],
+          [this.tenantId, this.goalId, scan.offset.toString(), (BigInt(limit) + 1n).toString()],
         )).map(decodeTransactionRow);
-        const hasMore = result.length > limit;
-        const page = result.slice(0, limit);
-        const transactions: AuthorityStoreCommittedTransaction[] = page.map((value) => ({
-          cursor: value.cursor,
-          provider_revision: providerRevisionToken(storeIdentity, value.provider_revision),
-          operation_id: value.operation_id,
-          events: structuredClone(value.events),
-          projection: structuredClone(value.projection),
-          receipts: structuredClone(value.receipts),
-        }));
-        return {
-          status: "page",
-          transactions,
-          next_cursor: transactions.at(-1)?.cursor ?? afterCursor,
-          has_more: hasMore,
-        } as const;
+        const transactions = result.map(value => ({...value,
+          provider_revision: providerRevisionToken(storeIdentity, value.provider_revision)}));
+        return scan.page(transactions, snapshot);
       });
     } catch (error) {
       return readFailure(error);

@@ -9,9 +9,19 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-_LOCAL_PATH_RE = re.compile(r"(^|[\s:=])(?:/Users/|/private/|/tmp/|~/)")
-_RAW_LOCATION_RE = re.compile(r"(?i)\b(?:https?|file|s3|gs|tos|hdfs)://")
+from ...control_plane.runtime.public_safety import (
+    REMOTE_LOCATION_SURFACE_PATTERN,
+    SECRET_LIKE_SURFACE_PATTERN,
+    find_public_safe_local_path,
+)
+from ...public_safe_text import COMPACT_TOKEN_PATTERN as _TOKEN_RE
+
+# Refs #5136, direction 3: "does this text carry a local path?" is decided once
+# by find_public_safe_local_path; this site keeps its own rejection message and
+# length limit for whatever the owner recognizes.
+#
+# Local threshold policy only: the credential *shapes* are decided once by
+# SECRET_LIKE_SURFACE_PATTERN, which this site consults in addition to this list.
 _CREDENTIAL_RE = re.compile(
     "(?i)("
     + "|".join(
@@ -47,11 +57,11 @@ def compact_text(value: Any, *, field: str, max_len: int = 320) -> str:
         raise ValueError(f"{field} must be non-empty")
     if len(text) > max_len:
         raise ValueError(f"{field} must be at most {max_len} characters")
-    if _LOCAL_PATH_RE.search(text):
+    if find_public_safe_local_path(text) is not None:
         raise ValueError(f"{field} must not contain a local path")
-    if _RAW_LOCATION_RE.search(text):
+    if REMOTE_LOCATION_SURFACE_PATTERN.search(text):
         raise ValueError(f"{field} must use an opaque reference, not a raw URL")
-    if _CREDENTIAL_RE.search(text):
+    if SECRET_LIKE_SURFACE_PATTERN.search(text) or _CREDENTIAL_RE.search(text):
         raise ValueError(f"{field} contains a credential-like value")
     return text
 

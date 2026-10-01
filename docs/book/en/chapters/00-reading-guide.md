@@ -5,8 +5,8 @@ tool. You do not need to read the LoopX Kernel source or learn every CLI subcomm
 
 ## What you will accomplish
 
-The first six chapters establish one control-plane model. The book then branches into two independent
-practice paths:
+Six numbered chapters plus one state-machine map establish one control-plane model. The book then
+branches into two independent practice paths:
 
 ```text
 Control-plane foundations
@@ -23,6 +23,8 @@ The foundation sequence covers:
 2. which state belongs to an agent session, a Host Goal, and LoopX;
 3. canonical state, workbenches, events, and read-only projections;
 4. Todo graphs, Gates, claims, leases, authority, and peer collaboration;
+   then [Core state machines and transitions](./core-state-machines.md) connects source state, derived
+   decisions, projections, and the nine cooperating state-machine families in one map;
 5. how one governed Turn is decided, executed, validated, and written back;
 6. retry, replan, self-repair, terminal closure, and runtime boundaries.
 
@@ -51,10 +53,12 @@ Developers ready to enter Kernel implementation can go directly to the
   [Lesson 1: Harness is the effectful program](/loopx/docs/development/control-plane-course/01-agent-loop-effectful-program/),
   and [Lesson 2](/loopx/docs/development/control-plane-course/02-goal-control-plane-architecture/), then walk
   through a real Loop in [Lesson 3](/loopx/docs/development/control-plane-course/03-first-real-loop/).
-- **Who owns state, the work graph, and authority?** Read Chapters 3 and 4, then descend into
+- **Who owns state, the work graph, and authority?** Read Chapters 3 and 4 plus
+  [Core state machines and transitions](./core-state-machines.md), then descend into
   [Lesson 4](/loopx/docs/development/control-plane-course/04-state-substrate/) and
   [Lesson 5](/loopx/docs/development/control-plane-course/05-work-graph-and-peers/).
-- **Which rule wins when a Gate, Monitor, and Replan coexist?** Read Chapter 5, then descend into
+- **Which rule wins when a Gate, Monitor, and Replan coexist?** Read
+  [Core state machines and transitions](./core-state-machines.md) and Chapter 5, then descend into
   [Lesson 6](/loopx/docs/development/control-plane-course/06-quota-decision-kernel/) and
   [Lesson 7](/loopx/docs/development/control-plane-course/07-host-scheduler-and-heartbeat/).
 - **How does long-running work avoid drift and local loops?** Read Chapter 6, then descend into
@@ -68,6 +72,8 @@ Developers ready to enter Kernel implementation can go directly to the
 
 After those chapters:
 
+- to learn the daily 1.0 operator surface first, start with
+  [Operate the LoopX 1.0 Workspace](./workspace-v1.md);
 - to manage your own repository, start with
   [Connect an existing Git project](./05-connect-existing-project.md);
 - to make any public LoopX contribution, start with the
@@ -114,8 +120,8 @@ Do not bypass a newer permission or lifecycle check just to make an older exampl
 
 ## Version baseline
 
-The current release anchor is LoopX GitHub release `v1.0.2`. Local command examples were checked against
-the public `loopx 1.0.2` CLI and protocol surface. This release requires Python 3.11+ and Node.js 22.6+.
+This book targets LoopX release `v1.2.3`. Local command examples were checked against
+the public `loopx 1.2.3` CLI and protocol surface. It requires Python 3.11+ and Node.js 22.22.3+.
 LoopX starts and reuses its managed, idle-exiting TypeScript Effect runtime automatically; users do not
 operate that runtime as a manual daemon.
 
@@ -175,6 +181,16 @@ If you read an earlier edition of the Dev Book, recalibrate these four areas fir
 
 This table is a reading map, not a copy of the release notes. Confirm whether a surface is usable through
 the installed release's `doctor`, `capability show`, Host readback, and versioned documentation.
+
+### From `v0.5.4` into the `v1.0.0` Workspace
+
+The `v1.0.0` product milestone is the Personal Workspace, not blanket promotion of every staged
+authority path or optional Provider. It brings cross-Goal overview, Agent lanes, completed work,
+Capability settings, verified reports, Goal Channels, and desktop recovery into one operator surface
+while preserving the authority of the CLI, typed Kernel, and project state. Follow the
+[1.0 Workspace operations chapter](./workspace-v1.md) through startup, readback,
+preview/apply/receipt, configuration, and disable checks before entering the project-onboarding or
+developer-contribution path.
 
 ## Deliberate scope
 

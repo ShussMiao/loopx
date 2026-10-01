@@ -1,11 +1,18 @@
+import {AUTHORITY_SOURCE_CHANGED, uncheckedAuthoritySource, type AuthoritySourceCheck} from "./authority_source.ts";
+import {currentLeaseAcquisitionProof} from "./lease_acquisition_proof.ts";
+import {canonicalTaskLeaseAcquireFacts} from "./task_lease_state.ts";
+import {evaluateTaskLeaseAcquireDecision, materializeTaskLeaseAcquire} from "../work_items/task_lease_acquire_decision.ts";
 import type { JsonObject } from "../effect_program.ts";
-import type { AuthorityStore, AuthorityStoreCommit, AuthorityStoreReceiptResult } from "./authority_store.ts";
+import type { AuthorityStore, AuthorityStoreCommit } from "./authority_store.ts";
 import {
   AuthorityStoreProtocolError,
   canonicalAuthorityObject,
   canonicalAuthoritySha256,
   requireAuthorityStoreId,
 } from "./authority_store_codec.ts";
+import {validateContinuationNote, computeContinuationTodoFacts} from "./continuation_note.ts";
+import {CoordinationCommandReceipt} from "./command_receipt.ts";
+import {acceptanceWorkGuard} from "../goals/acceptance_contract.ts";
 import {normalizeRegisteredTodoAgents, normalizeTodoAgent} from "./todo_agents.ts";
 import {
   prepareCoordinationProjectionCommit,
@@ -14,20 +21,13 @@ import {
   type CoordinationProjectionMutation,
 } from "./coordination_projection.ts";
 import {
-  evaluateTaskLeaseAcquireDecision,
-  leaseEpoch,
   leaseInteger,
   leaseIsActive,
   normalizeAgent,
   normalizeIdempotencyKey,
   normalizeTtl,
-  normalizeWriteScopes,
-  ownerRejection,
-  TASK_LEASE_SCHEMA_VERSION,
-  utcIsoformat,
-  type LeaseRecord,
-  type TodoFact,
 } from "../work_items/task_lease_acquire.ts";
+import {coordinationTodoWriteScopes} from "./todo_write_scopes.ts";
 
 export const COORDINATION_TODO_CLAIM_RESULT_SCHEMA =
   "loopx_coordination_todo_claim_result_v0";
@@ -35,6 +35,15 @@ export const COORDINATION_TODO_CLAIM_RECEIPT_SCHEMA =
   "loopx_coordination_todo_claim_receipt_v0";
 export const COORDINATION_TODO_CLAIM_DECISION_SCHEMA =
   "loopx_coordination_todo_claim_decision_v0";
+
+export interface CoordinationTodoClaimTransferGrant {
+  readonly schema_version: "todo_transfer_grant_v0";
+  readonly source_agent_id: string;
+  readonly target_agent_id: string;
+  readonly todo_id: string;
+  readonly expected_revision: string;
+  readonly continuation_note_facts: string;
+}
 
 export interface CoordinationTodoClaimInput {
   readonly goal_id: string;
@@ -44,6 +53,8 @@ export interface CoordinationTodoClaimInput {
   readonly expected_role: string | null;
   readonly registered_agents: readonly string[];
   readonly operation_id: string;
+  readonly expected_provider_revision?: string;
+  readonly transfer_grant?: CoordinationTodoClaimTransferGrant;
   readonly lease_request?: CoordinationTodoClaimLeaseRequest | null;
   readonly dry_run: boolean;
   readonly now: Date;
@@ -200,6 +211,7 @@ function rejectIneligibleTodo(
 export function evaluateCoordinationTodoClaimDecision(
   todo: JsonObject,
   input: CoordinationTodoClaimInput,
+  activeLeaseOwner?: string | null,
 ): CoordinationTodoClaimDecision {
   const registered = input.registered_agents;
   const owner = input.claimed_by;
@@ -217,12 +229,41 @@ export function evaluateCoordinationTodoClaimDecision(
   const existing = typeof todo.claimed_by === "string" && todo.claimed_by.length > 0
     ? normalizeTodoAgent(todo.claimed_by, "todo.claimed_by")
     : null;
+  // Cross-agent transfer requires an explicit handoff transfer grant.
+  // The grant binds source owner, target owner, todo id, revision, and
+  // current continuation-note facts; it can only be produced by the handoff
+  // flow. Without a valid grant, foreign-owner claims are always rejected.
+  // The final claim authority reuses the shared validateContinuationNote so
+  // the prepared-note invariant is enforced in one place: an arbitrary JSON
+  // note with matching hash is rejected because it lacks the typed marker,
+  // bounded fields, and current todo_facts.
   if (existing !== null && existing !== owner) {
-    return decisionFailure(
-      "claim_owner_mismatch",
-      "Todo is already claimed by another agent",
-      { claim_owner: existing },
-    );
+    const grant = input.transfer_grant;
+    let grantValid = false;
+    if (grant != null) {
+      // Validate the continuation note using the shared predicate. This
+      // enforces the typed loopx-explicit-continuation invariant: marker,
+      // bounded fields, source session, and current todo_facts. An invalid
+      // note yields empty noteFacts, which cannot match a real grant.
+      const noteValidation = validateContinuationNote(todo.note, computeContinuationTodoFacts(todo));
+      grantValid = noteValidation.valid
+        && grant.schema_version === "todo_transfer_grant_v0"
+        && grant.source_agent_id === existing
+        && grant.target_agent_id === owner
+        && grant.todo_id === todo.todo_id
+        && grant.expected_revision === input.expected_provider_revision
+        && grant.continuation_note_facts === noteValidation.noteFacts
+        && registered.includes(existing)
+        && registered.includes(owner);
+    }
+    const leasedByOther = activeLeaseOwner !== undefined && activeLeaseOwner !== null && activeLeaseOwner === existing;
+    if (leasedByOther || !grantValid) {
+      return decisionFailure(
+        "claim_owner_mismatch",
+        "Todo is already claimed by another agent",
+        { claim_owner: existing },
+      );
+    }
   }
   const mode = registered.length <= 1 ? "single_agent_compatibility" : "registered_peer_actor";
   return {
@@ -260,39 +301,6 @@ function normalizeLeaseRequest(value: unknown): CoordinationTodoClaimLeaseReques
   };
 }
 
-function todoLeaseFact(todo: JsonObject): TodoFact {
-  const requiredWriteScopes = todo.required_write_scopes ?? [];
-  if (!Array.isArray(requiredWriteScopes) ||
-      requiredWriteScopes.some((scope) => typeof scope !== "string")) {
-    throw new AuthorityStoreProtocolError(
-      "todo.required_write_scopes must be an array of strings",
-    );
-  }
-  const writeScopes = normalizeWriteScopes(requiredWriteScopes);
-  if (writeScopes.length !== requiredWriteScopes.length) {
-    throw new AuthorityStoreProtocolError(
-      "todo.required_write_scopes contains an invalid or duplicate scope",
-    );
-  }
-  return {
-    todo_id: String(todo.todo_id),
-    status: typeof todo.status === "string" ? todo.status : "",
-    claimed_by: normalizeAgent(todo.claimed_by),
-    excluded_agents: normalizeExcludedAgents(todo.excluded_agents),
-    role: typeof todo.role === "string" ? todo.role : undefined,
-    task_class: typeof todo.task_class === "string" ? todo.task_class : null,
-    bound_agent: normalizeAgent(todo.bound_agent),
-    blocks_agent: normalizeAgent(todo.blocks_agent),
-  };
-}
-
-function leaseDecisionInteger(value: unknown, label: string): number {
-  if (!Number.isSafeInteger(value) || Number(value) < 0) {
-    throw new AuthorityStoreProtocolError(`${label} must be a non-negative safe integer`);
-  }
-  return Number(value);
-}
-
 function activeLeaseForOwner(
   lease: JsonObject | undefined,
   owner: string,
@@ -321,6 +329,7 @@ function activeLeaseForOwner(
 export async function executeCoordinationTodoClaim(
   store: AuthorityStore,
   rawInput: CoordinationTodoClaimInput,
+  authoritySourcesCurrent: AuthoritySourceCheck = uncheckedAuthoritySource,
 ): Promise<CoordinationTodoClaimResult> {
   let input: CoordinationTodoClaimInput;
   try {
@@ -357,28 +366,19 @@ export async function executeCoordinationTodoClaim(
     claimed_by: input.claimed_by,
     actor_agent_id: input.actor_agent_id,
     expected_role: input.expected_role,
+    ...(input.expected_provider_revision === undefined ? {} :
+      {expected_provider_revision: input.expected_provider_revision}),
+    ...(input.transfer_grant === undefined ? {} : {transfer_grant: input.transfer_grant}),
     dry_run: input.dry_run,
     ...(leaseRequest === null ? {} : {lease_request: leaseRequest}),
   });
-  const replay = (
-    receipt: AuthorityStoreReceiptResult,
-    status: "replayed" | "applied" | "recovered",
-  ): CoordinationTodoClaimResult | null => {
-    if (receipt.status === "missing") return null;
-    if (receipt.status !== "found") {
-      return { schema_version: COORDINATION_TODO_CLAIM_RESULT_SCHEMA, ...receipt };
-    }
-    const original = receipt.receipts[0];
-    if (receipt.receipts.length !== 1 ||
-        original?.schema_version !== COORDINATION_TODO_CLAIM_RECEIPT_SCHEMA ||
-        original.operation_id !== input.operation_id || original.goal_id !== input.goal_id ||
-        original.request_sha256 !== requestSha) {
-      return failure("coordination_operation_identity_mismatch",
-        "operation id already names a different coordination request");
-    }
-    let result: JsonObject;
-    try {
-      result = canonicalAuthorityObject(original.result, "original claim result");
+  const receipt = new CoordinationCommandReceipt({result_schema: COORDINATION_TODO_CLAIM_RESULT_SCHEMA,
+    identity: {schema_version: COORDINATION_TODO_CLAIM_RECEIPT_SCHEMA,
+      operation_id: input.operation_id, goal_id: input.goal_id, request_sha256: requestSha},
+    failure: (code, reason) => failure(code === "invalid_coordination_command_receipt"
+      ? "invalid_coordination_todo_claim_receipt" : code, reason),
+    decode(original) {
+      const result = canonicalAuthorityObject(original.result, "original claim result");
       if (result.todo_id !== input.todo_id || result.claimed_by !== input.claimed_by ||
           (result.changed !== undefined && typeof result.changed !== "boolean") ||
           (result.changed !== false && typeof result.updated_at !== "string") ||
@@ -393,31 +393,52 @@ export async function executeCoordinationTodoClaim(
           throw new AuthorityStoreProtocolError("original claim lease identity is invalid");
         }
       }
-    } catch (error) {
-      return failure("invalid_coordination_todo_claim_receipt",
-        error instanceof Error ? error.message : "invalid claim receipt");
+      // Pre-change claim receipts may omit changed; those encoded a real mutation.
+      return {fields: {...result, original_receipt: original}, changed: result.changed !== false};
+  }});
+  const currentProof = async (result: CoordinationTodoClaimResult): Promise<CoordinationTodoClaimResult> => {
+    if (!await authoritySourcesCurrent()) return failure(AUTHORITY_SOURCE_CHANGED.code, AUTHORITY_SOURCE_CHANGED.reason,
+      {original_receipt: result.original_receipt}, "decision_rejection");
+    if (leaseRequest !== null) {
+      try {
+        result = await currentLeaseAcquisitionProof(store, {...input, owner: input.claimed_by,
+          idempotency_key: leaseRequest.idempotency_key, required_handoff_mode: "hard_lease"}, result,
+          (code, reason, detail = {}) => failure(code, reason, detail, "decision_rejection"));
+      } catch (error) {
+        return failure("invalid_coordination_task_lease", error instanceof Error ? error.message : "invalid canonical task lease",
+          {original_receipt: result.original_receipt});
+      }
+    } else if (["replayed", "recovered"].includes(String(result.status))) {
+      // A plain historical claim has no lease proof to grant, but an enabled
+      // acceptance contract still governs adoption of that work.
+      const current = await store.loadAuthority();
+      if (current.status === "loaded") {
+        const guard = acceptanceWorkGuard(current.head, input.goal_id, input.todo_id);
+        if (guard !== null && !guard.allowed) return failure(String(guard.reason_code),
+          `${String(guard.reason)} Inspect Goal acceptance and ask the owner to configure or rebind this Todo.`,
+          {goal_acceptance_guard: guard}, "decision_rejection");
+      }
     }
-    return {
-      ...result,
-      schema_version: COORDINATION_TODO_CLAIM_RESULT_SCHEMA,
-      status: status === "applied" && result.changed === false ? "no_change" : status,
-      changed: status !== "replayed" && result.changed !== false,
-      provider_revision: receipt.provider_revision,
-      cursor: receipt.cursor,
-      original_receipt: original,
-      projection_delivery: result.changed === false ? "not_required" : "pending",
-      projection_source: "committed_authority_journal",
-    };
+    if (!await authoritySourcesCurrent()) return failure(AUTHORITY_SOURCE_CHANGED.code, AUTHORITY_SOURCE_CHANGED.reason,
+      {original_receipt: result.original_receipt}, "decision_rejection");
+    return result;
   };
-  const existing = replay(await store.readReceipt(input.operation_id), "replayed");
-  if (existing !== null) return existing;
-
-  const head = await store.loadAuthority();
+  const existing = await receipt.read(store);
+  if (existing !== null) return currentProof(existing);
+  if (!await authoritySourcesCurrent()) return failure(AUTHORITY_SOURCE_CHANGED.code, AUTHORITY_SOURCE_CHANGED.reason, {}, "decision_rejection");
+  const observation = await receipt.observe(store);
+  if (observation.kind === "receipt") return currentProof(observation.result);
+  const head = observation.authority;
   if (head.status !== "loaded") {
     return {
       schema_version: COORDINATION_TODO_CLAIM_RESULT_SCHEMA,
       ...head,
     } as CoordinationTodoClaimResult;
+  }
+
+  if (input.expected_provider_revision !== undefined &&
+      input.expected_provider_revision !== head.provider_revision) {
+    return failure("provider_revision_mismatch", "Current revision changed; inspect again before continuing");
   }
 
   let projection: ReturnType<typeof indexCoordinationProjection>;
@@ -440,9 +461,14 @@ export async function executeCoordinationTodoClaim(
     );
   }
 
+  const activeLeaseOwner = projection.leases.get(input.todo_id);
+  const activeLeaseActive = activeLeaseOwner !== undefined && leaseIsActive(activeLeaseOwner, input.now);
+  const activeLeaseHolder = activeLeaseActive && activeLeaseOwner !== undefined && typeof activeLeaseOwner.owner === "string"
+    ? normalizeTodoAgent(activeLeaseOwner.owner, "lease.owner")
+    : null;
   let authority: ReturnType<typeof evaluateCoordinationTodoClaimDecision>;
   try {
-    authority = evaluateCoordinationTodoClaimDecision(todo, input);
+    authority = evaluateCoordinationTodoClaimDecision(todo, input, activeLeaseHolder);
   } catch (error) {
     return failure(
       "invalid_coordination_todo_claim",
@@ -479,56 +505,14 @@ export async function executeCoordinationTodoClaim(
   try {
     const currentLease = projection.leases.get(input.todo_id);
     if (handoffMode === "hard_lease" && leaseRequest !== null) {
-      const todoFact = todoLeaseFact(todo);
-      const currentActive = currentLease !== undefined && leaseIsActive(currentLease, input.now);
-      const currentEffective = currentLease !== undefined && currentActive && ownerRejection(
-        todoFact,
-        normalizeAgent(currentLease.owner),
-        input.registered_agents,
-      ) === null;
-      const otherLeases = projection.lease_todo_ids.flatMap((todoId) => {
-        if (todoId === input.todo_id) return [];
-        const candidate = projection.leases.get(todoId)!;
-        const active = leaseIsActive(candidate, input.now);
-        const otherTodo = projection.todos.get(todoId);
-        return [{
-          todo_id: todoId,
-          active,
-          effective: active && otherTodo !== undefined && ownerRejection(
-            todoLeaseFact(otherTodo),
-            normalizeAgent(candidate.owner),
-            input.registered_agents,
-          ) === null,
-          write_scopes: normalizeWriteScopes(candidate.write_scopes),
-        }];
-      });
-      const writeScopes = normalizeWriteScopes(todo.required_write_scopes ?? []);
-      const decision = evaluateTaskLeaseAcquireDecision({
-        handoff_mode: handoffMode,
-        registered_agents: [...input.registered_agents],
-        todo: todoFact,
-        lease: currentLease === undefined ? null : {
-          present: true,
-          active: currentActive,
-          effective: currentEffective,
-          status: typeof currentLease.status === "string" ? currentLease.status : null,
-          owner: normalizeAgent(currentLease.owner),
-          idempotency_key: typeof currentLease.idempotency_key === "string"
-            ? currentLease.idempotency_key : null,
-          version: leaseInteger(currentLease, "version") ?? 0,
-          lease_epoch: leaseEpoch(currentLease),
-          write_scopes: normalizeWriteScopes(currentLease.write_scopes),
-          acquire_ttl_seconds: leaseInteger(currentLease, "acquire_ttl_seconds"),
-        },
-        other_leases: otherLeases,
-        command: {
-          owner: authority.owner,
-          idempotency_key: leaseRequest.idempotency_key,
-          ttl_seconds: leaseRequest.ttl_seconds,
-          write_scopes: writeScopes,
-          expected_version: leaseRequest.expected_version,
-        },
-      });
+      // Validate required scopes before planning; a caller cannot omit a required conflict.
+      const writeScopes = coordinationTodoWriteScopes(todo);
+      const facts = canonicalTaskLeaseAcquireFacts(projection, input.goal_id, input.todo_id, input.registered_agents, input.now);
+      const decision = evaluateTaskLeaseAcquireDecision({handoff_mode: handoffMode,
+        registered_agents: [...input.registered_agents], ...facts,
+        command: {owner: authority.owner, idempotency_key: leaseRequest.idempotency_key,
+          ttl_seconds: leaseRequest.ttl_seconds, write_scopes: writeScopes,
+          expected_version: leaseRequest.expected_version}});
       if (decision.outcome === "no_change") {
         if (currentLease === undefined) {
           throw new AuthorityStoreProtocolError(
@@ -541,27 +525,9 @@ export async function executeCoordinationTodoClaim(
         if (decision.next_lease === null) {
           throw new AuthorityStoreProtocolError("lease acquire apply is missing next_lease");
         }
-        const acquiredAt = utcIsoformat(input.now);
-        lease = {
-          schema_version: TASK_LEASE_SCHEMA_VERSION,
-          goal_id: input.goal_id,
-          todo_id: input.todo_id,
-          owner: authority.owner,
-          idempotency_key: leaseRequest.idempotency_key,
-          write_scopes: writeScopes,
-          acquire_ttl_seconds: leaseRequest.ttl_seconds,
-          version: leaseDecisionInteger(decision.next_lease.version, "next_lease.version"),
-          lease_epoch: leaseDecisionInteger(
-            decision.next_lease.lease_epoch,
-            "next_lease.lease_epoch",
-          ),
-          acquired_at: acquiredAt,
-          updated_at: acquiredAt,
-          expires_at: utcIsoformat(
-            new Date(input.now.valueOf() + leaseRequest.ttl_seconds * 1_000),
-          ),
-          status: "active",
-        } satisfies LeaseRecord;
+        lease = materializeTaskLeaseAcquire(input, {owner: authority.owner,
+          idempotency_key: leaseRequest.idempotency_key, ttl_seconds: leaseRequest.ttl_seconds,
+          write_scopes: writeScopes, expected_version: leaseRequest.expected_version}, decision, input.now);
         leaseChanged = true;
       } else {
         return failure(
@@ -610,6 +576,12 @@ export async function executeCoordinationTodoClaim(
     );
   }
 
+  const acceptance = acceptanceWorkGuard(head.head, input.goal_id, input.todo_id);
+  if (acceptance !== null && !acceptance.allowed) {
+    return failure(String(acceptance.reason_code), `${String(acceptance.reason)} Inspect Goal acceptance and ask the owner to configure or rebind this Todo.`,
+      {goal_acceptance_guard: acceptance}, "decision_rejection");
+  }
+
   const mutationAuthority = canonicalAuthorityObject(
     authority.mutation_authority,
     "Todo claim mutation authority",
@@ -632,6 +604,7 @@ export async function executeCoordinationTodoClaim(
     }),
   };
 
+  if (!await authoritySourcesCurrent()) return failure(AUTHORITY_SOURCE_CHANGED.code, AUTHORITY_SOURCE_CHANGED.reason, {}, "decision_rejection");
   if (input.dry_run) {
     return {
       ...result,
@@ -676,11 +649,5 @@ export async function executeCoordinationTodoClaim(
     request_sha256: requestSha,
     result,
   }];
-  const committed = await store.commitAuthority(commit);
-  const readback = replay(await store.readReceipt(input.operation_id),
-    committed.status === "applied" ? "applied" : "recovered");
-  if (readback !== null) return readback;
-  return committed.status === "applied"
-    ? failure("coordination_commit_readback_mismatch", "applied claim lacks its durable receipt")
-    : { schema_version: COORDINATION_TODO_CLAIM_RESULT_SCHEMA, ...committed, changed: false };
+  return currentProof(await receipt.commit(store, commit));
 }

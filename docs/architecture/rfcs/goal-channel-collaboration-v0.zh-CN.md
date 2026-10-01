@@ -1,6 +1,7 @@
 # RFC: Goal Channel 协作模型 v0
 
-- 状态：Draft
+- 状态：已接受
+- 替代 / 关闭：无
 - 范围：绑定到单个 LoopX goal 的 provider-backed 外部协作通道
 - 决策类型：产品架构与分阶段集成契约
 
@@ -262,7 +263,10 @@ loopx goal-channel configure --goal-id <goal-id> --auto-notify-human-gates --exe
 已有的 bot 身份校验、语义幂等、冷却、provider idempotency key 和消息回读。
 
 单次 refresh 可使用 `loopx refresh-state ... --suppress-external-sinks`
-临时抑制投递，而无需禁用 binding。持久关闭自动投递：
+临时抑制投递，而无需禁用 binding。对带 Turn 绑定的恢复，工具会记住这次暂停；
+再次允许外发需使用返回的 `resume_key`，提交 `--resume-external-sinks <resume_key>`。
+这只确认恢复当前操作的投递，不授予新权限；无暂停记录的旧操作保留原行为。
+详见 [恢复握手](../../state-interaction-model.md)。持久关闭自动投递：
 
 ```bash
 loopx goal-channel configure --goal-id <goal-id> --no-auto-notify-human-gates --execute

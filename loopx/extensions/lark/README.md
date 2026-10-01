@@ -11,7 +11,7 @@ evidence, or recovery authority.
 | `lark-event-inbox` | Collect, inspect, reply to, and acknowledge bounded project feedback | [`event_inbox.py`](event_inbox.py), [`event_collector.py`](event_collector.py) |
 | `lark-reviewer-notification` | Send and verify a reviewer notification through a project-dedicated Lark app | [`reviewer_notification.py`](reviewer_notification.py) |
 | `lark-kanban-projection` | Render public-safe LoopX todo and control-plane projections into Lark Base | [`presentation/kanban.py`](presentation/kanban.py) |
-| `lark-goal-channel` | Bind one verified Lark group and projection surface to one LoopX goal | [`goal_channel.py`](goal_channel.py), [`goal_channel_setup.py`](goal_channel_setup.py) |
+| `lark-goal-channel` | Bind one verified Lark group and projection surface to one LoopX goal, including authenticated confirmation cards for canonical typed operations | [`goal_channel.py`](goal_channel.py), [`goal_channel_operation.py`](goal_channel_operation.py) |
 | `lark-explore-projection` | Project canonical Explore results into Lark tables, cards, and whiteboards | [`presentation/explore_results.py`](presentation/explore_results.py) |
 | `lark-periodic-report-announcement` | Deliver a periodic report through the current Goal Channel's verified project Bot while mentioning only recipients selected by its typed audience plan | [`periodic_report_delivery.py`](periodic_report_delivery.py) |
 | `lark-periodic-report-source` | Bind and settle one exact Agent-selected Goal Channel source for a typed report action without classifying message text | [`periodic_report_request.py`](periodic_report_request.py) |
@@ -70,6 +70,96 @@ The [event inbox guide](docs/lark-event-inbox.md) documents the complete
 collector, processing, reply, reaction, and acknowledgement lifecycle. The
 [Lark Kanban integration guide](../../../docs/integrations/lark-kanban-control-plane-adapter.md)
 documents projection configuration and lineage.
+
+### Human-confirmed typed operations
+
+The Goal Channel may project a canonical `operation.execute` typed-action
+proposal as one non-forwardable Card 2.0 confirmation card. The operation
+envelope, lifecycle, exact digests, authorized operator set, claim, and outcome
+remain in the Core Chat action store; Lark owns only authenticated transport,
+callback provenance checks, and result-card readback. It does not create a
+second User Todo or approval ledger.
+
+Confirmation and result cards consume the same internal TypeScript
+`operation_review_frame_v0` used by Dashboard. Lark requests that frame once per
+card render, then owns only provider-specific Card 2.0 markup and delivery; the
+frame neither grants authority nor replaces the canonical operation receipt.
+
+That request path is not operation-only. `presentation.action_review_plan.compile`
+also returns a `review_card_frame_v0` for a validated steward team plan
+(`team.plan`), whose confirmation identity is the action proposal and the state
+fingerprint the apply re-validates against rather than an operation envelope. Its
+fields are `{key, value}` pairs and its fixed labels are keys, so this boundary
+stays language-neutral and the surface owns the words. A plan card can therefore
+reuse the card shell, the callback consumer, the operator membership check,
+replay protection and card readback described here. What a plan card still needs
+is its own delivery route for the audience that asked (the manager group is not a
+Goal channel binding) and a callback effect that applies the proposal through the
+Chat action service instead of claiming an operation envelope.
+
+```bash
+loopx goal-channel prepare-operation \
+  --goal-id <goal-id> \
+  --agent-id <registered-agent-id> \
+  --summary "Review one simulated order" \
+  --idempotency-key <stable-request-key> \
+  --request-json <loopx-operation-request.json> \
+  --execute
+
+loopx goal-channel deliver-operation \
+  --goal-id <goal-id> \
+  --proposal-id <typed-action-proposal-id>
+
+loopx goal-channel deliver-operation \
+  --goal-id <goal-id> \
+  --proposal-id <typed-action-proposal-id> \
+  --execute
+```
+
+The request file contains the provider-neutral `loopx_operation_request_v0`
+fields except `goal_id` and `agent_id`, which come from the CLI scope. Preparing
+uses the canonical Chat action service and store; it does not create a Lark- or
+finance-owned approval ledger. Preview mode validates in an ephemeral store and
+writes nothing durable.
+
+Enable `operation_callbacks.enabled=true` in a v1 event collector config and
+install that collector with the pinned LoopX runtime root. The service starts a
+separate `card.action.trigger` consumer beside message capture because each
+`lark-cli event consume` process owns one EventKey. Collector status reports
+listener health separately from real callback evidence; a healthy process does
+not prove the application console is configured to deliver callbacks.
+
+The callback listener becomes ready only after the provider emits its event-bus
+ready marker or the listener receives a typed callback. Status remains
+`listener_ready_unqualified` until one authenticated callback is handled and its
+canonical result-card readback succeeds; only then does it become
+`callback_qualified`. Simulation-only cards use one explicit confirmation click.
+Effectful protected operations retain the provider's second confirmation dialog
+and label the first button as a continuation rather than a completed decision.
+
+回调进程只有在 provider 发出事件总线 ready 标记，或收到一条真实 typed callback
+后，才会被视为 ready。在一条已认证 callback 被处理且结果卡完成规范读回之前，
+状态保持 `listener_ready_unqualified`；完成后才进入 `callback_qualified`。
+纯模拟卡使用一次明确确认；有外部效果的受保护操作仍保留平台二次确认，并把第一步
+按钮明确标为继续操作，而不是已经完成决策。
+
+On click, LoopX verifies the original App, chat, message, immutable card digest,
+operator allowlist, tenant membership, expiry, and globally unique event id.
+Confirmation atomically claims the operation before dispatch. Exact event
+replay reuses the existing claim/outcome, and a per-operation dispatch lock
+prevents concurrent copies of that callback from invoking the executor twice.
+The result update is not complete until the same card is read back with the
+expected App, chat, message, and content digest. If that update is acknowledged
+but cannot be verified, the canonical outcome remains durable and the collector
+retries only the result-card patch after restart. A restart may also resume one
+already-claimed request only when its exact executor permission, operation kind,
+and destination prove that it is the bundled non-effectful M1 simulation; live or
+otherwise effectful domain operations are never retried. Callback health,
+recovered simulations, and recovered-result counts remain separate. The initial
+finance executor is a
+simulation-only optional package: it has no venue, signer, wallet, transfer, or
+live-order permission. A successful SDK callback acknowledgement is never
+reported as the domain execution receipt.
 
 ### Bounded group-history catch-up
 
@@ -193,6 +283,10 @@ execute resolves only selected recipients and omits unrelated recipients. Raw
 The Goal Channel delivery command accepts exactly two ordered HTTPS entries
 (hosted report, then Lark document), emits two independently idempotent
 messages, and verifies the native sender App plus exact chat for each readback.
+Each provider idempotency key binds the base delivery identity to the rendered
+announcement kind, title, body, footer, and an explicit semantic version. A
+renderer change therefore cannot make an upgraded retry reuse an older card
+under the same provider key.
 
 Installation controls discoverability and provider lifecycle only. Every
 private chat, app, group, Base, document, or Miaoda target remains in ignored
@@ -275,5 +369,113 @@ https://open.larkoffice.com/page/scope-apply?clientID=<app_id>&scopes=<scope1%2C
 ```
 
 （`recommended_bot_scope_apply_url(app_id)` 会拼出完整 URL。）随后用
-`lark-cli config init --app-id <app_id> --app-secret-stdin --name <profile> --brand lark`
-注册 bot profile，再走 `loopx goal-channel setup`。敏感 scope 需企业管理员审核。
+`lark-cli config init --app-id <app_id> --app-secret-stdin --name <profile> --brand feishu`
+注册飞书 bot profile；国际版 Lark 应用才使用 `--brand lark`。品牌必须与应用实际
+所属平台一致，不能从 App ID 或普通 API 查询成功推断。然后走
+`loopx goal-channel setup`。敏感 scope 需企业管理员审核。
+
+### Real-time source health / 实时连接排障
+
+A successful bot authentication or history query does not verify the event
+WebSocket. The CLI ready marker confirms local consumer registration, not
+upstream connectivity. If the bus subsequently closes and the CLI exits with
+`reason: signal`, LoopX reports `lark_event_source_disconnected` and retries;
+exit code zero alone does not make this a healthy scheduled restart. Only the
+requested timeout/limit or LoopX's own shutdown is a planned ending.
+
+遇到该错误，先核对所选 profile 的品牌：飞书为 `feishu`，国际版为 `lark`。
+上游 `1000040351` / `Incorrect domain name` 表示域名与应用平台不匹配。
+随后核查事件总线的连接错误、订阅和权限；不要仅凭 `event status` 的本地
+consumer 数或普通消息查询成功宣布恢复。不要自动切换品牌、账号或扩大权限。
+修复后核验真实 WebSocket 连接，再通过原消息 ID 核对收件、执行、回复回读和
+ACK；断线期间的历史消息不能批量重放，已执行请求必须复用原幂等标识。
+错误日志可能带连接凭据，诊断与公开报告只保留错误码和脱敏结论。
+
+## Goal Topic defaults and existing connections
+
+New Agent connections use `async_inbox` by default across the provider and local
+Chat API. `session_queue` and `live_steering` require an exact Agent session.
+`direct_session` is accepted when reading old bindings; it cannot be selected
+for a new connection write. Existing routes continue to work during migration.
+The older `goal-channel setup` notification/kanban workflow remains available;
+its recipientless connections need an Agent mapping before accepting modern
+Agent inbox work.
+
+Upgrade a Goal's existing Lark connections through the same provider contract:
+
+```sh
+loopx goal-channel upgrade --goal-id example-goal
+loopx goal-channel upgrade --goal-id example-goal --execute
+```
+
+An existing recipient, or the only registered Agent, is reused automatically.
+If an old connection has no recipient and the Goal has multiple Agents, select
+its opaque connection ID and the intended Agent explicitly:
+
+```sh
+loopx goal-channel upgrade --goal-id example-goal \
+  --connection-id lark_example --agent-id example-agent --execute
+```
+
+Preview is read-only. Upgrade retains the connection ID, default route, App,
+group, Topic root, capture scope, notification settings and receipts. It verifies
+the same Bot's membership and reads the exact old message back. Both the earlier
+`LoopX Goal:` control marker and the newer `Goal ID:` Topic marker are recognized
+as exact lines in that message. It creates no Topic and adds no group members.
+An unavailable root, mismatched identity, changed capture scope, or duplicate
+Agent route leaves the connection unmodified. Already upgraded routes are
+skipped, and a blocked route does not prevent independent upgrades.
+
+The local frontend uses `connection_id` for edits rather than reconstructing a
+connection from displayed App/group names. Saving an old connection defaults to
+its Agent inbox. Identity fields stay bound to the original connection even if
+its App profile alias is missing from the current App catalog. Source snapshots,
+private provider IDs and migration receipts belong in ignored local storage.
+Configuration readback alone does not prove that a user message was processed;
+verify runtime routing and delivery separately after migration.
+
+## Built-in machine manager
+
+Machine-level Lark onboarding defaults to **Manager · live conversation**. Goal
+worker connections remain a separate purpose with async inbox defaults. The
+manager is the built-in `loopx-manager` role, not an ordinary worker name or a
+project-specific heartbeat. Its executor endpoint defaults to `codex` and is
+recorded separately from its logical identity.
+
+A manager connection uses `conversation_kind=manager`. Preview has no session
+creation side effect. On apply, the Chat service opens or resumes the manager's
+exact audience session and binds `session_queue`; delivery waits for that turn
+and its verified reply, without waiting for a scheduled Agent wakeup. When a
+manager Turn ends in a persisted failure, the same verified-reply path sends a
+bounded failure notice before acknowledging the source. Unknown upstream
+details are not copied into the group. The connection keeps its processing
+failure state; delivery of that notice is not a successful model answer.
+An unverified outbound notice leaves the source pending, and a verified notice
+prevents duplicate source events from replaying the failed request. Group-root
+mentions and addressed replies can reach the manager without an invented Topic
+root. Exact worker Topics retain their own routing, and ambiguous manager
+bindings fail closed.
+
+Before Lark delivery, a manager answer is stored in a private, event-bound
+outbox. A transport retry or service restart reuses that exact saved answer and
+provider idempotency identity instead of rerunning the model. Presentation-only
+defects may downgrade from Markdown to inert plain text: literal newline tokens
+become real newlines and unresolved visual `@` text cannot become a native
+mention. An incomplete review envelope is never delivered as visible protocol
+and never grants a gate, proposal, or protected action. The source event is ACKed
+only after reply readback and the durable delivery receipt are both verified.
+
+管家答复在发送到飞书前，会先按来源事件写入本地私有 outbox。传输重试或服务
+重启只续投同一份已保存答复并复用 provider 幂等标识，不会再次运行模型。仅影响
+展示的瑕疵可以从 Markdown 安全降级为不可执行的纯文本：字面换行转为真实换行，
+未解析的可视 `@` 文本不会变成原生 mention。不完整的 review envelope 不会作为
+正文泄漏，也不能恢复 gate、proposal 或受保护动作。只有回复回读和持久投递回执
+都验证通过后，来源事件才会 ACK。
+
+The frontend and Lark use the same manager conversation service and the existing
+typed control plane. Their transcripts are separated by audience: an external
+conversation can never resume the owner's private frontend session or another
+group's session. Long-running work still belongs to worker Agents. Conversation
+turns retain the existing read-only tool policy and typed preview/apply authority;
+a synchronous response is not permission to mutate arbitrary repositories or
+skip a control-plane receipt.

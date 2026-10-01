@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
-from hashlib import sha256
+import base64
 import json
+import zlib
 from typing import Any
 
-from ..runtime.time import parse_timestamp
-from .contract import normalize_todo_claimed_by
-from .projection import todo_item_task_class
+from ..effect_runtime import effect_runtime_result
+# Refs #4447: the todo contract owns this vocabulary; import it instead of
+# restating the literal in every module that classifies a Todo.
+from .contract import (
+    TODO_TASK_CLASS_ADVANCEMENT,
+    normalize_todo_claimed_by,
+    normalize_todo_excluded_agents,
+)
+from .todo_semantics import todo_item_task_class
 
 
 TODO_FRONTIER_REVISION_SCHEMA_VERSION = "todo_frontier_revision_v0"
 TODO_FRONTIER_REVISION_INDEX_SCHEMA_VERSION = "todo_frontier_revision_index_v0"
-TODO_TASK_CLASS_ADVANCEMENT = "advancement_task"
 
 FRONTIER_REVISION_FIELDS = (
     "todo_id",
@@ -50,159 +56,80 @@ FRONTIER_REVISION_FIELDS = (
 )
 
 
-def _revision_for_claims(
+def frontier_source_facts(
     source_items: list[dict[str, Any]] | None,
-    *,
-    included_claims: set[str | None] | None,
-) -> tuple[str | None, str | None, bool]:
+) -> list[dict[str, Any]] | dict[str, str] | None:
+    """Legacy codecs only; TS selects lanes and builds complete revision identity."""
     if not isinstance(source_items, list):
-        return None, None, False
-    revisions: list[dict[str, Any]] = []
-    revision_times: list[tuple[Any, str]] = []
-    relevant_count = 0
-    for item in source_items:
-        if not isinstance(item, dict):
-            continue
-        if todo_item_task_class(item) != TODO_TASK_CLASS_ADVANCEMENT:
-            continue
-        claimed_by = normalize_todo_claimed_by(item.get("claimed_by"))
-        if included_claims is not None and claimed_by not in included_claims:
-            continue
-        relevant_count += 1
-        todo_id = str(item.get("todo_id") or "").strip()
-        raw_revision = str(
-            item.get("updated_at") or item.get("completed_at") or ""
-        ).strip()
-        parsed_revision = parse_timestamp(raw_revision)
-        if not todo_id or parsed_revision is None:
-            return None, None, False
-        revisions.append(
-            {
-                field: item.get(field)
-                for field in FRONTIER_REVISION_FIELDS
-                if item.get(field) is not None
-            }
-        )
-        revision_times.append((parsed_revision, raw_revision))
-    if relevant_count == 0 or not revisions:
-        return None, None, False
-    encoded = json.dumps(
-        sorted(revisions, key=lambda item: str(item.get("todo_id") or "")),
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return (
-        f"{TODO_FRONTIER_REVISION_SCHEMA_VERSION}:"
-        f"{sha256(encoded).hexdigest()[:24]}",
-        max(revision_times, key=lambda item: item[0])[1],
-        True,
-    )
+        return None
+    rows = [
+        {
+            "id": str(item.get("todo_id") or "").strip(),
+            "claim": normalize_todo_claimed_by(item.get("claimed_by")),
+            "excluded": normalize_todo_excluded_agents(item.get("excluded_agents")),
+            "updated": str(item.get("updated_at") or item.get("completed_at") or "").strip(),
+            "advancement": todo_item_task_class(item) == TODO_TASK_CLASS_ADVANCEMENT,
+            "serialized": json.dumps(
+                {key: item[key] for key in FRONTIER_REVISION_FIELDS if item.get(key) is not None},
+                ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+            ),
+        }
+        for item in source_items if isinstance(item, dict)
+    ]
+    # Lossless transport codec only: never truncate material identity or raise
+    # the shared Effect request limit for large history/frontier reads.
+    raw = json.dumps(rows, ensure_ascii=True, separators=(",", ":")).encode()
+    if len(raw) < 512 * 1024:
+        return rows
+    return {"encoding": "deflate-base64-json-v0",
+            "data": base64.b64encode(zlib.compress(raw)).decode("ascii")}
+
+
+def _request(operation: str, **facts: Any) -> dict[str, Any]:
+    result = effect_runtime_result("todo.frontier_revision.project", {
+        "schema_version": "todo_frontier_revision_request_v0",
+        "operation": operation, **facts,
+    })
+    if not isinstance(result, dict):
+        raise TypeError("typed frontier revision response must be an object")
+    return result
+
+
+def _checkpoint_tuple(value: Any) -> tuple[str | None, str | None, bool] | None:
+    if value is None:
+        return None
+    if value["complete"]:
+        return value["frontier_revision"], value["frontier_updated_at"], True
+    return None, None, False
 
 
 def selectable_advancement_frontier_revision(
-    source_items: list[dict[str, Any]] | None,
-    *,
-    agent_id: str | None,
+    source_items: list[dict[str, Any]] | None, *, agent_id: str | None,
 ) -> tuple[str | None, str | None, bool]:
-    """Return the material revision for one agent's selectable frontier."""
-
-    normalized_agent_id = normalize_todo_claimed_by(agent_id)
-    included_claims = (
-        {None, normalized_agent_id} if normalized_agent_id else None
-    )
-    return _revision_for_claims(source_items, included_claims=included_claims)
-
-
-def _checkpoint(
-    source_items: list[dict[str, Any]],
-    *,
-    included_claims: set[str | None] | None,
-) -> dict[str, Any]:
-    revision, updated_at, complete = _revision_for_claims(
-        source_items,
-        included_claims=included_claims,
-    )
-    checkpoint: dict[str, Any] = {"complete": complete}
-    if complete and revision and updated_at:
-        checkpoint["frontier_revision"] = revision
-        checkpoint["frontier_updated_at"] = updated_at
-    return checkpoint
+    result = _checkpoint_tuple(_request("select", rows=frontier_source_facts(source_items),
+        agent_id=normalize_todo_claimed_by(agent_id))["checkpoint"])
+    assert result is not None
+    return result
 
 
 def build_advancement_frontier_revision_index(
     source_items: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Project full frontier identity without retaining every Todo row."""
-
-    agent_ids = sorted(
-        {
-            claimed_by
-            for item in source_items
-            if isinstance(item, dict)
-            and todo_item_task_class(item) == TODO_TASK_CLASS_ADVANCEMENT
-            and (claimed_by := normalize_todo_claimed_by(item.get("claimed_by")))
-        }
-    )
-    return {
-        "schema_version": TODO_FRONTIER_REVISION_INDEX_SCHEMA_VERSION,
-        "all": _checkpoint(source_items, included_claims=None),
-        "unclaimed": _checkpoint(source_items, included_claims={None}),
-        "by_agent": [
-            {
-                "agent_id": agent_id,
-                **_checkpoint(source_items, included_claims={None, agent_id}),
-            }
-            for agent_id in agent_ids
-        ],
-    }
+    index = _request("index", rows=frontier_source_facts(source_items)).get("index")
+    if not isinstance(index, dict):
+        raise TypeError("typed frontier revision response index must be an object")
+    return index
 
 
 def attach_advancement_frontier_revision_index(
-    summary: dict[str, Any],
-    source_items: list[dict[str, Any]],
-    *,
-    role: str | None,
+    summary: dict[str, Any], source_items: list[dict[str, Any]], *, role: str | None,
 ) -> None:
-    """Attach the complete decision checkpoint only to Agent Todo summaries."""
-
     if role == "agent":
-        summary["advancement_frontier_revision_index"] = (
-            build_advancement_frontier_revision_index(source_items)
-        )
+        summary["advancement_frontier_revision_index"] = build_advancement_frontier_revision_index(source_items)
 
 
 def advancement_frontier_revision_from_index(
-    value: Any,
-    *,
-    agent_id: str | None,
+    value: Any, *, agent_id: str | None,
 ) -> tuple[str | None, str | None, bool] | None:
-    """Read one complete lane checkpoint; invalid indexes fail closed."""
-
-    if not isinstance(value, dict):
-        return None
-    if value.get("schema_version") != TODO_FRONTIER_REVISION_INDEX_SCHEMA_VERSION:
-        return None, None, False
-    normalized_agent_id = normalize_todo_claimed_by(agent_id)
-    checkpoint: Any = value.get("all")
-    if normalized_agent_id:
-        by_agent = value.get("by_agent")
-        if not isinstance(by_agent, list):
-            return None, None, False
-        checkpoint = next(
-            (
-                row
-                for row in by_agent
-                if isinstance(row, dict)
-                and normalize_todo_claimed_by(row.get("agent_id"))
-                == normalized_agent_id
-            ),
-            value.get("unclaimed"),
-        )
-    if not isinstance(checkpoint, dict) or checkpoint.get("complete") is not True:
-        return None, None, False
-    revision = str(checkpoint.get("frontier_revision") or "").strip()
-    updated_at = str(checkpoint.get("frontier_updated_at") or "").strip()
-    if not revision or parse_timestamp(updated_at) is None:
-        return None, None, False
-    return revision, updated_at, True
+    return _checkpoint_tuple(_request("read", index=value,
+        agent_id=normalize_todo_claimed_by(agent_id))["checkpoint"])

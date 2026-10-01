@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Optional
 
+from ..goals.legacy_event_source import RetiredTodoEventSourceError
+
 
 AttentionItemBuilder = Callable[..., dict[str, Any]]
 GlobalRegistryShadowAttacher = Callable[[dict[str, Any], dict[str, Any]], None]
@@ -42,6 +44,7 @@ class AttentionQueueContext:
     autonomous_replan_obligation_from_runs: Callable[..., dict[str, Any] | None]
     source_registry_shadow_findings: AbstractSet[str]
     monitor_signal_waiting_on: str
+    external_progress_review_context: Optional[Callable[..., dict[str, Any] | None]] = None
 
 
 def merge_global_registry_findings(
@@ -165,7 +168,23 @@ def build_attention_queue(
         current_status_run = context.latest_run(goal)
         goal_latest_runs = goal.get("latest_runs") if isinstance(goal.get("latest_runs"), list) else []
         if goal.get("registry_member"):
-            active_state_fields = context.active_state_todo_fields(goal, runtime_root=runtime_root)
+            try:
+                active_state_fields = context.active_state_todo_fields(goal, runtime_root=runtime_root)
+            except RetiredTodoEventSourceError as error:
+                # Refuse this source without hiding independent Goals or turning
+                # stale Todo/run projections into executable fallback work.
+                item = context.attention_item(
+                    goal_id=str(goal.get("id") or ""),
+                    status=error.reason_code,
+                    waiting_on="user_or_controller",
+                    severity="high",
+                    recommended_action=str(error),
+                    source="active_state",
+                )
+                item["todo_source"] = "unavailable"
+                item["activation_state"] = str(goal.get("activation_state") or "active")
+                history_items.append(item)
+                continue
             active_state_item = context.active_state_todo_attention_item(
                 goal,
                 active_state_fields,
@@ -252,11 +271,17 @@ def build_attention_queue(
                     active_state_fields = context.active_state_todo_fields(goal, runtime_root=runtime_root)
                 item.update(active_state_fields)
                 context.sync_connected_attention_action_from_todos(item)
+                external_progress_review = (
+                    context.external_progress_review_context(goal, runtime_root)
+                    if context.external_progress_review_context is not None
+                    else None
+                )
                 context.attach_active_state_project_asset_fields(
                     item,
                     latest_runs=goal_latest_runs,
                     next_action_projection_warning=context.next_action_projection_warning,
                     autonomous_replan_obligation_from_runs=context.autonomous_replan_obligation_from_runs,
+                    external_progress_review=external_progress_review,
                 )
                 item["quota"] = context.quota_status(
                     goal,

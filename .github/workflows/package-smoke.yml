@@ -6,6 +6,7 @@ on:
       - ".github/workflows/package-smoke.yml"
       - "packages/loopx-repo-health/**"
       - "packages/loopx-obelisk/**"
+      - "packages/loopx-codex-provider-routing/**"
       - "loopx/capabilities/decision_context/extension_provider.py"
       - "loopx/extensions/runtime.py"
   push:
@@ -15,6 +16,7 @@ on:
       - ".github/workflows/package-smoke.yml"
       - "packages/loopx-repo-health/**"
       - "packages/loopx-obelisk/**"
+      - "packages/loopx-codex-provider-routing/**"
       - "loopx/capabilities/decision_context/extension_provider.py"
       - "loopx/extensions/runtime.py"
 
@@ -26,6 +28,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  codex-provider-routing:
+    name: loopx-codex-provider-routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install provider and schema validator
+        run: python -m pip install packages/loopx-codex-provider-routing "jsonschema==4.26.0"
+      - name: Validate recovery and existing operator contracts
+        run: |
+          python -m compileall -q packages/loopx-codex-provider-routing/src
+          python packages/loopx-codex-provider-routing/smoke/codex_provider_routing_smoke.py
+          python packages/loopx-codex-provider-routing/smoke/recovery_contracts_smoke.py
+          python packages/loopx-codex-provider-routing/smoke/operator_smoke.py
+      - name: Validate installed entrypoint and example schemas
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          from jsonschema import validate
+          root = Path("packages/loopx-codex-provider-routing")
+          request_schema = json.loads((root / "schemas/request.schema.json").read_text())
+          response_schema = json.loads((root / "schemas/response.schema.json").read_text())
+          for example in sorted((root / "examples").glob("*.json")):
+              request = json.loads(example.read_text())
+              validate(request, request_schema)
+              result = subprocess.run(["loopx-codex-provider-routing"], input=json.dumps(request), text=True, capture_output=True, check=True)
+              response = json.loads(result.stdout)
+              validate(response, response_schema)
+              assert response["ok"], example.name
+          PY
+
   repo-health:
     name: loopx-repo-health
     runs-on: ubuntu-latest

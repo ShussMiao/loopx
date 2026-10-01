@@ -15,14 +15,15 @@ from ...control_plane.capability_hooks import (
     POST_WRITEBACK_HOOK_RECEIPT_SCHEMA_VERSION,
     InteractionProjectionHookRegistration,
 )
-from ...control_plane.todos.active_state_todo_parser import parse_active_state_todos
+from ...control_plane.effect_runtime import effect_runtime_result
+from ...history import load_registry
+from .todo_source import read_report_todo_source
 from ...registry import (
     atomic_write_json,
     find_registry_goal,
-    read_json,
-    resolve_state_file,
 )
 from ...todos import add_goal_todo
+from ...file_lock import LockAcquisitionPolicy, exclusive_file_lock
 from ...presentation.renderers.periodic_report_html import render_periodic_report_html
 from ...presentation.renderers.periodic_report_markdown import (
     render_periodic_report_markdown,
@@ -54,6 +55,7 @@ from .machine_defaults import (
     resolve_goal_periodic_report_subscription,
 )
 from .machine_store import read_periodic_report_machine_defaults
+from .cadence_journal import cadence_intent, cadence_journal_path, read_cadence_journal
 from .workspace import (
     build_periodic_report_workspace_projection,
     write_periodic_report_workspace_projection,
@@ -175,57 +177,45 @@ def _editorial_response_path(
     )
 
 
-def _decision_scope_text(value: object) -> str:
-    if isinstance(value, Mapping):
-        return ":".join(
-            str(value.get(field) or "")
-            for field in ("kind", "granularity", "scope_key")
-        )
-    return str(value or "")
-
-
 def _superseding_approval_revision(
     *,
     registry_path: Path,
     goal_id: str,
     agent_id: str,
     receipt: Mapping[str, Any],
+    runtime_root: Path | None = None,
 ) -> str | None:
     approval_scope = str(receipt.get("approval_scope") or "")
     if receipt.get("status") != "approval_pending" or not approval_scope:
         return None
-    registry = read_json(registry_path)
-    goal = find_registry_goal(registry, goal_id)
-    if not isinstance(goal, Mapping):
-        return None
-    repo = Path(str(goal.get("repo") or "")).expanduser()
-    state_path = resolve_state_file(repo, str(goal.get("state_file") or ""))
-    if state_path is None or not state_path.is_file():
-        return None
-    parsed = parse_active_state_todos(
-        state_path.read_text(encoding="utf-8"),
-        goal=dict(goal),
-        state_path=state_path,
-        item_limit=None,
+    _, items = read_report_todo_source(
+        registry_path=registry_path, goal_id=goal_id, runtime_root=runtime_root
     )
-    user_summary = parsed.get("user_todos")
-    items = user_summary.get("items") if isinstance(user_summary, Mapping) else []
-    superseding = [
-        item
-        for item in items or []
-        if isinstance(item, Mapping)
-        and item.get("status") == "done"
-        and item.get("action_kind")
-        in {"approve_periodic_report_payload", "cancel_periodic_report_payload"}
-        and item.get("decision_outcome") in {"reject", "cancel"}
-        and _decision_scope_text(item.get("decision_scope")) == approval_scope
-        and str(item.get("bound_agent") or item.get("blocks_agent") or "") == agent_id
-    ]
-    if not superseding:
-        return None
-    latest = max(superseding, key=lambda item: str(item.get("updated_at") or ""))
-    revision = f"{latest.get('todo_id')}:{latest.get('updated_at')}"
-    return hashlib.sha256(revision.encode("utf-8")).hexdigest()[:16]
+    keys = (
+        "todo_id",
+        "status",
+        "action_kind",
+        "decision_outcome",
+        "decision_scope",
+        "bound_agent",
+        "blocks_agent",
+        "updated_at",
+    )
+    result = effect_runtime_result(
+        "capabilities.periodic_report.approval_retry.select",
+        {
+            "schema_version": "periodic_report_approval_retry_request_v0",
+            "agent_id": agent_id,
+            "approval_scope": approval_scope,
+            "items": [{key: item.get(key) for key in keys} for item in items],
+        },
+    )
+    if (
+        not isinstance(result, dict)
+        or result.get("schema_version") != "periodic_report_approval_retry_result_v0"
+    ):
+        raise ValueError("periodic-report approval retry selection result mismatch")
+    return result["revision"]
 
 
 def _load_consumption_receipt(
@@ -252,9 +242,9 @@ def _active_delivery_subscription(
 ) -> dict[str, Any] | None:
     """Resolve the current standing delivery authority for one pending report."""
 
-    registry = read_json(registry_path)
+    registry = load_registry(registry_path)
     goal = find_registry_goal(registry, goal_id)
-    if not isinstance(goal, Mapping):
+    if not isinstance(goal, Mapping) or goal.get("status") in {"stopped", "paused", "archived"}:
         return None
     subscription = resolve_goal_periodic_report_subscription(
         goal,
@@ -290,7 +280,7 @@ def _next_attempt_revision(
     candidate_revisions: list[str] = []
     for receipt in receipts:
         revision = _superseding_approval_revision(
-            registry_path=registry_path,
+            runtime_root=runtime_root, registry_path=registry_path,
             goal_id=goal_id,
             agent_id=agent_id,
             receipt=receipt,
@@ -414,6 +404,28 @@ def pending_periodic_report_intents(
             )
             if actionable:
                 pending.append(sidecar_intent)
+    # Explicit requests and validated stage reports precede automatic calendars.
+    subscription = _active_delivery_subscription(registry_path=registry_path,
+        runtime_root=runtime_root, goal_id=goal_id)
+    cadence = None
+    if subscription and subscription.get("schedule") is not None:
+        try:
+            cadence = read_cadence_journal(runtime_root=runtime_root, goal_id=goal_id)
+        except (OSError, ValueError):
+            if not pending:
+                raise
+            # Turn-start still reports the failure; other valid work can run.
+    if cadence is not None and cadence["publication"] is None and cadence["window"]["agent_id"] == agent_id:
+        if subscription and subscription.get("schedule") is not None and (
+            subscription["effective_revision"] == cadence["window"]["subscription_revision"]
+        ):
+            intent = cadence_intent(cadence["window"])
+            actionable, _revision = _next_attempt_revision(registry_path=registry_path,
+                runtime_root=runtime_root, goal_id=goal_id, agent_id=agent_id, intent=intent)
+            # A delivery-ready window already has a delivery Todo. Do not
+            # regenerate it or project a consume command that masks that Todo.
+            if actionable:
+                pending.append(intent)
     deduplicated: dict[str, dict[str, Any]] = {}
     for intent in pending:
         deduplicated.setdefault(str(intent.get("idempotency_key") or ""), intent)
@@ -493,6 +505,7 @@ def periodic_report_pending_intent_interaction_hook(
         projection_slots=("pending_capability_intent",),
         requested_read_scope=(
             "periodic_report_request_journal",
+            "periodic_report_cadence_journal",
             "post_writeback_intent_journal",
         ),
         producer=produce,
@@ -507,6 +520,7 @@ def _progress_facts(
     agent_id: str,
     completed_at: str,
     available_capabilities: Any = None,
+    allow_empty: bool = False,
 ) -> list[dict[str, Any]]:
     from ...control_plane.todos.todo_index import (
         MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
@@ -514,7 +528,7 @@ def _progress_facts(
     from ...rollout_event_log import load_rollout_events, rollout_event_log_path
 
     snapshot = build_project_progress_snapshot(
-        registry_path=registry_path,
+        runtime_root=runtime_root, registry_path=registry_path,
         goal_id=goal_id,
         agent_id=agent_id,
         completed_at=completed_at,
@@ -525,6 +539,8 @@ def _progress_facts(
         ),
     )
     if not isinstance(snapshot, Mapping):
+        if snapshot is None and allow_empty:
+            return []
         raise ValueError("periodic-report has no public-safe progress items")
     return _progress_facts_from_snapshot(
         snapshot,
@@ -627,6 +643,30 @@ def _validated_snapshot_timestamp(value: str, *, observed_at: str) -> str:
     return value
 
 
+def _cadence_coverage_fact(cadence_window: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the bounded coverage caveat for one frozen calendar window.
+
+    A calendar report reads only what this agent's records can still show inside
+    the window, so the caveat describes the report's own coverage. It used to be
+    classified as a risk, which rendered a bounded coverage limitation to the
+    reader under the risks section and let it stand in for the period's headline
+    risk; supporting coverage evidence is the honest classification.
+    """
+
+    return {
+        "fact_id": "calendar_coverage",
+        "title": "本期证据覆盖范围",
+        "summary": (
+            "仅核对当前可读的本 Agent 任务记录，并按记录时间筛选本期交付；"
+            "未验证完整历史和其他 Agent。空结果不能证明本期没有进展。"
+        ),
+        "status": "unknown",
+        "content_kind": "coverage",
+        "visibility": "supporting",
+        "source_ref": "cadence:" + str(cadence_window["window_id"]),
+    }
+
+
 def _build_editorial_request(
     *,
     intent: Mapping[str, Any],
@@ -649,6 +689,15 @@ def _build_editorial_request(
             else None
         ),
     )
+    cadence_window = intent.get("payload", {}).get("cadence_window")
+    if isinstance(cadence_window, Mapping):
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(cadence_window["schedule"]["timezone"])
+        start = datetime.fromisoformat(cadence_window["start_at"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(cadence_window["due_at"].replace("Z", "+00:00"))
+        work_window = {"start_at": cadence_window["start_at"], "end_at": cadence_window["due_at"],
+            "period_label": f"{start.astimezone(zone):%Y-%m-%d %H:%M} — {end.astimezone(zone):%Y-%m-%d %H:%M}（{zone.key}）",
+            "source": "frozen_calendar_window"}
     request: dict[str, Any] = {
         "schema_version": EDITORIAL_REQUEST_SCHEMA,
         "goal_id": goal_id,
@@ -711,7 +760,7 @@ def _actual_work_window(
     run_index = runtime_root / "goals" / goal_id / "runs" / "index.jsonl"
     if run_index.is_file():
         try:
-            rows = run_index.read_text(encoding="utf-8").splitlines()
+            rows = run_index.read_text(encoding="utf-8").split("\n")
         except OSError:
             rows = []
         for raw_row in rows:
@@ -988,6 +1037,29 @@ def _build_authored_source(
 
 
 def consume_pending_periodic_report_intent(
+    *, registry_path: Path, runtime_root: Path, goal_id: str, agent_id: str,
+    execute: bool, provider_request_ports: PeriodicReportRequestPorts | None = None,
+) -> dict[str, Any]:
+    kwargs = dict(registry_path=registry_path, runtime_root=runtime_root,
+                  goal_id=goal_id, agent_id=agent_id, execute=execute,
+                  provider_request_ports=provider_request_ports)
+    # Leave effect-free/empty reads unchanged. Re-read under the same lock as
+    # calendar admission before any preparation, generation, or Todo write.
+    if not execute:
+        return _consume_pending_periodic_report_intent(**kwargs)
+    if not pending_periodic_report_intents(
+        registry_path=registry_path, runtime_root=runtime_root,
+        goal_id=goal_id, agent_id=agent_id,
+    ):
+        return {"ok": True, "schema_version": CONSUMPTION_RECEIPT_SCHEMA,
+                "status": "no_pending_intent", "external_writes_performed": False}
+    with exclusive_file_lock(cadence_journal_path(runtime_root, goal_id),
+            policy=LockAcquisitionPolicy.MUTATION, agent_id=agent_id,
+            operation="periodic_report_intent_consumption"):
+        return _consume_pending_periodic_report_intent(**kwargs)
+
+
+def _consume_pending_periodic_report_intent(
     *,
     registry_path: Path,
     runtime_root: Path,
@@ -1036,11 +1108,14 @@ def consume_pending_periodic_report_intent(
         else None
     )
     stage = payload.get("stage_completion")
+    cadence_window = payload.get("cadence_window")
     completed_at = str(
         report_request.get("requested_at")
         if isinstance(report_request, Mapping)
         else stage.get("completed_at")
         if isinstance(stage, Mapping)
+        else cadence_window.get("due_at")
+        if isinstance(cadence_window, Mapping)
         else ""
     )
     project_progress = payload.get("project_progress")
@@ -1114,8 +1189,16 @@ def consume_pending_periodic_report_intent(
             agent_id=agent_id,
             completed_at=completed_at,
             available_capabilities=fallback_capabilities,
+            allow_empty=isinstance(cadence_window, Mapping),
         )
     )
+    if isinstance(cadence_window, Mapping):
+        start = datetime.fromisoformat(cadence_window["start_at"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(cadence_window["due_at"].replace("Z", "+00:00"))
+        facts = [fact for fact in facts if fact.get("status") != "done" or (
+            start < datetime.fromisoformat(str(fact["completed_at"]).replace("Z", "+00:00")) <= end
+        )]
+        facts.append(_cadence_coverage_fact(cadence_window))
     request_path = _editorial_request_path(
         runtime_root,
         goal_id,

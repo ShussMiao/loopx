@@ -1,11 +1,31 @@
-## Summary
+## Goal And Delivered Outcome
 
--
+<!-- State the reproduced defect, accepted request or concrete maintenance
+outcome. A public issue, roadmap card or RFC section is optional for a
+self-contained ordinary contribution. Curated board work follows its anchor
+rule; do not invent an issue or roadmap id only to admit a useful repair.
+Catalog entries, behavior-pinning tests and fixture dimensions still need a
+concrete gap and consumer. These author facts are independently reviewed.
+-->
 
-## Issue Or Task
+- Outcome basis / optional anchor:
 
-- Closes #
-- Contributor task ID:
+- Goal/source and gap:
+- Observable before → after, with the validation row that proves it:
+- Issue/task and intended base: <!-- Use Closes only for the issue actually completed; otherwise Related to. -->
+
+## Scope And Continuation
+
+<!-- A scoped fix may be complete while the parent program remains open.
+For a staged increment, explain the useful delta, remaining gap, next owner/task
+and why this is an independently testable/reversible boundary. Link existing
+work before creating follow-ups. Docs/research/maintenance need a concrete value,
+not a fabricated runtime caller. Write "complete within this scope" when no
+successor is needed. Do not grade quality from LOC, PR counts or test counts.
+-->
+
+- Completed scope and remaining work:
+- Slice boundary / successor: <!-- N/A with reason when the accepted task is complete. -->
 
 ## Validation
 
@@ -41,7 +61,29 @@ baseline/head comparison and a failing-before or mutation check, not just test c
   Documentation-only changes may use a static/manual row and explain runtime N/A.
   A passing row does not waive required real-path/backend gates. -->
 
-See [validation disclosure guidance](https://github.com/huangruiteng/loopx/blob/main/CONTRIBUTING.md#validation-disclosure).
+See [validation disclosure guidance](https://github.com/loopx-project/loopx/blob/main/CONTRIBUTING.md#validation-disclosure).
+
+## Frontend / Visual Evidence
+
+<!--
+Required for dashboard, website, desktop, documentation chrome, or any other
+user-visible UI change. Attach public-safe screenshots that let reviewers judge
+the changed state, not only a happy-path landing screen. For an existing surface,
+show both before and after. For a new surface, write "Before: N/A" and show the
+after view. Include desktop and mobile when responsive layout changes, and include
+loading, empty, error, permission, or gated states when those states changed. Add
+a short recording only when still images cannot explain the interaction.
+
+Use synthetic or public fixture data only. Do not upload live/private screenshots,
+even when the underlying access was authorized.
+-->
+
+- UI impact: <!-- choose one: none | changed -->
+- Before:
+- After:
+- States and viewports shown:
+- Source data: <!-- choose one: none | synthetic | public_fixture -->
+- Attention review: <!-- Per docs/development/design.md: what earns its place through high-value information, essential interaction, or expressive visual presentation? Name consolidation/removal across the whole viewport, and how failures, uncertainty, and one-step controls remain available. -->
 
 ## Type of Change
 
@@ -67,16 +109,14 @@ See [validation disclosure guidance](https://github.com/huangruiteng/loopx/blob/
 
 ## Technical Direction
 
-<!-- Select one. Direction labels route review; they do not imply maturity or merge authority. -->
+<!-- Optional routing: Core control-plane hardening; Long-horizon benchmark evidence;
+Operator surface and IM integration; Shared Goal Authority and cross-host coordination;
+Architecture and research incubator. For cross-cutting work, reference an existing
+roadmap S/G/R or domain acceptance id rather than copying the plan.
+Routing is not maturity or implementation authority.
+-->
 
-- [ ] Core control-plane hardening
-- [ ] Long-horizon benchmark evidence
-- [ ] Operator surface and IM integration
-- [ ] Shared Goal Authority and cross-host coordination
-- [ ] Architecture and research incubator
-
-- Target base branch:
-- Direction tracker or promotion unit:
+- Direction / acceptance reference, when applicable:
 
 ## Shared-authority RFC fixture impact
 
@@ -97,4 +137,5 @@ than attaching private fixtures, snapshot identifiers, raw output or infrastruct
 - [ ] Neither the diff nor this PR body/comments/attachments disclose private state, credentials, raw traces or verifier output, internal links, or local machine paths (including `.loopx/`, `.codex/goals/`, and live `ACTIVE_GOAL_STATE.md`).
 - [ ] I did not duplicate maintainer-owned benchmark work unless a maintainer split out a public issue for it.
 - [ ] I kept the change scoped to the linked issue/task.
+- [ ] I completed the visual evidence section for UI changes, or marked UI impact `none`.
 - [ ] Every commit includes a DCO `Signed-off-by` trailer (`git commit -s`).

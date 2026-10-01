@@ -18,6 +18,10 @@ update, select **Install update**, then **Restart to finish**. The App verifies
 the archive signature before replacing itself; the restarted App installs its
 bundled runtime and verifies the selected CLI revision before reconnecting.
 This updates both layers without asking the operator to run a terminal command.
+The boot screen shows runtime installation separately from status/chat service
+connection, and reports elapsed startup time across WebView reloads. Slow
+startup exposes recovery guidance in the first screen instead of hiding all
+progress in the collapsed update panel.
 Existing desktop builds without this updater need a one-time App replacement.
 Windows preview installers retain the manual CLI installation path; they are
 not advertised in the signed update feed until their runtime installer is
@@ -38,14 +42,21 @@ The bundled runtime owns the CLI, HTTP APIs and workspace assets. A runtime-only
 CLI update cannot patch native startup or updater bugs; those require an App
 update. The App update workflow packages both layers from one Git revision.
 
-On macOS, opening the App now automatically prepares its bundled runtime when
-the default CLI is missing or has a different source revision. This changes
-the previous startup behavior, which stopped at a manual repair gate. It can
-replace a separately updated default CLI with the App's matching snapshot;
-use an App update to move the paired installation forward. Automatic startup
-does not download another App or choose another update channel. Explicit
-`LOOPX_BIN` overrides are retained and are never replaced automatically: a
-mismatched override must be corrected by its owner.
+On macOS, opening the App prepares its bundled runtime automatically only when
+no default CLI runtime is installed: with nothing to replace, a fresh machine
+still bootstraps in one launch. When a *different* runtime is already selected,
+the first screen asks the operator instead of replacing it, because that
+default CLI may be the newer layer. The two choices are **Update App and
+runtime** (check this App's channel, then install the signed App and its
+matching snapshot together) and **Use this App's runtime** (install the
+snapshot this App carries, which aligns the CLI to the App's revision and can
+move it backwards). Services stay stopped until one of them is chosen, so an
+App that lags the CLI can no longer silently downgrade the CLI on open. Neither
+choice downloads another App on its own or selects another update channel, and
+both leave Goal data untouched. A channel with no newer build says so and
+leaves the CLI choice standing. Explicit `LOOPX_BIN` overrides are retained and
+are never replaced automatically: a mismatched override must be corrected by
+its owner.
 
 The installer and App-owned services use the same bounded tool search,
 including standard Homebrew locations on macOS, without loading interactive

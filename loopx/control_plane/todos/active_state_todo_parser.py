@@ -5,25 +5,55 @@ from typing import Any
 
 from ...materials import extract_review_materials
 from ...orchestration import compact_orchestration_policy
-from ..goals.active_state_metadata import (
-    TODO_ARCHIVE_HEADER_MARKERS,
-    todo_role_for_heading,
-)
 from .contract import (
-    TODO_TASK_PATTERN,
     normalize_todo_id,
-    parse_todo_metadata_line,
-    todo_done_for_status,
-    todo_status_from_marker,
+    TODO_TASK_PATTERN,
 )
-from .decision_scope import build_standing_decision_authority
-from .machine_region import TODO_REGION_PREFIX, find_todo_regions
+from .standing_decision import build_standing_decision_authority
+from .machine_region import find_todo_source_regions, visible_markdown_lines
+from .todo_block_codec import decode_todo_blocks
 from .todo_summary import (
     MAX_STATUS_TODOS_PER_ROLE,
     compact_todo_group,
     count_advancement_todos,
     normalize_todo_text,
 )
+from ..runtime.time import now_utc_iso
+
+
+def parse_todo_source(
+    state_text: str,
+    *,
+    goal: dict[str, Any] | None = None,
+    state_path: Path | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], dict[str, str | None]]:
+    """Decode full source rows; attention summaries compact only after this read."""
+    source_sections: dict[str, str | None] = {"user": None, "agent": None}
+    items: dict[str, list[dict[str, Any]]] = {"user": [], "agent": []}
+    archive_items: list[dict[str, Any]] = []
+    lines = state_text.splitlines()
+    visible = visible_markdown_lines(lines)
+    for region in find_todo_source_regions(lines, visible=visible):
+        archive = region.role == "archive"
+        target = archive_items if archive else items[region.role]
+        if not archive and source_sections[region.role] is None:
+            source_sections[region.role] = region.heading
+        for block in decode_todo_blocks(
+            lines, region.start, region.body_end, visible=visible, text_limit=None,
+        ):
+            todo = {"archive_state": "archive" if archive else "active",
+                    "source_section": region.heading if archive else source_sections[region.role],
+                    **({} if archive else {"role": region.role}),
+                    **{key: value for key, value in block.items() if key not in {"start", "end"}},
+                    "index": len(target) + 1}
+            if goal is not None:
+                match = TODO_TASK_PATTERN.match(lines[block["start"]])
+                assert match is not None  # The shared decoder only emits matched task lines.
+                materials = extract_review_materials(match.group(2), goal=goal, state_path=state_path)
+                if materials:
+                    todo["review_materials"] = materials
+            target.append(todo)
+    return items, archive_items, source_sections
 
 
 def parse_active_state_todos(
@@ -35,7 +65,9 @@ def parse_active_state_todos(
     rollout_events: list[dict[str, Any]] | None = None,
     available_capabilities: Any = None,
     item_limit: int | None = MAX_STATUS_TODOS_PER_ROLE,
+    evaluated_at: str | None = None,
 ) -> dict[str, Any]:
+    resume_evaluated_at = evaluated_at or now_utc_iso()
     orchestration = compact_orchestration_policy(
         goal.get("spawn_policy") if isinstance(goal, dict) else None
     )
@@ -44,75 +76,7 @@ def parse_active_state_todos(
         and orchestration.get("spawn_allowed") is True
         and int(orchestration.get("max_children") or 0) > 0
     )
-    role: str | None = None
-    source_sections: dict[str, str | None] = {"user": None, "agent": None}
-    items: dict[str, list[dict[str, Any]]] = {"user": [], "agent": []}
-    archive_items: list[dict[str, Any]] = []
-    archive_mode = False
-    archive_source_section: str | None = None
-    current_todo: dict[str, Any] | None = None
-
-    lines = state_text.splitlines()
-    regions = find_todo_regions(lines) if TODO_REGION_PREFIX in state_text else None
-    region_starts = {r.start for r in regions} if regions is not None else None
-    region_ends = {r.body_end for r in regions} if regions is not None else set()
-    for index, line in enumerate(lines):
-        if index in region_ends:
-            role = None
-            current_todo = None
-        if line.startswith("## "):
-            heading = line.lstrip("#").strip()
-            normalized_heading = heading.strip().lower()
-            archive_mode = any(
-                marker in normalized_heading for marker in TODO_ARCHIVE_HEADER_MARKERS
-            )
-            archive_source_section = heading if archive_mode else None
-            role = todo_role_for_heading(heading)
-            if role and region_starts is not None and index not in region_starts:
-                role = None
-            current_todo = None
-            if role and source_sections[role] is None:
-                source_sections[role] = heading
-            continue
-        if role is None and not archive_mode:
-            continue
-        match = TODO_TASK_PATTERN.match(line)
-        if match:
-            marker, text = match.groups()
-            status = todo_status_from_marker(marker)
-            target_items = archive_items if archive_mode else items[str(role)]
-            todo: dict[str, Any] = {
-                "index": len(target_items) + 1,
-                "done": todo_done_for_status(status),
-                "status": status,
-                "text": normalize_todo_text(text),
-            }
-            if archive_mode:
-                todo["archive_state"] = "archive"
-                todo["source_section"] = archive_source_section
-            else:
-                todo["archive_state"] = "active"
-                todo["source_section"] = source_sections[str(role)]
-                todo["role"] = role
-            if goal is not None:
-                materials = extract_review_materials(text, goal=goal, state_path=state_path)
-                if materials:
-                    todo["review_materials"] = materials
-            target_items.append(todo)
-            current_todo = todo
-            continue
-        if current_todo is None or not line.startswith((" ", "\t")):
-            continue
-        metadata = parse_todo_metadata_line(line)
-        if metadata:
-            current_todo.update(metadata)
-            continue
-        continuation = line.strip()
-        if continuation:
-            current_todo["text"] = normalize_todo_text(
-                f"{current_todo.get('text', '')} {continuation}"
-            )
-
+    items, archive_items, source_sections = parse_todo_source(state_text, goal=goal, state_path=state_path)
     result: dict[str, Any] = {}
     archived_resume_source_items = [
         item for item in archive_items if normalize_todo_id(item.get("todo_id"))
@@ -129,6 +93,7 @@ def parse_active_state_todos(
         available_capabilities=available_capabilities,
         item_limit=item_limit,
         include_task_orchestration_authority=include_task_orchestration_authority,
+        evaluated_at=resume_evaluated_at,
     )
     agent = compact_todo_group(
         items["agent"],
@@ -142,9 +107,14 @@ def parse_active_state_todos(
         item_limit=item_limit,
         include_task_orchestration_authority=include_task_orchestration_authority,
         vision_runs=(goal or {}).get("latest_runs"),
+        evaluated_at=resume_evaluated_at,
     )
     archived_advancement_done_count = count_advancement_todos(
-        [item for item in archive_items if item.get("done") is True]
+        # Lossless source text must not widen legacy attention classification.
+        [
+            {**item, "text": normalize_todo_text(str(item.get("text") or ""))}
+            for item in archive_items if item.get("done") is True
+        ]
     )
     if agent and archived_advancement_done_count:
         agent["archived_advancement_done_count"] = archived_advancement_done_count
@@ -156,7 +126,12 @@ def parse_active_state_todos(
         result["user_todos"] = user
     if agent:
         result["agent_todos"] = agent
-    standing_authority = build_standing_decision_authority(items["user"])
+    archived_decisions = [item for item in archive_items if item.get("role") == "user"]
+    standing_authority = build_standing_decision_authority(
+        [*items["user"], *archived_decisions],
+        # Separate sections are not a single chronological append log.
+        legacy_source_order=not archived_decisions,
+    )
     if standing_authority:
         result["standing_decision_authority"] = standing_authority
     return result

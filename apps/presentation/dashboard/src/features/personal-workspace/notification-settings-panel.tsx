@@ -16,6 +16,56 @@ type BindState =
   | { phase: "busy" }
   | { phase: "error"; message: string };
 
+export function GoalAutoNotifyToggle({
+  callbacks,
+  goalId,
+  notification,
+  onChanged,
+}: {
+  callbacks: PersonalWorkspaceCallbacks;
+  goalId: string;
+  notification?: WorkspaceGoalNotification;
+  onChanged: () => void;
+}) {
+  const { t } = useWorkspaceI18n();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function toggle(autoNotify: boolean) {
+    if (!callbacks.onToggleGoalAutoNotify) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await callbacks.onToggleGoalAutoNotify({ autoNotify, goalId });
+      if (!result.ok) {
+        setError(result.public_summary ?? result.blocker ?? t("notifications.setupFailed"));
+        return;
+      }
+      onChanged();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : t("notifications.setupFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <label className="personal-notification-toggle">
+        <input
+          checked={notification?.humanGateAutoNotifyEnabled ?? false}
+          disabled={busy || notification?.configured !== true || !callbacks.onToggleGoalAutoNotify}
+          onChange={(event) => void toggle(event.target.checked)}
+          type="checkbox"
+        />
+        <span>{t("notifications.autoNotify")}</span>
+        {busy ? <Loader2 aria-hidden className="is-spinning" size={14} /> : null}
+      </label>
+      {error ? <p className="personal-notification-error" role="alert">{error}</p> : null}
+    </>
+  );
+}
+
 function GoalNotificationRow({
   callbacks,
   goal,
@@ -32,8 +82,6 @@ function GoalNotificationRow({
   const { t } = useWorkspaceI18n();
   const [bindState, setBindState] = useState<BindState>({ phase: "idle" });
   const [selectedTarget, setSelectedTarget] = useState(targets[0]?.target_name ?? "");
-  const [toggleBusy, setToggleBusy] = useState(false);
-  const [toggleError, setToggleError] = useState<string | null>(null);
 
   async function bind(execute: boolean) {
     if (!callbacks.onSetupGoalChannel || !selectedTarget) return;
@@ -59,24 +107,6 @@ function GoalNotificationRow({
     }
   }
 
-  async function toggleAutoNotify(autoNotify: boolean) {
-    if (!callbacks.onToggleGoalAutoNotify) return;
-    setToggleBusy(true);
-    setToggleError(null);
-    try {
-      const result = await callbacks.onToggleGoalAutoNotify({ autoNotify, goalId: goal.goalId });
-      if (!result.ok) {
-        setToggleError(result.public_summary ?? result.blocker ?? t("notifications.setupFailed"));
-        return;
-      }
-      onChanged();
-    } catch (error) {
-      setToggleError(error instanceof Error ? error.message : t("notifications.setupFailed"));
-    } finally {
-      setToggleBusy(false);
-    }
-  }
-
   const configured = notification?.configured === true;
 
   return (
@@ -94,17 +124,12 @@ function GoalNotificationRow({
             <span>{t("notifications.sentCount", { count: notification?.receiptCount ?? 0 })}</span>
             {notification?.lastNotifiedAt ? <span>{t("notifications.recent", { time: notification.lastNotifiedAt })}</span> : null}
           </div>
-          <label className="personal-notification-toggle">
-            <input
-              checked={notification?.humanGateAutoNotifyEnabled ?? false}
-              disabled={toggleBusy}
-              onChange={(event) => void toggleAutoNotify(event.target.checked)}
-              type="checkbox"
-            />
-            <span>{t("notifications.autoNotify")}</span>
-            {toggleBusy ? <Loader2 aria-hidden className="is-spinning" size={14} /> : null}
-          </label>
-          {toggleError ? <p className="personal-notification-error">{toggleError}</p> : null}
+          <GoalAutoNotifyToggle
+            callbacks={callbacks}
+            goalId={goal.goalId}
+            notification={notification}
+            onChanged={onChanged}
+          />
         </>
       ) : targets.length === 0 ? (
         <p className="personal-notification-hint">
@@ -186,7 +211,6 @@ export function NotificationSettingsPanel({
     <section className="personal-detail-card personal-notification-settings">
       <small>{t("notifications.title")}</small>
       <h3>{t("notifications.settings")}</h3>
-      <p>{t("notifications.description")}</p>
       {targetsError ? <p className="personal-notification-error">{targetsError}</p> : null}
       <ul className="personal-notification-list">
         {goals.map((goal) => (

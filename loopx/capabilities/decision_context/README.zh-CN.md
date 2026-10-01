@@ -80,6 +80,42 @@ exact-read 完整度和未覆盖的 P0 source 投影为公开安全的回执。`
 不阻断安全的 LoopX lifecycle，但调用方必须显式标记结论为部分覆盖，或者先通过
 其他 authority 路径补齐 exact read；不能把 fail-open 误写成“所有关键上下文已检查”。
 
+## 代码地图
+
+一次决策按下表顺序经过各模块；只读你的改动涉及的那几行即可。
+
+| 模块 | 负责 |
+|---|---|
+| `profile.py` | 默认关闭、goal 级的 profile：关注哪些信源类别、新鲜度策略、扫描模式、权重；激活状态 |
+| `providers.py` | 可替换的 current-authority provider 注册表，以及本地文件 provider |
+| `sources.py` | provider 中立的信源合同：spec、item、scan、exact read、source manifest |
+| `runtime.py` | 从 profile 到 provider 再到 evidence assembly 与 advisory recall 的薄编排层 |
+| `assembler.py` | 确定性的 authority rebase、advisory recall 装配、`decision_source_coverage_v0` |
+| `packets.py` | 公开安全的 evidence、proposal、review、outcome packet |
+| `review_settlement.py` | 对单次 assembly 做 owner 把关或 quiet settlement |
+| `cursor_commit.py` | settlement 校验通过后提交私有 cursor |
+| `private_state.py` | 私有 cursor 与 pending settlement 的文件读写 |
+| `freshness.py` | 逐来源 freshness 报告与 capture host 健康投影 |
+| `outcome_feedback.py` | 从 outcome 回流到 Reward Memory 的审计反馈 |
+| `capture.py` | opt-in 的 source-reference capture 与 `capture-status` |
+| `capture_recovery.py` | 保留引用的 capture 诊断与恢复 |
+| `extension_provider.py` | 由扩展交付的 advisory context provider（`decision_context_advisory_provider_v0`） |
+| `architecture.py` | 能力合同的 `architecture` 读回 |
+| `catalog_entry.py` | 能力 catalog 记录 |
+| `cli.py` | 所有 `loopx decision-context` 子命令及其渲染 |
+
+新增一个可观测字段时：
+
+- **单个信源的事实**（如读取时间、扫描状态）：在 `sources.py` 或 `providers.py`
+  的 provider 里产出，再在 `assembler.py` 带进 coverage。
+- **决策级字段**：加在 `assembler.py`；只有属于公开 packet 时才进 `packets.py`，
+  公开安全检查在那里。
+- **只和 capture 有关的事实**：加在 `capture.py`。
+- **对外暴露**：由 `cli.py` 渲染；只有需要新的顶层分发时才改 `loopx/cli.py`。
+- **文档与测试**：更新本 README 和英文 README 对应的入口段落；测试放在
+  `tests/capabilities/test_decision_context_<module>.py`，packet 形状用
+  `examples/decision-context-contract-smoke.py` 覆盖。
+
 ## 四类可审计产物
 
 | 产物 | 回答的问题 | 典型内容 |
@@ -232,18 +268,28 @@ cursor。
   "fail_open": true,
   "source_ids": ["source:authority:baseline"],
   "interval_seconds": 900,
-  "max_pending_batches": 1000
+  "max_pending_batches": 1000,
+  "max_sources_per_tick": 8
 }
 ```
 
 白名单只能包含已启用、支持 exact read 的 incremental source，不会隐式纳入
-on-demand 来源；goal/agent 的启用边界不变。先预览，再添加 `--execute` 执行一次：
+on-demand 来源；goal/agent 的启用边界不变。只有 profile、当前 agent 和自动采集
+均已启用，capture 返回才包含 `activation.capture_max_sources_per_tick`。
+共用 activation、`inspect-profile` 和 evidence assembly 不投影此采集预算。
+先预览，再添加 `--execute` 执行一次：
 
 ```bash
 loopx decision-context capture --goal-id <goal-id> --agent-id <agent-id> \
   --profile <private-profile.json> --spool <private-capture.sqlite> \
   --cursor-state <reviewed-cursors.json> --format json
 ```
+
+每轮最多调用 `automation.max_sources_per_tick` 个 provider（默认 8，整数 1–64），
+优先读取最久未尝试的来源。失败调用消耗名额；hold、背压和未到读取间隔的来源不消耗。
+延期来源保留采集游标和 freshness 时间，下轮继续；`scan_budget` 报告尝试数与延期来源。
+该预算限制调用次数，不保证墙钟耗时；provider 仍须遵守 timeout，宿主仍须施加进程期限。
+profile 并发修改时仍保持整轮原子回滚。
 
 `capture-status` 使用相同参数但不带 `--execute`，只读回查。宿主负责定时调用、
 进程总超时和启动/卸载；capability 执行配置中的采集间隔，不创建模型 heartbeat。
@@ -252,7 +298,11 @@ loopx decision-context capture --goal-id <goal-id> --agent-id <agent-id> \
 
 权限为 0600 的私有 SQLite spool 绑定单个 goal/agent，只保存有界 scan receipt
 和私有回放游标，不保存正文。采集事务串行执行，批次和采集游标一起提交；失败不前移
-游标，容量耗尽报 `backpressure` 而不丢弃待审阅批次。来源绑定变化报
+游标，容量耗尽报 `backpressure` 而不丢弃待审阅批次。每个已登记采集来源现在保留
+`max(1, floor(max_pending_batches / 来源数))` 个活跃批次窗口。单来源窗口用完时，
+只有该来源报 `source_backpressure`，不调用 provider、不推进采集游标或成功读取时间；
+安静来源的空闲份额与整数余数不借给高频来源，保留给后来的独立变化。此项改变多来源
+profile 原先只有全局上限的默认准入，单来源行为不变。来源绑定变化报
 `binding_changed`，需显式 rebase 或启用独立新 spool。数据库及 journal 均不得公开。
 
 每个来源从状态中的 `next_batch_id` 开始回读：
@@ -273,8 +323,8 @@ loopx decision-context prepare-captured --goal-id <goal-id> --agent-id <agent-id
 
 两次采集之间若发生多次 settlement，中间变化可能无法观察；有歧义的批次保留，
 不推断为已审阅。旧 spool 没有观察记录时，仅建立基线，不清理已有批次。
-这两类阻塞均需依据真实审阅证据显式核对；若在当前来源 rebase 后启用新 spool，
-旧 spool 仍须保留为私有检查点。本协议不保证跳过审阅变化后自动排空队列。
+这两类阻塞均需依据真实审阅证据显式核对，或使用下述受保护的恢复入口。
+本协议不保证跳过审阅变化后自动排空队列。
 
 这是变更引用队列，**不是无损历史归档**。首轮历史范围、分页、旧消息编辑/删除可见性、
 超时依然由 provider 保证。回读要求同一边界能确定性复现；历史版本已不可读时明确
@@ -282,12 +332,86 @@ loopx decision-context prepare-captured --goal-id <goal-id> --agent-id <agent-id
 完成 rebase。采集健康不等于决策覆盖完整。
 
 停用时设置 `automatic_capture=false` 并卸载宿主定时任务，已有私有批次仍可回读。
-回滚到旧版本还需移除新增的三个 automation 字段；保留 spool 作为私有检查点，
-不要删除尚未审阅的工作。验证：
+回滚有界续扫时移除 `max_sources_per_tick`；若回滚到尚未支持引用采集的版本，
+还须移除 `source_ids`、`interval_seconds` 和 `max_pending_batches`。
+保留 spool 作为私有检查点，不要删除尚未审阅的工作。验证：
 
 ```bash
 python3 -m pytest -q tests/capabilities/test_decision_context_capture.py
 ```
+
+#### 无损恢复无法重放的来源
+
+恢复由现有 `decision_context` 私有 SQLite spool 负责，不改变 Core 生命周期。
+入口是本地 CLI／受信任 host，不新增 provider、模型调用、远程权限或调度器配置。
+私有 host 可从 `loopx.capabilities.decision_context.capture_recovery` 调用
+`diagnose_capture_source` / `recover_capture_source`，继续传现有 provider overrides。
+
+1. 用相同的 `--goal-id`、`--agent-id`、`--profile`、`--spool`、`--cursor-state`
+   以及明确的 `--source-id` 调用 `capture-diagnose`。默认只读元数据；加 `--probe`
+   才做一次有界、瞬态的 replay / exact read，不做语义审阅或待结算写入。
+   区分未检查、可重放、revision 不可用、binding 改变、cursor 分叉、probe 不可用、
+   状态并发改变、空队列及 acquisition held，不把 provider 原始异常写进输出。
+2. `capture-recovery --action hold` 先预览；确认影响范围后，以
+   `--execute --expected-token <preview_token>` 显式应用。该来源所有待审阅引用
+   原样转入 **held、未解决历史**，暂停其采集，释放活跃队列容量给其他来源。
+   这不是审阅完成，不修改 reviewed cursor，也不丢弃旧证据。
+3. 准备读取当前材料时，重新预览并应用 `--action restart`。它以当前 profile
+   binding 和 **未改动的审阅游标** 重启采集，清除此来源的扫描间隔等待。
+   下一次正常 capture 产生新批次，再走 `prepare-captured` / `settle-review`。
+   新批次被审阅，也不会把旧 held 引用变成已审阅。
+4. `--action rollback --recovery-id <已应用回执 ID>` 同样需要预览和显式应用。
+   只有来源状态、profile／reviewed 文件仍匹配回执且恢复后不超过容量上限时，
+   才恢复操作前状态；新采集或审阅后拒绝覆盖进展。回执保留在私有 spool 中。
+
+预览令牌绑定 action、source、profile／binding、spool 身份、完整队列前沿、
+审阅文件内容与文件身份，以及审计记录。并发采集／审阅、重复应用、重绑或文件 ABA
+必须重新预览。SQLite 串行化采集与恢复写入，恢复使用与 settlement 相同的游标锁。
+不支持手工改库绕过门禁；恢复不替代合法的独立审阅结算，也不宣称创建新审阅 epoch。
+
+`max_pending_batches=N` 继续限制活跃批次；另最多保留 N 条未解决历史，
+2N 条审计记录后停止新增 hold/restart（每条适用回执最多再 rollback 一次）。
+不会自动删除、压缩或无限扩容。达到上限需保留／导出私有 spool 后明确处理保留策略。
+hold 是显式恢复操作，默认来源窗口则阻止高频来源借走其他来源的未来容量。
+两者都不能代替语义审阅：来源窗口满时须审阅最旧批次；无法回放时先
+`capture-diagnose`，再按授权走受保护恢复。两种背压状态在容量释放后的下一 tick
+都可重试，不再多等一个扫描间隔。
+
+升级前已有的超份额批次完整保留，不自动删除或转 held；它们仍占全局容量，直到显式
+审阅或恢复。若全局容量小于登记来源数，不能保证隔离，状态会明确报告
+`reservation_capacity_sufficient=false`，仍严格遵守全局上限。
+`capture-status.capacity_policy` 给出两层上限，各来源给出 `pending_capacity`、
+`review_required` 和 `recovery_diagnosis_required`。这些是工作提示，不代表已探测到
+回放失败，也不授予恢复或结算权限。已退出采集登记的来源留下的 pending 仍计入全局容量。
+
+`capture-status` 分开报告 active pending、held 历史、每来源 acquisition hold，
+并明确 `semantic_review_completion=not_inferred_from_capture`。`last_checked_at`
+是尝试时间，不保证成功。
+仅看 status 不能证明历史可重放或决策覆盖完整。停用仍使用原 profile 开关；
+降级旧版本前必须停止调度器，因为旧运行时不认识 recovery hold。
+保留 spool 与回执，不能把软件降级当成状态回滚。
+
+#### 来源新鲜度合同
+
+profile 已启用、`loopx doctor` 健康或已有结算投影，都不代表来源是新鲜的。
+每个 `prepare-evidence` / `prepare-review` 组装结果，以及每次 `capture` /
+`capture-status` 输出，都携带 `source_freshness`（`decision_source_freshness_v0`）：
+每个已启用来源一行，包含 `last_read_at`（最近一次**成功**读取）、`staleness_seconds`、
+来源的 `freshness_seconds` 窗口、`status`（`fresh`、`stale`、`never_read`、
+`not_scanned`）、`failure_streak` 和 `alert_reasons`。不在本次扫描范围内的已启用来源
+（例如按需来源）以 `not_scanned` 出现，不会被静默省略。Markdown 输出对所有告警行标 🔴。
+消费方在把结论当作"当前情况"之前，必须先披露告警来源。
+
+provider 读取失败会更新 `last_checked_at` 并累加 `failure_streak`，但绝不推进
+`last_read_at`。已有 spool 原地迁移；旧记录若最后一次尝试成功，则以该次尝试作为最近读取。
+
+`loopx decision-context capture --execute` 会在
+`<runtime-root>/decision-context/capture-hosts/` 下写入本机 host 健康记录。
+直接调用 `capture_profile_sources` 的私有 host 应传入 `health_runtime_root` 获得同样效果。
+`loopx doctor` 不打开私有 spool，以可选检查 `decision_context_capture_hosts_healthy`
+报告：已登记 host 超过 `max(2 × interval, interval + 600s)` 未 tick（例如调度器仍指向
+已删除的 checkout）、最后一次 tick 失败、spool 丢失，或记录中的来源陈旧／持续失败时告警。
+主动退役的 host 需删除其记录。
 
 ## 与其他能力的关系
 

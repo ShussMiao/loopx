@@ -315,7 +315,7 @@ def _read_stdin_events() -> list[object]:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        payload = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        payload = [json.loads(line) for line in raw.split("\n") if line.strip()]
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
@@ -765,6 +765,7 @@ def handle_lark_inbox_command(
                 project=args.project,
                 config_path=args.config,
                 lark_cli_executable=args.lark_cli_executable,
+                runtime_root=runtime_root_arg,
                 node_executable=args.node_executable,
             )
         else:

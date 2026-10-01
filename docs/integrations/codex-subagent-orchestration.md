@@ -40,6 +40,24 @@ Parallelize when it reduces uncertainty or latency:
 - run an independent review or validation pass;
 - inspect separate adapter, evidence, or boundary questions.
 
+The enabled capability also guides **coordinator participation** at its existing
+context phases. Before planning, reserve a distinct decision-relevant evidence
+question for the coordinator when useful independent work exists. Before
+launch, identify that question and its dependencies alongside the child briefs;
+continue it while children work. After results return, validate decisive sources,
+reconcile findings and revisit uncovered questions. Reviewing children is still
+necessary, but does not replace the coordinator's own parallel investigation.
+Wait when the remaining useful work depends on child results; do not invent
+work, require a minimum child count, or duplicate evidence to fill capacity.
+These are guidance-only instructions, not a new scheduler or completion gate.
+
+启用能力后，现有三个上下文阶段也引导主 Agent 参与研究：规划前保留一个
+独立、影响决策的证据问题；委派前说明自己的问题、依赖和子任务边界，并在
+子 Agent 工作期间推进；回收后核验原件、整合结果、重审尚未覆盖的问题。
+核验子任务不能替代主 Agent 自己的并行研究。剩余工作确实依赖子任务时可以
+等待，不要求凑满并发、重复取证或制造工作。这些是引导，不是新增调度器或
+完成门禁；等待某一候选也不意味着其他可执行研究必须停止。
+
 Keep tightly coupled decisions in one peer lane. Do not launch workers merely
 to make the activity graph look busy, and never let worker count override
 quota, user gates, write scope, or repository policy.
@@ -198,8 +216,38 @@ loopx configure-goal \
   --goal-id example-peer-task-goal \
   --multi-subagent-feature enabled \
   --max-children 2 \
+  --align-codex-subagent-capacity \
   --execute
 ```
+
+### Codex Host Capacity Alignment / Codex 宿主容量对齐
+
+`max_children` is the Goal-owned upper bound. Codex separately owns the
+host-side [`[agents].max_concurrent_threads_per_session`](https://developers.openai.com/zh-Hans/docs/agent-configuration/subagents)
+limit. That Codex key
+counts child threads and excludes the main thread, so a Goal maximum of `6`
+requires a Codex value of `6`, not `7`.
+
+`--align-codex-subagent-capacity` turns the same preview/apply confirmation into
+a one-click cross-boundary adjustment. Preview reads the active `CODEX_HOME`,
+reports an explicit shortfall or an unknown implicit default, and performs no
+write. When a raise is needed, apply writes the canonical Codex key to at least
+`max_children`, keeps a higher existing value, removes the legacy
+`agents.max_threads` alias, writes atomically, and verifies an exact TOML
+readback. A sufficient legacy alias remains a compatible no-op. It never lowers capacity.
+Existing Sessions retain their startup configuration; the receipt therefore
+states when a new Session is required.
+
+`max_children` 是 Goal 权威拥有的上限；Codex 另外拥有宿主侧的
+`[agents].max_concurrent_threads_per_session`。该 Codex 配置只统计子线程，
+不包含主线程，因此 Goal 上限为 `6` 时，Codex 目标值也是 `6`，不是 `7`。
+
+加入 `--align-codex-subagent-capacity` 后，同一次 preview/apply 确认即可完成
+跨边界的一键对齐。预览只读取当前 `CODEX_HOME`，显示显式容量不足或“隐式默认值
+未知”，不会写文件；需要提升时，确认后只会把新配置键提升到至少
+`max_children`，保留已有更高值，移除旧别名 `agents.max_threads`，随后进行原子
+写入和精确 TOML 读回。容量已足够的旧别名仍是兼容的 no-op。该操作绝不降低
+容量。已有 Session 不会热加载宿主配置，因此回执会明确提示何时必须新建 Session。
 
 Task-domain filtering is optional. With no `--allowed-domain`, both tagged and
 untagged ready Todos remain eligible subject to every other admission boundary.
@@ -247,18 +295,31 @@ loopx quota should-run \
   --available-capability peer_agent_activation
 ```
 
-The contract includes only peer lanes that are currently actionable. Dormant
-registered agents and closed, blocked, or deferred todos are not coordinator
-candidates. A dormant or non-resumable lane is projected under
-`blocked_peer_lanes`; if no peer lane can run, the bundle has
+The peer contract is scoped to `execution_scope=peer_agent_activation`.
+Its `task_selection=canonical_claimed_candidates` identifies open claimed
+Todo candidates, not the task pinned to a running session. Canonical inventory
+outranks display rows; all eligible tasks for the same peer remain visible.
+Large inventories stay in the full decision. The thin TurnEnvelope preserves
+scoped gates, counts and a signed content hash plus a required detail read;
+counts alone never authorize a task selection. Native child lanes are preserved
+when only their nested peer diagnostic needs compaction.
+Only currently actionable candidates appear under `eligible_peer_lanes`.
+Closed, blocked, or deferred Todos are excluded. An open candidate whose peer
+is dormant or whose dependency is not ready appears under `blocked_peer_lanes`;
+if no peer lane can run, the bundle has
 `execution_state=blocked`,
 `terminal_outcome=blocked`, and `retry_policy=material_peer_state_change_only`.
+When native child admission succeeds, its adaptive contract remains actionable
+and retains the blocked peer contract as `peer_activation_diagnostic`. Neither
+path grants permission to use a different entrypoint.
 That blocked diagnostic does not replace the coordinator's own runnable lane or
 re-arm an activation obligation on every heartbeat. If the coordinator also
 has no in-scope runnable fallback, the final interaction mode is
-`peer_coordination_blocked`: schedulers return the bundle to its owner and stop
-the recurring heartbeat until peer capability/readiness, coordinator
-configuration, or the coordinator's own work frontier materially changes.
+`peer_coordination_blocked`: schedulers keep a no-spend observer alive with a
+10/20/30/60 minute stateful backoff. Peer capability/readiness, coordinator
+configuration, reassignment, or the coordinator's own work frontier changes
+the reset identity and restores the initial cadence; this recoverable state
+does not pause or delete the recurring heartbeat.
 
 Disable registered-peer coordination without changing peer registration or
 child-worker policy:
@@ -312,3 +373,241 @@ durable leader from a temporary coordination event.
 The result is parallel execution without a permanent leader: durable agents
 remain peers, while task coordination and host-child relationships stay bounded
 to the work that requires them.
+
+## Child Model Preferences And Read-Heavy Work
+
+Persist child launch preferences on the existing Goal orchestration policy:
+
+```bash
+loopx configure-goal --goal-id example-peer-task-goal \
+  --multi-subagent-feature enabled --max-children 2 \
+  --subagent-model gpt-5.6-luna --subagent-reasoning-effort max --execute
+loopx --format json configure-goal --goal-id example-peer-task-goal
+```
+
+Read back `after.orchestration.model_config` (or the current configuration
+summary) and `quota_should_run.goal_boundary.orchestration.model_config`.
+The registry stores this under `spawn_policy.model_config`. The current
+registry wins over an older project-asset model snapshot. Clearing the setting
+cannot resurrect a model preference from that snapshot.
+
+This is a per-Goal preference, not a global vendor default. Existing Goals with
+no model configuration retain their previous behavior. Setting a model alone
+does not enable spawning, change the coordinator model, register a peer, or
+supply a host capability. Disabling spawning retains the preference for later
+use. Remove both model and effort with:
+
+```bash
+loopx configure-goal --goal-id example-peer-task-goal \
+  --clear-subagent-model-config --execute
+```
+
+The native launch is still owned by the host/task coordinator. Before launch,
+read the model configuration and pass the model and effort explicitly through
+that host's supported arguments. Verify support against the host catalog;
+unsupported combinations must be reported instead of silently substituting
+the coordinator's model. Configuration readback proves persistence, not a model
+execution receipt. These instructions are coordinator guidance, not interception
+of arbitrary host tool calls. Automatic typed-driver argument propagation is
+not implemented by this configuration change.
+
+For read-heavy research, prefer fresh contexts with disjoint evidence questions:
+provide the exact source/period, allowed paths, claim to challenge, a bounded
+reading budget and a compact expected result. A worker returns source citations,
+units, calculations, counterevidence and unknowns; it does not edit the plan,
+spend quota or contact third parties. The coordinator verifies decisive claims
+against original sources and accepts or rejects the result. Two worker opinions
+are not two independent market observations. Record requested model/effort,
+worker reference and accepted evidence separately; do not infer the executed
+model from response style.
+
+中文操作要点：示例显式配置 Luna/max，仅作用于当前 Goal 的子任务偏好；
+未配置的 Goal 不改变默认行为。宿主启动时仍须显式传参并核验支持情况，
+不支持时不能悄悄继承主模型。只读研究拆分不同证据问题，子任务返回来源、
+反证和未知项，主任务复核并决定是否采纳。配置生效不等于研究结果有效。
+
+### Frontend configuration
+
+The capability detail page also lists **Coordinator workflow guidance** in
+English / **主 Agent 协作指导** in Chinese. It shows the three supported phases
+and their purpose, using the shared capability catalog. It is read-only metadata,
+not a per-run delivery indicator. The existing capability switch controls this
+guidance together with child capacity; there is no second enable switch.
+
+Goal settings → Goal details exposes child model and reasoning effort next to
+the existing execution boundary. “Use Luna / max” fills the draft only; use
+“Preview configuration update” to save it, including while execution is off.
+Clearing the preference returns to host defaults after applying the preview.
+Turning execution off retains the saved model preference.
+
+The Goal capability editor exposes the same fields through the existing
+`multi_subagent` capability. Both UI routes use the same registry policy and
+preview/readback validation; a model change invalidates an older preview.
+The model field is a preference, not a discovery menu or an execution receipt.
+The CLI accepts an empty `--subagent-reasoning-effort ''` to clear effort while
+retaining the model; `--clear-subagent-model-config` clears both.
+
+### Authorized delegation route discovery
+
+An operator can make the existing requester-scoped local delegation bindings
+discoverable to the same `multi_subagent` capability without copying grants,
+credentials or host arguments into the registry:
+
+```bash
+loopx configure-goal --goal-id example-peer-task-goal \
+  --subagent-execution-config .loopx/config/delegations.json
+loopx configure-goal --goal-id example-peer-task-goal \
+  --subagent-execution-config .loopx/config/delegations.json --execute
+loopx --format json configure-goal --goal-id example-peer-task-goal
+```
+
+The pointer must be a repository-relative JSON path under `.loopx/config/`.
+Keep the file ignored and operator-owned. The file and the existing local
+delegation validator remain the execution-grant authority; the Goal registry
+stores only the pointer. The Dashboard Goal settings and generic capability
+editor preview, apply and read back the same field. Clear it with
+`--clear-subagent-execution-config --execute`. Turning child execution off
+retains the pointer for a later re-enable.
+
+An unfinished Goal Chat run created before this field existed may resume with
+its already pinned Session reference until that run becomes terminal. New runs
+and completed legacy runs must configure the Goal-owned pointer first; the
+compatibility path does not write or synchronize a second configuration owner.
+
+At `before_plan`, `loopx agent-context` considers at most six bindings authorized
+for the current requester and projects as many as fit the existing context byte
+budget; `authorized_count` and `routes_truncated` make omissions explicit. Each
+route carries only binding/Agent/Todo/runtime
+identity, separate `runtime_readiness` and `readiness` observations, an optional public-safe execution profile and
+the existing host owner's `probe_scope` for a supplied non-null probe, and one stable
+`loopx delegation` entrypoint. Full probe/remediation facts are disclosed by
+inspecting that binding, not inlined into the planning budget. A separate, explicit
+`agent-context --phase after_delegate_result` read may include bounded
+operation-status and recovery-required counts. Automatic planning and managed
+return paths do not enumerate the operation journal. These reads do not launch,
+resume or accept a worker, and they never expose raw host
+arguments, workspaces, output references, credentials or child results.
+
+Runtime availability, entrypoint admission and business adoption are separate.
+`runtime_readiness=ready` only reports the existing runtime probe. Planning does
+not run the execution preflight: `execution_scope=bound_delegation` and
+`preflight=required` accompany `readiness=unknown` (or `blocked` for a known
+runtime failure). Use `loopx delegation inspect` on the selected binding to
+check canonical authority, task validation and Turn admission before dispatch.
+A peer-activation blocker does not assess this route or native children; neither
+does a successful runtime probe bypass authority promotion or another gate.
+Before dispatch, recheck runtime/model/budget and record a stable operation id;
+never silently substitute a runtime or model. User preferences guide independent
+batch selection; no heartbeat must relaunch every route. Lark and other managed
+surfaces consume this same capability context, not another route configuration.
+
+中文：peer 合约的阻塞范围仅为 `peer_agent_activation`，候选来自完整权威任务源，
+不再以显示列表第一条任务冒充绑定；同一 Agent 的多条候选保留。
+候选过多时，全量决策保留全部条目，简版携带状态、数量、哈希和必读详情引用；
+不能凭数量选择任务。若 native 子 Agent
+通过独立准入，使用 adaptive 合约并保留 `peer_activation_diagnostic`，不因另一个
+入口受阻而提前返回。运行库/凭据可用只记为 `runtime_readiness`；委派入口尚未预检时
+`readiness=unknown`、`preflight=required`，通过现有 `loopx delegation inspect`
+核验权威状态、任务验证与 Turn 准入。未知不等于禁用，ready 运行库也不等于可执行。
+用户的异构偏好影响批次选择，不要求每次心跳重启所有路线，不绕过任一真实门禁。
+投影保留 host owner 非空 probe 的 `probe_scope`，完整 probe 与修复代码通过原
+绑定预检渐进式披露，不额外发起探测或决定准入。`probing_interpreter` 的模块缺失只针对本次检查的解释器，不能
+推断整机没有运行库；未探测的通用适配器仍为 `null/unknown`。修复原绑定环境后必须
+重新核验，不通过创建替代 worker、静默换模型或复用旧任务成功来伪造恢复。
+
+中文：可在现有 `multi_subagent` 能力中配置
+`.loopx/config/delegations.json` 指针，让当前请求 Agent 在规划前看到自己已获授权的
+委托路由。注册表只保存指针，已忽略的本地文件与既有 delegation 校验器仍是执行授权
+唯一来源；Dashboard、通用 capability 编辑器、CLI 和 managed Turn 读写同一字段。
+投影只包含有界的路由就绪状态和回执计数，不包含凭据、host 参数、工作区或原始结果，
+也不会启动、恢复或验收任务。`ready` 只是运行时观察，不等于任务采用或执行成功；
+`blocked/unknown` 不阻塞其他有用工作，调度前仍须核对 runtime/model/budget，并禁止
+静默替换。
+
+### Capability context lifecycle
+
+An enabled `multi_subagent` capability contributes to the coordinator through
+the generic bounded provider contract in `control_plane/agent_context.ts`.
+The capability owns its guidance in `control_plane/subagent_context.ts`; other
+capabilities can implement the same typed provider interface and register with
+their runtime owner. This initial version registers this built-in provider,
+not arbitrary manifest scripts or external plugins.
+
+| Phase | Managed LoopX Turn call site | Coordinator responsibility |
+| --- | --- | --- |
+| `before_plan` | Live quota decision → `interaction_contract.agent_context` → signed `turn_envelope.agent_context` | Read requester-authorized route readiness when configured, choose only useful independent questions, and keep useful validation and integration work with the parent. |
+| `before_delegate` | Admitted child operations → plan and host request `delegation_context` | Bound briefs and expected evidence; recheck the chosen route/runtime/model/budget and forbid silent substitution. |
+| `after_delegate_result` | Host receipt reconciliation → journal `host_result.agent_context` → executor result `agent_context` | Reconcile bounded native receipts. Read delegation operation receipts explicitly when that separate source is needed, then validate original evidence and accept/defer/reject. |
+
+Planning guidance does not require two persistent Todos. Managed automatic
+child-lane admission still requires its existing prerequisites; this change
+does not grant spawning rights or force concurrency. Disabling the capability
+omits the context. Model preferences alone do not enable it.
+
+For a native-tool host such as a Codex App session, the LoopX project skill reads
+the same interface at delegation and result boundaries:
+
+```bash
+loopx agent-context --goal-id example-peer-task-goal --agent-id coordinator \
+  --phase before_delegate --format json
+loopx agent-context --goal-id example-peer-task-goal --agent-id coordinator \
+  --phase after_delegate_result --format json
+```
+
+`max_children` is the configured Goal ceiling, not a live count of available
+native host slots. When a native `spawn` or `followup` call reports the bounded
+`agent_thread_limit_reached` outcome, return that typed observation without raw
+host text:
+
+```bash
+loopx agent-context --goal-id example-peer-task-goal --agent-id coordinator \
+  --phase after_delegate_result --native-child-operation spawn \
+  --native-child-outcome agent_thread_limit_reached --native-child-count 1 \
+  --format json
+```
+
+The resulting `native_host_capacity` fact is read-only and scoped to the current
+host observation. It tells the coordinator to stop same-Turn spawn/followup
+retries, mark unlaunched work incomplete and continue useful parent work until
+capacity changes. It does not delete, import, resume or rebind sessions, lower
+the configured ceiling, or claim that a completed child freed a slot. Raw host
+errors and session identities are never accepted by this interface. A
+`succeeded` observation proves only that operation; it does not authorize
+another same-Turn attempt or claim that additional capacity remains.
+
+中文：`max_children` 只是 Goal 配置上限，不代表宿主此刻有同样数量的可用槽位。
+当原生 `spawn` 或 `followup` 返回 `agent_thread_limit_reached` 时，使用上述
+`after_delegate_result` 调用提交有界类型化观察；返回的
+`native_host_capacity` 会要求本 Turn 停止重复派发、把未启动工作标记为未完成，
+并继续主 Agent 的有用工作，待容量变化后再试。该只读接口不会删除、导入、恢复或
+重新绑定任何 Session，也不会把“子任务已完成”臆断成“容量已经释放”。一次
+`succeeded` 观察只证明该次操作成功，不会授权本 Turn 再次尝试，也不表示仍有
+额外容量。
+
+The coordinator must be registered. The command reads current registry policy
+without writing a Todo, starting a turn or spending quota. When an execution
+configuration is present, `before_plan` reads only the binding directory;
+`after_delegate_result` explicitly reads the current requester's existing local
+delegation operation journal. Otherwise it has no native execution receipt input
+and return-phase facts explicitly say `not_supplied`. The top-level
+`host_receipts_observed: false` is retained for compatibility and is explicitly
+scoped by `host_receipts_scope: native_tool_input`; it does not negate the
+separate bounded delegation-journal observation inside capability facts.
+LoopX cannot transparently intercept arbitrary host tools. The managed return
+packet is returned to the caller, not automatically sent as another model turn.
+
+Each packet binds Goal/Agent/optional Todo, phase, provider revision and a stable
+content ID. When the envelope approaches its existing budget, it carries a
+signed content hash and a read instruction pointing to the existing full-decision
+route instead of duplicating all guidance. Providers return only guidance, bounded facts and source references;
+they cannot replace action, permission or priority fields. Per-provider and
+aggregate limits are 2,048 and 3,072 UTF-8 bytes. Failures are isolated and
+diagnostic text excludes raw provider errors. These scoped context projections
+are not a new progress store and should not be exported as public evidence.
+`delivery: projected` means generated, not delivered/read/adopted. Read actual
+host receipts and parent validation evidence for those conclusions. Replaying
+a journal preserves the same packet; no new execution is inferred.
+
+中文：三个阶段已落到真实控制面接口，开启 capability 自动提供主 Agent
+协作指导。原生工具通过 skill 在边界读取同一接口，不声称拦截宿主工具。
+关闭 capability 即停止提供；前端展示支持范围，执行、采纳仍须看实际证据。

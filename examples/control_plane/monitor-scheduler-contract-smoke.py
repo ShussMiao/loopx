@@ -919,6 +919,42 @@ def assert_due_monitor_is_not_overridden_by_side_agent_scope_wait() -> None:
     assert contract["agent_channel"]["quiet_noop_allowed"] is False, contract
 
 
+def assert_known_due_monitor_survives_incomplete_work_counts() -> None:
+    status = status_payload(
+        agent_todo_items=[
+            monitor_item(
+                index=1,
+                todo_id="todo_incomplete_source_due_monitor",
+                priority="P1",
+                next_due_at=PAST_DUE_AT,
+                target_key="incomplete-source-due-watch",
+            ),
+            {
+                "index": 2,
+                "text": "[P1] Deferred independent branch work.",
+                "todo_id": "todo_deferred_branch_successor",
+                "role": "agent",
+                "status": "deferred",
+                "task_class": "advancement_task",
+                "claimed_by": AGENT_ID,
+                "resume_when": "capacity_available:project_branch",
+            },
+        ]
+    )
+    agent_todos = status["attention_queue"]["items"][0]["project_asset"]["agent_todos"]
+    # A legacy/partial source cannot certify monitor-only scheduling, but its
+    # explicitly projected due Todo remains an executable candidate.
+    agent_todos["work_counts"]["complete"] = False
+
+    guard = build_quota_should_run(status, goal_id=GOAL_ID, agent_id=AGENT_ID)
+    assert guard["agent_todo_summary"]["work_counts"]["complete"] is False, guard
+    assert guard["agent_todo_summary"]["monitor_due_count"] == 1, guard
+    assert guard["decision"] == "run", guard
+    assert guard["work_lane_contract"]["selected_todo_id"] == "todo_incomplete_source_due_monitor", guard
+    assert guard["interaction_contract"]["agent_channel"]["must_attempt"] is True, guard
+    assert "agent_scope_frontier" not in guard, guard
+
+
 def assert_multiple_due_monitor_cap_and_order() -> None:
     guard = guard_for(
         [
@@ -1043,6 +1079,7 @@ def main() -> int:
     assert_capability_repair_precedes_scheduled_monitor_wait()
     assert_read_only_projected_due_monitor_does_not_force_writeback()
     assert_due_monitor_is_not_overridden_by_side_agent_scope_wait()
+    assert_known_due_monitor_survives_incomplete_work_counts()
     assert_multiple_due_monitor_cap_and_order()
     assert_other_agent_due_monitor_does_not_preempt_current_agent_lane()
     assert_other_agent_claimed_work_stays_diagnostic_when_no_current_lane()

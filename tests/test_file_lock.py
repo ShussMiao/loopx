@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import loopx.file_lock as file_lock
 from loopx.file_lock import (
     LOCK_ACQUIRE_TIMEOUT_ERROR_CODE,
     LockAcquireTimeoutError,
+    _safe_label,
     exclusive_cross_runtime_file_lock,
     exclusive_file_lock,
     fcntl,
@@ -91,6 +93,9 @@ def test_exclusive_lock_persists_public_safe_holder_metadata(tmp_path: Path) -> 
         holder_path = lock_holder_path(target)
         holder = json.loads(holder_path.read_text(encoding="utf-8"))
         assert holder["pid"] > 0
+        # The record names its own machine, so a reader on another host that
+        # shares this runtime root never treats the pid as local.
+        assert holder["host"] == _safe_label(socket.gethostname(), fallback="unknown")
         assert holder["agent_id"] == "agent-a"
         assert holder["operation"] == "todo-update"
         assert holder["acquired_at"].endswith("Z")
@@ -100,6 +105,33 @@ def test_exclusive_lock_persists_public_safe_holder_metadata(tmp_path: Path) -> 
     assert released["released_at"].endswith("Z")
     assert lock_path.exists()
     assert holder_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
+def test_exclusive_lock_rejects_a_symlinked_lock_file(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("unchanged\n", encoding="utf-8")
+    target.with_name(f"{target.name}.lock").symlink_to(victim)
+
+    with pytest.raises(OSError):
+        with exclusive_file_lock(target):
+            pytest.fail("symlinked lock file was accepted")
+
+    assert victim.read_text(encoding="utf-8") == "unchanged\n"
+
+
+def test_exclusive_lock_rejects_a_hard_linked_lock_file(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("unchanged\n", encoding="utf-8")
+    os.link(victim, target.with_name(f"{target.name}.lock"))
+
+    with pytest.raises(OSError):
+        with exclusive_file_lock(target):
+            pytest.fail("hard-linked lock file was accepted")
+
+    assert victim.read_text(encoding="utf-8") == "unchanged\n"
 
 
 def test_stalled_holder_times_out_and_records_independent_incident(tmp_path: Path) -> None:
@@ -122,9 +154,18 @@ def test_stalled_holder_times_out_and_records_independent_incident(tmp_path: Pat
         assert payload["incident_recorded"] is True
         incident = payload["lock_timeout"]
         assert incident["holder"]["pid"] == process.pid
+        assert incident["holder"]["host"] == _safe_label(
+            socket.gethostname(), fallback="unknown"
+        )
         assert incident["holder"]["agent_id"] == "holder-agent"
         assert incident["waiter"]["agent_id"] == "waiter-agent"
         assert incident["waiter"]["waited_seconds"] >= 0.1
+        # The refused waiter learns which machine holds the pid, so the operator
+        # looks for it on the right host instead of assuming it is local.
+        assert (
+            incident["operator_action"]["holder_host"]
+            == incident["holder"]["host"]
+        )
         assert incident["operator_action"]["retry_mode"] == (
             "manual_after_holder_inspection"
         )
@@ -144,6 +185,30 @@ def test_stalled_holder_times_out_and_records_independent_incident(tmp_path: Pat
         _stop(process)
 
     assert target.with_name(f"{target.name}.lock").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
+def test_lock_timeout_does_not_follow_a_symlinked_incident_file(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "todos.md"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("unchanged\n", encoding="utf-8")
+    process = _start_stalled_holder(target)
+    try:
+        lock_incident_path(target).symlink_to(victim)
+        with pytest.raises(LockAcquireTimeoutError) as raised:
+            with exclusive_file_lock(
+                target,
+                timeout_seconds=0.05,
+                poll_interval_seconds=0.01,
+            ):
+                pytest.fail("waiter unexpectedly acquired the stalled lock")
+
+        assert raised.value.incident_recorded is False
+        assert victim.read_text(encoding="utf-8") == "unchanged\n"
+    finally:
+        _stop(process)
 
 
 def test_single_flight_returns_none_without_timeout_incident(tmp_path: Path) -> None:

@@ -2,26 +2,19 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from .experiment_identity import experiment_token_text as _token
 from .four_arm_contract import (
     BENCHMARK_FOUR_ARM_CONTRACT_SCHEMA_VERSION,
     BENCHMARK_FOUR_ARM_QUALIFICATION_SCOPE,
 )
+from ...control_plane.content_digest import BARE_SHA256_PATTERN
 
 BENCHMARK_FACTORIAL_CONTRAST_SCHEMA_VERSION = "benchmark_factorial_contrast_v0"
 
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,127}$")
 _FACTOR_CELLS = {(False, False), (True, False), (False, True), (True, True)}
-
-
-def _token(value: Any, *, field: str) -> str:
-    text = str(value or "").strip()
-    if not _TOKEN_RE.fullmatch(text):
-        raise ValueError(f"{field} must be a compact public-safe token")
-    return text
 
 
 def _optional_token(value: Any, *, field: str) -> str | None:
@@ -124,7 +117,7 @@ def _normalize_four_arm_design(contract: Mapping[str, Any]) -> dict[str, Any]:
         if arm_role != expected_role:
             raise ValueError("four-arm contract role does not match its factor cell")
         task_goal_sha256 = str(raw_arm.get("task_goal_sha256") or "").strip()
-        if not re.fullmatch(r"[0-9a-f]{64}", task_goal_sha256):
+        if not BARE_SHA256_PATTERN.fullmatch(task_goal_sha256):
             raise ValueError("four-arm task-goal hash must be sha256")
         arm = {
             "arm_id": arm_id,

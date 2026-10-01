@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -125,138 +124,25 @@ def _migrate(paths: dict[str, Path], *, execute: bool) -> dict[str, object]:
     )
 
 
-def test_execute_excludes_old_shadow_and_seeds_fresh_target_lineage(
-    tmp_path: Path,
-) -> None:
+@pytest.mark.parametrize("execute", [False, True])
+def test_migration_preserves_old_store_without_reseeding_retired_lineage(tmp_path: Path, execute: bool) -> None:
     paths = _migration_fixture(tmp_path)
-
-    result = _migrate(paths, execute=True)
-
+    old_dir = paths["legacy_runtime"] / "authority-shadow" / "file" / OLD_GOAL_ID
+    before = {p.name: p.read_bytes() for p in old_dir.iterdir()}
+    result = _migrate(paths, execute=execute)
     assert result["ok"] is True
-    runtime_result = result["runtime_goals"][0]  # type: ignore[index]
-    assert runtime_result["copied"] is True
-
-    target_goal_runtime = paths["target_runtime"] / "goals" / NEW_GOAL_ID
-    copied_lease = json.loads(
-        (target_goal_runtime / "task-leases" / "safe-local.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert copied_lease["goal_id"] == NEW_GOAL_ID
-
-    target_store_dir = (
-        paths["target_runtime"] / "authority-shadow" / "file" / NEW_GOAL_ID
-    )
-    target_identity = (target_store_dir / "store-identity").read_text(encoding="utf-8")
-    assert target_identity.startswith("file:")
-    assert target_identity != OLD_STORE_IDENTITY
-
-    store_paths = list(target_store_dir.glob("authority-store-*.json"))
-    assert len(store_paths) == 1
-    store_payload = json.loads(store_paths[0].read_text(encoding="utf-8"))
-    assert store_payload["goal_id"] == NEW_GOAL_ID
-    assert store_payload["store_identity"] == target_identity
-    assert store_payload["cursor"] == "1"
-    assert len(store_payload["committed"]) == 1
-    serialized_store = json.dumps(store_payload, sort_keys=True)
-    assert OLD_STORE_IDENTITY not in serialized_store
-    assert "file:99:legacy-lineage" not in serialized_store
-    assert str(paths["source_repo"]) not in serialized_store
-    assert "must-never-migrate" not in serialized_store
-
-    seed = result["authority_shadow_seeds"][0]  # type: ignore[index]
-    assert seed["goal_id"] == NEW_GOAL_ID
-    assert seed["attempted"] is True
-    assert seed["outcome"] == "captured"
-
-
-def test_dry_run_reports_exclusion_and_seed_plan_without_writing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    paths = _migration_fixture(tmp_path)
-    sentinel = b'{"schema_version":"existing","goals":[]}\n'
-    paths["target_registry"].write_bytes(sentinel)
-
-    def forbidden_observer(**_kwargs: object) -> object:
-        raise AssertionError("dry-run called the shadow observer")
-
-    original_rglob = Path.rglob
-
-    def guarded_rglob(path: Path, pattern: str) -> Iterator[Path]:
-        if path.name == "authority-shadow":
-            raise AssertionError("migration entered candidate-provider storage")
-        return original_rglob(path, pattern)
-
-    monkeypatch.setattr(
-        "loopx.control_plane.coordination.local_authority_shadow_observation."
-        "observe_local_authority_commit",
-        forbidden_observer,
-    )
-    monkeypatch.setattr(Path, "rglob", guarded_rglob)
-
-    result = _migrate(paths, execute=False)
-
-    assert result["ok"] is True
-    assert result["dry_run"] is True
-    assert paths["target_registry"].read_bytes() == sentinel
-    assert not paths["target_runtime"].exists()
-    runtime_result = result["runtime_goals"][0]  # type: ignore[index]
-    assert runtime_result["copied_file_count"] == 0
-    seed = result["authority_shadow_seeds"][0]  # type: ignore[index]
-    assert seed == {
+    assert result["authority_shadow_seeds"] == [{
         "schema_version": "loopx_state_migration_shadow_seed_evidence_v0",
-        "goal_id": NEW_GOAL_ID,
-        "attempted": False,
-        "outcome": "planned",
-        "reason_code": None,
-    }
-    rendered = render_state_migration_markdown(result)
-    assert "Authority Shadow Seeds" in rendered
-    assert "outcome=`planned`" in rendered
-    assert "must-never-migrate" not in json.dumps(result, sort_keys=True)
-    assert "must-never-migrate" not in rendered
-
-
-def test_seed_failure_is_public_safe_evidence_and_does_not_reverse_migration(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    paths = _migration_fixture(tmp_path)
-
-    def fail_observer(**_kwargs: object) -> object:
-        raise RuntimeError("credential=private-provider-value")
-
-    monkeypatch.setattr(
-        "loopx.control_plane.coordination.local_authority_shadow_observation."
-        "observe_local_authority_commit",
-        fail_observer,
-    )
-
-    result = _migrate(paths, execute=True)
-
-    assert result["ok"] is True
-    assert result["wrote_project_registry"] is True
-    migrated_registry = json.loads(paths["target_registry"].read_text(encoding="utf-8"))
-    assert migrated_registry["goals"][0]["id"] == NEW_GOAL_ID
-    assert (
-        paths["target_runtime"]
-        / "goals"
-        / NEW_GOAL_ID
-        / "task-leases"
-        / "safe-local.json"
-    ).exists()
-
-    seed = result["authority_shadow_seeds"][0]  # type: ignore[index]
-    assert seed["outcome"] == "failed"
-    assert seed["reason_code"] == "post_migration_shadow_seed_failed"
-    assert seed["attempted"] is True
-    assert "credential" not in json.dumps(result, sort_keys=True)
-    assert "private-provider-value" not in json.dumps(result, sort_keys=True)
-    assert not (
-        paths["target_runtime"]
-        / "authority-shadow"
-        / "file"
-        / NEW_GOAL_ID
-        / "authority-store-legacy.json"
-    ).exists()
+        "goal_id": NEW_GOAL_ID, "attempted": False, "outcome": "retired",
+        "reason_code": "local_authority_shadow_retired"}]
+    assert not (paths["target_runtime"] / "authority-shadow").exists()
+    assert {p.name: p.read_bytes() for p in old_dir.iterdir()} == before
+    assert "retired" in render_state_migration_markdown(result)
+    if execute:
+        target = json.loads(paths["target_registry"].read_text())["goals"][0]
+        assert target["id"] == NEW_GOAL_ID
+        assert "runtime_shadow" not in target["coordination"]
+        lease = paths["target_runtime"] / "goals" / NEW_GOAL_ID / "task-leases" / "safe-local.json"
+        assert json.loads(lease.read_text())["goal_id"] == NEW_GOAL_ID
+    else:
+        assert not paths["target_registry"].exists()

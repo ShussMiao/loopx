@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import test from "node:test";
+import {resolveTestPython} from "../../scripts/test-python.mjs";
+
+const PYTHON = resolveTestPython();
 
 import {
   canonicalCoordinationRecord,
@@ -69,7 +72,7 @@ const TODO = {
 
 function pythonContract(): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
-    const child = spawn("python3", ["-c", [
+    const child = spawn(PYTHON, ["-c", [
       "import json",
       "from loopx.control_plane.coordination.coordination_state_contract import COORDINATION_STATE_CONTRACT",
       "print(json.dumps(COORDINATION_STATE_CONTRACT, default=dict, sort_keys=True, separators=(',', ':')))",
@@ -100,7 +103,7 @@ test("coordination state contract generates identical cross-language bindings", 
 test("generated coordination bindings are current", async () => {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(
-      "python3",
+      PYTHON,
       ["scripts/generate_coordination_state_contract.py", "--check"],
       { cwd: process.cwd() },
     );

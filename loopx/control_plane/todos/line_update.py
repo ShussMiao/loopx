@@ -4,6 +4,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from .authoring_scope import todo_authoring_facts
+from .external_wait_contract import TodoExternalWaitAuthoringError, build_monitor_advancement_authoring_contract
+from .update_source import todo_update_snapshot
+from .todo_semantics import todo_priority_label
 
 from .active_state_editing import (
     TODO_SECTION_HEADINGS,
@@ -42,6 +46,7 @@ from .completion_state import (
     normalize_todo_completion_continuation,
     normalize_todo_completion_recovery,
 )
+from .contract import TODO_MONITOR_METADATA_FIELDS
 
 
 def upsert_todo_metadata(
@@ -150,17 +155,22 @@ def link_superseding_todo_id(
 
 
 def _field_update_plan(
-    block: Mapping[str, Any], intent: dict[str, Any], updated_at: str
+    block: Mapping[str, Any], intent: dict[str, Any], updated_at: str,
+    monitor_context: dict[str, Any] | None = None,
+    public_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Adapt source facts only; the TS planner owns omission/clear/state rules."""
     try:
         result = effect_runtime_result(
-            "todo.field_update.plan",
+            "todo.public_update.plan" if public_context is not None else "todo.field_update.plan",
             {
-                "schema_version": "loopx_todo_field_update_request_v0",
+                "schema_version": "todo_public_update_request_v0" if public_context is not None else "loopx_todo_field_update_request_v0",
                 "todo": {
-                    key: block.get(key)
+                    **todo_authoring_facts(dict(block)),
+                    "role": block.get("role"),
+                    **{key: block.get(key)
                     for key in (
+                        "text",
                         "todo_id",
                         "status",
                         "claimed_by",
@@ -169,13 +179,25 @@ def _field_update_plan(
                         "no_followup",
                         "completion_continuation",
                         "successor_todo_ids",
-                    )
+                        "resume_monitor_generation",
+                        "task_class",
+                        *TODO_MONITOR_METADATA_FIELDS,
+                    )},
                 },
                 "intent": intent,
                 "updated_at": updated_at,
+                "monitor_context": monitor_context,
+                "context": public_context,
             },
         )
     except EffectRuntimeRejected as exc:
+        if public_context is not None and exc.diagnostic_code.startswith("external_wait_"):
+            condition = str(intent.get("resume_when") or block.get("resume_when") or "").strip().lower()
+            kind, _, target = condition.partition(":")
+            raise TodoExternalWaitAuthoringError(str(exc), code=exc.diagnostic_code,
+                monitor_todo_id=target if kind == "monitor_changed" else None,
+                successor_todo_ids=intent.get("successor_todo_ids")
+                    if intent.get("successor_todo_ids") is not None else block.get("successor_todo_ids")) from None
         raise ValueError(str(exc)) from None
     if (
         not isinstance(result, dict)
@@ -186,6 +208,11 @@ def _field_update_plan(
         or not isinstance(result.get("metadata_updates"), dict)
     ):
         raise RuntimeError("TypeScript Todo field update result shape mismatch")
+    transition = result.get("external_wait_transition")
+    if isinstance(transition, dict) and transition.get("resume_kind") == "monitor_changed":
+        transition["authoring_contract"] = build_monitor_advancement_authoring_contract(
+            monitor_todo_id=transition["dependency_todo_id"],
+            successor_todo_ids=transition["successor_todo_ids"])
     return result
 
 
@@ -194,6 +221,8 @@ def apply_todo_update_to_lines(
     *,
     todo_id: str,
     text: str | None = None,
+    priority: str | None = None,
+    clear_priority: bool = False,
     status: str | None = None,
     role: str | None = None,
     note: str | None = None,
@@ -232,11 +261,13 @@ def apply_todo_update_to_lines(
     clear_resume_when: bool = False,
     no_followup: bool | None = None,
     monitor_metadata: dict[str, Any] | None = None,
+    monitor_context: dict[str, Any] | None = None,
+    public_context: dict[str, Any] | None = None,
     clear_claim: bool = False,
     claim_only: bool = False,
     updated_at: str,
 ) -> dict[str, Any]:
-    normalized_resume_when = require_supported_todo_resume_when(resume_when)
+    normalized_resume_when = resume_when if public_context is not None else require_supported_todo_resume_when(resume_when)
     if normalized_resume_when and clear_resume_when:
         raise ValueError(
             "todo update accepts either resume_when or clear_resume_when, not both"
@@ -255,9 +286,13 @@ def apply_todo_update_to_lines(
             f"todo_id {normalized_todo_id!r} was not found in active user or agent todos"
         )
     resolved_role, section, _start, _end, block = block_match
-    plan = _field_update_plan(
-        block,
-        {
+    if public_context is not None:
+        public_context = {**public_context, "items": todo_update_snapshot(lines)
+                          if resume_when or block.get("resume_when") else []}
+    raw_intent = {
+            "text": text,
+            "priority": priority,
+            "clear_priority": clear_priority,
             "status": status,
             "note": note,
             "evidence": evidence,
@@ -297,12 +332,29 @@ def apply_todo_update_to_lines(
             "monitor_metadata": monitor_metadata,
             "clear_claim": clear_claim,
             "claim_only": claim_only,
-        },
+    }
+    # Python's compatibility API uses None (and blank note text) for
+    # omission. Strip those sentinels before crossing the typed planner; an
+    # actual empty scalar such as reason="" remains an explicit clear.
+    intent = {
+        key: value for key, value in raw_intent.items()
+        if value is not None and not (
+            key == "note" and isinstance(value, str) and not value.strip()
+        )
+    }
+    plan = _field_update_plan(
+        {**block, "role": resolved_role},
+        intent,
         updated_at,
+        monitor_context,
+        public_context,
     )
     normalized_status = plan["normalized_status"]
     target_status = plan["target_status"]
     updates = plan["metadata_updates"]
+    text = updates.pop("text", text)
+    updated_priority = updates.pop("priority", todo_priority_label(block))
+    updates.pop("title", None)
     status_changed = (
         set_todo_marker(lines, block, normalized_status) if normalized_status else False
     )
@@ -319,6 +371,10 @@ def apply_todo_update_to_lines(
     metadata_updated = upsert_todo_metadata(lines, block, metadata_line)
     effective_metadata = parse_todo_metadata_line(metadata_line or "") or {}
     return {
+        **({"monitor_poll_transition": plan["monitor_poll_transition"]}
+           if "monitor_poll_transition" in plan else {}),
+        **({"external_wait_transition": plan["external_wait_transition"]}
+           if "external_wait_transition" in plan else {}),
         "role": resolved_role,
         "section": section,
         "todo": block.get("text"),
@@ -326,6 +382,7 @@ def apply_todo_update_to_lines(
         "status": target_status,
         "status_changed": status_changed,
         "text_changed": text_changed,
+        "priority": updated_priority,
         "metadata_updated": metadata_updated,
         "changed": status_changed or text_changed or metadata_updated,
         "claimed_by": normalize_todo_claimed_by(effective_metadata.get("claimed_by")),

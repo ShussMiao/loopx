@@ -24,6 +24,8 @@ from .contract import (
     reject_private_material,
 )
 
+from .stream_recovery import qualify_stream_recovery
+
 EXTENSION_ID = "loopx-codex-provider-routing"
 
 
@@ -57,6 +59,7 @@ def _doctor() -> int:
                 "qualify_outage_recovery",
                 "qualify_quota_recovery",
                 "qualify_snapshot",
+                "qualify_stream_recovery",
                 "qualify_tool_transport",
                 "reconcile_integration_candidate",
                 "upgrade_plan",
@@ -84,6 +87,7 @@ def _run_request(request: Any) -> dict[str, Any]:
         "qualify_outage_recovery": "outage_recovery",
         "qualify_quota_recovery": "quota_recovery",
         "qualify_snapshot": "snapshot",
+        "qualify_stream_recovery": "stream_recovery",
         "qualify_tool_transport": "tool_transport",
         "reconcile_integration_candidate": "integration",
         "upgrade_plan": "upgrade",
@@ -144,6 +148,11 @@ def _run_request(request: Any) -> dict[str, Any]:
         if not isinstance(quota_recovery, Mapping):
             raise ValueError("qualify_quota_recovery requires object `quota_recovery`")
         result = qualify_quota_recovery(quota_recovery)
+    elif operation == "qualify_stream_recovery":
+        recovery = request.get("stream_recovery")
+        if not isinstance(recovery, Mapping):
+            raise ValueError("qualify_stream_recovery requires object `stream_recovery`")
+        result = qualify_stream_recovery(recovery)
     elif operation == "qualify_snapshot":
         snapshot = request.get("snapshot")
         if not isinstance(snapshot, Mapping):

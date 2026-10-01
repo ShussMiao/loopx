@@ -14,6 +14,11 @@ from loopx.status import project_post_handoff_history
 
 PROFILE = {"outcome_floor": {"outcome_markers": ["outcome"], "surface_only_hints": ["surface"]}}
 
+# Every resume evaluation in this module reads one injected clock instead of the
+# wall clock, so the fixtures stay valid before and after any scheduled instant.
+EVALUATED_AT = "2026-09-14T00:00:00Z"
+RESUME_AT = "2026-09-15T00:00:00Z"
+
 
 def blocked_run():
     return {"agent_id": "agent-a", "todo_id": "todo_delivery", "delivery_outcome": "outcome_gap",
@@ -89,13 +94,20 @@ def test_status_compaction_preserves_binding_and_all_consumers_defer_to_current_
     ("monitor_changed:todo_dependency", {"baseline_generation": 1}),
     ("capacity_available:network", {"capability": "other"}),
     ("pr_merged:#1", {"pr_number": 2}),
+    # The scheduled instant is one day ahead of the injected evaluation clock,
+    # so the condition stays unsatisfied no matter when CI runs.
+    (f"resume_at:{RESUME_AT}", {"clock_provider": "other"}),
 ])
 def test_real_resume_projection_identity_survives_python_transport(resume, patch):
     todo = {**waiting_todo(), "resume_when": resume, "resume_monitor_generation": 0,
             "task_repository": "git:github.com/example/project"}
     dependency = {**dependency_todo(), "task_class": "continuous_monitor", "material_change_generation": 0}
-    condition = evaluate_todo_resume_conditions([todo], source_items=[dependency], available_capabilities=[])[todo["todo_id"]]
-    summary = quota_todo_summary([todo, dependency], claim_scope_agent_id="agent-a")
+    condition = evaluate_todo_resume_conditions(
+        [todo], source_items=[dependency], available_capabilities=[],
+        evaluated_at=EVALUATED_AT,
+    )[todo["todo_id"]]
+    summary = quota_todo_summary([todo, dependency], claim_scope_agent_id="agent-a",
+                                evaluated_at=EVALUATED_AT)
     for key in TODO_PLANNING_SOURCE_KEYS:
         for row in summary.get(key, []):
             if row["todo_id"] == todo["todo_id"]:
@@ -103,6 +115,49 @@ def test_real_resume_projection_identity_survives_python_transport(resume, patch
     assert project_delivery_response(blocked_run(), summary)["reason"] == "canonical_todo_wait"
     condition.update(patch)
     assert project_delivery_response(blocked_run(), summary)["reason"] == "history_supervision"
+
+
+def _resume_at_projection(evaluated_at: str, tamper_clock: bool = False) -> tuple[bool, str]:
+    """Evaluate one `resume_at` wait at an explicit instant and project it."""
+
+    todo = {**waiting_todo(), "resume_when": f"resume_at:{RESUME_AT}", "resume_monitor_generation": 0,
+            "task_repository": "git:github.com/example/project"}
+    dependency = {**dependency_todo(), "task_class": "continuous_monitor", "material_change_generation": 0}
+    condition = evaluate_todo_resume_conditions(
+        [todo], source_items=[dependency], available_capabilities=[],
+        evaluated_at=evaluated_at,
+    )[todo["todo_id"]]
+    summary = quota_todo_summary([todo, dependency], claim_scope_agent_id="agent-a",
+                                evaluated_at=evaluated_at)
+    for key in TODO_PLANNING_SOURCE_KEYS:
+        for row in summary.get(key, []):
+            if row["todo_id"] == todo["todo_id"]:
+                row["resume_condition"] = condition
+    if tamper_clock:
+        condition.update({"clock_provider": "other"})
+    return bool(condition.get("satisfied")), project_delivery_response(blocked_run(), summary)["reason"]
+
+
+@pytest.mark.parametrize("evaluated_at, expected_reason", [
+    ("2026-09-14T00:00:00Z", "canonical_todo_wait"),
+    ("2026-09-14T23:59:59Z", "canonical_todo_wait"),
+    ("2026-09-15T00:00:00Z", "history_supervision"),
+    ("2026-09-15T00:00:01Z", "history_supervision"),
+    ("2027-09-15T00:00:00Z", "history_supervision"),
+])
+def test_resume_at_boundary_projects_from_the_injected_clock_not_the_wall_clock(evaluated_at, expected_reason):
+    """A `resume_at` boundary must stay stable before and after the scheduled instant.
+
+    The wall clock passed `RESUME_AT` long before this regression was written, so
+    only an injected evaluation time can keep both sides of the boundary covered.
+    """
+
+    satisfied, reason = _resume_at_projection(evaluated_at)
+    assert reason == expected_reason
+    assert satisfied is (expected_reason == "history_supervision")
+    # An unsatisfied wait still yields to a tampered clock provider, which is the
+    # history-supervision half of the original transport contract.
+    assert _resume_at_projection(evaluated_at, tamper_clock=True)[1] == "history_supervision"
 
 
 def test_surface_supervision_remains_and_invalid_wait_does_not_clear_floor():

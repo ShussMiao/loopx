@@ -1,17 +1,17 @@
 from __future__ import annotations
+from .effective_action import EffectiveAction
 
-import json
 from collections.abc import Mapping
 from pathlib import Path
 
 from ...file_lock import exclusive_file_lock
 from ...rollout_event_log import (
-    ROLLOUT_EVENT_SCHEMA_VERSION,
+    _append_rollout_event_line,
     build_rollout_event,
     load_rollout_events,
     rollout_event_log_path,
 )
-from ..todos.contract import normalize_todo_replan_obligation_id
+from ..todos.contract import normalize_todo_id, normalize_todo_replan_obligation_id
 from .effect_program import SettlementBindingKind, SettlementIdentity
 from .error_codes import HeartbeatReceiptIdentityConflictError
 from .settlement_workspace_causality import (
@@ -115,6 +115,19 @@ def heartbeat_receipt_semantic_replan_obligation_id(
     )
 
 
+def heartbeat_receipt_pending_action_todo_id(
+    event: Mapping[str, object] | None,
+) -> str | None:
+    """Return an explicit Todo choice retained before settlement binding."""
+
+    if not isinstance(event, Mapping):
+        return None
+    details = event.get("details")
+    if not isinstance(details, Mapping):
+        return None
+    return normalize_todo_id(details.get("pending_action_selection_todo_id"))
+
+
 def _effective_heartbeat_receipt(
     events: list[dict[str, object]],
 ) -> dict[str, object] | None:
@@ -156,8 +169,26 @@ def find_heartbeat_receipt(
 def ensure_turn_heartbeat_settlement_receipt(
     runtime_root: Path,
     identity: SettlementIdentity,
+    *,
+    semantic_replan_guard_scoped: bool,
+    semantic_replan_obligation_id: str | None,
 ) -> dict[str, object]:
-    """Idempotently bind a Turn-created quota guard to its settlement identity."""
+    """Idempotently bind a Turn-created quota guard to its settlement identity.
+
+    Current Turn envelopes always carry ``replan_action_packet`` even when no
+    obligation was selected.  Persist that explicit empty selection so an
+    obligation opened while the host is running cannot retroactively reject
+    the admitted Turn.  Old envelopes without the field stay legacy-unscoped.
+    """
+
+    normalized_semantic_replan_obligation_id = (
+        normalize_todo_replan_obligation_id(semantic_replan_obligation_id)
+    )
+    if (
+        semantic_replan_obligation_id is not None
+        and normalized_semantic_replan_obligation_id is None
+    ):
+        raise ValueError("Turn semantic replan obligation id is malformed")
 
     log_path = rollout_event_log_path(runtime_root, identity.goal_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,7 +213,33 @@ def ensure_turn_heartbeat_settlement_receipt(
                     raise HeartbeatReceiptIdentityConflictError(
                         "Turn heartbeat receipt belongs to another settlement identity"
                     )
-                return effective
+                effective_details = effective.get("details")
+                effective_details = (
+                    effective_details
+                    if isinstance(effective_details, Mapping)
+                    else {}
+                )
+                if not semantic_replan_guard_scoped:
+                    return effective
+                if "semantic_replan_obligation_id" in effective_details:
+                    raw_existing_guard = effective_details.get(
+                        "semantic_replan_obligation_id"
+                    )
+                    existing_guard = normalize_todo_replan_obligation_id(
+                        raw_existing_guard
+                    )
+                    if (
+                        str(raw_existing_guard or "").strip()
+                        and existing_guard is None
+                    ):
+                        raise HeartbeatReceiptIdentityConflictError(
+                            "Turn heartbeat receipt has a malformed semantic replan guard"
+                        )
+                    if existing_guard != normalized_semantic_replan_obligation_id:
+                        raise HeartbeatReceiptIdentityConflictError(
+                            "Turn heartbeat receipt belongs to another semantic replan guard"
+                        )
+                    return effective
 
         details = {
             "turn_instance_id": identity.turn_instance_id,
@@ -192,6 +249,10 @@ def ensure_turn_heartbeat_settlement_receipt(
             "stall_observation": "not_applicable",
             "source": "loopx_turn_run_once",
         }
+        if semantic_replan_guard_scoped:
+            details["semantic_replan_obligation_id"] = (
+                normalized_semantic_replan_obligation_id or ""
+            )
         source_event_id = (
             str(effective.get("event_id") or "").strip()
             if effective is not None
@@ -209,9 +270,90 @@ def ensure_turn_heartbeat_settlement_receipt(
             caused_by=source_event_id or None,
             details=details,
         )
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(receipt, sort_keys=True, ensure_ascii=False) + "\n")
+        _append_rollout_event_line(log_path, receipt)
         return receipt
+
+
+def retain_pending_heartbeat_action_selection(
+    runtime_root: Path,
+    *,
+    goal_id: str,
+    agent_id: str,
+    turn_instance_id: str,
+    todo_id: str,
+    reason: str,
+) -> tuple[dict[str, object], bool]:
+    """Append an identity-less revision retaining one explicit Todo choice.
+
+    The choice is not settlement authority.  It only fences a later no-argument
+    reentry from silently replacing the agent's explicit selection with a new
+    recommendation.  A later explicit selection may replace it until the Turn
+    acquires its single settlement identity.
+    """
+
+    normalized_todo_id = normalize_todo_id(todo_id)
+    if normalized_todo_id is None:
+        raise HeartbeatReceiptIdentityConflictError(
+            "pending heartbeat action selection requires a legal Todo id"
+        )
+    normalized_reason = str(reason or "current_delivery_gate").strip()
+    log_path = rollout_event_log_path(runtime_root, goal_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive_file_lock(log_path):
+        events = load_rollout_events(log_path)
+        matching = _heartbeat_receipt_events(
+            events,
+            goal_id=goal_id,
+            agent_id=agent_id,
+            turn_instance_id=turn_instance_id,
+        )
+        effective = _effective_heartbeat_receipt(matching)
+        if effective is None:
+            raise ValueError(
+                "identity-less heartbeat receipt is missing; rerun the original guard"
+            )
+        if _receipt_settlement_identity(effective) is not None:
+            raise HeartbeatReceiptIdentityConflictError(
+                "a settled heartbeat Turn cannot retain a different pending selection"
+            )
+        details_value = effective.get("details")
+        details = (
+            dict(details_value) if isinstance(details_value, Mapping) else {}
+        )
+        if (
+            normalize_todo_id(details.get("pending_action_selection_todo_id"))
+            == normalized_todo_id
+            and str(details.get("pending_action_selection_reason") or "").strip()
+            == normalized_reason
+        ):
+            return effective, False
+        details.update(
+            {
+                "pending_action_selection_todo_id": normalized_todo_id,
+                "pending_action_selection_state": "deferred",
+                "pending_action_selection_reason": normalized_reason,
+                "settlement_effect_id": "",
+                "todo_id": "",
+                "replan_obligation_id": "",
+            }
+        )
+        source_event_id = str(effective.get("event_id") or "").strip() or None
+        retained = build_rollout_event(
+            goal_id=goal_id,
+            event_kind="quota_should_run",
+            agent_id=agent_id,
+            run_id=turn_instance_id,
+            status="action_selection_deferred",
+            summary=(
+                "heartbeat explicit action selection retained without settlement "
+                f"binding for turn={turn_instance_id}"
+            ),
+            source_event_id=source_event_id,
+            caused_by=source_event_id,
+            details=details,
+        )
+        _append_rollout_event_line(log_path, retained)
+        return retained, True
 
 
 def upgrade_identityless_heartbeat_receipt(
@@ -266,21 +408,7 @@ def upgrade_identityless_heartbeat_receipt(
     log_path = rollout_event_log_path(runtime_root, goal_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with exclusive_file_lock(log_path):
-        try:
-            lines = log_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            lines = []
-        events: list[dict[str, object]] = []
-        for line in lines:
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if (
-                isinstance(parsed, dict)
-                and parsed.get("schema_version") == ROLLOUT_EVENT_SCHEMA_VERSION
-            ):
-                events.append(parsed)
+        events = load_rollout_events(log_path)
         matching = _heartbeat_receipt_events(
             events,
             goal_id=goal_id,
@@ -348,10 +476,7 @@ def upgrade_identityless_heartbeat_receipt(
             caused_by=source_event_id,
             details=corrected_details,
         )
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(corrected, sort_keys=True, ensure_ascii=False) + "\n"
-            )
+        _append_rollout_event_line(log_path, corrected)
         return corrected, True
 
 
@@ -373,6 +498,8 @@ def heartbeat_receipt_view(
         "event_id": event.get("event_id"),
         "recorded_at": event.get("recorded_at"),
     }
+    if details.get("closeout_required") is True:
+        receipt["closeout_required"] = True
     todo_id = str(details.get("todo_id") or "").strip()
     replan_obligation_id = normalize_todo_replan_obligation_id(
         details.get("replan_obligation_id")
@@ -393,6 +520,13 @@ def heartbeat_receipt_view(
         )
         if workspace_causality:
             receipt["delivery_workspace_causality"] = workspace_causality
+    else:
+        # The documented wake order runs the guard before a work item is chosen,
+        # so a turn-scoped receipt can legitimately commit with no settlement
+        # binding. Saying so here is what keeps that receipt from reading as a
+        # finished guard: the caller otherwise discovers the debt only when the
+        # closeout cannot settle the turn and the work stays unaccounted.
+        receipt["settlement_binding_owed"] = True
     semantic_replan_obligation_id = (
         heartbeat_receipt_semantic_replan_obligation_id(event)
     )
@@ -400,7 +534,40 @@ def heartbeat_receipt_view(
         receipt["semantic_replan_obligation_id"] = (
             semantic_replan_obligation_id
         )
+    pending_action_todo_id = heartbeat_receipt_pending_action_todo_id(event)
+    if pending_action_todo_id:
+        receipt["pending_action_selection"] = {
+            "todo_id": pending_action_todo_id,
+            "state": str(
+                details.get("pending_action_selection_state") or "deferred"
+            ),
+            "reason": str(
+                details.get("pending_action_selection_reason")
+                or "current_delivery_gate"
+            ),
+            "settlement_bound": (
+                details.get("pending_action_selection_settlement_bound") is True
+            ),
+        }
     return receipt
+
+
+def attach_uncommitted_heartbeat_receipt(
+    payload: dict[str, object],
+    *,
+    turn_instance_id: str,
+) -> None:
+    """Expose an accurate non-durable receipt for an incomplete preflight."""
+
+    payload["heartbeat_receipt"] = {
+        "schema_version": HEARTBEAT_RECEIPT_SCHEMA_VERSION,
+        "turn_instance_id": turn_instance_id,
+        "status": "not_committed",
+        "stall_observation": "not_evaluated",
+        "reason_code": str(
+            payload.get("error_code") or "quota_preflight_incomplete"
+        ),
+    }
 
 
 def fail_heartbeat_receipt(
@@ -415,7 +582,7 @@ def fail_heartbeat_receipt(
             "ok": False,
             "decision": "skip",
             "should_run": False,
-            "effective_action": "heartbeat_receipt_write_failed",
+            "effective_action": EffectiveAction.HEARTBEAT_RECEIPT_WRITE_FAILED.value,
             "state": "blocked_health",
             "waiting_on": "codex",
             "reason": reason,

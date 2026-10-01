@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import json
-import os
 import shutil
 from pathlib import Path
 from typing import Any
 
+from .control_plane.projects.registry_codec import project_registry_transaction
 from .control_plane.runtime.time import now_local_iso, utc_timestamp
 from .global_registry import GlobalRegistryReduction, mutate_global_registry
 from .history import load_registry
 from .paths import DEFAULT_RUNTIME_ROOT, global_registry_path, resolve_runtime_root
-from .registry import registry_goals
+from .registry import read_json, registry_goals
 from .runtime import validate_goal_id_path_segment
 
 
@@ -20,15 +19,6 @@ def _now_local() -> str:
 
 def _timestamp() -> str:
     return utc_timestamp()
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temp_path.replace(path)
 
 
 def _copy_backup(path: Path, *, label: str, dry_run: bool) -> str | None:
@@ -274,7 +264,7 @@ def uninstall_project(
     )
 
     global_preview = _uninstall_global_registry_reduction(
-        load_registry(global_path),
+        read_json(global_path) if global_path.exists() else {},
         source_registry=registry_path,
         target_goal_ids=target_goal_ids,
     )
@@ -320,12 +310,18 @@ def uninstall_project(
     removed_local_registry_file = False
     wrote_global_registry = False
     if execute:
-        if remove_empty_registry and local_after == 0:
-            registry_path.unlink()
-            removed_local_registry_file = True
-        else:
-            _write_json(registry_path, new_project_registry)
-            wrote_local_registry = True
+        with project_registry_transaction(
+            registry_path,
+            operation="project_uninstall_local_registry",
+        ) as transaction:
+            locked_registry, local_before, local_after = _remove_local_goals(
+                transaction.payload_copy(),
+                target_goal_ids=target_goal_ids,
+            )
+            if remove_empty_registry and local_after == 0:
+                removed_local_registry_file = transaction.remove()
+            else:
+                wrote_local_registry = transaction.commit(locked_registry)
         global_mutation = mutate_global_registry(
             global_path,
             "project_uninstall_global_registry",

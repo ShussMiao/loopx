@@ -13,6 +13,7 @@ from loopx.attached_session import (
     claim_attached_agent_turn,
     complete_attached_agent_turn,
 )
+from loopx.chat_agent import CodexChatAgentError
 from loopx.chat_runtime import ChatRuntimeController
 from loopx.chat_server import ChatRequestHandler
 from loopx.chat_store import CHAT_SESSION_MODE_ATTACHED, ChatSessionStore
@@ -177,6 +178,80 @@ def test_concurrent_bind_and_completion_are_duplicate_safe(tmp_path: Path) -> No
     assert sorted(packet["created"] for packet in completions) == [False, True]
     agent_messages = [item for item in store.messages(session_id) if item["role"] == "agent"]
     assert len(agent_messages) == 1
+
+
+def test_completion_id_reuse_across_turns_preserves_each_response(
+    tmp_path: Path,
+) -> None:
+    store = ChatSessionStore(tmp_path)
+    session_id = str(_bind(store)["session"]["session_id"])
+
+    for index, response in enumerate(("first response", "second response"), 1):
+        queued, created = store.create_queued_turn(
+            session_id,
+            client_turn_id=f"completion-scope-{index}",
+            message=f"request {index}",
+            origin="web",
+        )
+        assert created
+        claim_attached_agent_turn(
+            store=store,
+            session_id=session_id,
+            host_surface=HOST_SURFACE,
+            host_session_id=HOST_SESSION_ID,
+            claim_id=f"completion-scope-claim-{index}",
+        )
+        complete_attached_agent_turn(
+            store=store,
+            session_id=session_id,
+            turn_id=str(queued["turn_id"]),
+            host_surface=HOST_SURFACE,
+            host_session_id=HOST_SESSION_ID,
+            claim_id=f"completion-scope-claim-{index}",
+            completion_id="host-local-completion",
+            response={"message": response},
+        )
+
+    agent_messages = [
+        item for item in store.messages(session_id) if item["role"] == "agent"
+    ]
+    assert [item["text"] for item in agent_messages] == [
+        "first response",
+        "second response",
+    ]
+    assert agent_messages[0]["turn_id"] != agent_messages[1]["turn_id"]
+
+
+def test_maximum_length_completion_id_does_not_strand_turn(tmp_path: Path) -> None:
+    store = ChatSessionStore(tmp_path)
+    session_id = str(_bind(store)["session"]["session_id"])
+    queued, _created = store.create_queued_turn(
+        session_id,
+        client_turn_id="maximum-completion-id",
+        message="complete with a valid opaque id",
+        origin="web",
+    )
+    claim_attached_agent_turn(
+        store=store,
+        session_id=session_id,
+        host_surface=HOST_SURFACE,
+        host_session_id=HOST_SESSION_ID,
+        claim_id="maximum-completion-id-claim",
+    )
+
+    completed = complete_attached_agent_turn(
+        store=store,
+        session_id=session_id,
+        turn_id=str(queued["turn_id"]),
+        host_surface=HOST_SURFACE,
+        host_session_id=HOST_SESSION_ID,
+        claim_id="maximum-completion-id-claim",
+        completion_id="c" * 160,
+        response={"message": "durable response"},
+    )
+
+    assert completed["completed"] is True
+    assert store.load_turn(session_id, str(queued["turn_id"]))["status"] == "completed"  # type: ignore[index]
 
 
 def test_attached_host_can_wait_for_queue_wakeup(tmp_path: Path) -> None:
@@ -362,6 +437,118 @@ def test_web_and_lark_share_ordered_attached_session_without_spawning(
     ]
 
 
+def test_resume_latest_reuses_attached_session_without_local_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ChatSessionStore(tmp_path)
+    session = _bind(store)["session"]
+    runtime = ChatRuntimeController(store=store, codex_bin="missing-codex")
+    monkeypatch.setattr(
+        runtime,
+        "_start_adapter",
+        lambda **_kwargs: pytest.fail("attached Session must not start a local adapter"),
+    )
+
+    resumed, reused = runtime.open_session(
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        work_dir=tmp_path,
+        objective="sample objective",
+        mode="resume_latest",
+    )
+
+    assert reused is True
+    assert resumed["session_id"] == session["session_id"]
+    assert runtime.adapters == {}
+
+
+def test_attached_claimed_turn_interrupt_fails_closed(tmp_path: Path) -> None:
+    store = ChatSessionStore(tmp_path)
+    session_id = str(_bind(store)["session"]["session_id"])
+    runtime = ChatRuntimeController(store=store, codex_bin="missing-codex")
+    turn, _created = store.create_queued_turn(
+        session_id,
+        client_turn_id="claimed-interrupt",
+        message="keep host ownership",
+    )
+    claim_attached_agent_turn(
+        store=store,
+        session_id=session_id,
+        host_surface=HOST_SURFACE,
+        host_session_id=HOST_SESSION_ID,
+        claim_id="claimed-interrupt",
+    )
+
+    with pytest.raises(CodexChatAgentError) as raised:
+        runtime.interrupt_turn(session_id=session_id, turn_id=str(turn["turn_id"]))
+
+    assert raised.value.error_code == "attached_session_interrupt_unavailable"
+    current_turn = store.load_turn(session_id, str(turn["turn_id"]))
+    current_session = store.load_session(session_id)
+    assert current_turn is not None and current_turn["status"] == "running"
+    assert current_session is not None and current_session["status"] == "busy"
+    assert current_session["active_turn_id"] == turn["turn_id"]
+    assert (
+        claim_attached_agent_turn(
+            store=store,
+            session_id=session_id,
+            host_surface=HOST_SURFACE,
+            host_session_id=HOST_SESSION_ID,
+            claim_id="next-claim",
+        )["claimed"]
+        is False
+    )
+
+
+def test_attached_interrupt_endpoint_preserves_typed_failure(tmp_path: Path) -> None:
+    store = ChatSessionStore(tmp_path)
+    session_id = str(_bind(store)["session"]["session_id"])
+    runtime = ChatRuntimeController(store=store, codex_bin="missing-codex")
+    turn, _created = store.create_queued_turn(
+        session_id,
+        client_turn_id="endpoint-interrupt",
+        message="keep host ownership",
+    )
+    turn_id = str(turn["turn_id"])
+    claim_attached_agent_turn(
+        store=store,
+        session_id=session_id,
+        host_surface=HOST_SURFACE,
+        host_session_id=HOST_SESSION_ID,
+        claim_id="endpoint-interrupt",
+    )
+    responses: list[dict[str, object]] = []
+
+    class Handler:
+        server = SimpleNamespace(runtime_controller=runtime)
+
+        def _send_error(self, message: str, **kwargs: object) -> None:
+            responses.append({"error": message, **kwargs})
+
+        def _send_json(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("interrupt should fail closed")
+
+    ChatRequestHandler._interrupt_turn(Handler(), session_id, turn_id)  # type: ignore[arg-type]
+
+    assert responses == [
+        {
+            "error": "The attached host does not expose interrupt control to LoopX Chat.",
+            "status": 424,
+            "error_code": "attached_session_interrupt_unavailable",
+            "gate": {
+                "kind": "host_tool_gate",
+                "summary": "The active Turn is owned by the attached host.",
+                "next_action": "Stop the Turn in the attached host, then retry.",
+            },
+        }
+    ]
+    assert store.load_turn(session_id, turn_id)["status"] == "running"  # type: ignore[index]
+    session = store.load_session(session_id)
+    assert session is not None and session["status"] == "busy"
+    assert session["active_turn_id"] == turn_id
+
+
 def test_attached_completion_uses_canonical_response_and_terminal_events(
     tmp_path: Path,
 ) -> None:
@@ -449,12 +636,19 @@ def test_attached_completion_replays_closeout_after_restart(
         host_session_id=HOST_SESSION_ID,
         claim_id="attached-recovery-claim",
     )
+    append_message = store.append_message
     append_events = store.append_completed_response_events
+
+    def append_legacy_message(*args: object, **kwargs: object) -> dict[str, object]:
+        if kwargs.get("role") == "agent":
+            kwargs["message_id"] = "attached.attached-recovery-completion"
+        return append_message(*args, **kwargs)  # type: ignore[arg-type]
 
     def crash_after_events(*args: object, **kwargs: object) -> None:
         append_events(*args, **kwargs)  # type: ignore[arg-type]
         raise RuntimeError("crash after attached completion events")
 
+    monkeypatch.setattr(store, "append_message", append_legacy_message)
     monkeypatch.setattr(store, "append_completed_response_events", crash_after_events)
     with pytest.raises(RuntimeError, match="crash after attached completion events"):
         complete_attached_agent_turn(
@@ -485,6 +679,84 @@ def test_attached_completion_replays_closeout_after_restart(
         for event in restarted.events_after(session_id, turn_id, None)
         if event.get("kind") == "turn.completed"
     ] == ["turn.completed"]
+
+
+@pytest.mark.parametrize(
+    "message_specs",
+    [
+        [("reserved attached response", "other_runtime", "other")],
+        [("different runtime response", "other_runtime", "other")],
+        [("reserved attached response", "attached_host", "other")],
+        [
+            ("reserved attached response", "attached_host", "legacy"),
+            ("reserved attached response", "attached_host", "current"),
+        ],
+    ],
+    ids=["equal-wrong-origin", "different-wrong-origin", "wrong-id", "multiple"],
+)
+def test_attached_completion_recovery_rejects_ambiguous_agent_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message_specs: list[tuple[str, str, str]],
+) -> None:
+    store = ChatSessionStore(tmp_path)
+    session_id = str(_bind(store)["session"]["session_id"])
+    turn, _created = store.create_queued_turn(
+        session_id,
+        client_turn_id="ambiguous-completion-transcript",
+        message="preserve attached completion provenance",
+        origin="web",
+    )
+    turn_id = str(turn["turn_id"])
+    claim_attached_agent_turn(
+        store=store,
+        session_id=session_id,
+        host_surface=HOST_SURFACE,
+        host_session_id=HOST_SESSION_ID,
+        claim_id="wrong-origin-claim",
+    )
+    finalize = store.finalize_attached_turn_completion
+
+    def crash_before_closeout(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("crash before attached completion closeout")
+
+    monkeypatch.setattr(store, "finalize_attached_turn_completion", crash_before_closeout)
+    with pytest.raises(RuntimeError, match="crash before attached completion closeout"):
+        complete_attached_agent_turn(
+            store=store,
+            session_id=session_id,
+            turn_id=turn_id,
+            host_surface=HOST_SURFACE,
+            host_session_id=HOST_SESSION_ID,
+            claim_id="wrong-origin-claim",
+            completion_id="wrong-origin-completion",
+            response={"message": "reserved attached response"},
+        )
+    monkeypatch.setattr(store, "finalize_attached_turn_completion", finalize)
+    message_ids = {
+        "other": f"other-runtime-{turn_id}",
+        "legacy": "attached.wrong-origin-completion",
+        "current": f"attached.{turn_id}.completed",
+    }
+    for text, origin, identity in message_specs:
+        store.append_message(
+            session_id,
+            role="agent",
+            text=text,
+            turn_id=turn_id,
+            origin=origin,
+            message_id=message_ids[identity],
+        )
+
+    with pytest.raises(ValueError, match="attached completion transcript identity"):
+        store.finalize_attached_turn_completion(session_id, turn_id)
+
+    assert store.load_turn(session_id, turn_id)["status"] == "completing"  # type: ignore[index]
+    assert store.load_session(session_id)["active_turn_id"] == turn_id  # type: ignore[index]
+    assert not any(
+        event["kind"] == "turn.completed"
+        for event in store.events_after(session_id, turn_id, None)
+    )
 
 
 def test_chat_events_reconcile_writes_from_another_store_instance(tmp_path: Path) -> None:
@@ -608,6 +880,43 @@ def test_attached_close_rejects_active_claim_and_preserves_completion(
     assert runtime.wait_for_turn(session_id=session_id, turn_id=turn_id)["status"] == "completed"
     assert runtime.close_session(session_id) is True
     assert store.load_session(session_id)["status"] == "closed"  # type: ignore[index]
+    with pytest.raises(KeyError, match="attached Agent session was not found"):
+        claim_attached_agent_turn(
+            store=store,
+            session_id=session_id,
+            host_surface=HOST_SURFACE,
+            host_session_id=HOST_SESSION_ID,
+            claim_id="claim-after-close",
+        )
+
+    replay = complete_attached_agent_turn(
+        store=store,
+        session_id=session_id,
+        turn_id=turn_id,
+        host_surface=HOST_SURFACE,
+        host_session_id=HOST_SESSION_ID,
+        claim_id="close-active-claim",
+        completion_id="close-active-completion",
+        response={"message": "retry payload"},
+    )
+
+    assert replay["created"] is False
+    assert [
+        message["text"]
+        for message in store.messages(session_id)
+        if message["role"] == "agent"
+    ] == ["completed before close"]
+    with pytest.raises(ValueError, match="already completed by another receipt"):
+        complete_attached_agent_turn(
+            store=store,
+            session_id=session_id,
+            turn_id=turn_id,
+            host_surface=HOST_SURFACE,
+            host_session_id=HOST_SESSION_ID,
+            claim_id="close-active-claim",
+            completion_id="different-receipt",
+            response={"message": "conflicting retry"},
+        )
 
 
 def test_attached_close_rejects_pending_queue_and_preserves_claimability(

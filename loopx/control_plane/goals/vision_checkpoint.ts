@@ -1,5 +1,6 @@
 import type { JsonObject } from "../effect_program.ts";
 import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
+import { isBoundedBlockedRetry } from "../quota/settlement_phase.ts";
 import {
   DELIVERY_BOUNDARIES,
   type DeliveryBoundary,
@@ -19,7 +20,9 @@ export const VISION_CHECKPOINT_SCHEMA_VERSION = "vision_checkpoint_v0";
 const GOAL_VISION_REPLAN_SCHEMA_VERSION = "goal_vision_replan_contract_v0";
 const GOAL_PATH_DELTA_SCHEMA_VERSION = "goal_path_delta_v0";
 const GOAL_VISION_BUDGET_ERROR = "vision_budget_exceeded";
-const GOAL_VISION_TOTAL_LIMIT = 1_200;
+// Direction and evidence-linked path changes share one bounded packet.
+const GOAL_VISION_TOTAL_LIMIT = 1_800;
+const GOAL_VISION_ADVANCEMENT_POLICIES = ["as_needed", "repeat_until_closed"] as const;
 const VISION_UNCHANGED_REASON_LIMIT = 240;
 const VISION_BUDGET_SUGGESTION_LIMIT = 96;
 
@@ -47,8 +50,8 @@ const GOAL_PATH_DELTA_OUTCOMES = [
   "wait",
 ] as const;
 const GOAL_PATH_DELTA_SCALAR_LIMITS = {
-  prior_assumption: 220,
-  observed_reality: 220,
+  prior_assumption: 320,
+  observed_reality: 320,
   reentry_condition: 180,
 } as const;
 const GOAL_PATH_DELTA_LIST_LIMITS = {
@@ -58,6 +61,33 @@ const GOAL_PATH_DELTA_LIST_LIMITS = {
   unresolved_questions: [2, 140],
   evidence_refs: [4, 140],
 } as const;
+
+/** Authoring hints share the validator's limits; they grant no transition authority. */
+export function visionAuthoringContract(): JsonObject {
+  return {
+    schema_version: GOAL_VISION_REPLAN_SCHEMA_VERSION,
+    fields: {state: "lifecycle token", vision_patch: {...GOAL_VISION_FIELD_LIMITS}},
+    common_states: ["vision_patch_proposed", "vision_closed", "no_followup"],
+    advancement_policies: [...GOAL_VISION_ADVANCEMENT_POLICIES],
+    minimal_example: {schema_version: GOAL_VISION_REPLAN_SCHEMA_VERSION, state: "vision_patch_proposed", vision_patch: {
+      vision_summary: "Scoped outcome", acceptance_summary: "Verified evidence and remaining gap",
+    }},
+    authoring_hint: "Fields are optional, not a checklist. Keep the whole decision compact; total includes path_delta. Do not copy the delivery evidence report into every field.",
+    total_text_limit: GOAL_VISION_TOTAL_LIMIT,
+    unchanged_reason_limit: VISION_UNCHANGED_REASON_LIMIT,
+    path_delta: {
+      schema_version: GOAL_PATH_DELTA_SCHEMA_VERSION,
+      outcomes: [...GOAL_PATH_DELTA_OUTCOMES],
+      required: ["outcome", "prior_assumption", "observed_reality"],
+      require_any: ["retained", "changed", "stopped"],
+      scalar_limits: {...GOAL_PATH_DELTA_SCALAR_LIMITS},
+      list_limits: Object.fromEntries(Object.entries(GOAL_PATH_DELTA_LIST_LIMITS).map(
+        ([field, [maxItems, maxChars]]) => [field, {item_type: "string", max_items: maxItems, max_item_chars: maxChars}],
+      )),
+    },
+    rule: "Compare acceptance with evidence. vision_closed closes a stage, not the Goal; no_followup requires no remaining scoped work. A changed mainline needs path_delta; respect the live replan contract.",
+  };
+}
 // Bounded typed fallback declarations survive prepare unchanged so the
 // declared direction cannot disappear behind later read-model compaction.
 const VISION_FALLBACK_DECLARATION_ENTRY_LIMIT = 4;
@@ -86,7 +116,7 @@ const BASIC_CREDENTIAL_VALUE =
 const PRIVATE_TEXT_PATTERNS = [
   /\/Users\//,
   /\/ext_data\//,
-  /larkoffice/i,
+  /lark[o]ffice/i, // Equivalent matcher avoids matching its own policy source.
   /docs\.internal/i,
   /\bt-20\d{12}-[a-z0-9]+\b/,
   /\bBearer\b/i,
@@ -119,6 +149,7 @@ interface VisionRefreshFinalizeRequest {
   todo_id: string | null;
   completion_todo_id: string | null;
   autonomous_replan_recorded: boolean;
+  blocked_retry: JsonObject | null;
 }
 
 export type VisionCheckpointDecision =
@@ -298,7 +329,7 @@ function normalizeGoalVisionState(value: unknown): string {
 
 function normalizeAdvancementPolicy(value: unknown): string {
   const candidate = compactText(value).toLowerCase().replaceAll("-", "_");
-  if (candidate !== "as_needed" && candidate !== "repeat_until_closed") {
+  if (!GOAL_VISION_ADVANCEMENT_POLICIES.some(policy => policy === candidate)) {
     throw new EffectRuntimeRequestError(
       "agent_vision.advancement_policy must be one of: as_needed, repeat_until_closed",
     );
@@ -311,6 +342,11 @@ function normalizeGoalPathDelta(
 ): [JsonObject | null, Record<string, number>] {
   if (value === null || value === undefined) return [null, {}];
   const source = requiredObject(value, "agent_vision.path_delta");
+  if (source.schema_version !== undefined && source.schema_version !== GOAL_PATH_DELTA_SCHEMA_VERSION) {
+    throw new EffectRuntimeRequestError(
+      `agent_vision.path_delta.schema_version must be ${GOAL_PATH_DELTA_SCHEMA_VERSION}`,
+    );
+  }
   const outcome = compactText(source.outcome).toLowerCase().replaceAll("-", "_");
   if (!(GOAL_PATH_DELTA_OUTCOMES as readonly string[]).includes(outcome)) {
     throw new EffectRuntimeRequestError(
@@ -455,6 +491,22 @@ function decodePrepareRequest(request: JsonObject): VisionRefreshPrepareRequest 
 
 function prepareVisionRefresh(request: VisionRefreshPrepareRequest): JsonObject {
   const packet = request.agent_vision_packet;
+  // Validate authoring before merge/compaction can silently discard a declared
+  // protocol. Ordinary extension metadata is not classified by overlapping keys.
+  for (const [container, prefix] of [[packet, "agent_vision"], [packet.vision_patch, "agent_vision.vision_patch"]] as const) {
+    if (typeof container !== "object" || container === null || Array.isArray(container)) continue;
+    for (const [field, value] of Object.entries(container)) {
+      if (prefix === "agent_vision" && field === "path_delta") continue;
+      if (field === GOAL_PATH_DELTA_SCHEMA_VERSION ||
+          (prefix === "agent_vision.vision_patch" && field === "path_delta") ||
+          (typeof value === "object" && value !== null && !Array.isArray(value) &&
+           (value as JsonObject).schema_version === GOAL_PATH_DELTA_SCHEMA_VERSION)) {
+        throw new EffectRuntimeRequestError(
+          `${prefix}.${field} must be supplied as agent_vision.path_delta; ${GOAL_PATH_DELTA_SCHEMA_VERSION} is the schema_version, not the enclosing field`,
+        );
+      }
+    }
+  }
   const existing = request.existing_agent_vision ?? {};
   const updatePacket: JsonObject = { ...packet };
   if (request.merge_patch && Object.keys(existing).length > 0) {
@@ -590,7 +642,7 @@ function prepareVisionRefresh(request: VisionRefreshPrepareRequest): JsonObject 
     );
     if (changedFields.length > 0 && pathDelta?.outcome !== "replan") {
       throw new EffectRuntimeRequestError(
-        `autonomous agent vision replan changes durable fields ${changedFields.join(", ")}; provide goal_path_delta_v0 with outcome=replan so the mainline change is explicit`,
+        `autonomous agent vision replan changes durable fields ${changedFields.join(", ")}; provide path_delta with schema_version=goal_path_delta_v0 and outcome=replan so the mainline change is explicit`,
       );
     }
   }
@@ -623,7 +675,7 @@ function deliveryBoundary(value: unknown): DeliveryBoundary {
   throw new EffectRuntimeRequestError("delivery_boundary is unsupported");
 }
 
-function normalizeVisionUnchangedReason(value: unknown): string | null {
+export function normalizeVisionUnchangedReason(value: unknown): string | null {
   const unchanged = compactText(value);
   if (!unchanged) return null;
   validatePublicSafeText("vision_unchanged_reason", unchanged);
@@ -671,6 +723,7 @@ export function decodeVisionCheckpointRequest(
       request.autonomous_replan_recorded,
       "autonomous_replan_recorded",
     ),
+    blocked_retry: optionalObject(request.blocked_retry, "blocked_retry"),
   };
 }
 
@@ -713,10 +766,20 @@ export function buildVisionCheckpoint(value: unknown): JsonObject {
   }
   const request = decodeVisionCheckpointRequest(value);
   validateInFlightBoundary(request);
+  if (request.blocked_retry !== null && (
+    request.delivery_outcome !== "outcome_gap" ||
+    request.delivery_boundary !== "semantic_closeout" ||
+    request.todo_id === null ||
+    request.completion_todo_id !== null ||
+    !isBoundedBlockedRetry(request.blocked_retry, request.todo_id)
+  )) {
+    throw new EffectRuntimeRequestError("blocked retry does not bind a typed outcome-gap Todo closeout");
+  }
   const triggers: JsonObject[] = [];
   if (
     isMaterialDeliveryOutcome(request.delivery_outcome) &&
-    request.delivery_boundary === "semantic_closeout"
+    request.delivery_boundary === "semantic_closeout" &&
+    request.blocked_retry === null
   ) {
     triggers.push({
       kind: "material_delivery_outcome",

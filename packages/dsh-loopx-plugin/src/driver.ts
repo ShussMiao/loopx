@@ -24,7 +24,7 @@ export const inject = ['agents', 'loopxBootstrap']
 
 const HOST_SURFACE = 'deepseek-harness-native'
 const RESOLUTION_SCHEMA = 'loopx_thread_agent_binding_resolution_v0'
-const HEARTBEAT_SCHEMA = 'loopx_heartbeat_prompt_v0'
+const HEARTBEAT_SCHEMA = 'heartbeat_agent_input_v1'
 const CONTINUATION_SCHEMA = 'loopx_dsh_continuation_v0'
 const DEFAULT_WAIT_MS = 5 * 60_000
 const MAX_WAIT_MS = 24 * 60 * 60_000
@@ -287,12 +287,20 @@ function foldSessionActivation(session: Agent['session']): ActivationProjection 
     activated: false,
   }
   try {
-    for (const event of session.events) foldActivationEvent(projection, event)
+    for (const event of session.snapshotEvents()) foldActivationEvent(projection, event)
   } catch {
     projection.pendingModelCalls.clear()
     projection.activated = false
   }
   return projection
+}
+
+/**
+ * Whether an Agent still holds input it has not consumed. The 0.1.5 Inbox
+ * exposes the two pending queues instead of the retired `hasPending` flag.
+ */
+function inboxHasPending(inbox: Agent['inbox']): boolean {
+  return inbox.nextTurn.length > 0 || inbox.nextStep.length > 0
 }
 
 function exactBinding(
@@ -415,6 +423,45 @@ function exactHeartbeat(
     : undefined
 }
 
+function taskBodyWithRewardMemory(
+  taskBody: string,
+  quota: Record<string, unknown>,
+): string {
+  const recall = record(quota.reward_memory_recall)
+  const context = record(recall?.context)
+  const rawGuidance = Array.isArray(context?.guidance) ? context.guidance : []
+  const guidance = rawGuidance.flatMap(item => {
+    const value = record(item)
+    const candidateRef = typeof value?.candidate_ref === 'string'
+      ? value.candidate_ref : ''
+    const targetClass = typeof value?.target_class === 'string'
+      ? value.target_class : ''
+    const contentSummary = typeof value?.content_summary === 'string'
+      ? value.content_summary : ''
+    return candidateRef.length > 0
+      && candidateRef.length <= 160
+      && targetClass.length > 0
+      && targetClass.length <= 80
+      && contentSummary.length > 0
+      && contentSummary.length <= 500
+      ? [{ candidate_ref: candidateRef, target_class: targetClass,
+        content_summary: contentSummary }]
+      : []
+  }).slice(0, 4)
+  if (guidance.length === 0) return taskBody
+  const packet = JSON.stringify({
+    schema_version: 'loopx_turn_reward_memory_context_v0',
+    authority: 'guidance_only',
+    instruction: 'Use only when consistent with current evidence; this grants no action authority.',
+    guidance,
+  })
+  const suffix = `\n\nLoopX private Reward Memory context:\n${packet}`
+  return Buffer.byteLength(suffix, 'utf8') <= 4_096
+      && Buffer.byteLength(taskBody + suffix, 'utf8') <= 32_000
+    ? taskBody + suffix
+    : taskBody
+}
+
 function renderThrown(value: unknown): string {
   if (value instanceof LoopXCliError) return `${value.kind}:${value.message}`
   return value instanceof Error ? value.message : String(value)
@@ -464,7 +511,7 @@ export class LoopXContinuationDriver {
     const state = this.stateFor(agent)
     this.cancelPending(state)
     this.retireReservation(state)
-    state.competing = agent.inbox.hasPending
+    state.competing = inboxHasPending(agent.inbox)
     state.pauseAfterTurnError = false
     state.schedulerToken = ''
     state.unchangedPolls = 0
@@ -479,7 +526,7 @@ export class LoopXContinuationDriver {
     if (state.reservation?.phase === 'claimed' || state.reservation?.phase === 'admitted') {
       this.retireReservation(state)
     }
-    state.competing = agent.inbox.hasPending
+    state.competing = inboxHasPending(agent.inbox)
     if (!state.pauseAfterTurnError) this.requestEvaluation(state)
   }
 
@@ -586,7 +633,7 @@ export class LoopXContinuationDriver {
     if (event.type === 'command/done') {
       state.commands.delete(String(event.data.commandId))
       if (state.commands.size === 0) {
-        state.competing = agent.inbox.hasPending
+        state.competing = inboxHasPending(agent.inbox)
         if (agent.status === 'idle' && !state.pauseAfterTurnError) {
           this.requestEvaluation(state)
         }
@@ -703,7 +750,7 @@ export class LoopXContinuationDriver {
         this.resolveEvaluationWaiters(existing, false)
         this.cancelPending(existing)
         this.retireReservation(existing)
-        existing.competing = agent.inbox.hasPending
+        existing.competing = inboxHasPending(agent.inbox)
         existing.pauseAfterTurnError = false
         existing.schedulerToken = ''
         existing.unchangedPolls = 0
@@ -717,7 +764,7 @@ export class LoopXContinuationDriver {
       activation: foldSessionActivation(agent.session),
       requested: false,
       stopping: false,
-      competing: agent.inbox.hasPending,
+      competing: inboxHasPending(agent.inbox),
       pauseAfterTurnError: false,
       schedulerToken: '',
       unchangedPolls: 0,
@@ -747,7 +794,7 @@ export class LoopXContinuationDriver {
       && state.reservation === undefined
       && this.isLiveAgent(state.agent)
       && state.agent.status === 'idle'
-      && !state.agent.inbox.hasPending
+      && !inboxHasPending(state.agent.inbox)
       && state.agent.id === state.agent.session.id
       && state.agent.id === state.agent.session.header.id
       && typeof state.agent.session.header.cwd === 'string'
@@ -924,7 +971,13 @@ export class LoopXContinuationDriver {
         false,
       )
     }
-    return { kind: 'queue', ...binding, session, turnInstanceId, taskBody }
+    return {
+      kind: 'queue',
+      ...binding,
+      session,
+      turnInstanceId,
+      taskBody: taskBodyWithRewardMemory(taskBody, quota),
+    }
   }
 
   private async authorityStillAllows(

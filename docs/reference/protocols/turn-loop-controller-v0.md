@@ -12,11 +12,14 @@ host-specific wake adapters, and operator presentation are later slices in the
 Turn Loop Controller plan.
 
 The controller is an exported transition API, not a loop implicitly started by
-`loopx turn run-once`. The CLI does not currently call `decide_loop_disposition`
-or persist a `BoundedTurnBudget`. Both `max_turns` and `completed_turns` must be
-supplied by an integrating caller; there is no CLI or product default of three
-Turns. The budget applies to continued `validated_progress` on the same Todo,
-not a chain of completed Todos and not fine-grained planning mode.
+`loopx turn run-once`. `loopx turn managed-step` calls `decide_loop_disposition`
+for one already-journaled failed Turn and returns the typed answer without
+executing anything, which is the first production consumer of the transition.
+The CLI still does not persist a `BoundedTurnBudget`; both `max_turns` and
+`completed_turns` must be supplied by an integrating caller, and there is no CLI
+or product default of three Turns. The budget applies to continued
+`validated_progress` on the same Todo, not a chain of completed Todos and not
+fine-grained planning mode.
 
 ## Inputs
 
@@ -61,22 +64,32 @@ Exactly one typed disposition:
 | disposition | meaning | quota |
 | --- | --- | --- |
 | `run_now` | fresh decision allows the next delivery Turn | no spend by the controller |
+| `capability_action_required` | a signed capability intent requires its adapter before a host Turn | no spend |
 | `wait` | quiet cadence or blocked delivery | no spend |
+| `stop` | the current iteration ended without authorizing a retry or successor | no spend |
 | `user_action_required` | a concrete user action is projected by receipt or decision | no spend |
 | `repair` | repair-class recovery is required before any successor Turn | no spend |
 | `replan` | replan-class recovery; see continuation boundary below | no spend |
 | `terminal` | fresh Goal frontier plus durable no-follow-up prove Goal closure | no spend |
 
-The output space is exactly these six dispositions. There is no
+The output space is exactly these eight dispositions. There is no
 `contract_error` disposition: contract failures are rejected at the typed-input
 boundary. Every payload carries `spends_quota=false`, `launches_host=false`,
 and `writes_state=false`.
+
+The capability handoff carries the signed intent and does not require a
+selected Todo or create a host transaction. If it follows committed progress
+or completion, predecessor and Goal/Agent identity are still checked. It does
+not consume a host-turn budget or authorize another host invocation. The
+adapter must return its own receipt and re-enter planning; a missing adapter
+must remain explicit rather than turning into `wait` or a successful delivery.
 
 ## Decision Table
 
 | receipt | fresh decision | disposition |
 | --- | --- | --- |
 | none | delivery allowed | `run_now` |
+| none / validated progress or completion | pending capability intent | `capability_action_required` |
 | none | quiet / cadence-only | `wait` |
 | none | fresh `terminal_no_followup` Goal frontier | `terminal` |
 | `validated_completion` + durable `successor` | selected Todo is a declared successor | route the fresh decision (`run_now`, `wait`, `repair`, `replan`, or user action) |
@@ -92,6 +105,8 @@ and `writes_state=false`.
 | durable `no_followup` + fresh terminal frontier + decision user action | — | `terminal` (proven Goal closure wins) |
 | continuing completion + decision user action | — | `user_action_required` |
 | `wait` | any | `wait` |
+| `iteration_failed` | no decision user action | `stop` (iteration-scoped, not Goal terminal) |
+| `iteration_failed` | decision user action | `user_action_required` (fresh decision precedence) |
 | retryable `host_failure`, attempt budget remains | delivery or wait | `wait` with a same-Turn bounded-backoff continuation |
 | retryable `host_failure`, attempt budget exhausted | any | `repair` |
 | non-retryable or legacy `host_failure` / `validation_failed` / `writeback_failed` / `quota_spend_failed` | any | `repair` (route before any successor Turn) |
@@ -126,17 +141,21 @@ and `writes_state=false`.
   scheduler may wake that same failed Turn with explicit retry authority after
   the delay. Once the attempt budget is exhausted, the controller returns
   `repair`; legacy or malformed failure metadata cannot opt into retry.
+- `iteration_failed` is an ordinary bounded-loop outcome, not an infrastructure
+  failure. It stops only the current iteration, sets neither retry nor replan
+  continuation, creates no successor, and does not claim Goal terminal closure.
+  A later iteration starts only through a new explicit controller decision.
 - The fresh decision must satisfy the shared Turn envelope contract
   (`loopx_turn_envelope_v0` schema, non-empty equal signature hashes, and an
   in-budget compaction) via the same typed route the Turn plan driver uses;
   forged or truncated envelopes raise `ValueError`, never `run_now`.
-- `validated_progress` may continue only with a proven `BoundedTurnBudget`
+- `validated_progress` may continue to another host Turn only with a proven `BoundedTurnBudget`
   whose lineage matches the fresh decision; without it the controller raises
   `ValueError` instead of guessing an unbounded continuation. Budget
   exhaustion routes to `replan`, not `terminal`, because a bounded Turn chain
   ending is not evidence that the Goal ended.
-- Input validity is enforced at the typed-input boundary, not encoded as a
-  seventh disposition. The transition output space is always one of the six
+- Input validity is enforced at the typed-input boundary, not encoded as an
+  separate error disposition. The transition output space is always one of the eight
   dispositions above.
 
 ## Replan Continuation Boundary
@@ -155,6 +174,40 @@ This mirrors the autonomous-replan and two-stall contracts: no runnable todo
 with an open acceptance gap, a terminal/obsolete/incompatible selected todo,
 validated negative evidence, or two eligible turns without material progress
 all require replan rather than another delivery attempt.
+
+## Managed Step Surface
+
+`loopx turn managed-step` is the CLI surface that consumes this transition for
+one already-journaled Turn:
+
+```bash
+loopx turn managed-step \
+  --goal-id <goal-id> \
+  --agent-id <agent-id> \
+  --turn-key <sha256:64-hex-digest> \
+  --format json
+```
+
+It rebuilds the `ValidatedTurnReceipt` from the canonical Journal, projects the
+current control-plane decision as a fresh `loopx_turn_envelope_v0`, and returns
+`loopx_turn_managed_step_v0`: the disposition, its reason, the goal/agent/Todo
+lineage, and, on `wait`, the typed `retry_continuation` block.
+
+The command is read-only and grants no authority of its own. It never launches
+a host, writes state, spends quota, sleeps, or mints a Turn. On `wait` the
+answer only describes the bounded backoff after which the outer scheduler may
+wake the *same* Turn; carrying the existing `--retry-failed-turn` /
+`--resume-turn-key` flags on the next `run-once` stays the caller's decision.
+
+The Turn Journal remains the sole authority for the attempt count and retry
+ceiling. `--observed-attempt` and `--observed-max-attempts` are reconciled
+against it and refused on disagreement, so a caller's bookkeeping can be
+checked but never substituted. A Journal that is not a finished failed Turn,
+whose typed host failure is not retryable, or whose current snapshot fails the
+canonical TypeScript journal consistency checks is refused before the transition
+is reached. A stored recovery audit describes an earlier attempt, not current
+eligibility. The eventual `run-once` still revalidates host-session binding and
+execution authority before retrying.
 
 ## Boundary
 

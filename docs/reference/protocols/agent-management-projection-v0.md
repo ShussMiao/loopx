@@ -91,7 +91,8 @@ Required fields:
 - `agent_id`;
 - `agent_model`: `peer_v1`;
 - `state`: one of `running`, `waiting`, `blocked`, `monitoring`,
-  `scope_wait`, `stale`, or `unknown`;
+  `scope_wait`, `stale`, `unknown`, `registered`, `addressable`, `bound`,
+  `launchable`, `executing`;
 - `current_todo`: a `todo_row_v0` object or `null`;
 - `next_action`: compact local-control next action text. Private project refs
   are allowed; inline credentials are not. Shareable sinks must redact private
@@ -111,6 +112,18 @@ Optional fields:
 - `handoff_refs`;
 - `handoff_note`;
 - `material_frontier`;
+- `session_binding_candidates` and `session_binding_count`: present together
+  when the Agent has at least one entry in existing
+  `run_history.goals[].coordination.thread_agent_bindings`. The list holds up
+  to three distinct `{thread_id, host_surface}` candidates in first-seen order
+  and `session_binding_count` is the number of distinct bindings observed, so a
+  shorter list than the count means candidates were capped, not that the
+  remainder is invalid. Distinctness is decided on the full binding identity, not
+  on the rendered text: the owner accepts wider identifiers than this projection
+  displays, so two counted bindings can render alike. Neither field selects an execution route: absence is
+  not evidence of a stopped host, a binding does not prove executable capacity,
+  and several candidates for one Agent are resolved by the owning binding
+  resolver, not by this display projection;
 - `stale_claim_hint`;
 - `blocked_on`;
 - `recent_events`;
@@ -121,6 +134,42 @@ projection keeps the runnable todo in `current_todo` and may expose the
 highest-priority blocked maintenance todo as a separate `blocked_on`
 `todo_row_v0`. The blocker remains visible without changing todo ownership or
 making the whole peer appear blocked.
+
+### Worker state refinement and compatibility
+
+The current producer emits `registered`, `addressable`, `bound`, `launchable`,
+`executing`, `blocked`, `monitoring`, and `waiting`.
+`running`, `unknown`, `scope_wait`, and `stale` remain
+accepted legacy vocabulary; this producer does not emit them. There is no
+parallel `lifecycle_state` field.
+
+This changes the default read projection: registered idle rows previously
+reported `unknown` or `waiting`, and open advancement work reported `running`.
+The new states refine those observations without adding dispatch authority:
+
+| State | Observed facts |
+| --- | --- |
+| `registered` | Registered row without current work or session binding |
+| `addressable` | Session binding exists, with no current work |
+| `bound` | Current open work and a session binding; no recent work update |
+| `launchable` | Current open work without a binding or recent work update |
+| `executing` | Current open work updated between zero and eight hours ago |
+| `blocked` | Current work is blocked or has the blocker task class |
+| `monitoring` | Current work is a monitor, regardless of activity age |
+| `waiting` | Other non-open current work, such as deferred work |
+
+Blocked, monitor and waiting classification precedes activity/binding refinement.
+The eight-hour activity window is inclusive, rejects future timestamps, and
+uses the current Todo only; it is independent of the 36-hour stale-claim
+warning. `last_activity_at` still summarizes the displayed Todos. Neither an
+`executing` observation nor `launchable` proves a live process, configured
+runtime, available capacity, lease, or permission to start a worker.
+
+Registered-peer orchestration accepts `executing`, `bound`, and `launchable`
+where it accepted legacy `running`, and continues to accept `monitoring` and
+cached `running` rows. Its existing stale-claim, observed activation-capability,
+and dependency-readiness gates still apply. Idle, blocked, waiting and unknown
+rows do not gain admission. Other consumers must tolerate the added strings.
 
 ## Todo Row
 
@@ -156,6 +205,32 @@ Optional fields:
 The row may be rendered as a "task" card for operator familiarity, but API and
 state names should keep `todo` terminology to avoid implying a second runtime
 model.
+
+### Capability prerequisites and repair outputs
+
+The read-only capability gate distinguishes `required_capabilities` (execution
+prerequisites) from `target_capabilities` (what a repair task aims to provide).
+A target is not its own prerequisite, but declaring it neither enables it nor
+grants credentials, production access, write scope, a claim or a lease. A task
+repairing `network` can therefore be runnable while another task requiring
+`network` stays blocked until availability is observed.
+
+`agents/capability_gate.ts` owns missing-set evaluation, resolution responsibility
+and impacted-Todo bindings. Unknown missing capabilities retain Agent repair
+routing; `credentials` and `production_access` retain owner routing. Other runnable
+work remains available when one candidate is blocked. A shared capability binding
+uses the highest-priority affected Todo rather than whichever display row appears
+first, while preserving all affected Todo IDs. Display variants of one ID do not
+become separate tasks. An explicitly empty evaluated backlog is authoritative;
+the older first-item source is used only when the backlog field is absent.
+
+Quota's v1 planning request carries normalized requirement facts, so the same TS
+rule partitions due Monitors without per-Todo RPCs or trusting stale precomputed
+missing lists. Candidate source/eligibility and profile ranking remain adapters;
+this does not claim complete-inventory selection or change Monitor due/writeback
+and deferred-replan rules. Use `quota should-run --include-detail agent-todos` to
+inspect the existing full capability-gate detail; the default CLI keeps its
+compact representation. No configuration, UI control or storage migration is added.
 
 ## Handoff Notes
 

@@ -10,6 +10,7 @@ from ..coordination.coordination_state_contract_generated import (
     ACTION_PORTFOLIO_SELECTION_REQUEST_SCHEMA,
     ACTION_PORTFOLIO_SELECTION_RESULT_SCHEMA,
 )
+from ..todos.contract import normalize_todo_id, normalize_todo_task_class
 from .planning_inventory import (
     build_quota_planning_inventory_request,
     compact_planning_candidate,
@@ -19,6 +20,12 @@ ACTION_SELECTION_QUALIFICATION_REQUEST_SCHEMA_VERSION = ACTION_PORTFOLIO_SELECTI
 ACTION_SELECTION_QUALIFICATION_SCHEMA_VERSION = ACTION_PORTFOLIO_SELECTION_RESULT_SCHEMA
 QUOTA_PLANNING_PACKET_REQUEST_SCHEMA_VERSION = ACTION_PORTFOLIO_PLANNING_PACKET_REQUEST_SCHEMA
 QUOTA_PLANNING_PACKET_SCHEMA_VERSION = ACTION_PORTFOLIO_PLANNING_PACKET_RESULT_SCHEMA
+RETAINED_ACTION_SELECTION_REENTRY_REQUEST_SCHEMA_VERSION = (
+    "retained_action_selection_reentry_request_v0"
+)
+RETAINED_ACTION_SELECTION_REENTRY_SCHEMA_VERSION = (
+    "retained_action_selection_reentry_v0"
+)
 
 
 def _compact_candidate(value: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -100,6 +107,7 @@ def qualify_action_selection(
     *,
     requested_todo_id: str,
     candidate: Mapping[str, Any] | None,
+    requested_task_class: str | None,
     should_run: bool,
     normal_delivery_allowed: bool,
     delivery_preemptions: list[str],
@@ -114,6 +122,7 @@ def qualify_action_selection(
                 "schema_version": ACTION_SELECTION_QUALIFICATION_REQUEST_SCHEMA_VERSION,
                 "requested_todo_id": requested_todo_id,
                 "candidate": compact_candidate,
+                "requested_task_class": requested_task_class,
                 "should_run": should_run,
                 "normal_delivery_allowed": normal_delivery_allowed,
                 "delivery_preemptions": delivery_preemptions,
@@ -125,4 +134,76 @@ def qualify_action_selection(
         result.get("schema_version") != ACTION_SELECTION_QUALIFICATION_SCHEMA_VERSION
     ):
         raise RuntimeError("TypeScript action-selection qualification shape mismatch")
+    return dict(result)
+
+
+def qualify_action_selection_from_inventory(
+    *,
+    requested_todo_id: str,
+    candidate: Mapping[str, Any] | None,
+    source_items: list[dict[str, Any]],
+    should_run: bool,
+    normal_delivery_allowed: bool,
+    delivery_preemptions: list[str],
+) -> dict[str, Any]:
+    """Resolve the requested task class before invoking the typed reducer."""
+
+    requested_item = next(
+        (
+            item
+            for item in source_items
+            if normalize_todo_id(item.get("todo_id")) == requested_todo_id
+        ),
+        None,
+    )
+    requested_task_class = (
+        normalize_todo_task_class(
+            requested_item.get("task_class"),
+            text=str(requested_item.get("text") or ""),
+            action_kind=requested_item.get("action_kind"),
+        )
+        if requested_item is not None
+        else None
+    )
+    return qualify_action_selection(
+        requested_todo_id=requested_todo_id,
+        candidate=candidate,
+        requested_task_class=requested_task_class,
+        should_run=should_run,
+        normal_delivery_allowed=normal_delivery_allowed,
+        delivery_preemptions=delivery_preemptions,
+    )
+
+
+def reconcile_retained_action_selection(
+    *,
+    retained_todo_id: str,
+    projected_todo_id: str | None,
+    effective_action: str,
+    replan_obligation_id: str | None,
+) -> dict[str, Any]:
+    """Ask the typed owner whether a reentry may bind its new projection."""
+
+    try:
+        result = effect_runtime_result(
+            "work_item.action_selection.reconcile_retained",
+            {
+                "schema_version": (
+                    RETAINED_ACTION_SELECTION_REENTRY_REQUEST_SCHEMA_VERSION
+                ),
+                "retained_todo_id": retained_todo_id,
+                "projected_todo_id": projected_todo_id,
+                "effective_action": effective_action,
+                "replan_obligation_id": replan_obligation_id,
+            },
+        )
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+    if not isinstance(result, Mapping) or (
+        result.get("schema_version")
+        != RETAINED_ACTION_SELECTION_REENTRY_SCHEMA_VERSION
+    ):
+        raise RuntimeError(
+            "TypeScript retained action-selection reentry shape mismatch"
+        )
     return dict(result)

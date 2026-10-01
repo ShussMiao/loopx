@@ -5,33 +5,41 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { atomicWriteJson } from "../../loopx/control_plane/effect_runtime_io.ts";
+import { withCanonicalWriter } from "../../loopx/control_plane/coordination/local_authority_write.ts";
 import {
   shadowMaintenanceLockPath,
   shadowManagementStatePath,
 } from "../../loopx/control_plane/coordination/shadow_management.ts";
 import {
   archiveLocalCoordinationTodos,
+  acknowledgeLocalCoordinationTodoArchive,
   createLocalCoordinationTodo, claimLocalCoordinationTodo,
-  mutateLocalCoordinationAuthority, editLocalCoordinationTodo,
   terminalLifecycleLocalCoordinationTodo,
   LOCAL_COORDINATION_TODO_ARCHIVE_REQUEST_SCHEMA,
+  LOCAL_COORDINATION_TODO_ARCHIVE_ACK_REQUEST_SCHEMA,
   LOCAL_COORDINATION_TODO_CREATE_REQUEST_SCHEMA, LOCAL_COORDINATION_TODO_CLAIM_REQUEST_SCHEMA,
   LOCAL_COORDINATION_TODO_TERMINAL_LIFECYCLE_REQUEST_SCHEMA,
-  LOCAL_COORDINATION_MUTATION_REQUEST_SCHEMA,
 } from "../../loopx/control_plane/coordination/local_authority_runtime.ts";
 
 for (const [name, invoke, schema, requestFields] of [
   ["create", createLocalCoordinationTodo, LOCAL_COORDINATION_TODO_CREATE_REQUEST_SCHEMA, {}],
   ["claim", claimLocalCoordinationTodo, LOCAL_COORDINATION_TODO_CLAIM_REQUEST_SCHEMA, {}],
-  ["mutate", mutateLocalCoordinationAuthority, LOCAL_COORDINATION_MUTATION_REQUEST_SCHEMA, {}],
-  ["edit", editLocalCoordinationTodo, "loopx_todo_compatibility_edit_request_v0", {}],
   ["terminal", terminalLifecycleLocalCoordinationTodo,
     LOCAL_COORDINATION_TODO_TERMINAL_LIFECYCLE_REQUEST_SCHEMA, {
       registered_agents: [], lifecycle_grants: [], successor_intents: [],
       linked_successor_todo_ids: [], lease_expected_version: null,
+      registry_source: {path: join(tmpdir(), "unused-registry.json"), sha256: "0".repeat(64)},
+      command: "complete", operation_identity: {kind: "explicit", operation_id: "maintenance"},
     }],
   ["archive", archiveLocalCoordinationTodos,
-    LOCAL_COORDINATION_TODO_ARCHIVE_REQUEST_SCHEMA, {max_active_done: 0}],
+    LOCAL_COORDINATION_TODO_ARCHIVE_REQUEST_SCHEMA, {
+      max_active_done: 0, role: "agent", operation_id: "archive-maintenance",
+      observed_at: "2026-01-01T00:00:00Z",
+    }],
+  ["archive acknowledgement", acknowledgeLocalCoordinationTodoArchive,
+    LOCAL_COORDINATION_TODO_ARCHIVE_ACK_REQUEST_SCHEMA, {
+      role: "agent", operation_id: "archive-maintenance",
+    }],
 ] as const) {
   test(`promoted ${name} checks maintenance before opening a provider`, async (t) => {
     const root = await mkdtemp(join(tmpdir(), "loopx-native-maintenance-"));
@@ -52,9 +60,18 @@ for (const [name, invoke, schema, requestFields] of [
     LOCAL_COORDINATION_TODO_TERMINAL_LIFECYCLE_REQUEST_SCHEMA, {
       registered_agents: [], lifecycle_grants: [], successor_intents: [],
       linked_successor_todo_ids: [], lease_expected_version: null,
+      registry_source: {path: join(tmpdir(), "unused-registry.json"), sha256: "0".repeat(64)},
+      command: "complete", operation_identity: {kind: "explicit", operation_id: "maintenance"},
     }],
   ["archive", archiveLocalCoordinationTodos,
-    LOCAL_COORDINATION_TODO_ARCHIVE_REQUEST_SCHEMA, {max_active_done: 0}],
+    LOCAL_COORDINATION_TODO_ARCHIVE_REQUEST_SCHEMA, {
+      max_active_done: 0, role: "agent", operation_id: "archive-maintenance",
+      observed_at: "2026-01-01T00:00:00Z",
+    }],
+  ["archive acknowledgement", acknowledgeLocalCoordinationTodoArchive,
+    LOCAL_COORDINATION_TODO_ARCHIVE_ACK_REQUEST_SCHEMA, {
+      role: "agent", operation_id: "archive-maintenance",
+    }],
 ] as const) {
   test(`promoted ${name} waits behind the bootstrap and rollback maintenance lock`, async (t) => {
     const root = await mkdtemp(join(tmpdir(), "loopx-native-maintenance-race-"));
@@ -88,6 +105,36 @@ import { engageLegacyCoordinationWriterFence, legacyCoordinationTodoLockPath, le
 import { taskLeaseLockPath } from "../../loopx/control_plane/work_items/task_lease_acquire.ts";
 import { withFileMutationLock } from "../../loopx/control_plane/effect_runtime_io.ts";
 import { access } from "node:fs/promises";
+
+test("a canonical writer waits for a slow file-v0 critical section without losing the fence", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "loopx-canonical-long-writer-"));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  let entered!: () => void;
+  let release!: () => void;
+  const firstEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const firstRelease = new Promise<void>((resolve) => { release = resolve; });
+  const first = withCanonicalWriter(root, "goal-a", false, async () => {
+    entered();
+    await firstRelease;
+    return "first";
+  });
+  await firstEntered;
+  let secondState = "pending";
+  const second = withCanonicalWriter(root, "goal-a", false, async () => "second")
+    .then((value) => { secondState = "applied"; return value; }, (error: unknown) => {
+      secondState = "failed";
+      return error;
+    });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+    assert.equal(secondState, "pending", "the old five-second lock deadline must not reject a live writer");
+  } finally {
+    release();
+  }
+  assert.equal(await first, "first");
+  assert.equal(await second, "second");
+  assert.equal(secondState, "applied");
+});
 
 function fenceRequest(root: string) {
   return {schema_version: "loopx_legacy_coordination_writer_fence_engage_request_v0",

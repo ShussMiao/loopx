@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 MANAGED_MARKER_PREFIX = "<!-- loopx-managed-slash-command:v1"
 LEGACY_UPGRADABLE_SIGNATURES = (
@@ -15,15 +15,47 @@ EXISTING_LOOPX_CAPABILITY_SKILL_SIGNATURES = (
 )
 
 
+class CommandFacadeSpec(TypedDict):
+    command: str
+    name: str
+    description: str
+    argument_hint: str
+    instructions: list[str]
+    title: NotRequired[str]
+    alias_for: NotRequired[str]
+
+
 def managed_marker(*, command: str, surface: str) -> str:
     return f"{MANAGED_MARKER_PREFIX} command={command} surface={surface} -->"
+
+
+def _needs_yaml_quotes(value: str) -> bool:
+    """Whether a front-matter scalar must be double-quoted to stay valid YAML.
+
+    Hosts do not agree on how forgiving their front-matter reader is. Kiro CLI
+    keeps the quote characters verbatim, so a quoted `name` turns the skill's
+    own slash command into `/"loopx"`; a strict YAML reader, on the other hand,
+    rejects an unquoted `[task text]` or a value containing `": "`. Quoting only
+    what YAML actually requires satisfies both: identifiers stay plain and
+    ambiguous prose stays quoted.
+    """
+    if not value or value.strip() != value:
+        return True
+    if value[0] in "-?:,[]{}#&*!|>'\"%@`":
+        return True
+    if value.lower() in {"true", "false", "null", "yes", "no", "on", "off", "~"}:
+        return True
+    return ": " in value or " #" in value or value.endswith(":") or "\n" in value
 
 
 def front_matter(*, fields: dict[str, str]) -> str:
     lines = ["---"]
     for key, value in fields.items():
-        escaped = value.replace('"', '\\"')
-        lines.append(f'{key}: "{escaped}"')
+        if _needs_yaml_quotes(value):
+            escaped = value.replace('"', '\\"')
+            lines.append(f'{key}: "{escaped}"')
+        else:
+            lines.append(f"{key}: {value}")
     lines.append("---")
     return "\n".join(lines)
 
@@ -109,7 +141,7 @@ def retire_status(path: Path, *, execute: bool) -> str:
 
 def install_skill_facade(
     *,
-    specs: list[dict[str, Any]],
+    specs: list[CommandFacadeSpec],
     installed: list[dict[str, Any]],
     skills_dir: Path,
     surface: str,
@@ -120,13 +152,27 @@ def install_skill_facade(
     invoke_prefix: str = "",
     flat: bool = False,
 ) -> None:
-    """Write managed command facades in directory or flat host layouts."""
+    """Install canonical skills and retire catalog aliases in every layout."""
     for spec in specs:
         path = (
             skills_dir / f"{spec['name']}.md"
             if flat
             else skills_dir / str(spec["name"]) / "SKILL.md"
         )
+        if "alias_for" in spec:
+            status = retire_managed_file(path, execute=execute)
+            if status:
+                installed.append({
+                    "surface": surface,
+                    "host_surfaces": list(host_surfaces),
+                    "mechanism": f"retired_{surface.replace('-', '_')}_legacy_alias",
+                    "command": spec["command"],
+                    "path": str(path),
+                    "status": status,
+                    "invoke_as": [],
+                    "replacement_command": spec["alias_for"],
+                })
+            continue
         if uninstall:
             installed.append(
                 {

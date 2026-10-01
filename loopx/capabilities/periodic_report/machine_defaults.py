@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .cadence import normalize_report_cadence
+
+from ...control_plane.content_digest import ENVELOPED_SHA256_PATTERN
 from ...control_plane.todos.contract import normalize_todo_claimed_by
 from ..configuration_ui import resolve_capability_configuration
 from ..machine_configuration.contract import (
@@ -29,7 +31,6 @@ DELIVERY_PLAN_SCHEMA = "periodic_report_goal_delivery_plan_v0"
 SUBSCRIPTION_ERROR_SCHEMA = "periodic_report_subscription_error_v0"
 
 _INHERITANCE_MODE = "live_machine_default"
-_REVISION_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class PeriodicReportSubscriptionConfigurationError(ValueError):
@@ -108,6 +109,7 @@ def normalize_periodic_report_machine_defaults(
             "profile_preset",
             "route_ref",
             "timezone",
+            "schedule",
         },
         label="periodic_report",
     )
@@ -128,10 +130,11 @@ def normalize_periodic_report_machine_defaults(
         periodic.get("timezone", "UTC"),
         "periodic_report.timezone",
     )
-    try:
-        ZoneInfo(timezone)
-    except ZoneInfoNotFoundError as exc:
-        raise ValueError("periodic_report.timezone is unknown") from exc
+    if timezone != "UTC":
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("periodic_report.timezone is unknown") from exc
     normalized_periodic: dict[str, Any] = {
         "schema_version": PERIODIC_REPORT_MACHINE_DEFAULTS_SCHEMA,
         "enabled": enabled,
@@ -155,6 +158,11 @@ def normalize_periodic_report_machine_defaults(
                     value,
                     f"periodic_report.{field}",
                 )
+    schedule = normalize_report_cadence(periodic.get("schedule"))
+    if schedule is not None:
+        if schedule["timezone"] != timezone:
+            raise ValueError("schedule.timezone must match periodic_report.timezone")
+        normalized_periodic["schedule"] = schedule
     return normalized_periodic
 
 
@@ -258,10 +266,11 @@ def _normalized_goal_subscription(
     timezone_name = _text(
         config.get("timezone", "UTC"), "goal periodic_report.timezone"
     )
-    try:
-        ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError as exc:
-        raise ValueError("goal periodic_report.timezone is unknown") from exc
+    if timezone_name != "UTC":
+        try:
+            ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("goal periodic_report.timezone is unknown") from exc
     profile_preset = str(config.get("profile_preset") or "").strip() or None
     route_ref = str(config.get("route_ref") or "").strip() or None
     if enabled:
@@ -277,6 +286,11 @@ def _normalized_goal_subscription(
         "route_ref": route_ref,
         "timezone": timezone_name,
     }
+    schedule = normalize_report_cadence(config.get("schedule"))
+    if schedule is not None:
+        if schedule["timezone"] != timezone_name:
+            raise ValueError("schedule.timezone must match periodic_report.timezone")
+        subscription["schedule"] = schedule
     subscription["effective_revision"] = _digest(subscription)
     return subscription
 
@@ -285,6 +299,12 @@ def _invalid_goal_subscription_fields(config: Mapping[str, Any]) -> tuple[str, .
     """Identify invalid typed fields without interpreting exception prose."""
 
     invalid: list[str] = []
+    try:
+        schedule = normalize_report_cadence(config.get("schedule"))
+        if schedule is not None and schedule["timezone"] != str(config.get("timezone") or "UTC"):
+            invalid.append("schedule")
+    except (TypeError, ValueError):
+        invalid.append("schedule")
     enabled = config.get("enabled")
     if not isinstance(enabled, bool):
         invalid.append("enabled")
@@ -292,7 +312,8 @@ def _invalid_goal_subscription_fields(config: Mapping[str, Any]) -> tuple[str, .
         timezone_name = _text(
             config.get("timezone", "UTC"), "goal periodic_report.timezone"
         )
-        ZoneInfo(timezone_name)
+        if timezone_name != "UTC":
+            ZoneInfo(timezone_name)
     except (TypeError, ValueError, ZoneInfoNotFoundError):
         invalid.append("timezone")
     if enabled is True:
@@ -378,7 +399,7 @@ def normalize_periodic_report_delivery_authority(raw: object) -> dict[str, Any]:
         authority.get("effective_revision"),
         "delivery_authority.effective_revision",
     )
-    if not _REVISION_RE.fullmatch(effective_revision):
+    if not ENVELOPED_SHA256_PATTERN.fullmatch(effective_revision):
         raise ValueError("delivery_authority.effective_revision is invalid")
     return {
         "schema_version": DELIVERY_AUTHORITY_SCHEMA,

@@ -92,7 +92,7 @@ def _build_capability_repair_fixture(root: Path) -> _SelectedTodoToolFixture:
         cwd=project_root,
         check=True,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=10,
     )
     state_path.write_text(

@@ -65,6 +65,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     "--applied-rrule",
     "--failed-rrule",
     "--failure-kind",
+    "--app-automation-current-rrule",
     "--codex-app-current-rrule",
     "--turn-instance-id",
     "--reset-token",
@@ -76,6 +77,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   const booleanOptions = new Set([
     "-A",
     "--codex-app",
+    "--trae_app",
     "--execute",
     "--dry-run",
     "--host-match-observed",
@@ -148,7 +150,7 @@ function decodeSchedulerHostFactsChunks(chunks: string[]): Record<string, unknow
   if (
     chunks.length === 0 ||
     encoded.length > MAX_ENCODED_FACTS_CHARS ||
-    !/^[A-Za-z0-9_-]+$/.test(encoded)
+    !/^[A-Za-z0-9_+\/-]+$/.test(encoded)
   ) {
     throw new EffectRuntimeRequestError(
       "scheduler host facts are missing or exceed the encoded boundary",
@@ -215,6 +217,26 @@ function requestFromArgs(argv: string[]): { request: Record<string, unknown>; fo
     );
   }
   const values = parsed.values;
+  const neutralObservedRrule = values["--app-automation-current-rrule"] ?? "";
+  const legacyCodexObservedRrule = values["--codex-app-current-rrule"] ?? "";
+  if (neutralObservedRrule && legacyCodexObservedRrule && neutralObservedRrule !== legacyCodexObservedRrule) {
+    throw new EffectRuntimeRequestError(
+      "App automation and Codex compatibility RRULE observations disagree",
+      "scheduler_host_facts_identity_mismatch",
+    );
+  }
+  if (parsed.booleans.has("--trae_app")) {
+    matchingText(facts, "surface", "trae_app", "--trae_app");
+    if (legacyCodexObservedRrule) {
+      throw new EffectRuntimeRequestError(
+        "Trae App cannot use the Codex RRULE compatibility alias",
+        "scheduler_host_facts_identity_mismatch",
+      );
+    }
+  }
+  if (parsed.booleans.has("-A") || parsed.booleans.has("--codex-app")) {
+    matchingText(facts, "surface", "codex_app", "--codex-app");
+  }
   if (values["--surface"]) matchingText(facts, "surface", values["--surface"], "--surface");
   if (values["--state-key"]) matchingText(facts, "state_key", values["--state-key"], "--state-key");
   if (values["--reset-token"]) matchingText(facts, "reset_token", values["--reset-token"], "--reset-token");
@@ -227,12 +249,14 @@ function requestFromArgs(argv: string[]): { request: Record<string, unknown>; fo
   if (expectedOperation === "host_failure" && values["--failed-rrule"]) {
     matchingText(facts, "expected_rrule", values["--failed-rrule"], "--failed-rrule");
   }
-  if (values["--codex-app-current-rrule"]) {
+  if (neutralObservedRrule || legacyCodexObservedRrule) {
     matchingText(
       facts,
       "observed_host_rrule",
-      values["--codex-app-current-rrule"],
-      "--codex-app-current-rrule",
+      neutralObservedRrule || legacyCodexObservedRrule,
+      neutralObservedRrule
+        ? "--app-automation-current-rrule"
+        : "--codex-app-current-rrule",
     );
   }
   if (values["--failure-kind"]) matchingText(facts, "failure_kind", values["--failure-kind"], "--failure-kind");
@@ -280,6 +304,13 @@ async function readRequest(): Promise<unknown> {
 
 async function main(): Promise<number> {
   try {
+    const [major, minor, patch] = process.versions.node.split(".").map(Number);
+    if (major < 22 || (major === 22 && (minor < 22 || (minor === 22 && patch < 3)))) {
+      throw new EffectRuntimeRequestError(
+        "native scheduler follow-up requires Node.js 22.22.3 or newer",
+        "node_unsupported",
+      );
+    }
     const fromArgs = process.argv.length > 2;
     const parsed = fromArgs
       ? requestFromArgs(process.argv.slice(2))

@@ -169,7 +169,7 @@ def classify_codex_cli_session_surface(
 
 
 def load_codex_cli_probe_fixture(path: Path) -> dict[str, str]:
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     if "command_outputs" in data:
         outputs = data["command_outputs"]
     else:
@@ -180,21 +180,21 @@ def load_codex_cli_probe_fixture(path: Path) -> dict[str, str]:
 
 
 def load_codex_cli_visible_session_proof_fixture(path: Path) -> dict[str, Any]:
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("Codex CLI visible session proof fixture must be a JSON object")
     return data
 
 
 def load_codex_cli_runtime_idle_fixture(path: Path) -> dict[str, Any]:
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("Codex CLI runtime idle fixture must be a JSON object")
     return data
 
 
 def load_codex_cli_first_response_fixture(path: Path) -> dict[str, Any]:
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("Codex CLI first-response fixture must be a JSON object")
     return data
@@ -222,7 +222,7 @@ def probe_human_input_idle_seconds(*, timeout_seconds: float = DEFAULT_TIMEOUT_S
             ["ioreg", "-c", "IOHIDSystem"],
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout_seconds,
         )
     except FileNotFoundError:
@@ -275,7 +275,7 @@ def run_codex_cli_session_probe(
                 [codex_bin, *extra_args],
                 check=False,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=timeout_seconds,
             )
         except FileNotFoundError:

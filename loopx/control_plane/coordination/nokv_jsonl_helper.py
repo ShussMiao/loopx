@@ -4,13 +4,16 @@ The bridge deliberately knows only byte storage.  Authority transitions,
 receipts, cursor ordering, and ambiguous-outcome reconciliation stay in the
 TypeScript ``NoKVAuthorityStore``.  The first JSON line configures one SDK
 client; every later line invokes exactly one of ``store_identity``,
-``read_blob``, or ``cas_publish_blob``.
+``read_blob``, or ``cas_publish_blob``.  Every publication names the workbench
+incarnation it expects; the SDK refuses a stale one before any row or object
+exists, and the helper admits only an SDK that can make that refusal typed.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import inspect
 import json
 import re
 import sys
@@ -19,8 +22,13 @@ from typing import Any, TextIO
 
 _HEX_128 = re.compile(r"^[0-9a-f]{32}$")
 _CLIENT_AVAILABILITY_ERRORS = (RuntimeError, OSError)
-QUALIFIED_NOKV_SDK_VERSION = "0.11.0"
+QUALIFIED_NOKV_SDK_VERSION = "0.11.1"
 QUALIFIED_NOKV_API_VERSION = 1
+# NoKV 0.11.1 evaluates ``expected_workspace_incarnation_id`` atomically with
+# the generation before any durable row or object exists and refuses a stale
+# incarnation with a typed exception. Both halves are admission requirements.
+_INCARNATION_FENCE_PARAMETER = "expected_workspace_incarnation_id"
+_INCARNATION_MISMATCH_EXCEPTION = "WorkspaceIncarnationMismatch"
 
 _CONFIG_KEYS = frozenset(
     {
@@ -36,6 +44,13 @@ _CONFIG_KEYS = frozenset(
     }
 )
 _ETCD_ROUTING_KEYS = frozenset({"kind", "endpoints", "key_prefix", "lease_ttl_seconds"})
+# Seed routing names one or more serving NoKV owners directly (numeric IP:port);
+# the SDK rejects hostnames, empty lists and unspecified ports itself.
+_SEEDS_ROUTING_KEYS = frozenset({"kind", "endpoints"})
+# Every routing kind this helper can express. A kind outside this set is a
+# configuration error; a kind inside it that the installed SDK cannot build is
+# a capability mismatch between the wheel and the configuration.
+_ROUTING_KINDS = frozenset({"etcd", "seeds", "static"})
 _STATIC_ROUTING_KEYS = frozenset(
     {
         "kind",
@@ -65,6 +80,17 @@ _S3_OBJECT_STORE_KEYS = frozenset(
 
 class RequestError(ValueError):
     """The JSON-lines caller violated the raw storage protocol."""
+
+
+class SdkCapabilityMismatch(RequestError):
+    """The installed NoKV SDK lacks a surface this helper requires.
+
+    Either the routing constructor this configuration names or the fenced
+    publication surface (``expected_workspace_incarnation_id`` plus the typed
+    ``WorkspaceIncarnationMismatch`` refusal). Raised only after the
+    configuration itself validated, so the caller can tell "wrong wheel" apart
+    from "invalid config".
+    """
 
 
 class ProviderProtocolError(RuntimeError):
@@ -298,10 +324,13 @@ def _cas_publish_blob(
     payload = _decode_bytes(values.get("bytes_base64"))
     operation_id = _required_string(values, "operation_id")
     artifact_revision_id = _required_string(values, "artifact_revision_id")
+    expected_incarnation = _required_string(values, _INCARNATION_FENCE_PARAMETER)
     if not _HEX_128.fullmatch(operation_id):
         raise RequestError("operation_id must be 32 lowercase hex")
     if not _HEX_128.fullmatch(artifact_revision_id):
         raise RequestError("artifact_revision_id must be 32 lowercase hex")
+    if not _HEX_128.fullmatch(expected_incarnation):
+        raise RequestError(f"{_INCARNATION_FENCE_PARAMETER} must be 32 lowercase hex")
     try:
         raw_result = client.publish_bytes(
             workbench,
@@ -311,6 +340,24 @@ def _cas_publish_blob(
             expected_generation=expected_generation,
             operation_id=operation_id,
             artifact_revision_id=artifact_revision_id,
+            expected_workspace_incarnation_id=expected_incarnation,
+        )
+    except _incarnation_mismatch_errors() as error:
+        # The owner evaluated the fence before claiming the path, so nothing
+        # durable exists for this attempt. A refusal that names a different
+        # fence than the one sent is an SDK contract violation, not evidence.
+        if getattr(error, "expected", None) != expected_incarnation:
+            return _opaque_failure(
+                request_id,
+                "ambiguous",
+                "provider_protocol_violation",
+                "NoKV refused a workbench incarnation fence this request did not send",
+            )
+        return _opaque_failure(
+            request_id,
+            "failed",
+            "store_identity_mismatch",
+            "NoKV workbench incarnation does not match the expected incarnation",
         )
     except FileExistsError:
         return _response(
@@ -420,6 +467,8 @@ def build_client(config_value: object) -> Any:
     _require_exact_keys(config, _CONFIG_KEYS, "config")
     routing_value = _mapping(config.get("routing"), "routing")
     routing_kind = _required_string(routing_value, "kind")
+    if routing_kind not in _ROUTING_KINDS:
+        raise RequestError(f"unsupported routing kind {routing_kind!r}")
     if routing_kind == "etcd":
         _require_exact_keys(routing_value, _ETCD_ROUTING_KEYS, "routing")
         routing_arguments: tuple[object, ...] = (
@@ -443,7 +492,8 @@ def build_client(config_value: object) -> Any:
             _generation(routing_value.get("owner_epoch"), "owner_epoch"),
         )
     else:
-        raise RequestError(f"unsupported routing kind {routing_kind!r}")
+        _require_exact_keys(routing_value, _SEEDS_ROUTING_KEYS, "routing")
+        routing_arguments = (_string_list(routing_value, "endpoints"),)
 
     object_value = _mapping(config.get("object_store"), "object_store")
     object_kind = _required_string(object_value, "kind")
@@ -515,13 +565,25 @@ def build_client(config_value: object) -> Any:
         RoutingConfig = nokv.RoutingConfig
     except AttributeError as error:
         raise RequestError("the NoKV Python SDK surface is incomplete") from error
-
-    try:
-        routing = (
-            RoutingConfig.etcd(*routing_arguments)
-            if routing_kind == "etcd"
-            else RoutingConfig.static(*routing_arguments)
+    if not publish_incarnation_fence_supported(Client):
+        raise SdkCapabilityMismatch(
+            "the installed NoKV Python SDK does not fence publication on the "
+            f"expected workbench incarnation (Client.publish_bytes lacks "
+            f"{_INCARNATION_FENCE_PARAMETER} or nokv.{_INCARNATION_MISMATCH_EXCEPTION} "
+            "is missing)"
         )
+
+    # The kind was checked against _ROUTING_KINDS above, so this attribute
+    # lookup never reaches an arbitrary caller-chosen name. The 0.11.x release
+    # wheels provide etcd/static; the metadata-runtimes line provides seeds.
+    routing_constructor = getattr(RoutingConfig, routing_kind, None)
+    if not callable(routing_constructor):
+        raise SdkCapabilityMismatch(
+            "the installed NoKV Python SDK does not provide "
+            f"RoutingConfig.{routing_kind}"
+        )
+    try:
+        routing = routing_constructor(*routing_arguments)
     except (TypeError, ValueError) as error:
         raise RequestError("NoKV routing configuration is invalid") from error
     try:
@@ -550,6 +612,48 @@ def build_client(config_value: object) -> Any:
         raise RequestError("NoKV client configuration is invalid") from error
 
 
+def _incarnation_mismatch_errors() -> tuple[type[BaseException], ...]:
+    """The SDK's typed incarnation-fence refusal, or nothing when it has none."""
+    error = getattr(sys.modules.get("nokv"), _INCARNATION_MISMATCH_EXCEPTION, None)
+    if isinstance(error, type) and issubclass(error, BaseException):
+        return (error,)
+    return ()
+
+
+def publish_incarnation_fence_supported(client_type: object) -> bool:
+    """True only when publishing names the fence and refusing it is typed.
+
+    Both halves are required: a wheel that accepted the keyword without a typed
+    refusal would collapse a stale-incarnation rejection into the ambiguous
+    ``RuntimeError`` path, which is exactly the outcome the fence exists to
+    remove. The 0.11.0 release wheel has neither half.
+    """
+    if not _incarnation_mismatch_errors():
+        return False
+    try:
+        signature = inspect.signature(getattr(client_type, "publish_bytes"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    parameter = signature.parameters.get(_INCARNATION_FENCE_PARAMETER)
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
+def _sdk_protocol_schema() -> str | None:
+    """Return the wire schema the imported SDK declares, if it declares one.
+
+    The 0.11.0 release wheel has no such attribute; newer wheels export
+    ``WORKSPACE_PROTOCOL_SCHEMA`` so a deployment can compare it against the
+    server before trusting a nominally equal ``__version__``.
+    """
+    schema = getattr(sys.modules.get("nokv"), "WORKSPACE_PROTOCOL_SCHEMA", None)
+    if isinstance(schema, str) and schema and schema.strip() == schema:
+        return schema
+    return None
+
+
 def main() -> int:
     first = sys.stdin.readline()
     try:
@@ -561,6 +665,15 @@ def main() -> int:
         client = build_client(values.get("config"))
     except json.JSONDecodeError as error:
         result = _failure(None, "failed", "invalid_json", error)
+    except SdkCapabilityMismatch as error:
+        result = _failure(
+            _request_id(value.get("request_id"))
+            if isinstance(value, Mapping)
+            else None,
+            "failed",
+            "nokv_sdk_capability_mismatch",
+            error,
+        )
     except RequestError as error:
         result = _failure(
             _request_id(value.get("request_id"))
@@ -592,6 +705,7 @@ def main() -> int:
                     "ready",
                     nokv_sdk_version=QUALIFIED_NOKV_SDK_VERSION,
                     nokv_api_version=QUALIFIED_NOKV_API_VERSION,
+                    nokv_protocol_schema=_sdk_protocol_schema(),
                 ),
                 sort_keys=True,
                 separators=(",", ":"),

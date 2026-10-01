@@ -6,9 +6,9 @@ LoopX 控制台是为工程师与 Agent 深度协作打造的统一本地工作�
 
 ## 🎬 30 秒产品发布演示视频
 
-<video controls width="100%" poster="https://huangruiteng.github.io/loopx/docs/assets/personal-workspace/guide_manager_overview.png" style="border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.12);">
-  <source src="https://huangruiteng.github.io/loopx/docs/assets/personal-workspace/loopx-dashboard-launch.mp4" type="video/mp4">
-  您的浏览器暂不支持直接播放视频，可下载 <a href="https://huangruiteng.github.io/loopx/docs/assets/personal-workspace/loopx-dashboard-launch.mp4">MP4 视频文件</a> 进行查看。
+<video controls width="100%" poster="https://loopx-project.github.io/loopx/docs/assets/personal-workspace/guide_manager_overview.png" style="border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.12);">
+  <source src="https://loopx-project.github.io/loopx/docs/assets/personal-workspace/loopx-dashboard-launch.mp4" type="video/mp4">
+  您的浏览器暂不支持直接播放视频，可下载 <a href="https://loopx-project.github.io/loopx/docs/assets/personal-workspace/loopx-dashboard-launch.mp4">MP4 视频文件</a> 进行查看。
 </video>
 
 > 💡 **视频高光**：终端一键启动 ➔ 管家 4 泳道任务流 ➔ 快捷指令浮动托盘 ➔ 4 列看板与智能「转为 Task」清洗 ➔ 飞书话题直连 ➔ Brutal 野兽派主题切换。
@@ -48,17 +48,17 @@ curl -fsS http://127.0.0.1:8767/status.json
 
 ```mermaid
 graph TD
-    A[LoopX 控制台] --> B[LoopX 管家模式 (全局总览)]
-    A --> C[Goal 频道模式 (单一目标深度)]
+    A["LoopX 控制台"] --> B["LoopX 管家模式 (全局总览)"]
+    A --> C["Goal 频道模式 (单一目标深度)"]
 
-    B --> B1[你不在的时候 (离线统计)]
-    B --> B2[4 泳道任务流 (需要你 / 执行中 / 观察中 / 已安排)]
-    B --> B3[全局快捷问询与创建 Goal]
+    B --> B1["你不在的时候 (离线统计)"]
+    B --> B2["4 泳道任务流 (需要你 / 执行中 / 观察中 / 已安排)"]
+    B --> B3["全局快捷问询与创建 Goal"]
 
-    C --> C1[Tasks 4 列看板]
-    C --> C2[Chat 完整对话流]
-    C --> C3[Files 产出交付物]
-    C --> C4[Context 诊断抽屉 (仓绑定 / Lark 状态)]
+    C --> C1["Tasks 4 列看板"]
+    C --> C2["Chat 完整对话流"]
+    C --> C3["Files 产出交付物"]
+    C --> C4["Context 诊断抽屉 (仓绑定 / Lark 状态)"]
 ```
 
 ---
@@ -82,6 +82,34 @@ graph TD
    - `[汇总所有 Goal 进展 (立即发送)]`：带有蓝色高亮标识，点击后**立即发送**并在右下角弹出托盘展示全局总结；
    - `[创建新 Goal (草稿)]`：快速填入目标模板草稿。
 
+### 问答中的等待与失败
+
+管家与 Goal 的前端对话共用运行视图，适用于查询、编码、投研等各种任务：回答下方显示当前收到的活动阶段，展开「最近活动」可查看最近六条记录。命令、工具、检索等阶段来自执行器事件；尚未收到活动时保留等待提示，不根据等待时长推测执行进度。
+
+![运行中的回答显示当前活动、最近活动和中断本轮](../assets/personal-workspace/conversation-activity-desktop.png)
+
+点击回答中的「中断本轮」可以停止该回合。成功后保留已经显示的回答，继续发送消息会沿用当前会话；这不会停止整个 Goal。中断失败时错误留在原回答中，执行状态继续显示；若回合先完成，界面保留完成结果。仅连接到外部宿主、未开放中断的会话会返回宿主限制。
+
+The steward and Goal conversations share the same frontend activity view across task types. Command, tool and search phases appear when the executor reports them; missing activity stays an honest waiting state. Expand **Recent activity** for the latest six observations. **Interrupt turn** targets that reply, preserves already visible text, and keeps the conversation available for continuation. A rejected interruption leaves the live reply visible; completion wins a race with interruption. This control does not stop the Goal. Attached hosts that do not expose interruption report that limitation.
+
+运行中可点击「调整本轮」，向原任务追加指令。当前支持原生 Codex 执行器；只有收到匹配的执行器回执后才显示已接收，这不代表调整后的任务已经完成。不支持的执行器、过期回合或无法确认的回执会保留草稿，不自动变成新任务。送达状态未知时，重试沿用同一请求编号，防止重复投递；执行器明确拒绝且确认未送达时，条件恢复后可用原文安全地重新发起。回合结束后，未发送的草稿仍可复制到输入框。草稿仅保存在当前页面，刷新前请自行保存。
+
+Use **Adjust turn** to add instructions to the running task. Native Codex executors currently support this control. A matching executor receipt confirms acceptance, not completion. Unsupported executors, expired turns and unconfirmed receipts retain the draft without starting another task. An unresolved delivery keeps the request identity on retry to prevent duplicates; a confirmed pre-delivery rejection allows the unchanged draft to start a new request after recovery. After the turn ends, copy an unsent draft to the composer. Drafts are page-local; save them before refreshing.
+
+For API callers, `POST /api/chat/sessions/{session_id}/turns/{turn_id}/steer`
+accepts `message` (1–12000 characters) and a stable `client_ingress_id`.
+The successful receipt includes both identities, the ingress id and
+`status: delivered`. Reusing the ingress id with changed text or a different
+turn is rejected. The original turn stream continues; this endpoint never
+queues a new turn. A pre-delivery rejection reports `delivery_state: not_delivered`;
+an uncertain outcome reports `delivery_state: unresolved`. Replaying the same
+ingress id preserves its recorded outcome; a confirmed non-delivery needs a new
+id for a fresh attempt. Existing LoopX-mode and Lark ingress keep their contracts.
+
+Codex 上游声明仍会重试时，会话显示「Codex 正在重试」并继续等待最终结果。若上游明确终止，LoopX 保存失败回执，不把已经出现的部分文字当成完整回答。明确的策略拦截、用量限制、频率限制、上下文超限和身份验证失败会保留各自类别；未知错误仍显示通用失败，不从报错正文猜测原因。
+
+策略拦截是本轮已结束，不是仍在安全检查中。LoopX 不会自动重放该请求；重启或重复提交同一个请求编号也会返回原失败回执。界面提示只说明上游给出的类别，不解释其未提供的具体触发原因，也不公开上游原始错误详情。
+
 ### 3.1 停止暂时不活跃的 Goal
 
 当 Goal 较多时，主列表只展示仍处于 active 状态的 Goal。点击 Goal 右侧的暂停按钮后，LoopX 会先展示 Typed Action 预览；只有你明确确认，Goal 才会进入 **「已停止」** 折叠区。
@@ -102,14 +130,22 @@ CLI 提供同一套可预览、可验证的生命周期操作：
 loopx goal-lifecycle --goal-id <goal-id> --operation stop
 
 # 确认执行，再读取 quota 验证自动推进已暂停
-loopx goal-lifecycle --goal-id <goal-id> --operation stop --execute
+loopx goal-lifecycle --goal-id <goal-id> --operation stop --actor-kind owner --execute
 loopx quota status --goal-id <goal-id>
 
 # 恢复；不会绕过其他运行门禁
-loopx goal-lifecycle --goal-id <goal-id> --operation resume --execute
+loopx goal-lifecycle --goal-id <goal-id> --operation resume --actor-kind owner --execute
 ```
 
+`--execute` 必须显式声明 `--actor-kind owner` 或 `controller`；不带 actor 的
+预览仍保持只读。写入的 activation receipt 会保留该 actor kind。
+
 执行时，LoopX 会写入权威 source registry、同步全局 registry，并验证两端 readback；任一端未验证成功时不会宣称操作完成。
+
+切换到 SSH 状态来源后，只有来源与本机 OpenSSH 配置中的精确 Host alias 绑定时，
+侧边栏才显示停止/恢复按钮。操作通过 SSH 在目标主机执行同一个
+`goal-lifecycle` typed contract，并验证远端投影；不会回退修改本机同名 Goal。
+手工 URL 以及创建、删除、Todo、会话等其他远端操作继续保持只读。
 
 ---
 
@@ -139,6 +175,81 @@ loopx goal-lifecycle --goal-id <goal-id> --operation resume --execute
 
 ---
 
+### 4.2 Goal 概览与交付依据 / Goal overview
+
+Goal 顶部直接提供 **概览、任务、对话、成果**，分别用于判断进展、推进工作、
+与 Agent 沟通和查看产出。选择一个 Goal 后仍默认进入四列任务看板；
+看板与列表保持原有任务范围。切换页面后，任务筛选、已加载历史和各页滚动位置保留。
+右上角设置直接打开既有能力配置；返回后保留工作区。切换 Goal 或数据源则重新建立页面上下文。
+
+点击一次 **概览**，即可查看当前进展、需要处理的决定、执行记录和用量。
+决定与执行记录直接打开原有详情；「查看任务」「查看成果」前往对应页面。
+低频仓库、连接和运行信息保留在「Goal 信息」中，不再充当查看进展的必经路径。
+
+**交付与依据：**概览直接展示当前交付链、责任、关联关系和验收观察，
+不需要额外打开复盘弹窗。可按标题、负责人或引用搜索，选择节点沿关系追溯，
+并打开当前工作区中的任务、决定或执行记录。桌面支持关系图，手机默认列表。
+
+**范围与刷新：**交付链覆盖当前选中工作及有限前序，不是完整 Goal 依赖图。
+缺失前序、来源裁剪与未展开决定可展开查看；任务完成或缺口列表为空都不代表通过验收。
+仅进入概览或点击「刷新快照」时读取交付链；离开概览取消未完成请求，
+不增加普通状态读取的图计算。状态变化后旧快照的来源跳转和导出暂停，刷新后继续。
+读取失败保留其他概览内容并显示重试提示，不将失败视为工作已完成。
+
+**导出：**「导出交付快照」下载包含读取时间、完整当前链、关系、证据引用和验收观察的
+Markdown。搜索筛选不会裁剪导出；不包含原始日志、文件正文或对话正文。
+成果与报告继续由成果页统一展示，不在概览建立第二份成果清单。
+
+**显式验收合同：**若本地所有者已为使用 canonical authority 的 Goal 启用合同，
+交付链下方可展开「Goal 验收合同」，查看条件、任务关联与独立的产物检查结果。
+「任务关联已确认」不等于「产物检查通过」，后者也不自动批准或完成 Goal。
+缺失、停用保持原界面；旧检查显示其原版本，刷新失败不会作为最新结果导出。
+配置入口是本地所有者 CLI：先 `loopx goal-acceptance inspect --goal-id example-goal`，
+再按[配置与回滚指南（v0）](../reference/goal-acceptance-observations.md#owner-authorized-contract-v0)
+使用 `configure --document --expected-provider-revision`、`verify` 或 `disable`；
+变更与执行检查需要 `--execute`。不新增网页配置入口，不自动提升 provider。
+
+**边界：**原有交付链观察无需模型调用或新配置。远端只读来源可查看同步的概览和验收观察，
+不回退查询本机同名 Goal 的交付链。所有阅读、筛选与导出均不改变任务、租约、预算或
+审批；来源操作仍使用既有预览和权限检查。本次没有状态迁移，回滚沿用原安装流程。
+
+English: Use the direct **Overview / Tasks / Chat / Files** navigation. Goal
+selection still opens Tasks. Switching views or returning from settings retains
+task filters, loaded history and scroll; a different Goal or source starts a new
+view session. Settings opens the existing capability editor directly.
+
+Overview brings progress, pending decisions, execution and usage into one page.
+Its delivery section reads the bounded current chain and acceptance observations
+on entry or explicit refresh, with search, map/list layouts, source navigation
+and Markdown export. Leaving Overview aborts pending reads. Export retains the
+entire validated delivery snapshot regardless of filtering, excluding raw logs
+and conversation/file bodies. Outputs remain in Files. Missing observations
+never certify acceptance. Remote sources show their synchronized observations
+without querying the local delivery API. The baseline delivery-chain read
+requires no model call or configuration and adds no write authority or migration.
+
+When a local owner explicitly enables an acceptance contract on an already
+canonical Goal, expand **Goal acceptance contract** below the delivery chain.
+It separates confirmed task associations from artifact checks and shows both
+the current contract basis and recorded verification basis. Neither approves
+or completes the Goal. Missing or disabled contracts preserve the baseline view.
+Start with `loopx goal-acceptance inspect --goal-id example-goal`; the
+[owner guide (v0)](../reference/goal-acceptance-observations.md#owner-authorized-contract-v0)
+covers exact configure, verify and disable commands. Authoring stays in the
+explicit local-owner CLI; it does not automatically promote a provider or add a
+web configuration surface. Refresh the snapshot after a CLI operation.
+
+CLI readback uses the same existing owners:
+
+```bash
+loopx --format json status --goal-id example-goal --include-task-graph
+loopx --format json review-packet --goal-id example-goal
+```
+
+The local Chat HTTP read is `GET /api/chat/delivery-review?goal_id=example-goal`.
+Lark continues using its existing Goal Channel projection; this slice adds no
+Lark card or notification and does not qualify cross-channel presentation parity.
+
 ## 💬 5. 悬浮会话托盘（ManagerConversationTray）
 
 无论你在浏览总览还是在处理看板，只要点击带有 **`立即发送`** 标识的快捷指令，页面右下角都会弹出抽屉式的轻量对话托盘：
@@ -152,7 +263,7 @@ loopx goal-lifecycle --goal-id <goal-id> --operation resume --execute
 
 ## 🔍 6. Goal 诊断与 Lark / 飞书话题连接抽屉
 
-点击页面右上角的 **`[Goal 详情]`** 按钮，可从右侧滑出元数据诊断抽屉：
+进入 **概览**，点击 **Goal 信息**，可从右侧滑出元数据诊断抽屉：
 
 ![Goal 诊断与 Lark 连接状态抽屉](../assets/personal-workspace/guide_goal_context_drawer.png)
 
@@ -183,7 +294,7 @@ loopx dashboard --enable-goal-subagent-configuration
 
 然后要为一个 Goal 开启运行时能力：
 
-1. 进入该 Goal，点击 **`Goal 详情`**；
+1. 进入该 Goal 的 **概览**，点击 **Goal 信息**；
 2. 在「自适应子代理执行」中选择最多子代理数。任务领域限制是可选项：全部不选表示
    不按领域过滤；需要进一步收窄时，再从当前 Goal 开放 advancement Todo 已声明的
    `task_domain` 中多选。每个选项会显示当前匹配的开放 Todo 数量。控制台优先读取

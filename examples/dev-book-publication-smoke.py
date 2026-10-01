@@ -19,11 +19,13 @@ BRAND_STYLES = REPO_ROOT / "docs" / "stylesheets" / "loopx.css"
 HOMEPAGE = REPO_ROOT / "apps" / "presentation" / "site" / "src" / "App.tsx"
 
 CHAPTERS = (
+    "workspace-v1",
     "00-reading-guide",
     "01-from-session-to-loop",
     "02-session-goal-loopx",
     "state-substrate",
     "work-graph-and-authority",
+    "core-state-machines",
     "03-one-turn",
     "04-runtime-boundaries",
     "05-connect-existing-project",
@@ -176,14 +178,51 @@ def assert_community_casebook_is_bilingual() -> None:
 
 
 def validate_rendered_site(site_dir: Path) -> None:
+    def assert_state_machine_diagrams(html: str, route: str) -> None:
+        diagram_count = len(re.findall(r'<pre class="mermaid">', html))
+        assert diagram_count == 10, (
+            f"{route}: expected 10 Mermaid source containers, found {diagram_count}"
+        )
+        assert "language-mermaid" not in html, (
+            f"{route}: Mermaid source was rendered as a highlighted code block"
+        )
+        assert "javascripts/mermaid.js" not in html, (
+            f"{route}: stale custom Mermaid initializer is still referenced"
+        )
+        assert len(re.findall(r'<script src="[^"]*assets/javascripts/bundle\.[^"]+\.min\.js"></script>', html)) == 1, (
+            f"{route}: expected the single MkDocs Material renderer owner"
+        )
+
     routes = {
         "index.html": ("LoopX Developer Book", "English edition", "MkDocs Material"),
         "chapters/00-reading-guide/index.html": (
             "Dev Book 与 Control-Plane Course 如何配合",
             "/loopx/docs/development/control-plane-course/06-quota-decision-kernel/",
         ),
+        "chapters/workspace-v1/index.html": (
+            "操作 LoopX 1.0 Workspace",
+            "typed preview",
+            "live_steering",
+        ),
         "chapters/01-from-session-to-loop/index.html": (
             "从一次会话到长程任务",
+        ),
+        "chapters/core-state-machines/index.html": (
+            "主要状态机与状态流转",
+            "一条 Loop、三层抽象、九组状态机",
+            "先认识名词：把“事实、判断、动作、证明”分开",
+            "为什么这样设计，而不是一个大状态机",
+            "状态机通过事实与协议接力",
+            "L0：为什么需要 LoopX",
+            "GoalControlSnapshot",
+            "expected_provider_revision",
+            "deferred_resume_candidate",
+            "Agent 提交 bounded proposal",
+            "Agent 判断错了怎么办",
+            "Source state",
+            "durable_writeback",
+            "LoopX 怎样体现“闭环”",
+            "terminal_no_followup",
         ),
         "chapters/05-connect-existing-project/index.html": (
             "快速阅读路线",
@@ -196,8 +235,30 @@ def validate_rendered_site(site_dir: Path) -> None:
             "How the Dev Book and Control-Plane Course work together",
             "/loopx/docs/development/control-plane-course/06-quota-decision-kernel/",
         ),
+        "chapters/workspace-v1/index.html": (
+            "Operate the LoopX 1.0 Workspace",
+            "typed preview",
+            "live_steering",
+        ),
         "chapters/01-from-session-to-loop/index.html": (
             "From one session to long-running work",
+        ),
+        "chapters/core-state-machines/index.html": (
+            "Core state machines and transitions",
+            "one Loop, three abstraction levels, nine state-machine families",
+            "Vocabulary first: separate facts, decisions, actions, and proof",
+            "Why this design instead of one large state machine",
+            "facts and protocols connect the machines",
+            "L0: Why does LoopX need to exist",
+            "GoalControlSnapshot",
+            "expected_provider_revision",
+            "deferred_resume_candidate",
+            "Agent submits bounded proposal",
+            "What if the Agent is wrong",
+            "Source state",
+            "durable_writeback",
+            "What makes LoopX a closed loop",
+            "terminal_no_followup",
         ),
         "chapters/05-connect-existing-project/index.html": (
             "Fast reading path",
@@ -210,6 +271,8 @@ def validate_rendered_site(site_dir: Path) -> None:
         html = read(target)
         for marker in markers:
             assert marker in html, f"{relative_path}: missing rendered marker {marker}"
+        if relative_path == "chapters/core-state-machines/index.html":
+            assert_state_machine_diagrams(html, relative_path)
         assert ":::: tip" not in html, f"{relative_path}: unrendered VitePress container"
         assert 'data-md-color-scheme="slate"' in html, f"{relative_path}: not dark by default"
         if relative_path == "index.html":
@@ -232,6 +295,8 @@ def validate_rendered_site(site_dir: Path) -> None:
         html = read(target)
         for marker in markers:
             assert marker in html, f"en/{relative_path}: missing rendered marker {marker}"
+        if relative_path == "chapters/core-state-machines/index.html":
+            assert_state_machine_diagrams(html, f"en/{relative_path}")
         assert 'data-md-color-scheme="slate"' in html, f"en/{relative_path}: not dark by default"
         if relative_path == "index.html":
             chapter_links = set(re.findall(r'href="[^"]*chapters/[^"#?]+/?(?:index\.html)?"', html))
@@ -270,6 +335,15 @@ def main() -> int:
     assert "book/chapters/" not in mkdocs
     assert "book/en/chapters/" not in mkdocs
     assert "book/**" in mkdocs
+    assert "javascripts/mermaid.js" not in mkdocs
+    assert not (REPO_ROOT / "docs" / "javascripts" / "mermaid.js").exists()
+    chinese_state_machines = read(BOOK / "chapters" / "core-state-machines.md")
+    english_state_machines = read(BOOK / "en" / "chapters" / "core-state-machines.md")
+    for chapter in (chinese_state_machines, english_state_machines):
+        assert "must_attempt_work" in chapter
+        assert "selection_command" in chapter
+        assert "next_cli_actions[0]" in chapter
+        assert "turn_instance_id" in chapter
     docs_home = read(REPO_ROOT / "docs" / "index.md")
     docs_readme = read(REPO_ROOT / "docs" / "README.md")
     assert "Developer Book](/loopx/docs/book/)" in docs_home
@@ -371,11 +445,27 @@ def main() -> int:
             assert f"/loopx/docs/development/control-plane-course/{page}/" in guide, page
 
     assert_bilingual_concepts(
+        "chapters/workspace-v1.md",
+        "en/chapters/workspace-v1.md",
+        (
+            ("Personal Workspace milestone", "Personal Workspace milestone"),
+            ("不是一套新的事实源", "not a new source of truth"),
+            ("loopx dashboard --no-open", "loopx dashboard --no-open"),
+            ("typed preview -> human or policy review -> governed apply -> verified receipt -> refreshed projection", "typed preview -> human or policy review -> governed apply -> verified receipt -> refreshed projection"),
+            ("loopx machine-config inspect --format json", "loopx machine-config inspect --format json"),
+            ("`live_steering`", "`live_steering`"),
+            ("`session_queue`", "`session_queue`"),
+            ("`async_inbox`", "`async_inbox`"),
+            ("loopx periodic-report inspect-profile --preset weekly --format json", "loopx periodic-report inspect-profile --preset weekly --format json"),
+            ("Stage 2C authority", "Stage 2C authority"),
+        ),
+    )
+    assert_bilingual_concepts(
         "index.md",
         "en/index.md",
         (
             (f"LoopX 发布锚点：`{release_tag}`", f"LoopX release anchor: `{release_tag}`"),
-            ("运行时前提：Python 3.11+ 与 Node.js 22.6+", "Runtime prerequisites: Python 3.11+ and Node.js 22.6+"),
+            ("运行时前提：Python 3.11+ 与 Node.js 22.22.3+", "Runtime prerequisites: Python 3.11+ and Node.js 22.22.3+"),
             ("TypeScript owner", "TypeScript owners"),
             ("这不是两套可独立演进的 控制面", "These are not two independently evolving control planes"),
         ),
@@ -386,7 +476,7 @@ def main() -> int:
         (
             ("语义镜像", "semantic mirrors"),
             ("Python 3.11+", "Python 3.11+"),
-            ("Node.js 22.6+", "Node.js 22.6+"),
+            ("Node.js 22.22.3+", "Node.js 22.22.3+"),
             ("用户不需要手工维护 daemon", "users do not operate that runtime as a manual daemon"),
             ("TypeScript 已拥有", "TypeScript owns"),
             ("Python CLI 仍负责", "Python CLI still owns"),
@@ -407,6 +497,22 @@ def main() -> int:
             "DeepSeek Harness",
             "Runtime Connector Catalog",
         )),
+    )
+    assert_bilingual_concepts(
+        "chapters/core-state-machines.md",
+        "en/chapters/core-state-machines.md",
+        (
+            ("不靠一个巨型状态机", "does not advance a Goal through one giant state machine"),
+            ("一条 effectful Agent Loop", "one effectful Agent Loop"),
+            ("一条 Loop、三层抽象、九组状态机", "one Loop, three abstraction levels, nine state-machine families"),
+            ("状态机通过事实与协议接力", "facts and protocols connect the machines"),
+            ("没有一个可以整体覆盖的 `GoalState` 大对象", "does **not** expose one `GoalState` object"),
+            ("Agent 提交的是 proposal 或 typed effect", "An Agent submits a proposal or typed effect"),
+            ("Agent 判断错了怎么办", "What if the Agent is wrong"),
+            ("LoopX 怎样体现“闭环”", "What makes LoopX a closed loop"),
+            ("不是 `Todo=done`", "not the same as `Todo=done`"),
+            ("严格合取", "strict conjunction"),
+        ),
     )
     assert_bilingual_concepts(
         "chapters/03-one-turn.md",
@@ -439,7 +545,7 @@ def main() -> int:
         "chapters/05-connect-existing-project.md",
         "en/chapters/05-connect-existing-project.md",
         (
-            ("Node.js 22.6", "Node.js 22.6"),
+            ("Node.js 22.22.3", "Node.js 22.22.3"),
             ("Windows PowerShell 7", "Windows PowerShell 7"),
             ("loopx doctor --deep", "loopx doctor --deep"),
             ("用户不需要手工维护 daemon", "users do not supervise a daemon manually"),

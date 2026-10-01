@@ -13,7 +13,10 @@ from pathlib import Path
 
 import pytest
 
+from loopx.control_plane.effect_runtime import EffectRuntimeRejected
+
 from loopx.control_plane.coordination.coordination_state_contract_generated import (
+    LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA,
     TASK_LEASE_ACQUIRE_REQUEST_SCHEMA,
 )
 from loopx.control_plane.coordination.runtime_shadow import (
@@ -50,7 +53,7 @@ def cli(registry: Path, runtime: Path, *arguments: str, success: bool = True) ->
     assert completed.stdout.strip(), completed.stderr
     payload = json.loads(completed.stdout)
     if success:
-        assert completed.returncode == 0, (completed.stderr, payload)
+        assert completed.returncode == 0, completed.stderr + "\n" + json.dumps(payload, indent=2)
         assert payload.get("ok") is True, payload
     return payload
 
@@ -179,6 +182,216 @@ def test_public_cli_and_independent_native_writer_qualify_one_complete_lineage(t
     assert all(receipt["capture_lineage_id"] == boot["bootstrap"]["capture_lineage_id"] for receipt in receipts)
 
 
+def test_reviewed_promotion_survives_restart_and_enables_managed_codex_preflight(
+    tmp_path: Path,
+) -> None:
+    registry, runtime, _state = workspace(tmp_path)
+    registry_payload = json.loads(registry.read_text(encoding="utf-8"))
+    registry_payload["goals"][0]["adapter"] = {
+        "kind": "generic_project_goal_v0",
+        "status": "connected",
+    }
+    registry_payload["goals"][0]["domain"] = "coordination-promotion"
+    registry_payload["goals"][0]["quota"] = {
+        "compute": 1.0,
+        "window_hours": 24,
+        "slot_minutes": 1,
+        "allowed_slots": 10,
+    }
+    registry.write_text(
+        json.dumps(registry_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    delegated = cli(
+        registry,
+        runtime,
+        "todo",
+        "add",
+        "--goal-id",
+        "goal-a",
+        "--role",
+        "agent",
+        "--text",
+        "Validate a managed worker only after reviewed promotion",
+        "--task-class",
+        "advancement_task",
+        "--action-kind",
+        "validate",
+        "--claimed-by",
+        "agent-b",
+    )
+    cli(
+        registry,
+        runtime,
+        "task-lease",
+        "acquire",
+        "--goal-id",
+        "goal-a",
+        "--todo-id",
+        delegated["todo_id"],
+        "--owner",
+        "agent-b",
+        "--idempotency-key",
+        "managed-worker-before-promotion",
+        "--ttl-seconds",
+        "600",
+    )
+    enable(registry)
+    cli(
+        registry,
+        runtime,
+        "coordination-shadow",
+        "bootstrap",
+        "--goal-id",
+        "goal-a",
+        "--execute",
+    )
+    cli(
+        registry,
+        runtime,
+        "todo",
+        "add",
+        "--goal-id",
+        "goal-a",
+        "--role",
+        "agent",
+        "--text",
+        "Capture one promotion qualification mutation",
+        "--task-class",
+        "advancement_task",
+        "--action-kind",
+        "capture",
+        "--claimed-by",
+        "agent-a",
+    )
+    common = (
+        "coordination-shadow",
+        "promote",
+        "--goal-id",
+        "goal-a",
+        "--minimum-operations",
+        "1",
+        "--require-event-kind",
+        "todo_add",
+    )
+    preview = cli(registry, runtime, *common)
+    assert preview["promotion"]["status"] == "preview_ready"
+    assert preview["promotion"]["promotion_ready"] is True
+    assert not (runtime / "authority" / "file-v0").exists()
+    assert not (runtime / ".local" / "manager-context" / "executions").exists()
+
+    applied = cli(registry, runtime, *common, "--execute")
+    assert applied["promotion"]["status"] == "applied"
+    assert applied["promotion"]["legacy_writer_fenced"] is True
+
+    # A fresh CLI process owns each call below. The first post-promotion
+    # canonical mutation therefore proves that runtime-root identity and the
+    # promoted authority survive process restart before any worker can launch.
+    inspected = cli(registry, runtime, "goal-acceptance", "inspect", "--goal-id", "goal-a")
+    document = tmp_path / "managed-acceptance.json"
+    document.write_text(
+        json.dumps(
+            {
+                "objective": "Validate managed worker acceptance after restart",
+                "scope": {"kind": "selected_work", "todo_ids": [delegated["todo_id"]]},
+                "non_goals": ["Start the managed worker during inspection"],
+                "criteria": [
+                    {
+                        "id": "ready",
+                        "description": "The fixture validator succeeds",
+                        "validation_argv": [sys.executable, "-c", "raise SystemExit(0)"],
+                    }
+                ],
+                "bindings": [
+                    {"todo_id": delegated["todo_id"], "criterion_ids": ["ready"]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    configured = cli(
+        registry,
+        runtime,
+        "goal-acceptance",
+        "configure",
+        "--goal-id",
+        "goal-a",
+        "--document",
+        str(document),
+        "--expected-provider-revision",
+        inspected["provider_revision"],
+        "--operation-id",
+        "post-promotion-managed-acceptance",
+        "--execute",
+    )
+    bound = next(
+        item
+        for item in configured["goal_acceptance_contract"]["tasks"]
+        if item["todo_id"] == delegated["todo_id"]
+    )
+    assert bound == {
+        "todo_id": delegated["todo_id"],
+        "state": "ready",
+        "criterion_ids": ["ready"],
+        "reason": "The owner confirmed this work's current acceptance association.",
+        "reason_code": "goal_acceptance_ready",
+        "applicable": True,
+    }
+
+    worker = tmp_path / "managed-worker"
+    worker.mkdir()
+    config = tmp_path / "delegations.json"
+    config.write_text(
+        json.dumps(
+            {
+                "schema_version": "loopx_local_delegation_v0",
+                "bindings": [
+                    {
+                        "id": "managed-sol",
+                        "agent_id": "agent-b",
+                        "todo_id": delegated["todo_id"],
+                        "requesters": ["agent-a"],
+                        "workspace": str(worker),
+                        "timeout_seconds": 60,
+                        "output_refs": ["output.json"],
+                        "host_args": [
+                            "--host",
+                            "codex-cli",
+                            "--codex-model",
+                            "gpt-5.6-sol",
+                            "--codex-reasoning-effort",
+                            "xhigh",
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    preflight = cli(
+        registry,
+        runtime,
+        "delegation",
+        "inspect",
+        "--goal-id",
+        "goal-a",
+        "--agent-id",
+        "agent-a",
+        "--execution-config",
+        str(config),
+        "--binding-id",
+        "managed-sol",
+    )
+    assert preflight["authority_state"] == "promoted"
+    assert preflight["authority_ready"] is True
+    assert preflight["acceptance_ready"] is True
+    assert preflight["executor"]["profile"] == "gpt-5.6-sol@xhigh"
+    assert preflight["state"] in {"launchable", "runtime_unverified"}
+    assert not any(preflight["effects"].values())
+    assert not (runtime / ".local" / "manager-context" / "executions").exists()
+    assert not (runtime / "goals" / "goal-a" / "turns").exists()
+
+
 def test_unrecorded_canonical_change_cannot_become_qualified_after_a_later_public_write(tmp_path: Path) -> None:
     registry, runtime, state = workspace(tmp_path)
     enable(registry)
@@ -209,14 +422,16 @@ def test_snapshot_changed_between_python_builder_and_native_inspection_is_reject
     assert result["reason_code"] == "source_changed_retry"
 
 
-def test_public_handoff_followups_and_monitor_successor_capture_each_primary_mutation(tmp_path: Path) -> None:
+def test_public_handoff_todo_and_monitor_successor_capture_each_primary_mutation(tmp_path: Path) -> None:
     registry, runtime, _state = workspace(tmp_path)
     enable(registry)
     cli(registry, runtime, "coordination-shadow", "bootstrap", "--goal-id", "goal-a", "--execute")
     cli(registry, runtime, "handoff-mode", "set", "--goal-id", "goal-a", "--mode", "soft_claim")
     assert len(history(tmp_path, runtime)) == 2
-    cli(registry, runtime, "todo", "capture-followups", "--goal-id", "goal-a",
-        "--follow-up", "First retained followup", "--follow-up", "Second retained followup", "--evidence", "validation://followups")
+    cli(
+        registry, runtime, "todo", "add", "--goal-id", "goal-a", "--role", "agent",
+        "--text", "Validate the retained projection", "--evidence", "validation://todo-add",
+    )
     assert len(history(tmp_path, runtime)) == 3
     monitor = cli(registry, runtime, "todo", "add", "--goal-id", "goal-a", "--role", "agent",
         "--text", "Observe the public release", "--task-class", "continuous_monitor", "--action-kind", "monitor",
@@ -231,11 +446,11 @@ def test_public_handoff_followups_and_monitor_successor_capture_each_primary_mut
         "--next-continuation-policy", "same_agent_non_delivery", "--next-claimed-by", "agent-a", "--execute")
     assert len(result["successor_todo_ids"]) == 1
     transactions = history(tmp_path, runtime)
-    assert len(transactions) == 6  # Baseline, handoff, followup batch, monitor add, observation update, successor add.
+    assert len(transactions) == 6  # Baseline, handoff, todo add, monitor add, observation update, successor add.
     receipts = [transaction["receipts"][0] for transaction in transactions[1:]]
     assert len({receipt["entry_id"] for receipt in receipts}) == 5
     assert [receipt["seq"] for receipt in receipts] == [1, 2, 3, 4, 5]
-    assert {receipt["write_class"] for receipt in receipts} >= {"handoff_mode_set", "todo_capture_followups", "todo_add", "todo_update"}
+    assert {receipt["write_class"] for receipt in receipts} >= {"handoff_mode_set", "todo_add", "todo_update"}
     qualified = cli(registry, runtime, "coordination-shadow", "qualify", "--goal-id", "goal-a", "--minimum-operations", "5")
     assert qualified["qualification"]["qualified"] is True
     assert qualified["qualification"]["evidence"]["operation_count"] == 5
@@ -299,14 +514,29 @@ def test_public_committed_primary_cannot_be_relabelled_abandoned_by_native_reque
     w.crash("before_commit", "todo", "add", "--role", "agent", "--text", "A committed primary is never abandoned")
     directory = outbox.partition_directory(w.runtime, w.goal, "todos")
     [entry] = outbox.list_entries(directory)
-    request = adapter._commit_entry_request(runtime_root=w.runtime, goal_id=w.goal, entry=entry,
-        resolution="abandoned", projection=None, digest=None)
-    assert request["entry"]["committed_sha256"] is not None
+    # The batch drain owns public commits now, so the witnessed selection is
+    # built here from durable entry bytes instead of a retired private helper.
+    request = {
+        "schema_version": LOCAL_AUTHORITY_SHADOW_COMMIT_ENTRY_REQUEST_SCHEMA,
+        "runtime_root": str(w.runtime),
+        "goal_id": w.goal,
+        "entry_id": entry.entry_id,
+        "partition": entry.partition,
+        "seq": entry.seq,
+        "capture_lineage_id": entry.prepared.get("capture_lineage_id"),
+        "prepared_sha256": outbox.raw_bytes_digest(entry.prepared_path.read_bytes()),
+        "committed_sha256": (
+            outbox.raw_bytes_digest(entry.committed_path.read_bytes())
+            if entry.committed_path
+            else None
+        ),
+    }
+    assert request["committed_sha256"] is not None
+    request["resolution"] = "abandoned"
     before = {path.name: path.read_bytes() for path in directory.iterdir()}
     primary = w.state.read_bytes()
-    result = adapter.effect_runtime_result("coordination.runtime_shadow.commit_entry", request, timeout=15)
-    assert result["outcome"] == "failed"
-    assert result["reason_code"] == "outbox_resolution_marker_mismatch"
+    with pytest.raises(EffectRuntimeRejected, match="shadow_entry_selection_invalid"):
+        adapter.effect_runtime_result("coordination.runtime_shadow.commit_entry", request, timeout=15)
     assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
     assert w.state.read_bytes() == primary
     assert w.drain()["ok"] is True

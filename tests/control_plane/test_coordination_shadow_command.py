@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from contextlib import nullcontext
 from pathlib import Path
 
 from loopx.cli import build_parser
 from loopx.cli_commands import coordination_shadow as command
+from loopx.control_plane.coordination.shadow_goal_scope import (
+    resolve_shadow_goal_scope,
+)
 
 
 def _goal() -> dict[str, object]:
     return {
         "id": "goal-a",
         "coordination": {
+            "agent_model": "peer_v1",
+            "registered_agents": ["agent-a", "agent-b"],
             "runtime_shadow": {
                 "enabled": True,
                 "schema_version": "loopx_coordination_runtime_shadow_config_v0",
@@ -43,18 +49,39 @@ def _run(
     minimum_operations: int = 3,
     require_event_kind: list[str] | None = None,
     todo_id: str | None = None,
+    handoff_mode_migration: str | None = None,
+    registry: dict[str, object] | None = None,
 ) -> tuple[int, dict[str, object]]:
-    monkeypatch.setattr(command, "load_registry", lambda _path: {"goals": [_goal()]})
+    registry_data = registry if registry is not None else {"goals": [_goal()]}
+    goals = registry_data["goals"]
+    assert isinstance(goals, list)
+    goal = goals[0]
+    assert isinstance(goal, dict)
+    monkeypatch.setattr(
+        command,
+        "load_project_registry",
+        lambda _path: registry_data,
+    )
     monkeypatch.setattr(
         command, "resolve_runtime_root", lambda *_args, **_kwargs: tmp_path
     )
-    monkeypatch.setattr(command, "resolve_goal_state", lambda **kwargs: (_goal(), tmp_path, tmp_path / "ACTIVE_GOAL_STATE.md"))
+    monkeypatch.setattr(command, "resolve_goal_state", lambda **kwargs: (goal, tmp_path, tmp_path / "ACTIVE_GOAL_STATE.md"))
     monkeypatch.setattr(command, "build_runtime_shadow_source_snapshot", lambda **kwargs: (
         command.build_todo_runtime_shadow_projection(goal_id="goal-a", todos=[
             _canonical_todo("todo_b", status="open"), _canonical_todo("todo_a", status="done")],
             leases=[{"todo_id": "todo_b", "owner": "agent-a"}]),
         {"state_path": str(tmp_path / "ACTIVE_GOAL_STATE.md")},
     ))
+    monkeypatch.setattr(
+        command,
+        "shadow_goal_scope",
+        lambda _path, *, goal_id: nullcontext(
+            resolve_shadow_goal_scope(
+                registry_data,
+                goal_id=goal_id,
+            )
+        ),
+    )
     captured: dict[str, object] = {}
 
     def print_payload(payload, *_args) -> None:
@@ -71,6 +98,7 @@ def _run(
         minimum_operations=minimum_operations,
         require_event_kind=require_event_kind or [],
         todo_id=todo_id,
+        handoff_mode_migration=handoff_mode_migration,
         format="json",
     )
     result = command.handle_coordination_shadow_command(
@@ -160,6 +188,53 @@ def test_coordination_shadow_bootstrap_requires_execute_and_reads_back_parity(
         _canonical_todo("todo_a", status="done"),
         _canonical_todo("todo_b", status="open"),
     ]
+    assert bootstrap_request["goal_ref"] is None
+
+
+def test_coordination_shadow_bootstrap_uses_source_session_goal_ref(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source_goal = {
+        **_goal(),
+        "goal_instance_id": "ginst_0123456789abcdef0123456789abcdef",
+        "status": "active",
+    }
+    source_registry = {
+        "profile_id": "source_session_v1",
+        "goals": [source_goal],
+    }
+    bootstrap_request: dict[str, object] = {}
+    monkeypatch.setattr(
+        command,
+        "inspect_coordination_runtime_shadow",
+        lambda **_kwargs: {
+            "status": "matched",
+            "parity_matches": True,
+            "decision_read_from_shadow": False,
+        },
+    )
+
+    def bootstrap(**kwargs) -> dict[str, object]:
+        bootstrap_request.update(kwargs)
+        return {"status": "applied", "decision_read_from_shadow": False}
+
+    monkeypatch.setattr(command, "bootstrap_coordination_runtime_shadow", bootstrap)
+
+    result, payload = _run(
+        monkeypatch,
+        tmp_path,
+        action="bootstrap",
+        execute=True,
+        registry=source_registry,
+    )
+
+    assert result == 0
+    assert payload["ok"] is True
+    assert bootstrap_request["goal_ref"] == {
+        "goal_id": "goal-a",
+        "goal_instance_id": "ginst_0123456789abcdef0123456789abcdef",
+    }
 
 
 def test_coordination_shadow_parser_exposes_explicit_execute_gate() -> None:
@@ -222,6 +297,26 @@ def test_coordination_shadow_parser_exposes_explicit_execute_gate() -> None:
         ]
     )
     assert read_candidate.todo_id == "todo_b"
+
+    promote = parser.parse_args(
+        [
+            "coordination-shadow",
+            "promote",
+            "--goal-id",
+            "goal-a",
+            "--minimum-operations",
+            "5",
+            "--require-event-kind",
+            "todo_claim",
+            "--handoff-mode-migration",
+            "hard_lease",
+            "--execute",
+        ]
+    )
+    assert promote.minimum_operations == 5
+    assert promote.require_event_kind == ["todo_claim"]
+    assert promote.handoff_mode_migration == "hard_lease"
+    assert promote.execute is True
 
 
 def test_coordination_shadow_reads_parity_matched_todo_candidate(
@@ -315,6 +410,77 @@ def test_coordination_shadow_qualify_applies_coverage_policy(
     ]
 
 
+def test_coordination_shadow_promote_previews_and_applies_only_through_review_owner(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        command,
+        "inspect_coordination_runtime_shadow",
+        lambda **_kwargs: {
+            "status": "matched",
+            "parity_matches": True,
+            "decision_read_from_shadow": False,
+        },
+    )
+    requests: list[dict[str, object]] = []
+
+    def promote(**kwargs) -> dict[str, object]:
+        requests.append(kwargs)
+        return {
+            "status": "applied" if kwargs["execute"] else "preview_ready",
+            "promotion_ready": True,
+            "executed": kwargs["execute"],
+            "legacy_writer_fenced": kwargs["execute"],
+            "legacy_fallback_used": False,
+        }
+
+    monkeypatch.setattr(
+        command,
+        "review_local_coordination_authority_promotion",
+        promote,
+    )
+    preview_result, preview = _run(
+        monkeypatch,
+        tmp_path,
+        action="promote",
+        minimum_operations=5,
+        require_event_kind=["todo_claim"],
+    )
+    apply_result, applied = _run(
+        monkeypatch,
+        tmp_path,
+        action="promote",
+        execute=True,
+        minimum_operations=5,
+        require_event_kind=["todo_claim"],
+    )
+    migrated_result, migrated = _run(
+        monkeypatch,
+        tmp_path,
+        action="promote",
+        minimum_operations=5,
+        require_event_kind=["todo_claim"],
+        handoff_mode_migration="hard_lease",
+    )
+
+    assert preview_result == 0
+    assert preview["executed"] is False
+    assert preview["promotion"]["status"] == "preview_ready"
+    assert apply_result == 0
+    assert applied["executed"] is True
+    assert applied["promotion"]["status"] == "applied"
+    assert migrated_result == 0
+    assert migrated["promotion"]["status"] == "preview_ready"
+    assert requests[0]["execute"] is False
+    assert requests[1]["execute"] is True
+    assert requests[0]["minimum_operations"] == 5
+    assert requests[0]["required_event_kinds"] == ["todo_claim"]
+    assert requests[2]["handoff_mode_migration"] == "hard_lease"
+    assert requests[2]["registered_agents"] == ["agent-a", "agent-b"]
+    assert str(requests[0]["operation_id"]).startswith("promote:goal-a:")
+
+
 def test_coordination_shadow_rollback_passes_exact_selector_to_management_owner(
     monkeypatch,
     tmp_path: Path,
@@ -374,7 +540,7 @@ def test_coordination_shadow_rejects_goal_without_exact_opt_in(
 ) -> None:
     monkeypatch.setattr(
         command,
-        "load_registry",
+        "load_project_registry",
         lambda _path: {"goals": [{"id": "goal-a"}]},
     )
     monkeypatch.setattr(

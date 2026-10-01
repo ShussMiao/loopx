@@ -17,13 +17,8 @@ from ...paths import resolve_runtime_root
 from ..runtime.time import now_utc as runtime_now_utc
 from ..runtime.time import parse_timestamp, utc_isoformat
 from ..coordination.authority_core import (
-    CoordinationSnapshot,
-    DecisionOutcome,
-    LeaseOwnerEligibilityCommand,
-    decide,
     write_scopes_overlap as core_write_scopes_overlap,
 )
-from ..coordination.local_snapshot import todo_snapshot_from_mapping
 from ..todos.contract import (
     normalize_required_write_scopes,
     normalize_todo_claimed_by,
@@ -45,10 +40,11 @@ from .local_lease_record import (
     lease_acquire_ttl_seconds as lease_acquire_ttl_seconds,
     lease_epoch as lease_epoch,
     lease_version as lease_version,
-    read_lease,
+    read_lease as read_lease,
     require_expected_version as require_expected_version,
     write_lease as write_lease,
 )
+from ..content_digest import BARE_SHA256_PATTERN
 
 DEFAULT_TASK_LEASE_TTL_SECONDS = 45 * 60
 MAX_TASK_LEASE_TTL_SECONDS = 24 * 60 * 60
@@ -152,7 +148,7 @@ def _native_fence_payload(
     operation_id = raw.get("fence_operation_id")
     if operation_id is not None and (
         not isinstance(operation_id, str)
-        or not re.fullmatch(r"[a-f0-9]{64}", operation_id)
+        or not BARE_SHA256_PATTERN.fullmatch(operation_id)
     ):
         raise TaskLeaseError(
             f"native task-lease {operation} result has an invalid fence operation id",
@@ -605,36 +601,26 @@ def task_lease_owner_constraint(
     owner: Any,
     registered_agents: list[str] | None = None,
 ) -> dict[str, Any]:
+    from ..effect_runtime import effect_runtime_result
+
     normalized_owner = normalize_todo_claimed_by(owner)
-    effective_registered_agents = (
-        tuple(registered_agents)
-        if registered_agents is not None
-        else ((normalized_owner,) if normalized_owner else ())
-    )
-    plan = decide(
-        CoordinationSnapshot(
-            registered_agents=effective_registered_agents,
-            todo=todo_snapshot_from_mapping(todo),
-        ),
-        LeaseOwnerEligibilityCommand(owner=normalized_owner),
-    )
-    if plan.outcome is DecisionOutcome.APPLY:
-        return {"effective": True}
-    result: dict[str, Any] = {"effective": False, "reason": plan.code}
-    if plan.code == "todo_not_open":
-        todo_status = str((todo or {}).get("status") or "").strip().lower()
-        result["todo_status"] = todo_status or "unknown"
-    elif plan.code == "owner_not_registered":
-        result["registered_agents"] = list(registered_agents or [])
-    elif plan.code == "owner_excluded_from_todo":
-        result["excluded_agents"] = normalize_todo_excluded_agents(
-            (todo or {}).get("excluded_agents")
-        )
-    elif plan.code == "owner_conflicts_with_claim":
-        result["claimed_by"] = normalize_todo_claimed_by(
-            (todo or {}).get("claimed_by")
-        )
-    return result
+    registered = registered_agents if registered_agents is not None else ([normalized_owner] if normalized_owner else [])
+    result = effect_runtime_result("task_lease.owner_eligibility", {
+        "todo": None if todo is None else {
+            "status": str(todo.get("status") or "").strip().lower(),
+            "claimed_by": normalize_todo_claimed_by(todo.get("claimed_by")),
+            "excluded_agents": normalize_todo_excluded_agents(todo.get("excluded_agents")),
+        },
+        "owner": normalized_owner, "registered_agents": registered,
+    })
+    if not isinstance(result, dict) or result.get("schema_version") != "task_lease_owner_eligibility_v0":
+        raise RuntimeError("typed lease owner constraint is missing; update the runtime")
+    constraint = result.get("constraint")
+    if not isinstance(constraint, dict) or not isinstance(constraint.get("effective"), bool):
+        raise RuntimeError("typed lease owner constraint shape mismatch")
+    if constraint["effective"] is False and not isinstance(constraint.get("reason"), str):
+        raise RuntimeError("typed lease owner rejection omitted its reason")
+    return constraint
 
 
 def require_registered_task_lease_owner(
@@ -849,8 +835,12 @@ def transfer_task_lease(
     new_idempotency_key: str,
     ttl_seconds: int | None = None,
     expected_version: int | None = None,
+    transfer_claim: bool = False,
 ) -> dict[str, Any]:
-    """Transfer a local lease through the native TypeScript owner."""
+    """Transfer a local lease, optionally with its canonical Todo claim."""
+
+    if not isinstance(transfer_claim, bool):
+        raise TaskLeaseError("transfer_claim must be a boolean", code="invalid_claim_transfer_request")
 
     normalized_goal_id = normalize_goal_id(goal_id)
     normalized_todo_id = normalize_lease_todo_id(todo_id)
@@ -871,6 +861,7 @@ def transfer_task_lease(
         idempotency_key=normalized_key,
         new_owner=normalized_new_owner,
         new_idempotency_key=normalized_new_key,
+        **({"transfer_claim": True} if transfer_claim else {}),
         ttl_seconds=normalized_ttl,
         expected_version=normalized_expected_version,
     )
@@ -913,45 +904,9 @@ def inspect_task_lease(
     goal_id: str,
     todo_id: str,
 ) -> dict[str, Any]:
-    goal_id = normalize_goal_id(goal_id)
-    todo_id = normalize_lease_todo_id(todo_id)
-    lease_path = task_lease_path(runtime_root=runtime_root, goal_id=goal_id, todo_id=todo_id)
-    lease = read_lease(lease_path)
-    active = lease_is_active(lease)
-    executor_constraint: dict[str, Any] | None = None
-    if active and lease:
-        try:
-            todo = task_lease_todo_projection(
-                registry_path=registry_path,
-                goal_id=goal_id,
-                todo_id=todo_id,
-            )
-        except TaskLeaseError as exc:
-            active = False
-            executor_constraint = {
-                "effective": False,
-                "reason": exc.code,
-            }
-        else:
-            executor_constraint = task_lease_owner_constraint(
-                todo,
-                owner=lease.get("owner"),
-                registered_agents=registered_agent_ids_from_registry(registry_path, goal_id),
-            )
-            if executor_constraint.get("effective") is not True:
-                active = False
-            else:
-                executor_constraint = None
-    handoff_mode = _optional_handoff_mode(registry_path, goal_id)
-    return {
-        "ok": True,
-        "schema_version": TASK_LEASE_SCHEMA_VERSION,
-        "action": "inspect",
-        "goal_id": goal_id,
-        "todo_id": todo_id,
-        "active": active,
-        "lease": lease,
-        "lease_path": str(lease_path),
-        **({"handoff_mode": handoff_mode} if handoff_mode else {}),
-        **({"executor_constraint": executor_constraint} if executor_constraint else {}),
-    }
+    from .task_lease_acquire_adapter import inspect_native_task_lease
+
+    return inspect_native_task_lease(
+        registry_path=registry_path, runtime_root=runtime_root,
+        goal_id=normalize_goal_id(goal_id), todo_id=normalize_lease_todo_id(todo_id),
+    )

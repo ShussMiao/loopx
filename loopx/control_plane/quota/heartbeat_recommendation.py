@@ -264,6 +264,23 @@ def _recommendation(*parts: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def build_action_selection_recovery_recommendation(
+    *, reason: str,
+) -> dict[str, Any]:
+    """Project closed heartbeat guidance after a typed selection refusal."""
+
+    return _recommendation(
+        {
+            "source": "action_selection_recovery",
+            "recommended_mode": "quota_skip",
+            "notify": "DONT_NOTIFY",
+            "spend_policy": "no quota spend until an eligible Todo is selected",
+            "reason": reason,
+            "agent_must_attempt": False,
+        }
+    )
+
+
 def _stall_self_repair_rule(
     facts: _HeartbeatRecommendationFacts,
 ) -> dict[str, Any] | None:
@@ -596,13 +613,13 @@ def _post_handoff_observation_rule(
                 "recommended_mode": "post_handoff_observe_then_backlog_step",
                 "spend_policy": (
                     "observe registry/status/run history/repo state first; if unchanged, "
-                    "advance exactly one bounded agent-todo backlog segment and append "
+                    "advance scope-bounded agent-todo work and append "
                     "quota spend only after validation and durable writeback"
                 ),
                 "reason": (
                     "latest post-handoff implementation reached the primary outcome, "
                     "but an open agent todo remains; observe for new blockers first, "
-                    "then advance one bounded backlog step instead of quiet idling"
+                    "then advance scope-bounded backlog work instead of quiet idling"
                 ),
             },
         )
@@ -616,8 +633,8 @@ def _default_rule(
         {
             "recommended_mode": "steering_audit_then_one_step",
             "spend_policy": (
-                "append exactly one heartbeat spend only after a bounded progress "
-                "segment is validated and written back"
+                "append exactly one heartbeat spend only after scope-bounded work "
+                "is validated and written back; one_step: mode, not an operation limit"
             ),
             "reason": (
                 "eligible Codex-ready goal requires the standard steering audit "

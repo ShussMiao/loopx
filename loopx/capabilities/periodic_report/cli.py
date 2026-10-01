@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from ...extensions.runtime import (
     execute_extension_runtime_binding,
 )
+from ...history import load_registry
 from ...rollout_event_log import iter_rollout_events
 from .core import build_periodic_report_run
 from .machine_defaults import (
@@ -38,7 +39,6 @@ from .request_action import (
     record_periodic_report_request,
 )
 from ...paths import resolve_runtime_root
-from ...registry import read_json
 
 PrintPayload = Callable[
     [dict[str, object], str, Callable[[dict[str, object]], str]],
@@ -489,7 +489,7 @@ def handle_periodic_report_command(
                 ),
             )
         elif args.periodic_report_command == "request":
-            registry = read_json(registry_path)
+            registry = load_registry(registry_path)
             runtime_root = resolve_runtime_root(
                 registry, runtime_root_arg, registry_path=registry_path
             )
@@ -515,7 +515,7 @@ def handle_periodic_report_command(
                 execute=bool(args.execute),
             )
         elif args.periodic_report_command == "consume-pending":
-            registry = read_json(registry_path)
+            registry = load_registry(registry_path)
             runtime_root = resolve_runtime_root(
                 registry, runtime_root_arg, registry_path=registry_path
             )
@@ -543,7 +543,7 @@ def handle_periodic_report_command(
             "inspect-machine-defaults",
             "rollback-machine-defaults",
         }:
-            registry = read_json(registry_path)
+            registry = load_registry(registry_path)
             runtime_root = resolve_runtime_root(
                 registry, runtime_root_arg, registry_path=registry_path
             )
@@ -564,7 +564,7 @@ def handle_periodic_report_command(
                     expected_plan_revision=args.expected_plan_revision,
                 )
         elif args.periodic_report_command == "plan-goal-delivery":
-            registry = read_json(registry_path)
+            registry = load_registry(registry_path)
             runtime_root = resolve_runtime_root(
                 registry, runtime_root_arg, registry_path=registry_path
             )

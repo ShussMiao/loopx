@@ -182,4 +182,15 @@ def check_codex_app_delivery(
     # Re-observing an old turn must not extend its freshness.
     if now_ms - started > max_age_seconds * 1000:
         return _result("host_observation_stale")
+    # Prompt upgrades and host rebindings can race a bounded app-server read.
+    # Recheck only the evidence binding: an unrelated RRULE edit is harmless.
+    try:
+        current = tomllib.loads(_read_bounded(manifest_path, MAX_MANIFEST_BYTES))
+    except (OSError, UnicodeError, ValueError):
+        return _result("manifest_unreadable_or_invalid")
+    if any(
+        current.get(key) != manifest.get(key)
+        for key in ("id", "kind", "status", "target_thread_id", "prompt")
+    ):
+        return _result("manifest_binding_changed")
     return _result("selected_turn_delivery_and_start_matched", matched=True)

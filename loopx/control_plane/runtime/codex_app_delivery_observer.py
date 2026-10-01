@@ -23,6 +23,7 @@ _HEARTBEAT = re.compile(
 _ACTIVITY = frozenset(
     {"agentMessage", "reasoning", "commandExecution", "mcpToolCall", "dynamicToolCall"}
 )
+_INPUT = frozenset({"userMessage", "functionCallOutput"})
 
 
 class HostObservationError(Exception):
@@ -184,7 +185,7 @@ def observe_codex_app_delivery(
         (
             i
             for i, item in enumerate(items)
-            if item.get("type") in {"userMessage", "functionCallOutput"}
+            if item.get("type") in _INPUT
         ),
         None,
     )
@@ -196,13 +197,24 @@ def observe_codex_app_delivery(
             matches.append((index, match[2]))
     digest = None
     activity = False
-    if len(matches) == 1 and matches[0][0] == first_input:
+    if (
+        len(matches) == 1
+        and matches[0][0] == first_input
+        and not any(item.get("type") in _ACTIVITY for item in items[:first_input])
+    ):
         index, body = matches[0]
         try:
             digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         except UnicodeError:
             raise HostObservationError("host_observer_response_invalid") from None
-        activity = any(item.get("type") in _ACTIVITY for item in items[index + 1 :])
+        # Steering or a new standalone tool input can start unrelated activity.
+        # Only activity before the next input belongs to this initial delivery.
+        for item in items[index + 1 :]:
+            if item.get("type") in _INPUT:
+                break
+            if item.get("type") in _ACTIVITY:
+                activity = True
+                break
     started = turn.get("startedAt")
     return {
         "schema_version": OBSERVATION_SCHEMA,

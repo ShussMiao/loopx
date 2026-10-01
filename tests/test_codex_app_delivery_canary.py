@@ -185,6 +185,37 @@ def test_manifest_binding_is_required(delivery, old, new, reason):
     assert check_codex_app_delivery(**kwargs)["reason_code"] == reason
 
 
+@pytest.mark.parametrize(
+    "old,new,matched",
+    [
+        ("quota guard", "new bootstrap", False),
+        ('status = "ACTIVE"', 'status = "PAUSED"', False),
+        ('target_thread_id = "synthetic-thread"', 'target_thread_id = "other"', False),
+        ("version = 1", 'version = 1\nrrule = "FREQ=HOURLY;INTERVAL=1"', True),
+    ],
+)
+def test_host_read_rechecks_prompt_binding_without_capturing_rrule_changes(
+    delivery, monkeypatch, old, new, matched
+):
+    kwargs, observation = delivery
+    manifest = kwargs["manifest_path"]
+
+    def observe(**_):
+        manifest.write_text(manifest.read_text().replace(old, new))
+        return observation
+
+    monkeypatch.setattr(
+        "loopx.control_plane.runtime.codex_app_delivery_observer.observe_codex_app_delivery",
+        observe,
+    )
+    result = check_codex_app_delivery(
+        **{**kwargs, "observation_path": None, "observe_host": True}
+    )
+    assert result["ok"] is matched
+    if not matched:
+        assert result["reason_code"] == "manifest_binding_changed"
+
+
 def _argv(kwargs):
     return [
         "--check-delivery",

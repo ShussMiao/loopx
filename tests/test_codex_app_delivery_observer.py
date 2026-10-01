@@ -101,6 +101,34 @@ def test_prior_activity_or_completed_status_does_not_prove_agent_started(
 
 
 @pytest.mark.parametrize(
+    "items",
+    [
+        [user(ENVELOPE), user("manual recovery"), {"type": "agentMessage"}],
+        [
+            user(ENVELOPE),
+            {
+                "type": "functionCallOutput",
+                "name": "manual_recovery",
+                "output": "retry",
+            },
+            {"type": "reasoning"},
+        ],
+        [{"type": "agentMessage"}, user(ENVELOPE), {"type": "agentMessage"}],
+    ],
+)
+def test_unrelated_activity_cannot_certify_initial_delivery(monkeypatch, items):
+    assert observe(monkeypatch, items)["agent_activity_observed"] is False
+
+
+def test_activity_before_later_steering_still_counts(monkeypatch):
+    receipt = observe(
+        monkeypatch,
+        [user(ENVELOPE), {"type": "reasoning"}, user("later steering")],
+    )
+    assert receipt["agent_activity_observed"] is True
+
+
+@pytest.mark.parametrize(
     "changes,reason",
     [
         ({"id": "other"}, "host_selected_turn_unavailable"),
@@ -169,9 +197,9 @@ def test_transport_is_bounded_and_errors_do_not_expose_host_data(
     assert all(child.poll() is not None for child in children)
 
 
-@pytest.mark.parametrize("delivered", [True, False])
+@pytest.mark.parametrize("prompt_kind", ["missing", "fixed", "bootstrap"])
 def test_native_app_server_cli_with_isolated_synthetic_session(
-    tmp_path, monkeypatch, delivered
+    tmp_path, monkeypatch, prompt_kind
 ):
     """Opt-in real backend read; no model, scheduler or private session access."""
     import os
@@ -186,6 +214,16 @@ def test_native_app_server_cli_with_isolated_synthetic_session(
         pytest.skip("set LOOPX_TEST_CODEX_BIN to qualify the installed app-server")
     home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(home))
+    body = BODY
+    if prompt_kind == "bootstrap":
+        from loopx.control_plane.heartbeat.automation_upgrade import bootstrap_prompt
+
+        body = bootstrap_prompt(
+            registry=tmp_path / "registry.json",
+            goal_id="goal",
+            agent_id="agent",
+        )
+    delivered = prompt_kind != "missing"
     thread_id, turn_id = str(uuid.uuid4()), str(uuid.uuid4())
     now = int(time.time())
     timestamp = (
@@ -198,7 +236,13 @@ def test_native_app_server_cli_with_isolated_synthetic_session(
         / f"rollout-{timestamp.replace(':', '-')}-{thread_id}.jsonl"
     )
     session.parent.mkdir(parents=True)
-    received = ENVELOPE if delivered else "synthetic missing heartbeat"
+    received = (
+        "<heartbeat>\n  <automation_id>synthetic</automation_id>\n"
+        f"  <current_time_iso>{timestamp}</current_time_iso>\n"
+        f"  <instructions>\n{body}\n  </instructions>\n</heartbeat>\n"
+        if delivered
+        else "synthetic missing heartbeat"
+    )
     events = [
         (
             "session_meta",
@@ -207,7 +251,9 @@ def test_native_app_server_cli_with_isolated_synthetic_session(
                 "timestamp": timestamp,
                 "cwd": str(tmp_path),
                 "originator": "synthetic-canary",
-                "cli_version": "0.153.4",
+                "cli_version": subprocess.check_output(
+                    [codex, "--version"], text=True
+                ).strip(),
                 "source": "cli",
                 "model_provider": "openai",
             },
@@ -268,7 +314,7 @@ def test_native_app_server_cli_with_isolated_synthetic_session(
     manifest = home / "automations" / "synthetic" / "automation.toml"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(
-        f'id = "synthetic"\nkind = "heartbeat"\nstatus = "ACTIVE"\ntarget_thread_id = "{thread_id}"\nprompt = {json.dumps(BODY)}\n'
+        f'id = "synthetic"\nkind = "heartbeat"\nstatus = "ACTIVE"\ntarget_thread_id = "{thread_id}"\nprompt = {json.dumps(body)}\n'
     )
     before = manifest.read_bytes(), session.read_bytes()
     result = subprocess.run(
@@ -298,6 +344,6 @@ def test_native_app_server_cli_with_isolated_synthetic_session(
     )
     assert result.returncode == (0 if delivered else 1), result.stdout
     assert json.loads(result.stdout)["ok"] is delivered
-    assert BODY not in result.stdout
+    assert body not in result.stdout
     assert result.stderr == ""
     assert before == (manifest.read_bytes(), session.read_bytes())

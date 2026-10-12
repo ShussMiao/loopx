@@ -5,11 +5,11 @@ from typing import Any
 from ..agents.capability_gate import build_capability_gate
 from ..todos.contract import TODO_TASK_CLASS_ADVANCEMENT, TODO_TASK_CLASS_MONITOR
 from ..todos.todo_semantics import todo_item_task_class
-from ..todos.summary_item import compact_todo_summary_item
+from ..todos.summary_item import compact_todo_summary_items
+from .work_lane import WORK_LANE_CONTRACT_SCHEMA_VERSION as WORK_LANE_CONTRACT_SCHEMA_VERSION
 
 
 CAPABILITY_MONITOR_FALLBACK_SCHEMA_VERSION = "capability_skip_monitor_fallback_v0"
-WORK_LANE_CONTRACT_SCHEMA_VERSION = "work_lane_contract_v1"
 DEFAULT_MONITOR_ITEM_LIMIT = 1
 
 
@@ -18,11 +18,7 @@ def _compact_monitor_items(
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
-    return [
-        compact_todo_summary_item(item, text=str(item.get("text") or "").strip())
-        for item in items[:limit]
-        if isinstance(item, dict)
-    ]
+    return compact_todo_summary_items([item for item in items[:limit] if isinstance(item, dict)], strip_text=True)
 
 
 def _safe_count(value: Any) -> int:

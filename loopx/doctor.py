@@ -17,14 +17,24 @@ from .control_plane.runtime.promotion_readiness import (
     PROMOTION_READINESS_RUNTIME_INDEX,
 )
 from .control_plane.runtime.time import chronology_key
-from .install_contract import NO_CLONE_INSTALL_URL
-from .paths import DEFAULT_RUNTIME_ROOT, global_registry_path
-from .python_install_owner import PythonInstallOwner, python_distribution_upgrade_command, resolve_python_install_owner
+from .install_contract import (
+    NO_CLONE_INSTALL_URL,
+    local_install_command,
+    no_clone_upgrade_command,
+)
+from .paths import configured_runtime_route, default_runtime_route, global_registry_path
+from .python_install_owner import (
+    PythonInstallOwner,
+    interpreter_invocation,
+    python_distribution_upgrade_command,
+    resolve_python_install_owner,
+)
 from .capabilities.project_skill_delivery import discover_project_scoped_skill_ids
 from .registry_writability import probe_registry_write_path
-from .release_manifest import load_release_manifest, release_version_tag
+from .release_manifest import load_release_manifest, release_runtime_identity, release_version_tag
 from .skill_install_readback import (
     ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
+    PACKAGED_HOST_SKILL_IDS,
     configured_host_skills_dir,
     inspect_skill_install_readback,
     skill_install_doctor_checks,
@@ -78,62 +88,6 @@ REQUIRED_INSTALLED_SKILL_PHRASES = {
         "Repair at the lowest durable layer",
     ),
 }
-
-
-def _powershell_literal(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def local_install_command(repo_root: Path, *, skip_skills: bool = False) -> str:
-    if os.name == "nt":
-        return (
-            "pwsh -NoLogo -NoProfile -File "
-            f"{_powershell_literal(repo_root / 'scripts' / 'install-windows.ps1')} "
-            f"-Python {_powershell_literal(sys.executable)}"
-            + (" -SkipSkills" if skip_skills else "")
-        )
-    command = str(repo_root / "scripts" / "install-local.sh")
-    return f"LOOPX_INSTALL_SKILL=0 {command}" if skip_skills else command
-
-
-def no_clone_upgrade_command(
-    source_ref: Any = None,
-    *,
-    doctor_agent_type: str | None = None,
-    skip_skills: bool = False,
-) -> str:
-    if os.name == "nt":
-        repo_root = Path(__file__).resolve().parents[1]
-        doctor_agent_arg = (
-            f" --agent-type {_powershell_literal(doctor_agent_type)}"
-            if doctor_agent_type
-            else ""
-        )
-        return (
-            f"{local_install_command(repo_root, skip_skills=skip_skills)}\n"
-            f"loopx doctor{doctor_agent_arg}"
-        )
-    ref = str(source_ref or "").strip()
-    installer = f"curl -fsSL {NO_CLONE_INSTALL_URL}"
-    doctor_agent_arg = (
-        f" --agent-type {shlex.quote(doctor_agent_type)}"
-        if doctor_agent_type
-        else ""
-    )
-    install_env: list[str] = []
-    if ref and ref != "stable":
-        install_env.append(f"LOOPX_REF={shlex.quote(ref)}")
-    if skip_skills:
-        install_env.append("LOOPX_INSTALL_SKILL=0")
-    if install_env:
-        installer = f"{installer} | env {' '.join(install_env)} bash"
-    else:
-        installer = f"{installer} | bash"
-    return (
-        f"{installer}\n"
-        'export PATH="$HOME/.local/bin:$PATH"\n'
-        f"loopx doctor{doctor_agent_arg}"
-    )
 
 
 def user_local_bin() -> Path:
@@ -557,7 +511,8 @@ def installed_skill_summary(skills_roots: tuple[Path, ...]) -> dict[str, dict[st
         raise ValueError("at least one Codex skill root is required")
     primary_root = skills_roots[0]
     summaries: dict[str, dict[str, Any]] = {}
-    for skill_name, phrases in REQUIRED_INSTALLED_SKILL_PHRASES.items():
+    for skill_name in PACKAGED_HOST_SKILL_IDS:
+        phrases = REQUIRED_INSTALLED_SKILL_PHRASES.get(skill_name, ())
         candidates = [
             (root, root / skill_name / "SKILL.md")
             for root in skills_roots
@@ -598,6 +553,28 @@ def installed_skill_check(
             detail
             if applicable
             else "not applicable: skill delivery is owned by the selected host integration"
+        ),
+    }
+
+
+def optional_installation_script_check(
+    check_id: str,
+    *,
+    exists: bool,
+    path: Path,
+    distribution_install: bool,
+) -> dict[str, Any]:
+    """Report release scripts only where the installation includes them."""
+    applicable = not distribution_install
+    return {
+        "id": check_id,
+        "required": False,
+        "ok": exists if applicable else True,
+        "applicable": applicable,
+        "detail": (
+            str(path)
+            if applicable
+            else "not applicable: Python package installs do not include release installer scripts"
         ),
     }
 
@@ -692,6 +669,8 @@ def collect_doctor(
     deep: bool = False,
     agent_type: str | None = None,
     installation_only: bool = False,
+    registry_path: Path | None = None,
+    runtime_root_override: str | None = None,
 ) -> dict[str, Any]:
     if installation_only:
         from .release_candidate import collect_installation_doctor
@@ -701,6 +680,13 @@ def collect_doctor(
         collect_runtime_projection_route_diagnostics,
     )
     from .control_plane.effect_runtime import collect_effect_runtime_readiness
+
+    local_state_route = (
+        configured_runtime_route(registry_path=registry_path, runtime_root_override=runtime_root_override)
+        if registry_path is not None or runtime_root_override is not None
+        else default_runtime_route()
+    )
+    selected_runtime_root = Path(str(local_state_route["selected_runtime_root"]))
 
     from .host_loop_activation import (
         agent_type_uses_host_managed_skills,
@@ -808,7 +794,7 @@ def collect_doctor(
         )
     default_release["promotion_mode"] = release_manifest_source.get("promotion_mode")
     release_provenance = {
-        "runtime_root": str(DEFAULT_RUNTIME_ROOT),
+        "runtime_root": str(selected_runtime_root),
         "default_release": default_release,
         "live_canary": {
             **command_root_summary(canary_path, canary_realpath),
@@ -826,7 +812,7 @@ def collect_doctor(
             ),
         },
         "promotion_readiness": add_promotion_readiness_freshness(
-            latest_promotion_readiness_event(DEFAULT_RUNTIME_ROOT)
+            latest_promotion_readiness_event(selected_runtime_root)
         ),
     }
     install_freshness = build_install_freshness(
@@ -887,18 +873,22 @@ def collect_doctor(
             else {}
         ),
     }
-    default_global_registry = global_registry_path(DEFAULT_RUNTIME_ROOT)
-    global_registry_writability = probe_registry_write_path(default_global_registry, create_parent=True)
+    default_global_registry = global_registry_path(selected_runtime_root)
+    global_registry_writability = (
+        probe_registry_write_path(default_global_registry, create_parent=True)
+        if local_state_route["status"] not in {"conflict", "invalid"}
+        else {"ok": False, "error": local_state_route["recommended_action"]}
+    )
     runtime_projection_routes = (
         collect_runtime_projection_route_diagnostics(
             registry_path=default_global_registry,
-            runtime_root=DEFAULT_RUNTIME_ROOT,
+            runtime_root=selected_runtime_root,
         )
-        if default_global_registry.exists()
+        if default_global_registry.exists() and local_state_route["status"] not in {"conflict", "invalid"}
         else {
             "schema_version": "runtime_projection_route_diagnostics_v0",
             "registry": str(default_global_registry.resolve()),
-            "runtime_root": str(DEFAULT_RUNTIME_ROOT.resolve()),
+            "runtime_root": str(selected_runtime_root.resolve()),
             "goal_filter": None,
             "activation_state_filter": None,
             "available": False,
@@ -913,7 +903,7 @@ def collect_doctor(
         collect_capture_host_diagnostics,
     )
 
-    decision_context_capture = collect_capture_host_diagnostics(DEFAULT_RUNTIME_ROOT)
+    decision_context_capture = collect_capture_host_diagnostics(selected_runtime_root)
     typescript_control_plane = collect_effect_runtime_readiness(deep=deep)
     typescript_runtime_required = True
     deep_validation = None
@@ -982,18 +972,18 @@ def collect_doctor(
             "ok": module_path.exists(),
             "detail": str(module_path),
         },
-        {
-            "id": "install_script_exists",
-            "required": False,
-            "ok": install_script.exists(),
-            "detail": str(install_script),
-        },
-        {
-            "id": "wrapper_script_exists",
-            "required": False,
-            "ok": wrapper_script.exists(),
-            "detail": str(wrapper_script),
-        },
+        optional_installation_script_check(
+            "install_script_exists",
+            exists=install_script.exists(),
+            path=install_script,
+            distribution_install=bool(python_distribution.get("available")),
+        ),
+        optional_installation_script_check(
+            "wrapper_script_exists",
+            exists=wrapper_script.exists(),
+            path=wrapper_script,
+            distribution_install=bool(python_distribution.get("available")),
+        ),
         {
             "id": "local_bin_on_path",
             "required": False,
@@ -1043,6 +1033,12 @@ def collect_doctor(
         },
         *skill_install_doctor_checks(host_skill_install_readback),
         {
+            "id": "local_state_route_unambiguous",
+            "required": True,
+            "ok": local_state_route["status"] not in {"conflict", "invalid"},
+            "detail": str(local_state_route["recommended_action"] or local_state_route["status"]),
+        },
+        {
             "id": "global_registry_writable",
             "required": True,
             "ok": bool(global_registry_writability.get("ok")),
@@ -1088,6 +1084,7 @@ def collect_doctor(
     payload = {
         "ok": all(check["ok"] for check in checks if check["required"]),
         "mode": "deep" if deep else "standard",
+        "service_runtime_identity": release_runtime_identity(),
         "agent_type": canonical_agent_type,
         "python": {
             "executable": sys.executable,
@@ -1123,6 +1120,7 @@ def collect_doctor(
         "release_manifest": release_manifest,
         "desktop_installation": desktop_installation,
         "release_provenance": release_provenance,
+        "local_state_route": local_state_route,
         "global_registry_writability": global_registry_writability,
         "runtime_projection_routes": runtime_projection_routes,
         "decision_context_capture": decision_context_capture,
@@ -1156,7 +1154,7 @@ def collect_doctor(
             else (
                 "Run `loopx workflow-skills --install`, then "
                 "`loopx slash-commands --install`, and rerun doctor. Upgrade this "
-                f"installation with `{shlex.quote(sys.executable)} -m pip install --upgrade loopx`."
+                f"installation with `{interpreter_invocation(sys.executable)} -m pip install --upgrade loopx`."
                 if python_distribution.get("available")
                 else (
                     f"Run `{local_install_command(repo_root, skip_skills=externally_managed_skills)}` "
@@ -1209,6 +1207,9 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
         f"- skill_delivery_mode: `{(payload.get('skill_delivery') or {}).get('mode')}`",
         f"- skill_delivery_status: `{(payload.get('skill_delivery') or {}).get('status')}`",
         f"- global_registry_writable: `{(payload.get('global_registry_writability') or {}).get('ok')}`",
+        f"- local_state_route: `{(payload.get('local_state_route') or {}).get('status')}`"
+        f" (selected=`{(payload.get('local_state_route') or {}).get('selected_runtime_root')}`;"
+        f" target=`{(payload.get('local_state_route') or {}).get('target_runtime_root')}`)",
         f"- runtime_projection_routes_healthy: `{(payload.get('runtime_projection_routes') or {}).get('healthy')}`"
         f" (registry=`{(payload.get('runtime_projection_routes') or {}).get('registry')}`,"
         f" goals=`{(payload.get('runtime_projection_routes') or {}).get('goal_count')}`,"

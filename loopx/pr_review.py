@@ -31,6 +31,7 @@ from .capabilities.pr_review_queue.github_source import (
     attach_pr_review_details_concurrently as _attach_pr_review_details_concurrently,
 )
 from .capabilities.pr_review_queue.check_attempts import latest_check_attempts
+from .capabilities.pr_review_queue.scheduling import is_owner_authored
 from .capabilities.pr_review_queue.review_body import (
     check_review_body,
     english_review_verdict as _english_review_verdict,
@@ -859,16 +860,18 @@ def _review_conclusion(
             "invalid_reasons": reasons,
         }
 
-    latest_result = evaluate(reviews[0])
-    if (
-        str(reviews[0].get("state") or "").upper() == "COMMENTED"
-        and not latest_result["valid"]
-    ):
-        for earlier in reviews[1:]:
-            earlier_result = evaluate(earlier)
-            if earlier_result["valid"]:
-                return earlier_result
-    return latest_result
+    conclusions = [evaluate(review) for review in reviews]
+    if len(reviews) == 1:
+        return conclusions[0]
+    from .capabilities.pr_review_queue.approval_closeout import select_review_conclusion
+    index = select_review_conclusion({"head": head_oid, "author": pr_author,
+        "reviews": [{"state": conclusion["state"],
+            "login": str(_as_dict(review.get("author")).get("login") or ""),
+            "head": str(_as_dict(review.get("commit")).get("oid") or ""),
+            "time": _parse_updated_epoch(review.get("submittedAt")),
+            "conclusion": conclusion}
+            for review, conclusion in zip(reviews, conclusions)]})
+    return conclusions[index]
 
 
 def _review_sequence_entry(item: dict[str, Any], *, rank: int) -> dict[str, Any]:
@@ -886,6 +889,7 @@ def _review_sequence_entry(item: dict[str, Any], *, rank: int) -> dict[str, Any]
         "review_ready_at": item.get("review_ready_at"),
         "review_ready_age_hours": item.get("review_ready_age_hours"),
         "author_owned": item.get("author_owned") is True,
+        **({"owner_authored": item["owner_authored"]} if "owner_authored" in item else {}),
         "community_feedback_ready": item.get("community_feedback_ready") is True,
         "scheduling_lane": item.get("scheduling_lane"),
         "scheduling_tier": item.get("scheduling_tier"),
@@ -907,6 +911,7 @@ def _normalize_pr(
     wait_for_ci: bool = True,
     readiness_observations: Mapping[str, Mapping[str, object]] | None = None,
     repository: str | None = None,
+    owner_authored: bool | None = None,
 ) -> dict[str, Any]:
     files = _files(pr)
     checks = _checks(pr)
@@ -964,6 +969,7 @@ def _normalize_pr(
         "merge_state": str(
             pr.get("mergeStateStatus") or pr.get("mergeable") or "UNKNOWN"
         ),
+        "mergeability": str(pr.get("mergeable") or "UNKNOWN").upper(),
         "motivation": _motivation(pr),
         "scale": {
             "changed_files": int(pr.get("changedFiles") or len(files) or 0),
@@ -989,8 +995,10 @@ def _normalize_pr(
             review_threads=_as_dict(pr.get("review_thread_summary")),
         )
     )
+    if owner_authored is not None:
+        item["owner_authored"] = owner_authored
     item["community_feedback_ready"] = bool(
-        not item["author_owned"]
+        not is_owner_authored(item)
         and item["review_action_kind"] == "rereview_pull_request_exact_head"
         and community_feedback_ready(pr, review_ready_at=ready_at)
     )
@@ -1014,6 +1022,8 @@ def build_pr_review_packet(
     fresh_audit_exact_heads: Sequence[str] = (),
     target_exact_heads: Sequence[str] = (),
     review_priority: object = DEFAULT_REVIEW_PRIORITY,
+    review_order: str | None = None,
+    owner_logins: Sequence[str] = (),
     wait_for_ci: bool = True,
     readiness_observations: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, Any]:
@@ -1023,6 +1033,12 @@ def build_pr_review_packet(
     generated_at = _parse_timestamp(generated_at_text) or datetime.now(timezone.utc)
     requested_fresh_audits = normalize_fresh_audit_exact_heads(fresh_audit_exact_heads)
     requested_targets = normalize_fresh_audit_exact_heads(target_exact_heads)
+    owner_identity = None
+    if owner_logins:
+        from .capabilities.pr_review_queue.order import configuration
+        owner_identity = configuration({"action": "classify_owners", "reviewer_login": reviewer_login,
+            "owner_logins": list(owner_logins), "authors": [
+                str(_as_dict(item.get("author")).get("login") or "") for item in pull_requests]})
     normalized_all = [
         _normalize_pr(
             item,
@@ -1033,8 +1049,9 @@ def build_pr_review_packet(
             wait_for_ci=wait_for_ci,
             readiness_observations=readiness_observations,
             repository=repository,
+            owner_authored=owner_identity["owner_authored"][index] if owner_identity else None,
         )
-        for item in pull_requests
+        for index, item in enumerate(pull_requests)
     ]
     normalized_all = [
         item
@@ -1047,6 +1064,8 @@ def build_pr_review_packet(
             item, review_priority=normalized_priority
         )
     )
+    from .capabilities.pr_review_queue.order import order_queue
+    normalized_all = order_queue(normalized_all, review_order)
     packet_limit = len(requested_targets) if requested_targets else max(1, limit)
     unmerged_all = [item for item in normalized_all if str(item.get("state") or "").upper() != "MERGED"]
     merged_all = [item for item in normalized_all if str(item.get("state") or "").upper() == "MERGED"]
@@ -1210,7 +1229,7 @@ def build_pr_review_packet(
         "request": {
             "schema_version": "loopx_pr_review_command_request_v0",
             "command": COMMAND,
-            "cli_command": "loopx pr-review [--repo owner/repo] [--target-exact-head NUMBER@HEAD_OID] [--state open|merged|all] [--review-priority other-developers-first|owner-first] [--since ISO]",
+            "cli_command": "loopx pr-review [--goal-id GOAL --agent-id AGENT] [--repo owner/repo] [--target-exact-head NUMBER@HEAD_OID] [--state open|merged|all] [--review-order forward|reverse] [--since ISO]",
             "repository": repository,
             "limit": max(1, limit),
             "state_filter": normalized_state_filter,
@@ -1260,6 +1279,8 @@ def build_pr_review_packet(
         "scheduling_policy": build_scheduling_policy(
             authenticated_developer_login=reviewer_login,
             review_priority=normalized_priority,
+            review_order=review_order,
+            owner_logins=owner_identity["owner_logins"] if owner_identity else (),
         ),
         "review_sequence": review_sequence,
         "review_groups": review_groups,
@@ -1305,7 +1326,9 @@ def _review_why_now(item: dict[str, Any]) -> str:
             return "The current exact head has a complete approval; qualify merge readiness."
         return "The current exact head already has a complete standalone conclusion."
     if item.get("author_owned"):
-        return "Authenticated-developer-owned PR is in the first actionable scheduling tier."
+        return "Authenticated-developer-owned PR awaits an independent exact-head review."
+    if is_owner_authored(item):
+        return "Configured-owner-authored PR awaits an independent exact-head review."
     if item.get("community_feedback_ready"):
         return "A community contributor pushed a new exact head after an independent request-changes review."
     if (
@@ -1417,6 +1440,11 @@ def render_pr_review_markdown(payload: dict[str, Any]) -> str:
             ]
         )
         applicability = _as_dict(review_plan.get("applicability"))
+        memory = _as_dict(pr.get("repository_experience"))
+        if memory:
+            lines.extend(["", "### Repository experience (advisory)", "",
+                          "Compare this experience with the current review frame; context delivery does not establish adoption or utility.",
+                          "", "```json", json.dumps(memory, ensure_ascii=False, indent=2), "```", ""])
         if review_plan:
             lines.append(
                 "- review plan: "

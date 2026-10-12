@@ -1,210 +1,212 @@
 # Goal handoff mode
 
-`handoff-mode` chooses the ownership rule used by existing Todo/lease operations:
-`legacy` retains the claim/lease compatibility model, `soft_claim` uses the Todo
-claim, and `hard_lease` requires the existing lease fences. It is not an Agent
-capability grant, provider selector, or Goal promotion command.
+`soft_claim` uses the Todo assignment; `hard_lease` also requires the existing
+execution lease fences. New `set` and migration intents accept these two modes.
+`legacy` remains a historical source for backed-up upgrades and original receipt
+recovery; new requests cannot select it, even as a no-op. Existing Goals are not
+silently changed, and creation/Host defaults remain unchanged in this stage.
+This is an ownership policy, not a capability grant or a storage provider.
 
-## Read and change
+The App's Task list and Task details use the same reviewed completion entry.
+When the terminal owner requires a lease or its current execution proof, the
+App explains that completion is unavailable from this caller. The responsible
+Agent must complete from its execution with the current proof; refresh the Task
+to read back that result. A recorded claim or a lease existing in the store is
+not a proof supplied by this caller. The App does not borrow a key, acquire a
+lease or change ownership policy to make the completion succeed. Other preview
+failures retain their own diagnostics. This explains an unavailable operation;
+it does not qualify App completion under `hard_lease`.
 
-```bash
-loopx handoff-mode show --goal-id example-goal --format json
-loopx handoff-mode set --goal-id example-goal --mode soft_claim --dry-run --format json
-loopx handoff-mode set --goal-id example-goal --mode soft_claim --format json
-```
+## Choose the policy independently of storage
 
-Before promotion, these commands use the existing frontmatter writer and its
-state/event/lease locks. After promotion, they use the selected canonical provider;
-`show` returns `source=canonical_provider` and its `provider_revision`, even if
-Markdown is stale or missing. `--runtime-root` applies to both show and set.
-Provider errors fail closed. A leftover local lease file cannot override an
-empty canonical lease collection.
+Use `soft_claim` for an explicitly single executor without parallel takeover.
+Local parallel Agents/automations and shared cloud work need `hard_lease`, with
+Host acquire/renew/release and blocked settlement qualified before a default
+change. An unknown topology should eventually choose hard, but this command
+does not infer topology or silently enable it.
 
-A mode change requires no unfinished claimed active Todo and no time-active
-lease. The canonical transaction checks the complete Todo/lease snapshot,
-including records outside display limits. An expiry equal to the observation
-time is expired; an invalid active lease timestamp or unknown lease schema
-cannot prove quiescence. Concurrent mutations invalidate the CAS snapshot and
-return a conflict without switching the mode. Todos, lease records and their
-read-model digests are preserved by the mode change.
+A fresh `coordination-shadow promote` CLI preview defaults to `preserve`: it
+changes storage authority while retaining the source policy. Explicit
+`--handoff-mode-migration hard_lease` reviews the policy upgrade in the same
+fenced cutover. Historical saved v0 hard-only plans retain their original
+semantics; saved plans cannot be overridden at execution.
+See [reviewed promotion](reviewed-coordination-promotion.md).
 
-The unpromoted scan now includes the same complete event-overlay Todo view as
-Todo listing, without its display limit. This changes the previous behavior:
-an event-only claim now rejects a mode switch. Every configured/fallback event
-candidate must be readable; corrupt input returns `handoff_mode_source_unavailable`
-instead of silently falling back to apparently empty Markdown. The append store
-locks (including absent candidate paths) remain held through the durable mode
-write, followed by the existing per-goal lease mutex. Direct unsupported file
-edits are outside this contract.
-
-Both paths use the same TS claim/lease classifier and mode-transition rule.
-An identical valid mode remains a no-op even with active work. A malformed
-legacy mode can be repaired only when quiescent; the result retains its actual
-`previous_mode` and `previous_mode_valid=false`. Duplicate mode fields reject
-with `handoff_mode_duplicate_field`, and missing frontmatter rejects a changed
-mode with `state_frontmatter_missing`. Canonical malformed state still rejects;
-legacy repair does not grant permission to repair a canonical head.
-
-Only frontmatter and compact ownership facts enter the legacy TS plan. Python
-keeps the source locks, event projection and existing capture/writeback adapter;
-the body never crosses the mode-plan transport. The scalar replacement preserves
-unrelated metadata, CRLF/LF, Unicode separators and the final newline. No default
-mode, provider or capability changes.
-
-## Preserve claims during authority promotion
-
-The reviewed whole-Goal authority cutover has a narrower migration option for
-an active Goal that cannot satisfy the ordinary quiescence rule:
+## Read or change a quiescent Goal
 
 ```bash
-# Keep legacy or soft_claim while changing only the storage authority.
-loopx coordination-shadow promote --goal-id example-goal \
-  --minimum-operations 3 --require-event-kind todo_claim \
-  --handoff-mode-migration preserve
-
-# Move legacy/soft_claim directly to hard_lease in the same reviewed cutover.
-loopx coordination-shadow promote --goal-id example-goal \
-  --minimum-operations 3 --require-event-kind todo_claim \
-  --handoff-mode-migration hard_lease
-
-# Apply only the exact plan returned by preview.
-loopx coordination-shadow promote --goal-id example-goal \
-  --minimum-operations 3 --require-event-kind todo_claim \
-  --handoff-mode-migration hard_lease --execute
+loopx --format json handoff-mode show --goal-id example-goal
+loopx --format json handoff-mode set --goal-id example-goal --mode soft_claim --dry-run
+loopx --format json handoff-mode set --goal-id example-goal --mode soft_claim --operation-id mode-change-1
 ```
 
-This is not a general mode-change bypass. The only explicit choices are
-`preserve` and `hard_lease`; omitting the option retains the older requirement
-that the qualified source already be `hard_lease`. The TypeScript promotion
-transaction preserves every Todo, claim, lease record, receipt and validation
-field. It validates live claim owners against the Goal agent registry and
-retains an active lease only when its owner, Todo scopes, expiry, version and
-epoch are safe. It never invents a lease for a preserved claim. After a direct
-move to `hard_lease`, the same claim owner must acquire a fresh lease through
-the ordinary atomic claim-and-lease path before protected work; another owner
-remains rejected.
+Before promotion, `show`/`set` use the existing frontmatter adapter and locks.
+After promotion they use the selected canonical provider, even when Markdown
+is stale or absent. Provider failure rejects the operation without fallback;
+leftover lease files cannot override canonical records. Only frontmatter and
+compact ownership facts cross the legacy TS planning boundary; unrelated body,
+metadata, line endings and the final newline remain intact.
 
-Preview reports the source revision/digest, target digest, preserved claims,
-lease dispositions and conflicts. The target digest, selected migration and
-registered-agent set enter the promotion-plan identity. Therefore an
-interrupted cutover can recover only the same reviewed intent. The durable
-legacy-writer fence blocks late old-session writes after cutover; a zero active
-lease count alone is never treated as proof that no old Turn exists.
+A changed `set` requires no unfinished claimed active Todo and no time-active
+lease in the complete snapshot. Invalid expiry/schema cannot prove quiescence;
+concurrent work invalidates its CAS. Identical soft/hard mode is a no-op even
+with active work. Malformed legacy frontmatter can be repaired only when
+quiescent; duplicate fields or missing frontmatter reject, and malformed
+canonical state is never repaired through the legacy adapter.
 
-The CLI is the only mutation surface for this reviewed administrative action.
-Managed Turns invoke that same CLI contract. Dashboard delegation preflight and
-Lark/Chat remain read-only here: they already project `promotion_required` or
-the promoted canonical authority and direct an operator to the reviewed
-preview. The migration choice is one-shot operation intent, not Goal
-configuration, so adding it to the capability editor would create a second
-source of truth. After apply, all ordinary Todo/lease actions and receipts on
-those surfaces read the same promoted projection.
+Canonical `--operation-id` binds Goal and target. Even an accepted no-op seals a
+receipt. Retry with the same ID/target recovers the original decision and never
+restores an old mode over later work; changed intent needs a fresh ID.
+`ambiguous`/`coordination_receipt_recovery_required` means retry that same request.
+Malformed receipts reject. An original `set --mode legacy --operation-id <original-id>`
+request still reaches receipt recovery after upgrade, including after a later
+policy change. New legacy writes and dry-runs return `handoff_mode_retired`;
+`plan-migration` also refuses legacy as a target. The unpromoted writer does not
+promise durable operation replay.
 
-## Recover a canonical request
+## Migrate an assigned canonical Goal with a verified backup
 
-Choose an operation ID before a canonical set if a lost response must be retried:
+Ordinary `set` is deliberately quiescence-only. To preserve existing assignments
+on a canonical Goal, review an immutable plan, then apply its exact digest:
 
 ```bash
-loopx handoff-mode set --goal-id example-goal --mode soft_claim --operation-id mode-change-1 --format json
-# Repeat this exact intent to recover its original receipt.
-loopx handoff-mode set --goal-id example-goal --mode soft_claim --operation-id mode-change-1 --format json
-loopx handoff-mode show --goal-id example-goal --format json
+loopx --format json handoff-mode plan-migration --goal-id example-goal \
+  --mode hard_lease --plan reviewed-mode.json
+# Inspect source identity/revision/digest, target and preserved claims/leases.
+loopx --format json handoff-mode migrate --goal-id example-goal \
+  --plan reviewed-mode.json --plan-sha256 <reviewed-digest>
+loopx --format json handoff-mode migrate --goal-id example-goal \
+  --plan reviewed-mode.json --plan-sha256 <reviewed-digest> --execute
+loopx --format json handoff-mode show --goal-id example-goal
 ```
 
-The ID binds the goal and requested mode. Reuse with a different mode is rejected.
-A retry's clock may advance; it still recovers the original result. Even an
-accepted unchanged canonical set seals a receipt and advances provider revision,
-while returning `changed=false`. If another mode was selected afterward, replay
-returns the original decision without restoring it. Use `show` for current mode.
-A thrown commit response follows the same durable receipt recovery as other
-canonical commands. If the write may have committed but the receipt cannot be
-read, the result is `ambiguous` with `coordination_receipt_recovery_required`:
-retry the same operation ID. A malformed historical decision is rejected as
-`invalid_coordination_command_receipt`, not coerced into an unchanged success.
+Plan and preview do not change policy. Apply first exports and independently
+verifies `<plan>.backup.jsonl` using the existing portable authority archive.
+The archive retains every original transaction, receipt, full projection and
+Todo metadata. Goal/runtime, provider identity/revision, projection digest and
+registered Agents must match the reviewed source. Drift rejects; use a new plan
+path, never edit the digest. A concurrent write during backup fails the exact
+CAS and cannot be overwritten. File, SQLite and an admitted service provider
+use the same typed rule and receipt owner.
 
-Preview writes neither a mode nor an operation receipt. `--operation-id` requires
-canonical authority; the legacy writer does not promise durable operation replay.
+Claims remain assignments. Live claim owners must be registered; retained
+active leases must have eligible owners, valid fencing counters and all named
+required scopes. Additional standalone lease scopes are retained verbatim;
+requirements are not an exact grant template. No scope or lease is invented.
+An upgrade to hard retains a valid current proof; a claim without a live lease
+must acquire one normally before protected work. A soft migration rejects every
+unreleased active lease, including expired ones: expiry alone does not prove a
+Host stopped. Settle those executions first.
 
-Select a previous mode with a **new** operation ID to change it back, subject to
-the same quiescence check. Do not disable the writer fence or restore old Markdown
-to roll back a canonical change. The existing Todo-section renderer does not
-project frontmatter: canonical mode is read through `handoff-mode show`, not a
-possibly old frontmatter value. This command does not qualify a provider profile,
-complete D1–D3, deploy PostgreSQL, or authorize active-Goal migration.
+Apply uses a stable digest-derived operation and the existing durable receipt
+recovery. Retry the same plan after a lost response; it returns the original
+result without rewriting later work. Missing/corrupt retained backup rejects
+recovery. Changing policy back uses a **new** reviewed migration and backup,
+not an old archive that would discard subsequent writes. Archive restoration
+is a separate, isolated disaster-recovery operation.
+
+The App exposes this same explicit operation in **Goal settings → Task ownership**.
+Choose Collaborative claims (`soft_claim`) or Exclusive execution leases
+(`hard_lease`), preview preserved assignments/leases, then choose **Back up and
+apply**. Preview does not change policy or grant execution. Rejections show
+conflict counts and affected Todo identifiers; settle the owning executions
+before making a new plan. Unpromoted Goals must first use the promotion workflow.
+
+The App stores the opaque preview handle in browser session storage before
+enabling Apply; the server owns the immutable plan and verified backup. After a
+lost response or page reload in the same tab, retry the saved preview. Do not
+create a new operation to guess whether the first succeeded. A confirmed original
+receipt and the separately fetched current policy are distinct: later valid
+changes remain authoritative. **Read current policy** retries a failed readback;
+**Discard preview and start again** explicitly abandons the browser carrier,
+without deleting the server plan or backup. Clearing browser storage loses this
+carrier; retain server plans/backups for operator recovery through the CLI.
+Disabling browser storage leaves readback available but prevents applying an
+unretained preview.
+
+CLI and App share registry validation and the same TS migration owner. Lark
+ordinary Todo/lease actions consume that canonical state; policy migration has
+no Lark editor in this stage. The capability editor does not own this policy. Migration does not
+qualify provider defaults, D1–D3, or PostgreSQL deployment. Complete Host lease
+lifecycles and migration of remaining legacy Goals precede legacy execution and
+last-caller Python retirement; historical import/receipt readers stay at their
+migration/recovery boundary.
 
 ## 中文
 
-`handoff-mode` 选择 Todo 的 claim／lease 所有权规则，不授予 capability、不选择
-provider，也不执行 Goal 晋升。上面的命令分别用于读取、预览和切换。
+新增 `set` 和迁移只接受 `soft_claim`、`hard_lease`。legacy 仍可作为升级来源、
+历史回执恢复输入，不能再作为新请求的目标；已有 Goal 和创建／Host 默认值不被
+静默改写。soft 用于明确的单执行者，hard 用于本机并行 Agent／automation 和云端
+共享；默认策略切换前还需验证 Host 的 acquire、renew、release 和阻塞结算。
+App 的任务列表和详情共用审核完成入口。终态 owner 要求租约或当前执行证明时，
+页面明确说明此调用方无法代为完成；负责 Agent 须从原执行提交当前证明，之后刷新
+任务读回结果。已有 claim 或 store 中存在租约不等于页面持有执行证明；App 不借用
+key、自动 acquire 或更改策略绕过拒绝。其他预览失败保留原诊断。此项只完善不可用
+状态说明，不代表 `hard_lease` 下 App 手动完成已经合格。
+存储晋升与所有权分开：新 CLI promote 默认 `preserve`，显式 hard 才审核策略升级；
+旧 v0 保存计划仍按原合同恢复。
 
-晋升前保留 frontmatter 与本地锁兼容路径；晋升后从 canonical provider 读取，
-Markdown 缺失／陈旧和遗留本地 lease 不再影响判断。`show` 返回来源及 revision；
-provider 失败明确报错，不回退旧文件。现有 Todo-section 投影不包含 frontmatter，
-因此当前 mode 应通过 `show` 查询。
+上面的 show/set 命令读取、预览或切换空闲 Goal。晋升后以 canonical provider 为准，
+不回退旧 Markdown／lease 文件。改变策略要求完整快照没有未完成的已认领活动 Todo、
+没有有效 lease；相同 soft/hard 是 no-op。CAS 防止并发覆盖，canonical 请求用固定
+operation ID 恢复原回执，不把后来状态改回去。升级后仍可用原来的
+`set --mode legacy --operation-id <原ID>` 确认历史操作；新 legacy 写入、预览和
+迁移目标明确拒绝。
 
-切换要求完整快照内不存在未完成的已认领活动 Todo、不存在有效 lease。过期时间
-恰好等于观察时间视为已过期；非法有效期或未知 lease schema 不能作为空闲证据。
-并发修改使 CAS 冲突，不能在旧检查结果上继续切换。原 Todo、lease 和摘要不变。
-未晋升路径现在也读取完整事件覆盖视图，包含显示分页之外的 Todo。因此旧行为发生改变：
-仅在事件中存在的 claim 也会阻止切换。所有事件候选源必须可读，损坏源返回
-`handoff_mode_source_unavailable`，不能回退 Markdown 后宣称空闲。事件追加锁从读取
-保持到模式写回完成，再配合已有 lease 锁；直接手改文件仍不在该合同内。
+有 claim 的 canonical Goal 使用 `plan-migration → migrate 预览 → --execute`。
+执行先生成并核验 `<plan>.backup.jsonl`，保存全部事务、原回执、完整历史投影与
+Todo metadata；然后在同一个源 revision 上提交 mode。源身份、状态、注册 Agent
+或计划变化会拒绝，备份期间的并发写入也不能被覆盖。备份／恢复复用既有 authority
+archive，File、SQLite 和获准的 service provider 共用 TS 规则与 receipt owner。
 
-两条路径共用 TS 所有权分类和切换规则。相同合法模式仍是 no-op；非法旧模式以显式
-无效状态进入修复，只允许在无在途工作时修复，不再伪造另一个合法旧模式。
-重复字段拒绝为 `handoff_mode_duplicate_field`，缺少 frontmatter 时拒绝变更。
-只把 frontmatter 和必要事实传给 TS，Python 保留锁、事件投影和 capture 适配；
-正文不进入计划传输，并保留 CRLF、Unicode 分隔符和末尾换行。默认模式和 provider 不变。
+claim 原样保留；有效租约保留原 scope、version 和 epoch，不伪造 lease。
+Todo 的必需 scope 是任务要求，不等于本轮 lease 的完整范围；额外 scope 不被删除。
+没有有效 lease 的 claim owner 仍须正常 acquire 才能执行受保护写入。soft 迁移拒绝
+未 release 的 active lease，即使已过期，因为过期不能证明 Host 已停止。
+丢响应后重试同一计划恢复原结果；缺失／损坏备份会拒绝恢复。反向切换使用新计划和
+新备份，不恢复会丢掉后续工作数据的旧快照。
 
-canonical 提交响应丢失时复用已有回执恢复；若回执暂时不可读，返回 ambiguous 并要求
-以同一个 operation ID 重试。损坏的历史决策明确拒绝，不能当作“成功但没变化”。
+App 在 **Goal 设置 → 任务所有权** 复用同一操作：选择协作认领或独占执行租约，
+预览保留的归属／租约，再点“备份并应用”。预览不改策略、不授予执行权；冲突展示
+数量和相关 Todo，须结清对应执行后重新计划。尚未晋升的 Goal 先完成晋升。
 
-对于无法清空活跃 claim 的 Goal，整 Goal authority 晋升提供一个更窄的显式迁移入口：
-`--handoff-mode-migration preserve` 只切换存储权威并保留 `legacy`／`soft_claim`；
-`--handoff-mode-migration hard_lease` 在同一受评审事务中直接迁到 `hard_lease`。
-未传该参数时，继续沿用“源端已经是 `hard_lease`”的旧门禁。它不是通用 mode 绕过，
-也不开放降级。
+浏览器先保存不透明的预览标识才允许应用；服务端保存不可变计划和备份。丢响应或
+同一标签页刷新后重试原预览，不能新建操作猜测旧结果。“原操作已确认”与“当前策略”
+分别展示，后续合法变更不被旧回执覆盖。可单独重新读取当前策略；显式放弃预览只
+清除浏览器载体，不删除服务端计划／备份。清空浏览器存储会丢失该载体，需保留服务端
+计划和备份供 CLI 恢复；禁止浏览器存储时仍可读取，但不能应用无法保存的预览。
 
-TypeScript 事务会原样保存 Todo、claim、lease record、receipt 与验证字段；校验活跃
-claim owner 是否仍在 Goal agent registry 中，并且只有 owner、Todo scope、expiry、
-version 与 epoch 都安全时才保留活跃 lease。迁到 `hard_lease` 不会为 claim 伪造
-lease：原 owner 下一次受保护写入前，必须走正常的原子 claim+lease 路径取得新 lease，
-异主仍被拒绝。preview 会给出源 revision/digest、目标 digest、保留 claim、lease
-处置与冲突；这些内容进入 promotion-plan identity，所以中断后只能恢复完全相同的
-评审意图。持久 legacy-writer fence 负责拦截旧 Turn 的迟到写入，不能用“当前 0 条
-active lease”推断没有在途 Turn。
-
-该受评审管理动作只有 CLI 一个写入口，managed Turn 也调用同一 CLI contract。
-Dashboard 的 delegation preflight 与 Lark／Chat 在这里保持只读：它们已经投影
-`promotion_required` 或晋升后的 canonical authority，并把 operator 引导到受评审
-preview。migration choice 是单次 operation intent，不是 Goal 配置；把它再放进
-capability editor 会制造第二个 truth source。apply 之后，各入口的普通 Todo／lease
-动作与回执统一读取同一份 promoted projection。
-
-需支持丢响应恢复时，在首次 canonical set 前指定 `--operation-id`，重试沿用同一
-目标 mode 和 ID。不同 mode 复用 ID 会被拒绝；即使最初 mode 未变，也记录耐久回执。
-若后来已切到其他 mode，旧请求重放只返回原回执，不把 mode 改回去；用 `show` 读当前值。
-预览不写入；旧 writer 不支持该幂等 ID。需要切回时，用新 ID 请求原 mode，仍须满足
-空闲门禁，不能通过关闭 fence 或恢复旧 Markdown 回滚。本功能不解除 provider
-默认值、长程资格化、PostgreSQL 部署或 D1–D3 的剩余条件。
+CLI 与 App 共用注册信息校验和 TS 迁移 owner；飞书普通操作消费相同 canonical 状态，
+本阶段没有飞书策略编辑器，也不新建 capability 设置项。此批不关闭 provider 默认与
+D1–D3；先完成 Host 生命周期、
+逐 Goal 备份迁移，再删除 legacy 执行分支和无调用方的 Python 业务逻辑。旧格式解析
+只保留在迁移／历史回执恢复边界。
 
 ## Recover a canonical Todo edit with retained lease history
 
 A canonical Todo can retain a released or expired lease even in `legacy` mode.
-That record preserves execution lineage: `todo update` still requires a current
-active owner proof. `handoff_mode_requires_lease` does **not** mean that the Goal
+In `legacy` and `hard_lease`, that record preserves execution lineage: `todo update`
+still requires a current active owner proof. In `soft_claim`, an open agent Todo's
+current claim owner may edit text/notes or clear those fields without proof when
+its retained lease is released and held by the same owner. The transaction keeps
+the lease, epoch and historical receipts unchanged and still checks actor,
+exclusion, binding and provider CAS. This does not authorize ownership, planning,
+work-requirement or completion changes. `handoff_mode_requires_lease` does **not** mean that the Goal
 has silently switched to `hard_lease`.
 
 Lease-proof rejections of canonical metadata edits now include the actual `handoff_mode` and a
 read-only `recovery` projection. It contains no execution key and grants no
-permission. The original rejection code and all fences remain unchanged:
+permission. Explicit old or partial proof is still rejected; for the qualifying
+soft-claim copy edit, recovery tells the caller to retry without both proof flags
+under a fresh operation and current revision. Other execution fences remain:
 
 | Observation | Recovery |
 | --- | --- |
 | Active lease held by the current claim owner; missing/stale proof | Inspect the lease and retry using its current proof. Do not acquire a competing execution. |
 | Released/expired lease; current owner is eligible and acquisition passes the current mode, acceptance and scope checks | Inspect the version, acquire a short lease with a fresh key, update using the returned proof, then release it. |
 | Active foreign holder, divergent claim, or absent claim | Reconcile ownership through its lifecycle; never borrow another holder's proof. |
-| `soft_claim`, non-open Todo, acceptance hold or conflicting write scopes | Resolve the reported acquisition blocker. No acquire action is offered. |
+| `soft_claim` with released same-owner history, ordinary owner copy edit | Omit lease proof; keep the history. No replacement lease is needed or allowed. |
+| Non-open Todo, acceptance hold or conflicting write scopes | Resolve the reported acquisition blocker. No acquire action is offered. |
 | Edit changes retained leased work requirements or status | Use the owning lifecycle transition; acquiring another lease cannot authorize the metadata edit. |
 
 The recovery descriptor uses the standalone `loopx task-lease acquire` command.
@@ -223,8 +225,14 @@ the configured mode, promote a provider, or waive acceptance.
 
 ### 保留租约历史时的更新恢复
 
-canonical Todo 在 `legacy` 模式下也可能保留 released／expired lease。它记录的是
-执行世代，不能因为过期或已释放就绕过写入 fence。`handoff_mode_requires_lease`
+canonical Todo 在 `legacy` 模式下也可能保留 released／expired lease。legacy 与
+hard_lease 仍要求当前有效 owner proof。soft_claim 下，open Agent Todo 的当前
+claim owner 可不带 proof 编辑文本／备注或清空这些字段，前提是保留的 lease 已释放
+且同属本人。事务保留 lease、epoch 和原回执，仍核验 actor、excluded、bound 和
+provider CAS；这不授权 ownership、planning、工作要求或完成变更。未释放的 active
+lease 即使自然过期，也不适用。显式旧 proof 或部分 proof 仍拒绝；合法普通编辑的
+恢复提示要求去掉两个 proof flag，用新 operation 和当前 revision 重试。
+`handoff_mode_requires_lease`
 不表示 Goal 已自动切成 `hard_lease`；拒绝结果会返回真实 mode 与只读 `recovery`。
 
 有效的本主租约应 inspect 后使用当前 proof 重试；已释放或过期的租约，只有当前
@@ -232,7 +240,7 @@ claim owner 满足相同的 acquire 准入规则时，才提示“inspect versio
 申请短 lease → 带新 proof 更新 → release”。legacy 必须用独立 `task-lease acquire`，
 不能用仅限 hard_lease 的合并式 claim+lease。
 
-异主有效 lease、claim 不一致、soft_claim、不允许执行的 Todo、验收阻塞或 scope
+异主有效 lease、claim 不一致、不允许执行的 Todo、验收阻塞或 scope
 冲突不会得到不可执行的 acquire 建议；修改已租用工作的要求或状态须走对应 lifecycle。
 提示不包含 execution key、不授予权限，也不修改 mode 或 provider。并发造成 version
 变化时重新读取，不能绕过 CAS；dry-run 和拒绝路径不产生 Todo 或租约写入。

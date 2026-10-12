@@ -7,12 +7,12 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 from ..capabilities.pr_review_queue import (
     DEFAULT_REVIEW_PRIORITY,
     build_pull_request_review_queue_observation,
     normalize_fresh_audit_exact_heads,
-    normalize_review_priority,
 )
 from ..capabilities.machine_configuration.builtins import (
     build_builtin_machine_configuration_registry,
@@ -28,7 +28,8 @@ from ..capabilities.pr_review_queue.github_source import (
     scan_github_pull_request_targets,
 )
 from ..file_lock import exclusive_file_lock
-from ..history import load_registry
+from ..codex_app_thread_activity import current_codex_execution_identity
+from ..control_plane.projects.registry_codec import load_registry
 from ..pr_review import (
     build_pr_review_packet,
     load_pr_fixture,
@@ -45,6 +46,9 @@ from ..pr_review_merge_readiness import (
 )
 from ..registry import atomic_write_json, find_registry_goal
 from ..capabilities.pr_review_queue.goal_configuration import resolve_configuration
+from ..capabilities.pr_review_queue.order import configuration as order_configuration
+from ..thread_agent_binding import resolve_thread_agent_binding
+from ._host_thread import ambient_host_thread_id
 
 PrintPayload = Callable[
     [dict[str, object], str, Callable[[dict[str, object]], str]],
@@ -60,7 +64,7 @@ def _file_digest(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _read_json_object(path: Path, *, label: str) -> dict[str, object]:
+def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise TypeError(f"{label} must be an object")
@@ -152,12 +156,10 @@ def register_pr_review_command(
         "--review-priority",
         choices=("other-developers-first", "owner-first"),
         default=None,
-        help=(
-            "Scheduling preference for actionable PRs. Defaults to the configured "
-            "pull_request_review machine capability (other-developers-first when "
-            "unset); use owner-first to prioritize the authenticated reviewer's own PRs."
-        ),
+        help="Deprecated alias: other-developers-first maps to forward; owner-first maps to reverse (complete actionable queue).",
     )
+    parser.add_argument("--review-order", choices=("forward", "reverse"), help="Override this call's configured review direction. Reverse inverts the complete actionable forward queue.")
+    parser.add_argument("--agent-id", help="Registered Goal Agent whose capability direction is used; a bound Codex App thread is resolved automatically.")
     parser.add_argument(
         "--since",
         help="Only include PRs active since this ISO timestamp or YYYY-MM-DD date.",
@@ -262,8 +264,21 @@ def handle_pr_review_command(
             goal = find_registry_goal(load_registry(registry_path), goal_id)
             if goal is None:
                 raise ValueError("PR review Goal was not found: " + goal_id)
-        review_configuration = resolve_configuration(goal, machine_configuration)
+        review_agent_id = getattr(args, "agent_id", None)
+        if review_agent_id and goal is None:
+            raise ValueError("--agent-id requires --goal-id")
+        thread = ambient_host_thread_id("codex-app")
+        if goal is not None and thread:
+            binding = resolve_thread_agent_binding(goal, host_surface="codex-app", thread_id=thread)
+            if binding["status"] == "conflict":
+                raise ValueError("PR review thread has conflicting Agent bindings")
+            if binding["status"] == "bound":
+                if review_agent_id and review_agent_id != binding["agent_id"]:
+                    raise ValueError("PR review --agent-id conflicts with the current thread binding")
+                review_agent_id = binding["agent_id"]
+        review_configuration = resolve_configuration(goal, machine_configuration, review_agent_id)
         wait_for_ci = review_configuration["wait_for_ci"]
+        ci_options: dict[str, Any] = {"wait_for_ci": False} if not wait_for_ci else {}
         if getattr(args, "check_approval_closeout", None):
             from ..capabilities.pr_review_queue.approval_closeout import read_github_approval_closeout
             if any((args.check_result, args.packet, args.check_merge_readiness, args.fixture,
@@ -314,7 +329,13 @@ def handle_pr_review_command(
                 raise ValueError(
                     "review packet or result is unreadable; check the supplied files"
                 ) from None
-            payload = check_review_result(saved_packet, saved_result)
+            packet_request = saved_packet.get("request")
+            payload = check_review_result(
+                saved_packet, saved_result,
+                current_execution=({"status": "unavailable", "reason": "fixture_mode"}
+                                   if isinstance(packet_request, dict) and packet_request.get("source") == "fixture"
+                                   else current_codex_execution_identity()),
+            )
             print_payload(
                 payload, output_format(args), lambda value: json.dumps(value, indent=2)
             )
@@ -322,6 +343,7 @@ def handle_pr_review_command(
         if args.check_merge_readiness:
             if not goal_id:
                 raise ValueError("merge readiness requires --goal-id")
+            assert runtime_root is not None  # the Goal configuration guard already checked this
             if (
                 args.autonomous_observation
                 or args.observation_state_file
@@ -376,7 +398,7 @@ def handle_pr_review_command(
                 pull_request = fetch_github_pull_request(
                     repo=repository,
                     number=number,
-                    **({"wait_for_ci": False} if not wait_for_ci else {}),
+                    **ci_options,
                 )
                 review_threads = fetch_github_review_thread_summary(
                     repo=repository,
@@ -446,10 +468,13 @@ def handle_pr_review_command(
                 "cannot be combined with --since"
             )
         explicit_review_priority = getattr(args, "review_priority", None)
-        if explicit_review_priority is not None:
-            resolved_review_priority = normalize_review_priority(explicit_review_priority)
-        else:
-            resolved_review_priority = normalize_review_priority(review_configuration["review_priority"])
+        explicit_review_order = getattr(args, "review_order", None)
+        if explicit_review_priority is not None and explicit_review_order is not None:
+            raise ValueError("--review-order and legacy --review-priority cannot be combined")
+        selected_order = order_configuration({"action": "normalize", "configuration":
+            {"review_order": explicit_review_order} if explicit_review_order is not None else
+            {"review_priority": explicit_review_priority} if explicit_review_priority is not None else
+            {"review_order": review_configuration["review_order"]}})["review_order"]
         previous_observation = None
         checkpoint_digest = None
         if args.observation_state_file:
@@ -497,7 +522,7 @@ def handle_pr_review_command(
                 source_scan = scan_github_pull_request_targets(
                     repository=repository,
                     exact_heads=target_exact_heads,
-                    **({"wait_for_ci": False} if not wait_for_ci else {}),
+                    **ci_options,
                 )
                 source = "github_cli_exact_targets"
             else:
@@ -506,17 +531,17 @@ def handle_pr_review_command(
                     limit=max(1, args.limit) + 1,
                     state_filter=resolved_state_filter,
                     since=args.since,
-                    **({"wait_for_ci": False} if not wait_for_ci else {}),
+                    **ci_options,
                 )
             pull_requests = source_scan["pull_requests"]
         if readiness_observations:
             observed_rows = []
             for row in pull_requests:
-                number = row.get("number")
+                observed_number = row.get("number")
                 head_oid = str(row.get("headRefOid") or "").strip().casefold()
                 exact_head = (
-                    f"{number}@{head_oid}"
-                    if isinstance(number, int) and head_oid
+                    f"{observed_number}@{head_oid}"
+                    if isinstance(observed_number, int) and head_oid
                     else ""
                 )
                 if observation_key(str(repository or ""), exact_head) not in readiness_observations:
@@ -567,14 +592,29 @@ def handle_pr_review_command(
             fresh_audit_exact_heads=args.fresh_audit_exact_head,
             target_exact_heads=target_exact_heads,
             review_priority=resolved_review_priority,
+            review_order=selected_order,
+            owner_logins=review_configuration.get("owner_logins", []),
             wait_for_ci=wait_for_ci,
             readiness_observations=readiness_observations,
         )
         payload["request"]["goal_id"] = goal_id
         payload["request"]["review_configuration"] = review_configuration
+        payload["request"]["agent_id"] = review_agent_id
+        payload["request"]["review_order"] = selected_order
+        # Retained for readers of the old packet, while review_order is the
+        # execution authority and reverses time/ties as well as author tiers.
+        payload["request"]["review_priority"] = "owner-first" if selected_order == "reverse" else "other-developers-first"
+        payload["request"]["review_order_source"] = "command_override" if explicit_review_order is not None or explicit_review_priority is not None else review_configuration["order_source"]
         payload["request"]["readiness_observation_count"] = len(
             readiness_observations
         )
+        from ..capabilities.pr_review_queue.repository_experience import attach_repository_review_experience
+        try:
+            attach_repository_review_experience(payload, goal=goal, agent_id=review_agent_id)
+        except (OSError, TypeError, ValueError):
+            # Memory availability must not invalidate the review queue or create
+            # a user gate. Never expose source/config exception text.
+            payload["repository_experience_warning"] = "repository_experience_unavailable"
         if args.autonomous_observation:
             autonomous_review = build_pull_request_review_queue_observation(
                 repository=repository,
@@ -585,6 +625,8 @@ def handle_pr_review_command(
                 projected_exact_heads=args.projected_exact_head,
                 authenticated_developer_login=reviewer_login,
                 review_priority=resolved_review_priority,
+                review_order=selected_order,
+                owner_logins=payload["scheduling_policy"].get("owner_logins", []),
             )
             payload["autonomous_review"] = autonomous_review
             payload["request"]["autonomous_observation"] = True
@@ -626,7 +668,7 @@ def handle_pr_review_command(
             "request": {
                 "schema_version": "loopx_pr_review_command_request_v0",
                 "command": "/loopx-pr-review",
-                "cli_command": "loopx pr-review [--repo owner/repo] [--target-exact-head NUMBER@HEAD_OID] [--state open|merged|all] [--review-priority other-developers-first|owner-first] [--since ISO]",
+                "cli_command": "loopx pr-review [--repo owner/repo] [--target-exact-head NUMBER@HEAD_OID] [--state open|merged|all] [--goal-id GOAL --agent-id AGENT] [--review-order forward|reverse] [--since ISO]",
                 "repository": args.repo,
                 "limit": max(1, args.limit),
                 "state_filter": resolved_state_filter,
@@ -640,5 +682,20 @@ def handle_pr_review_command(
             },
             "error": error,
         }
+    # Queue inventory does not need execution metadata. Bind the invoking
+    # session only when this packet actually asks a reviewer to execute work.
+    if not args.fixture and any(item.get("review_action_kind") for item in payload.get("pull_requests", [])):
+        execution = current_codex_execution_identity()
+        payload["reviewer_execution"] = execution
+        if execution["status"] == "runtime_reported":
+            for item in payload["pull_requests"]:
+                plan = item.get("review_plan")
+                if isinstance(plan, dict):
+                    plan["result_template"]["reviewer"] = {
+                        "actor_kind": "model_agent", "declaration_source": "runtime_reported",
+                        "declared_model": execution["model"], "declared_provider": execution["provider"],
+                        "declared_reasoning_effort": execution["reasoning_effort"],
+                        "execution_observation_id": execution["observation_id"],
+                    }
     print_payload(payload, output_format(args), render_pr_review_markdown)
     return 0 if payload.get("ok") else 1

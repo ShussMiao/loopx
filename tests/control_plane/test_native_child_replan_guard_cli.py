@@ -31,12 +31,22 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, tod
     project, runtime = tmp_path / "project", tmp_path / "runtime"
     project.mkdir()
     state = project / "ACTIVE_GOAL_STATE.md"
-    state.write_text("---\nstatus: active\n---\n\n# Synthetic Goal\n\n## Agent Todo\n" + (
+    # Fifteen selectable Todos trigger long-chain replan and require an explicit choice.
+    source_todos = (
         "\n- [ ] [P1] Validate the original source.\n"
         f"  <!-- loopx:todo todo_id={TODO} status=open task_class=advancement_task "
-        f"claimed_by={AGENT} action_kind=validate validation_command=pytest -->\n"
+        f"claimed_by={AGENT} action_kind=validate validation_command=pytest "
+        "continuation_policy=same_agent_non_delivery "
+        "required_capabilities=shell%2Cfilesystem_read -->\n"
+        + "".join(
+            f"\n- [ ] [P1] Validate bounded slice {i}.\n"
+            f"  <!-- loopx:todo todo_id=todo_chain_{i:012d} status=open "
+            f"task_class=advancement_task claimed_by={AGENT} action_kind=validate -->\n"
+            for i in range(14)
+        )
         if todo_bound else ""
-    ))
+    )
+    state.write_text("---\nstatus: active\n---\n\n# Synthetic Goal\n\n## Agent Todo\n" + source_todos)
     index = runtime / "goals" / GOAL / "runs" / "index.jsonl"
     index.parent.mkdir(parents=True)
     evidence, report = index.parent / "source.json", index.parent / "source.md"
@@ -65,14 +75,40 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, tod
         goal_id=GOAL, todos=todos, handoff_mode="soft_claim", leases=[],
     ), state_path=state, provider=provider)
 
-    def call(*args: str) -> dict:
+    def call(*args: str, expected_code: int = 0) -> dict:
         result = subprocess.run([sys.executable, "-m", "loopx.cli", "--registry", str(registry),
             "--runtime-root", str(runtime), "--format", "json", *args], cwd=ROOT,
             capture_output=True, text=True, timeout=60)
-        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert result.returncode == expected_code, (result.stdout, result.stderr)
         return json.loads(result.stdout)
 
     return call, runtime, index
+
+
+def _admitted_guard(call, todo_bound: bool) -> dict:
+    guard_args = ("quota", "should-run", "--codex-app", "--goal-id", GOAL,
+                  "--agent-id", AGENT, "--turn-instance-id", TURN)
+    guard = call(*guard_args)
+    if todo_bound:
+        assert guard["decision"] == "autonomous_replan_required"
+        assert guard["interaction_contract"]["cli_channel"]["selection_required"] is True
+        # A recommendation cannot bind a multi-candidate Turn before choice.
+        assert "settlement_identity" not in guard["heartbeat_receipt"]
+        assert guard["heartbeat_receipt"]["settlement_binding_owed"] is True
+        rejected = call("native-child", "--goal-id", GOAL, "--agent-id", AGENT,
+            "--turn-instance-id", TURN, "record", "--operation-id", "op-before-choice",
+            "--stage", "decision", "--operation", "spawn", "--outcome", "started",
+            "--entrypoint-id", "generic_host", "--execute", expected_code=1)
+        assert "admitted" in rejected["error"]
+        guard = call(*guard_args, "--todo-id", TODO)
+        assert guard["normal_delivery_allowed"] is False
+        assert guard["heartbeat_receipt"]["settlement_identity"]["todo_id"] == TODO
+        assert guard["heartbeat_receipt"]["pending_action_selection"]["settlement_bound"] is True
+        assert guard["retained_action_selection"]["disposition"] == "preserve_retained_todo"
+        replay = call(*guard_args)
+        assert replay["heartbeat_receipt"]["settlement_identity"] == guard["heartbeat_receipt"]["settlement_identity"]
+        assert replay["heartbeat_receipt"]["event_id"] == guard["heartbeat_receipt"]["event_id"]
+    return guard
 
 
 @pytest.mark.parametrize("provider", ["file", "sqlite"])
@@ -81,8 +117,7 @@ def test_legal_replan_reports_native_child_without_settling_parent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, todo_bound: bool,
 ) -> None:
     call, runtime, index = _fixture(tmp_path, monkeypatch, provider, todo_bound)
-    guard = call("quota", "should-run", "--codex-app", "--goal-id", GOAL,
-                 "--agent-id", AGENT, "--turn-instance-id", TURN)
+    guard = _admitted_guard(call, todo_bound)
     assert guard["decision"] == "autonomous_replan_required", guard
     identity = guard["heartbeat_receipt"]["settlement_identity"]
     assert identity.get("todo_id") == (TODO if todo_bound else None)

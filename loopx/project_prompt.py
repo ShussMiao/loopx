@@ -4,7 +4,15 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from .bootstrap import default_goal_id
+from .control_plane.projects.identity import default_goal_id
+from .control_plane.projects.registry_codec import load_registry
+from .paths import (
+    registered_goal_state_file,
+    rel_or_abs,
+    resolve_runtime_root,
+    shell_selected_global_registry,
+)
+from .control_plane.progress_scope import AGENT_LANE_PROGRESS_SCOPE
 from .control_plane.scheduler.execution_context import (
     GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     SchedulerRuntimeProfile,
@@ -19,7 +27,6 @@ DEFAULT_HANDOFF_DOMAIN = "<DOMAIN>"
 DEFAULT_HANDOFF_ADAPTER_KIND = "read_only_project_map_v0"
 DEFAULT_HANDOFF_ADAPTER_STATUS = "connected-read-only"
 DEFAULT_HANDOFF_NEXT_PROBE = "(omit --next-probe until a read-only pre-tick command exists)"
-SHARED_GLOBAL_REGISTRY = '"$HOME/.codex/loopx/registry.global.json"'
 CODEX_CLI_VISIBLE_SCHEDULER_CONTEXT = {
     "host_surface": "codex_cli",
     "scheduler_owner": "agent_cli_loop",
@@ -41,17 +48,20 @@ def render_cli_command_prefix(
     *,
     cli_bin: str = "loopx",
     runtime_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
 ) -> str:
     prefix = shell_arg(cli_bin)
     if runtime_root is not None:
         prefix += f" --runtime-root {shell_arg(str(runtime_root))}"
+    if registry_path is not None:
+        prefix += f" --registry {shell_arg(str(registry_path))}"
     return prefix
 
 
 def _render_global_registry_arg(runtime_root: str | Path | None) -> str:
     if runtime_root is not None:
         return ""
-    return f"--registry {SHARED_GLOBAL_REGISTRY} "
+    return f"--registry {shell_selected_global_registry()} "
 
 
 def render_goal_start_bootstrap_command(
@@ -162,6 +172,7 @@ def render_quota_guard_command(
     *,
     cli_bin: str = "loopx",
     runtime_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
     agent_id: str | None = None,
     available_capabilities: Any = None,
     runtime_profile: str | None = None,
@@ -198,10 +209,10 @@ def render_quota_guard_command(
     else:
         turn_arg = ""
     registry_arg = (
-        _render_global_registry_arg(runtime_root) if include_shared_registry else ""
+        _render_global_registry_arg(runtime_root) if include_shared_registry and registry_path is None else ""
     )
     return (
-        f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root)} --format json "
+        f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root, registry_path=registry_path)} --format json "
         f"{registry_arg}"
         f"quota should-run --goal-id {shell_arg(goal_id)}{agent_arg}"
         f"{capability_args}{scheduler_args}{turn_arg}"
@@ -214,14 +225,15 @@ def render_quota_spend_command(
     source: str = "adapter",
     cli_bin: str = "loopx",
     runtime_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
     agent_id: str | None = None,
     available_capabilities: Any = None,
 ) -> str:
     agent_arg = f" --agent-id {shell_arg(agent_id)}" if agent_id else ""
     capability_args = render_available_capability_args(available_capabilities)
     return (
-        f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root)} --format json "
-        f"{_render_global_registry_arg(runtime_root)}"
+        f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root, registry_path=registry_path)} --format json "
+        f"{_render_global_registry_arg(runtime_root) if registry_path is None else ''}"
         "quota spend-slot "
         f"--goal-id {shell_arg(goal_id)} "
         f"--slots 1 --source {shell_arg(source)} --execute{agent_arg}{capability_args}"
@@ -233,6 +245,7 @@ def render_refresh_state_command(
     *,
     cli_bin: str = "loopx",
     runtime_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
     project: str | None = None,
     agent_id: str | None = None,
     progress_scope: str | None = None,
@@ -259,7 +272,7 @@ def render_refresh_state_command(
         else ""
     )
     return (
-        f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root)} "
+        f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root, registry_path=registry_path)} "
         f"refresh-state --goal-id {shell_arg(goal_id)}"
         f"{project_arg}{classification_arg}{scale_arg}{outcome_arg}{agent_arg}{scope_arg}"
     )
@@ -270,6 +283,7 @@ def render_accountable_progress_refresh_command(
     *,
     cli_bin: str = "loopx",
     runtime_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
     agent_id: str | None = None,
     progress_scope: str | None = None,
     classification: str = "<PUBLIC_SAFE_PROGRESS_CLASSIFICATION>",
@@ -280,6 +294,7 @@ def render_accountable_progress_refresh_command(
         goal_id,
         cli_bin=cli_bin,
         runtime_root=runtime_root,
+        registry_path=registry_path,
         agent_id=agent_id,
         progress_scope=progress_scope,
         classification=classification,
@@ -368,10 +383,11 @@ def render_connect_command(
     allowed_domains: list[str],
     write_scope: list[str],
     cli_bin: str = "loopx",
+    runtime_root: str | Path | None = None,
 ) -> str:
     lines = [
         f"cd {shell_arg(project)}",
-        f"{shell_arg(cli_bin)} connect \\",
+        f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root)} connect \\",
         f"  --goal-id {shell_arg(goal_id)} \\",
         f"  --objective {shell_arg(objective)} \\",
         f"  --domain {shell_arg(domain)} \\",
@@ -414,6 +430,21 @@ def build_new_project_prompt(
     resolved_objective = objective or DEFAULT_HANDOFF_OBJECTIVE
     resolved_domain = domain or DEFAULT_HANDOFF_DOMAIN
     resolved_next_probe = next_probe or DEFAULT_HANDOFF_NEXT_PROBE
+    project_registry_path = project.expanduser() / ".loopx" / "registry.json"
+    existing_registry = (
+        load_registry(project_registry_path)
+        if project_registry_path.is_file()
+        else None
+    )
+    declared_runtime_root = (
+        str(resolve_runtime_root(existing_registry, registry_path=project_registry_path))
+        if isinstance(existing_registry, dict) and existing_registry.get("common_runtime_root")
+        else None
+    )
+    active_state_path = rel_or_abs(
+        registered_goal_state_file(project.expanduser(), resolved_goal_id, existing_registry),
+        project.expanduser(),
+    )
     allowed_domains = allowed_domains or []
     write_scope = write_scope or []
     connect_command = render_connect_command(
@@ -429,22 +460,25 @@ def build_new_project_prompt(
         allowed_domains=allowed_domains,
         write_scope=write_scope,
         cli_bin="loopx",
+        runtime_root=declared_runtime_root,
     )
     quota_guard_command = render_quota_guard_command(
         resolved_goal_id,
+        runtime_root=declared_runtime_root,
         scheduler_execution_context=(
             GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT
         ),
     )
-    quota_spend_command = render_quota_spend_command(resolved_goal_id)
-    refresh_command = render_refresh_state_command(resolved_goal_id)
+    quota_spend_command = render_quota_spend_command(resolved_goal_id, runtime_root=declared_runtime_root)
+    refresh_command = render_refresh_state_command(resolved_goal_id, runtime_root=declared_runtime_root)
     progress_refresh_command = render_accountable_progress_refresh_command(
-        resolved_goal_id
+        resolved_goal_id, runtime_root=declared_runtime_root
     )
     prompt = render_prompt_text(
         project=project_text,
         goal_doc=goal_doc_text,
         goal_id=resolved_goal_id,
+        active_state_path=active_state_path,
         objective=resolved_objective,
         domain=resolved_domain,
         adapter_kind=adapter_kind,
@@ -456,7 +490,7 @@ def build_new_project_prompt(
         quota_spend_command=quota_spend_command,
         refresh_command=refresh_command,
         progress_refresh_command=progress_refresh_command,
-        cli_bin="loopx",
+        cli_bin=render_cli_command_prefix(runtime_root=declared_runtime_root),
         spawn_allowed=spawn_allowed,
         allowed_domains=allowed_domains,
         write_scope=write_scope,
@@ -545,13 +579,13 @@ def build_codex_cli_bootstrap_message(
         resolved_goal_id,
         cli_bin=cli_bin,
         agent_id=agent_id,
-        progress_scope="agent_lane" if agent_id else None,
+        progress_scope=AGENT_LANE_PROGRESS_SCOPE if agent_id else None,
     )
     progress_refresh_command = render_accountable_progress_refresh_command(
         resolved_goal_id,
         cli_bin=cli_bin,
         agent_id=agent_id,
-        progress_scope="agent_lane" if agent_id else None,
+        progress_scope=AGENT_LANE_PROGRESS_SCOPE if agent_id else None,
     )
     first_run_validation_checklist = [
         f"{cli_bin} doctor passed after PyPI install repair or an existing install",
@@ -898,6 +932,7 @@ def render_prompt_text(
     project: str,
     goal_doc: str,
     goal_id: str,
+    active_state_path: str,
     objective: str,
     domain: str,
     adapter_kind: str,
@@ -966,13 +1001,13 @@ def render_prompt_text(
 {connect_command}
 ```
 
-4. 确认 `.loopx/registry.json` 和 `.codex/goals/{goal_id}/ACTIVE_GOAL_STATE.md` 已创建或更新。
+4. 确认 `.loopx/registry.json` 和 `{active_state_path}` 已创建或更新。
    接入输出里不再有 onboarding 扫描、候选 todo 或自主推进选择项；首连之后状态里
    没有可执行的 agent todo。请只读核对目标文档和 registry 的 `execution_profile`，
    用中文给出 1-3 个第一个交付 todo 的候选，问用户确认后，用
    `{cli_bin} todo add ...` 写入被接受的条目，再运行 `{refresh_command}` 并汇报。
    在用户确认前不要开始 delivery。
-   如果目标状态包含私有证据，把 `.loopx/` 和 `.codex/goals/` 加入该项目 `.gitignore`。
+   如果目标状态包含私有证据，把 `.loopx/` 加入该项目 `.gitignore`；旧项目仍需忽略 `.codex/goals/`。
    `{cli_bin} connect` 默认会同步到共享全局 registry；不要手动编辑其他项目的 registry。
    接入后检查 registry 里的 `execution_profile`：它是本项目后续 heartbeat / adapter 的执行画像。
    默认 cadence 是 `bounded_progress_segment`，连续小步达到阈值后，下一轮必须扩展到
@@ -1038,7 +1073,7 @@ def render_prompt_text(
 7. 如果要给这个项目设置 recurring Codex App heartbeat，默认每 3 分钟一次，后续跟随 `quota should-run.scheduler_hint` 降频；不要手抄 guard 和 spend 协议；先生成 task body，再把输出复制进 automation：
 
 ```bash
-{cli_bin} heartbeat-prompt --goal-id {goal_id} --active-state .codex/goals/{goal_id}/ACTIVE_GOAL_STATE.md
+{cli_bin} heartbeat-prompt --goal-id {goal_id} --active-state {shell_arg(active_state_path)}
 ```
 
 8. 生成一个 read-only project map 或 first pre-tick run。不要启动线上任务、不同步外部系统、不要写生产状态，除非目标文档明确授权。通用接入优先跑：

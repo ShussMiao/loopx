@@ -68,7 +68,10 @@ def _requested_quota_action_todo_id(
     args: argparse.Namespace,
 ) -> str | None:
     if not (
-        bool(args.codex_app)
+        # Hosts may supply their own Turn identity without guided-start support.
+        # Forward their explicit selection to the same typed admission owner.
+        bool(getattr(args, "turn_instance_id", None))
+        or bool(args.codex_app)
         or bool(getattr(args, "trae_app", False))
         or args.runtime_profile
         in {profile.value for profile in GUIDED_START_TURN_RUNTIME_PROFILES}
@@ -82,6 +85,7 @@ def load_requested_quota_action_selection(
     *,
     runtime_root: Path,
     turn_instance_id: str | None,
+    goal_ref: Mapping[str, object] | None = None,
 ) -> RequestedQuotaActionSelection:
     requested_todo_id = _requested_quota_action_todo_id(args)
     if not turn_instance_id:
@@ -98,6 +102,7 @@ def load_requested_quota_action_selection(
         goal_id=args.goal_id,
         agent_id=args.agent_id,
         turn_instance_id=turn_instance_id,
+        goal_ref=goal_ref,
     )
     if not existing:
         return RequestedQuotaActionSelection(
@@ -234,6 +239,7 @@ def reconcile_requested_quota_action_selection(
     registry_path: Path,
     context: QuotaCommandContext,
     selection: RequestedQuotaActionSelection,
+    goal_ref: Mapping[str, object] | None = None,
 ) -> ActionSelectionPreflightResult:
     recovery = _requested_quota_action_selection_preflight(
         payload,
@@ -265,6 +271,7 @@ def reconcile_requested_quota_action_selection(
         scheduler_args=render_scheduler_execution_args(
             scheduler_execution_context=context.scheduler_context
         ),
+        goal_ref=goal_ref,
     )
     receipt, receipt_status, receipt_appended = _retain_deferred_action_selection(
         payload,
@@ -272,6 +279,7 @@ def reconcile_requested_quota_action_selection(
         runtime_root=context.runtime_root,
         turn_instance_id=context.heartbeat_turn_id,
         selection=selection,
+        goal_ref=goal_ref,
     )
     return ActionSelectionPreflightResult(
         rejected=True,
@@ -279,6 +287,35 @@ def reconcile_requested_quota_action_selection(
         receipt_status=receipt_status,
         receipt_appended=receipt_appended,
     )
+
+
+def inline_action_selection_reentry_args(
+    payload: Mapping[str, object],
+    args: argparse.Namespace,
+    *,
+    selection: RequestedQuotaActionSelection,
+    preflight: ActionSelectionPreflightResult,
+    turn_instance_id: str | None,
+) -> argparse.Namespace | None:
+    """Adapt one typed reentry instruction after the exact choice is durable."""
+    qualification = payload.get("action_selection_qualification")
+    if (
+        not isinstance(qualification, Mapping)
+        or qualification.get("inline_reentry_allowed") is not True
+        or preflight.receipt is None
+        or selection.requested_todo_id is None
+        or turn_instance_id is None
+        or heartbeat_receipt_pending_action_todo_id(preflight.receipt)
+        != selection.requested_todo_id
+    ):
+        return None
+    # Re-enter the real guard; changed quota, gates, leases and capabilities
+    # must be read again. No explicit selection on this hop means no recursion.
+    reentry = argparse.Namespace(**vars(args))
+    reentry.todo_id = None
+    reentry.begin_turn = False
+    reentry.turn_instance_id = turn_instance_id
+    return reentry
 
 
 def commit_requested_action_selection(
@@ -304,6 +341,7 @@ def _retain_deferred_action_selection(
     runtime_root: Path,
     turn_instance_id: str | None,
     selection: RequestedQuotaActionSelection,
+    goal_ref: Mapping[str, object] | None,
 ) -> tuple[dict[str, object] | None, str, bool]:
     """Append a deferred explicit choice without granting settlement authority."""
 
@@ -323,5 +361,6 @@ def _retain_deferred_action_selection(
         turn_instance_id=turn_instance_id,
         todo_id=selection.requested_todo_id,
         reason=str(qualification.get("reason") or "current_delivery_gate"),
+        goal_ref=goal_ref,
     )
     return retained, "selection_retained" if appended else "replayed", appended

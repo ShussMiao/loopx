@@ -84,7 +84,7 @@ semantic forms were analyzed.
 LoopX coordinates local agent state, so some files are runtime data and
 must stay out of public contributions:
 
-- do not commit `.loopx/`, `.codex/goals/`, or live
+- do not commit `.loopx/`, legacy `.codex/goals/`, or live
   `ACTIVE_GOAL_STATE.md` files;
 - do not publish private benchmark traces, verifier output, raw agent sessions,
   credentials, internal document links, or local machine paths;
@@ -189,6 +189,8 @@ touch, mention it in the PR instead of fixing it there.
 | `package-smoke.yml` | extension package paths | no | extension packages install, entrypoints, and example schemas |
 | `release-artifacts.yml` | `loopx/`, packaging, and lockfile paths | no | release identity and a release build from this source |
 | `ark-turn.yml` | Turn driver and collaboration paths | no | optional Ark Turn package, stdio MCP, and DSH parity |
+| `dsh-plugin.yml` | DSH plugin and distribution workflow paths | no | Linux/Windows package install and uninstall, typed host contracts, and Linux real LoopX/web runtime admission |
+| `dsh-plugin-publish.yml` | no (manual, published plugin tag) | no | merged release identity, immutable npm package publication, and distribution readback |
 | `frontstage-pages.yml` | README, dashboard, and chat bundle paths | no | public Pages build |
 | `desktop-release-artifacts.yml` | desktop app and dashboard paths | no | macOS and Windows desktop builds |
 | `desktop-updater.yml` | desktop app paths | no | desktop app build and updater feed |

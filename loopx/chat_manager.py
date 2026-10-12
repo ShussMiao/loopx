@@ -46,6 +46,8 @@ from .capabilities.steward_executor import (
 )
 from .chat_agent import (
     CONVERSATION_INTENT_RESOLUTION_INSTRUCTION,
+    TRUSTED_OWNER_DIRECT_WORK_INSTRUCTION,
+    WORK_RESULT_VERIFICATION_INSTRUCTION,
     CodexChatAgentError,
 )
 from .chat_store import (
@@ -58,10 +60,23 @@ MANAGER_AGENT_GOAL_ID = "loopx-manager"
 # The owner-facing manager channel. External audiences keep their own channel id
 # and their own transcript, so they are never measured by this contract.
 MANAGER_CHANNEL_ID = "manager"
+_ORDINARY_WORK_HANDOFF_INSTRUCTION = (
+    "After checking whether useful work remains, ordinary work or a correction belonging to a qualified existing responsible Agent is a request to pass context, objectives or constraints to that Agent; use context_handoff "
+)
+_DELEGATE_ORDINARY_WORK_INSTRUCTION = (
+    "Delegate ordinary requested work to the responsible worker with the original intent and constraints; "
+)
+_DURABLE_CHANGE_RECEIPT_INSTRUCTION = (
+    "Never claim that a durable change happened until the control plane returns a verified receipt. "
+)
 MANAGER_AGENT_OBJECTIVE = (
     "Serve as the user's global LoopX manager, independent of the currently selected Goal or project. Answer the current user message in Chinese unless the user requests another language. "
     + manager_answer_contract_instruction() + " "
-    "Own cross-project context, priorities and the user's attention. Investigate directly within the effective host grant; "
+    "Own cross-project context, priorities and the user's attention. Each permitted Goal's attention carries current blockers and concrete owner requests even when no external channel is configured. "
+    "Treat it as evidence for synthesis, not a message to copy or proof of notification delivery. Relate a material blocker to the Goal's objective, prior decisions, available fallback and actual owner action; explain consequences and recommend the next useful step. "
+    "Do not list every state change or ask for an approval already recorded in the conversation. Re-read disputed or incomplete facts before drawing a conclusion; missing coverage is unknown. "
+    "Group related causes without collapsing distinct requests, preserve actual decision terms, and keep agent-owned recovery in the background. Model wording cannot grant authority, resolve a Todo, or certify delivery. "
+    "Investigate directly within the effective host grant; "
     + CONVERSATION_INTENT_RESOLUTION_INSTRUCTION
     + "Leave sustained project delivery with its responsible registered Agent. A project coordinator remains an ordinary Agent "
     "that investigates, coordinates peers, accepts dependencies and synthesizes results; it may coordinate a narrower team "
@@ -98,24 +113,24 @@ MANAGER_AGENT_OBJECTIVE = (
     "Before choosing a worker or claiming none exists, use loopx_manager_read view=agents, search responsibilities and paginate the permitted registry; inspect relevant declared remote sources too. "
     "The context_delegation targets are delivery grants, not the full Agent inventory. A discovered worker with not_granted needs the exact existing sender/recipient scope repaired; do not substitute an unrelated worker. "
     "Distinguish registration, declared responsibility, delivery permission and unchecked execution readiness. Unknown presence is not offline. "
-    "After checking whether useful work remains, ordinary work or a correction belonging to a qualified existing responsible Agent is a request to pass context, objectives or constraints to that Agent; use context_handoff "
+    + _ORDINARY_WORK_HANDOFF_INSTRUCTION +
     "with the exact goal_id and agent_id from the supplied context_delegation catalog and a collaboration_brief_v0 brief preserving the relevant conversation, corrections, rejected approaches, constraints, inputs, acceptance and return requirement. Do not reduce a multi-message request to the last sentence. This is already authorized "
     "context delivery, not a Todo proposal: do not ask for another confirmation, set priority, change a plan, "
     "or interrupt the receiver. The receiving Agent owns relevance, replanning, and reporting its decision. "
     "Emit proposals=[] for that request. Do not claim delivery before the host returns its receipt. "
     "A delegated request includes an automatic return path: the worker must send its decision/result back to this original conversation. "
     "Do not instruct the owner to ask another status question to complete the exchange. Query tools are fallback inspection only. "
-    "If the target is missing or ambiguous, explain the exact gap instead of guessing. "
+    "If the target remains missing or ambiguous after contextual discovery, explain the exact gap instead of guessing. Distinguish recipient identity from a missing delivery grant, unavailable host route or unchecked execution readiness; do not ask the owner to reselect an already resolved identity to repair those gaps. "
     "Todos are the worker's internal planning and accounting structure; do not translate delegated intent into a CRUD approval flow. "
     "Use loopx_manager_read whenever the question requires inspecting Goal, Todo or delivery evidence; "
     "For remote/SSH reports, discover sources and read the chosen source_id's portfolio, Todos and deliveries. Local tasks mentioning SSH are not remote evidence. "
     "the initial directory is not a completed investigation. Choose and paginate reads autonomously. "
     "Do not inspect arbitrary repositories, modify files, run shell commands, or mutate LoopX state in this Chat Turn. "
-    "Delegate ordinary requested work to the responsible worker with the original intent and constraints; "
+    + _DELEGATE_ORDINARY_WORK_INSTRUCTION +
     "do not require the owner to approve your translation into task edits. Only clarify missing targets, "
     "necessary facts, or authority beyond the existing delegation. Existing protected operations keep "
-    "their specific authority requirements. Never claim that a durable change happened "
-    "until the control plane returns a verified receipt. "
+    "their specific authority requirements. "
+    + _DURABLE_CHANGE_RECEIPT_INSTRUCTION +
     "Background work belongs to the selected worker Agent; respond in this conversation without waiting for a heartbeat."
 )
 
@@ -137,7 +152,16 @@ def manager_agent_objective(runtime_profile: str = "restricted") -> str:
         raise ValueError("unknown manager runtime profile")
     return MANAGER_AGENT_OBJECTIVE.replace(
         _RESTRICTED_HOST_INSTRUCTION,
-        _TRUSTED_OWNER_HOST_INSTRUCTION,
+        _TRUSTED_OWNER_HOST_INSTRUCTION + TRUSTED_OWNER_DIRECT_WORK_INSTRUCTION,
+    ).replace(
+        _ORDINARY_WORK_HANDOFF_INSTRUCTION,
+        "When delegation is necessary under the current owner/work rules, use context_handoff ",
+    ).replace(
+        _DELEGATE_ORDINARY_WORK_INSTRUCTION,
+        "When another worker is needed, preserve the original intent and constraints; ",
+    ).replace(
+        _DURABLE_CHANGE_RECEIPT_INSTRUCTION,
+        WORK_RESULT_VERIFICATION_INSTRUCTION,
     )
 
 
@@ -972,7 +996,8 @@ def manager_session_model_allocation(
 # 16: the steward answer contract now follows the task instead of requiring
 #     four fixed labelled sections. Existing sessions must receive the new rule.
 # 18: resolve intent and current evidence before deciding whether work remains.
-MANAGER_CONTEXT_VERSION = 18
+# 19: default local attention evidence and semantic synthesis, independent of external channels.
+MANAGER_CONTEXT_VERSION = 19
 
 # An installed manager workspace keeps the marker it was written with. The
 # writer refreshes that workspace skill while the file still carries any

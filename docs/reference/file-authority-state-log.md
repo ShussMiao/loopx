@@ -62,8 +62,14 @@ Normal readers and writers **do not accept the old File format**. Old parsing
 belongs only to migration. There is no migration-on-read or first-business-write
 conversion. SQLite's existing v1-to-v2 converter follows the same explicit gate.
 
-Default local installation and Windows installation run the candidate's upgrade
-command before launcher activation. `loopx update apply` for pip/pipx runs it
+Default local installation and Windows installation run the candidate's format
+compatibility/upgrade command before launcher activation. This is not a provider
+switch: an already-current store receives its existing read-only validation,
+without acquiring a migration lock or creating a backup. Current File journals
+still receive full history validation; current SQLite stores retain metadata and
+contiguous-lineage checks. Only an old supported format enters the locked
+backup-and-upgrade path, which re-reads the source before publication.
+`loopx update apply` for pip/pipx runs it
 after package installation and before host updates or service restart. Canary
 installation does not migrate stores. Source checkouts and externally managed
 package updates use the same explicit command:
@@ -144,10 +150,12 @@ Budget additional local disk space approximately equal to the archive size.
 Resume checks the target's entire existing prefix before appending its missing
 suffix. Prefix scans use at most 16 reconstructed transactions per page; each
 original operation is also looked up through the provider's receipt index. The
-same TS comparator serves restore and independent audit. Acknowledged new writes
-also share a page proof; an uncertain write forces immediate readback before any
-later write, without retrying the uncertain operation. Logical commits remain
-individual CAS operations. SQLite resolves all requested operation IDs in one
+same TS comparator serves restore and independent audit. File restore publishes
+one updated retained envelope per bounded page; every original logical row,
+revision and receipt remains separate. One target CAS protects that isolated
+recovery page. Ordinary File writes and other providers keep per-transaction
+CAS/publication. Acknowledged new writes share a page proof; an uncertain write
+forces immediate readback before any later write, without retrying it. SQLite resolves all requested operation IDs in one
 read transaction and verifies each touched checkpoint window once per batch;
 other providers use the same contract with scalar receipt lookup as a fallback.
 This removes redundant replay without skipping old receipts, caching proof

@@ -314,13 +314,14 @@ loopx extension run <extension-id> --input-json <path-or-> [--execute]
 
 The active manifest fixes the executable, arguments, protocol, permissions,
 timeout, and revision. The caller supplies one JSON object over stdin and the
-provider must return one JSON object over stdout. LoopX does not accept an
-arbitrary executable path or argument passthrough. `run` never installs a
-missing extension, and it rejects extensions with `[[provides]]`,
-`[[implements]]`, or any declared permission; those providers are invoked
-through their capability or domain command. Extension lifecycle management is
-shared, but direct execution is reserved for zero-permission, runtime-only
-standalone extensions.
+provider must return one JSON object over stdout; both payloads are UTF-8 bytes,
+so a provider must pin its own stdio instead of falling back to the host locale
+codec. LoopX does not accept an arbitrary executable path or argument
+passthrough. `run` never installs a missing extension, and it rejects extensions
+with `[[provides]]`, `[[implements]]`, or any declared permission; those
+providers are invoked through their capability or domain command. Extension
+lifecycle management is shared, but direct execution is reserved for
+zero-permission, runtime-only standalone extensions.
 Direct provider binaries are implementation and debugging surfaces; they are
 not the supported management API.
 
@@ -543,9 +544,15 @@ it reruns the configured doctor and changes the enabled bit only after that
 probe succeeds. A successful doctor binds readiness to both the active manifest
 revision and a content-addressed runtime identity. Moving an unchanged release
 to a new install root, inode, or equivalent interpreter path preserves that
-identity; changed executable, interpreter, or Python module content fails closed
-until a new executed doctor succeeds. A failed executed doctor clears the stale
-proof without switching revisions.
+identity. The active revision retains up to 32 independently verified runtime
+identities, so probing a source checkout does not displace an installed release.
+Unverified executable, interpreter or module content still fails closed. A failed
+executed probe revokes its observed identity only; `probed_entrypoint_identity`
+is diagnostic evidence, never proof of readiness. An unavailable entrypoint
+cannot activate. Upgrade and rollback qualify their selected runtime afresh;
+proofs from another manifest revision do not carry over. Old single-identity
+state stays read-only until a lifecycle write migrates it. Evicting the oldest
+identity requires re-running doctor for that artifact, never implicit admission.
 
 An enabled implementation is resolved by capability id and versioned protocol,
 then checked against its declared permission, current revision, and current
@@ -906,6 +913,16 @@ bound to both that interpreter and the resolved module source. This lets a
 clean source checkout and a local LoopX release activate bundled providers
 without separately installing a console script; catalog discovery remains
 declarative and does not import the module.
+
+Automatic Goal Channel notifications require extension activation immediately
+before provider transport, after existing selection, suppression and receipt
+checks. An unconfigured, disabled, suppressed, unselected or already-delivered
+notification does not require doctor readiness and cannot block primary Turn
+settlement for that reason. A selected new delivery still requires the enabled,
+current verified revision, declared permissions, provider identity, channel
+membership and readback. There is no automatic doctor execution or new external
+write authority. Notification selection remains owned by the quota contract;
+the Python extension only orders its existing local checks and transport.
 
 Because discovery is declarative, a declared launch target is only shape-checked
 until activation. The public smoke

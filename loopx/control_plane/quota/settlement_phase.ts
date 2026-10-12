@@ -1,10 +1,13 @@
 import type { SettlementIdentity } from "../effect_program.ts";
 import { jsonObject } from "../runtime_decode.ts";
-import { isCausalBlockedWait } from "./blocked_wait.ts";
+import { isCausalBlockedWait, isMonitorUnavailableWait } from "./blocked_wait.ts";
 
-/** A blocked Turn needs a bounded retry or a verified canonical causal wait. */
+/** Historical entry point for blocked no-spend qualification: an advancement
+ * retry/causal wait or a canonical Monitor unavailable attempt. The latter
+ * creates no retry clock and cannot be projected as an advancement wait. */
 export function isBoundedBlockedRetry(value: unknown, todoId: string | null): boolean {
   if (isCausalBlockedWait(value, todoId)) return true;
+  if (isMonitorUnavailableWait(value, todoId)) return true;
   const retry = jsonObject(value);
   if (!retry || retry.schema_version !== "quota_blocked_retry_v0" ||
       (retry.source !== "todo" && retry.source !== "turn_settlement") ||
@@ -19,7 +22,7 @@ export function isBoundedBlockedRetry(value: unknown, todoId: string | null): bo
 
 /** The committed checkpoint accepts progress for a Turn, not Todo completion.
  * The caller must first verify this writeback's exact durable receipt. */
-export function isAcceptedInFlightWriteback(
+export function isAcceptedProgressWriteback(
   value: unknown,
   identity: SettlementIdentity,
 ): boolean {
@@ -32,15 +35,45 @@ export function isAcceptedInFlightWriteback(
       run.delivery_outcome !== "outcome_progress" ||
       !checkpoint || checkpoint.schema_version !== "vision_checkpoint_v0" ||
       checkpoint.agent_id !== identity.agent_id ||
-      checkpoint.delivery_boundary !== "in_flight_continuation" ||
       checkpoint.satisfied !== true || !Array.isArray(checkpoint.triggers)) {
     return false;
   }
   return checkpoint.triggers.some((value) => {
     const trigger = jsonObject(value);
-    return trigger?.kind === "in_flight_continuation" &&
-      trigger.todo_id === identity.todo_id;
+    if (checkpoint.delivery_boundary === "in_flight_continuation") {
+      return trigger?.kind === "in_flight_continuation" &&
+        trigger.todo_id === identity.todo_id;
+    }
+    // A semantic checkpoint can close a bounded segment while the Todo waits
+    // or remains open. Its accepted outcome, not the current frontier or Todo
+    // completion, owns replay of the exact paid Turn.
+    return checkpoint.delivery_boundary === "semantic_closeout" &&
+      trigger?.kind === "material_delivery_outcome" &&
+      trigger.delivery_outcome === run.delivery_outcome;
   });
+}
+
+/** A path replan may be qualified during work, without a preselected obligation.
+ * As with spend validation, only its exact, verified durable writeback is proof.
+ * This closes the Turn binding, never the Todo or its completion validation. */
+export function isAcceptedReplanWriteback(
+  value: unknown,
+  identity: SettlementIdentity,
+): boolean {
+  const run = jsonObject(value);
+  if (identity.binding_kind !== "todo" || identity.todo_id === null ||
+      !run || run.goal_id !== identity.goal_id ||
+      run.agent_id !== identity.agent_id || run.todo_id !== identity.todo_id ||
+      run.turn_instance_id !== identity.turn_instance_id) return false;
+  const ack = jsonObject(run.autonomous_replan_ack);
+  if (!ack || ack.schema_version !== "autonomous_replan_ack_v0" ||
+      ack.recorded !== true) return false;
+  const semantic = jsonObject(ack.semantic_delta);
+  const repair = jsonObject(ack.delta_contract);
+  return (semantic?.schema_version === "replan_semantic_delta_v0" &&
+      semantic.accepted === true) ||
+    (repair?.schema_version === "repair_delta_contract_v0" &&
+      repair.delta_present === true);
 }
 
 /** Both same-Turn readback and prior-Turn recovery accept the shipped effect identities. */
@@ -66,12 +99,14 @@ export interface ReceiptBoundMonitorSettlementState {
   material_change: boolean;
   durable_writeback_present: boolean;
   quota_spend_present: boolean;
+  /** Exact typed unavailable writeback, verified by the settlement owner. */
+  unavailable_attempt_present?: boolean;
 }
 
 export function receiptBoundMonitorPhase(
   state: ReceiptBoundMonitorSettlementState,
 ): ReceiptBoundMonitorPhase {
-  if (!state.poll_present) return "poll_due";
+  if (!state.poll_present && !state.unavailable_attempt_present) return "poll_due";
   // The committed monitor-poll is the durable no-spend closeout for this
   // monitor Turn. A material observation may atomically release an independent
   // successor, but it never upgrades the observe-only monitor into an

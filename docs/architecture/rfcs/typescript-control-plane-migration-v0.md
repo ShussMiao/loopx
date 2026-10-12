@@ -4,7 +4,7 @@
 - Supersedes / closes: none
 - Proposed by: LoopX maintainers
 - Date: 2026-08-15
-- Last revised: 2026-10-01
+- Last revised: 2026-10-07
 - Scope: an incremental, replacement-first migration of the LoopX control-plane
   core from Python to TypeScript without maintaining two semantic
   implementations
@@ -29,20 +29,186 @@ required for the first App outcome. These are planned product consumers of
 T0–T4, not additional provider promotion or completed migration claims.
 
 
-## Current delivery frontier (2026-09-28)
+<a id="current-delivery-frontier-2026-10-02"></a>
 
-Audit `ce3862e33`: #5054, #5140, #5144, #5156, #5173, #5175 and #5169
-are merged. Do not count event retirement, archive recovery, managed process
-supervision, reviewed local cutover or native drain as new pending PRs.
-#4931 remains an open SQLite optimization, not a completed D2 qualification.
+## Current delivery frontier (2026-10-07)
 
-Next: qualify whole-Goal execution/consumer integration and matched local
-profiles in parallel; then unify new-Goal/install/settings and supported upgrade
-entrypoints, deleting each replaced writer with its last caller. Retain necessary
-Host IO, original receipts and migration readers. No additional dead Python
-module is certified by this audit, and no fixed remaining-PR total is promised.
-[Deletion inventory, engineering windows, local evidence and remaining work](ledger/shared-goal-authority-state-provider-v0/2026-09-28-retirement-cadence.md)
-supersedes older current-count estimates; their execution evidence stays historical.
+Rechecked at main `06b6caa07`: #5413/#5466/#5283 and the affected creation,
+Host-stop and UI-history owners #5500/#5805/#5308/#5398 are merged. Reuse
+their delivered boundaries rather than reopening the October 2 merge queue.
+The [current validation, migration and deletion plan](ledger/shared-goal-authority-state-provider-v0/2026-09-28-retirement-cadence.md#current-closeout-validation-migration-and-deletion-2026-10-02)
+now prioritizes installed reversible qualification, affected consumer adoption,
+policy migration and last-caller deletion; it records the merged sources and
+the remaining evidence separately.
+
+Canonical new-Goal creation is already implemented by #5500/#5805. The existing
+machine setting and `coordination/local_authority_defaults.ts` choose canonical
+SQLite with `hard_lease` for unconfigured new Goals; CLI bootstrap and App
+creation share the typed initialization and original-operation recovery owner.
+Explicit v0 settings and v1 `canonical_creation=false` preserve post-promotion
+target behavior. Existing Goals keep their recorded selection. See the
+[configuration and disable contract](../../reference/local-authority-provider-selection.md#new-goal-authority-machine-setting).
+This is the source candidate, not certification of installed adoption, a released
+default, full shared Goal intent or D2/D3. Do not rebuild a creation/default owner.
+
+Canonical Todo entrypoint separation (T4): all five mutation facades now share
+`todos/mutation_api.py`; historic imports are lazy and the unpromoted writer is
+isolated in `todos/legacy_mutation.py`. The installed File/SQLite oracle can
+remove the whole writer module while exercising lifecycle and settlement
+recovery. The cold-import oracle now composes reviewed import, fresh leased
+updates/new writes and original-operation recovery with that writer absent;
+source-display loss and provider outage cannot replace the current authority
+or erase later writes. The original import cursor remains historical while the
+current provider revision is preserved. This prepares last-caller deletion
+without claiming code retirement:
+bootstrap, handoff, team-plan and Monitor still have supported source callers;
+keep capture/outbox and historical recovery until their own exits. [Caller and
+rollback inventory](../../reference/canonical-todo-completion-update.md#canonical-mutation-entrypoint-isolation).
+Production Todo consumers now bypass the historic `loopx.todos` re-export:
+CLI registration/actions, quota and planning, capability writeback, source lease
+reads and the Lark source projection import the same concrete mutation, full-read,
+path or Markdown display owners. No new wrapper, decision or RPC is introduced.
+The historic public imports and their supported unpromoted IO remain available.
+Disposable source/normal-wheel probes remove the facade, the whole legacy Todo
+writer and four shadow producers together; real File/SQLite CLI lifecycle,
+once-only settlement, Monitor replay and App cold-import/action/restart journeys
+must still work, with missing-provider/lease and changed-source/backup refusals.
+Lark dry-run and Explore replay qualify local consumers only, not live external
+adoption. This closes the production re-export dependency, while last supported
+source writers, historical recovery, installed cohort and release exits remain.
+
+The retained import-compatible field writer now composes resume normalization
+and contradictory-clear rejection in its existing typed field plan. Keep blank
+Python input omission and locked IO; retire the duplicate normalization crossing,
+not the still-supported writer or migration reader.
+
+The remaining legacy writer and bootstrap capture adapter now avoids loading
+rollout history and constructing a Todo projector when runtime shadow is off
+and there is no active durable binding. It still resolves the source identity;
+an active binding continues to require durable preparation even after config
+is disabled. This removes optional capture work from ordinary legacy writes,
+without changing their output, history retention or outbox recovery. Python
+retains this Host IO adapter until its last supported source writer is replaced;
+this is neither whole-writer retirement nor default-provider qualification.
+Unpromoted lease acquire now loads the capture adapter only when the typed
+result carries a capture request. The real CLI and normal-wheel oracle cover
+acquire/replay, rejected stale renewal, renewal, transfer and release with the
+four legacy shadow producer modules physically absent and with no enabled
+capture or active binding. An active binding still delivers capture after the
+setting is removed. This retires a default-off dependency, not the supported
+source writer or pending capture/history recovery.
+
+Handoff/continuation display decisions now belong to the existing TypeScript Todo
+context owner. Summary reuses its normalized identity/claim/exclusion/class
+facts in one batch; the index keeps source compaction before labelling and audit
+merging in one native batch. Planning and quota collectors project whole chosen
+sets. Oversized display context uses byte-bounded read-lens batches while
+counts, dependency decisions and closure retain their full-source owner. A
+single oversized historical record reuses the existing private snapshot transport:
+credential checks see its full text before display truncation. The
+Python facade keeps shared metadata codecs and historical tuple/SHA-1 identity
+encoding, with no Python decision fallback. Retain nested-empty precedence,
+Unicode whitespace/codepoint limits and credential rejection before truncation;
+these are compatibility obligations. File/SQLite CLI and normal-wheel recovery
+must preserve exact source and provider revision when Markdown display is absent
+or the selected provider is unavailable. This read-model retirement does not
+retire the supported mutation/Host callers or certify a released SQLite default.
+
+Public add now composes scope, supported wait and bounded Monitor metadata in
+one typed creation-scope request. The legacy add writer consumes that same
+fresh draft rather than re-planning it; standalone line codecs and successor
+creation retain their own admission. Priority and validation-declaration
+checks keep their prior diagnostic order, and canonical provider transactions
+still recheck registry/claim/lease/CAS authority. This retires duplicate add
+composition, not the supported Markdown writer or bootstrap/Host/history IO.
+
+The canonical team-plan caller now loads capture and Markdown editing only in
+its supported unpromoted arm. Real File/SQLite Chat and normal-wheel source
+removal cover confirmed batch commit, later-write replay, provider restoration,
+projection recovery and imported historical receipts. The existing TS
+transaction, source guards and projection owner remain unchanged; the legacy
+batch IO instrumentation seam stays lazy for its current consumers. This is a
+caller-isolation exit, not deletion of the live legacy writer or completion of
+receiver adoption, Host execution, PostgreSQL or D2 qualification.
+[Contract and retained duties](../../reference/canonical-todo-completion-update.md#team-plan-source-writer-isolation).
+
+Public CLI isolation now keeps shadow configuration in `coordination/configuration.py`
+and complete source capture in `coordination/authority_source_capture.py`. Cold import,
+source inspection and historical promotion recovery reuse those retained owners;
+only explicit enabled shadow actions load the old producers. Ordinary new-Goal
+SQLite creation, leased work, once-only settlement and reversible exit, plus cold
+File/SQLite import and original-operation replay, run through the real CLI with
+all four shadow producers physically absent in disposable source/normal-wheel
+copies. The old module still re-exports the retained APIs for current consumers;
+enabled capture, outbox and legacy commands remain supported. Preserve exact
+source identity, archive dependencies, safe lease reads and later-write recovery.
+This removes an eager-import blocker; deleting live producers still requires
+their last-caller exit. App/Lark contracts, provider transactions, cohort adoption
+and frozen D2 evidence remain separate.
+
+The Monitor router likewise isolates its live source writer. Historical receipt
+codec/replay has a small shared scheduler IO owner, while the existing TS batch
+still owns operation identity and decisions. File/SQLite CLI and normal-wheel
+source removal must preserve later canonical writes and original successors;
+promoted replay leaves old outbox bytes inert. Unpromoted markerless batch
+recovery retains its existing drain. This removes a canonical import dependency,
+not the supported legacy writer. The absent arm also removes all four shadow
+producer modules using the qualified CLI startup isolation above.
+[Retained duties and rollback](../../reference/canonical-todo-completion-update.md#monitor-source-writer-isolation).
+
+Shadow diagnostics now have an independent read-only boundary: retained outbox
+disk codecs live in `local_authority_shadow_history.py`, and status/candidate
+read transport in `local_authority_shadow_readback.py`. The public status and enabled
+`coordination-shadow inspect`/`qualify`/`read-candidate` commands call that owner
+without loading source producers. Full source and normal-wheel observations
+retain matched/refused, default-off, source-drift and missing/corrupt-store
+recovery behavior with all four producer modules absent. Historical imports
+remain exact aliases; bootstrap, rollback and promotion retain their live adapter.
+The existing TS qualifier now propagates provider read refusals before lineage
+validation can mislabel corruption as `bootstrap_required`; valid/missing stores
+retain their behavior. This is an explicit failure-diagnostic correction, with
+no new RPC or migration authority; drain still uses its existing orchestration.
+Original entry identity, malformed evidence, cursor residue and missing-store
+behavior remain unchanged. Python retains historical filesystem decoding and
+presentation IO; TS retains history proof, delivery and cleanup authority.
+Existing producer imports are aliases for supported callers, not duplicate
+implementations. Source and normal-wheel File/SQLite recipient checks compare
+complete status results and unchanged original bytes with producers present or
+absent. This is a historical-reader exit prerequisite, not writer deletion,
+outbox disposition, installed cohort adoption or release-default qualification.
+See [operator readback and rollback](../../reference/authority-observation-retirement.md#retained-readback-without-source-producers).
+
+Existing Goal migration, two-policy ownership retirement and storage-format
+upgrade retain separate receipts and exits. Original-receipt recovery does not
+justify retaining `legacy` as a live policy. Required migration readers remain.
+
+Imported canonical bootstrap reconnect now reuses the existing typed authority
+reader, keeping current Todos, leases and original import receipts without
+entering the Markdown writer. File/SQLite real CLI coverage includes an old v0
+preference naming the other provider, missing display, missing selected authority,
+force/route rejection and later-write replay with legacy producers absent.
+Python retains bootstrap registry/Host IO; it adds no decision owner or creation
+receipt. This closes a reconnect dependency, not the remaining unpromoted writer,
+active outbox, Host or release-default acceptance.
+
+A bounded cohort can start after its installed recovery and relevant execution
+controls pass; it does not certify a released default or formal ten-day D2.
+Frozen failures/missing evidence remain visible. T4 deletes proven redundant
+owners alongside implementation, without waiting for R6 or all Python to vanish.
+This replaces stale current-count estimates, not historical execution evidence.
+
+Public-scan privacy checkpoint: the retained Python filesystem/regex owner
+classifies canonical inputs before reader submission, independently of display
+paths. Overlapping roots cannot remove a private classification; reports use the
+widest requested root consistently. Narrow explicit files/directories retain
+private ancestry. Git-verified worktrees remain their own namespace beneath
+private parent directories, while a directory merely named `.git` grants no
+exception. Outside a worktree, explicit inputs beneath private state remain
+excluded. Tracked-file policy, fresh symlink resolution and existing error rules
+remain in this owner; no second control-plane decision source or new setting is
+introduced. This safety repair does not qualify scanner latency, SQLite release
+defaults or whole T4 retirement. CLI checks and quota preparation use the rule;
+App status continues to report repository scanning as deferred.
 
 ## Native authority qualification and prototype retirement (2026-09-26)
 
@@ -140,6 +306,23 @@ revision and resolves private declarations only after admission/replay. Python's
 separate terminal review selection and eager declaration sequencing are removed.
 This closes a T1/T2/L2 terminal caller family, not the remaining leased metadata,
 executor fences or T4 retirement. [Semantics, crossings and rollback](../../reference/canonical-terminal-review.md).
+
+Canonical completion now resolves linked-successor role/status in that same
+transaction head. Python forwards the declared IDs and registry intent without
+copying the full Todo collection or joining an earlier snapshot into the policy.
+Existing receipt replay returns its original policy even after linked work
+changes. This retires the canonical Python join; the unpromoted writer's actual
+source reads, private validation adapter and historical receipt contracts remain.
+No crossing or provider/default change is added. [Source and recovery boundary](../../reference/canonical-terminal-review.md#linked-work-source).
+
+The canonical supersede CLI/facade now forwards existing-successor links to that
+same terminal owner. One commit links already declared replacement work, retires
+the predecessor and releases its original lease, replacing the earlier
+link-update then supersede sequence. Receipt recovery, source/actor/lease fences
+and one-way display delivery remain with their existing owners. No new Python
+decision owner or writer is introduced; unpromoted Markdown's new direct-link
+option fails closed. This narrows a T1/T2 recovery cost, not T4 retirement,
+default-provider qualification or a new frontend lifecycle journey.
 
 Linked User completion now has one typed owner, `todos/user_completion.ts`.
 The terminal transaction commits exact-target scope consumption, reject/cancel
@@ -417,6 +600,19 @@ or passing accelerated volume tests is not ten-day continuity evidence.
 Local promotion waits for both volume and elapsed-time qualification; it does
 not wait for a PostgreSQL service and never expires receipts at day ten.
 
+Bounded caller recovery now has [claim argument guidance](../../reference/source-cli-entrypoint.md#claim-argument-recovery--claim-参数恢复):
+one rejected invocation exposes missing/unsupported flags and preserves the
+original argv bindings, without inferring executors or changing source/lease
+admission. This stays in the existing CLI grammar/formatting adapter; TypeScript
+retains claim authority. Real Legacy/File/SQLite retry and negative cases qualify
+that boundary. Larger errors versus avoided help, actual model token/retry costs,
+source-mode repair and short normal/full replan context remain separate evidence
+questions; this does not close long-goal or provider-performance acceptance.
+Material-closeout guidance now enters the existing settlement step before writing;
+the shared [authoring example](../../reference/protocols/goal-vision-replan-contract-v0.md)
+carries a complete evidence-linked continuation. Real CLI write/read negatives
+qualify that guidance seam; avoided model retries and sustained cost remain open.
+
 ### Delivery semantics: correctness before migration
 
 The replan obligation outcome policy now lives in
@@ -429,6 +625,27 @@ characterization precedes the move; the intentional correction is executable
 authoring for all vision triggers, with real bound CLI closeout/readback and
 negative qualification-scope cases. Checkpoint recovery and in-flight rules
 remain in their existing owners; no new capability, provider or setting is added.
+
+Known blocker qualification also consumes the host-projected coverage ledger.
+Changing a Turn/work-item binding or refreshing evidence cannot make the same
+blocker a new replan outcome. Python normalizes the observations and reports
+identity reuse; the TypeScript outcome owner rejects that claim for every
+replan source while retaining independently evidenced vision paths. This
+corrects false advancement admission; it does not add a blocked-wait settlement
+route or certify Goal completion.
+
+Replan decision context now follows the same boundary: `work_items/replan_context.ts`
+owns scoping, chronology, repetition reduction, result/route diversity and bounded
+coverage projection. Its Python codec reads the existing Goal and compact index,
+normalizes historical observations and reuses the private snapshot transport.
+The core Goal, scoped acceptance contract, evidence and uncovered frontier enter
+one context; the standalone evidence command is retired. Selection reads beyond
+the status display window. The readable view retains up to 24 distinct
+observations, while writeback novelty checks retain complete available history.
+Real CLI references, file/SQLite receipt reentry, wrong-scope/stale reads and
+omitted-old-blocker rejection qualify this S3/S6 slice. Ordinary guard output
+remains unchanged; the required-replan information budget increases explicitly.
+This does not complete T3, qualify ten-day costs or establish S11 score gains.
 
 The delivery-history boundary now treats `classification`, `health_check`, and
 `recommended_action` as narrative. They cannot create or discharge a
@@ -506,6 +723,18 @@ two invalid work-item identifiers must not compare equal merely because both
 normalize to a missing value. Such observations cannot infer blocker writeback
 or discharge a follow-through obligation. The remaining Python writer predicate
 rejects that case too; no active history is rewritten.
+
+The quota work-lane reader now also enforces this boundary. A historical run's
+`classification` (or the status label derived from it) cannot select the
+`dependency_observation` lane or replace a typed follow-through obligation.
+Status compaction retains authored `progress_scope=goal|agent_lane` for its
+existing ownership consumers; those values are distinct from the local
+work-lane `dependency_observation` mode. An old run without an authored scope
+remains readable and follows ordinary advancement unless typed Todo/monitor
+facts require monitoring. Explicit local work-lane scope still works; due and
+quiet monitor gates retain their typed behavior. This deliberately corrects
+quota guidance for old labels, without rewriting run history or adding another
+Python delivery-history decision owner.
 
 Next, inventory writers still omitting material-result fields and retire obsolete
 marker/hint configuration with an explicit compatibility plan. Exact legacy
@@ -777,7 +1006,19 @@ one canonical revision, with one CAS and durable operation receipt. It composes
 the existing generation, successor-route, User authoring-scope and Todo-create
 planners. Public create and Monitor batches share create admission/duplicate
 planning; target selection is shared by legacy preflight and native commit.
-Python only routes provider intent and drains the existing projection outbox.
+Unpromoted Goals now use the same typed batch planner. Their adapter holds the
+existing Todo/promotion locks and atomically replaces the Markdown state with
+the observation, both successor roles and an immutable operation receipt;
+the three separate Python update/add calls are retired. Exact retry returns
+the original identities after later rename, completion, archival or authority
+promotion. Python retains parsing, legacy lifecycle admission, storage and
+projection delivery. Fresh legacy batches now share canonical semantic-duplicate
+admission: conflicting same-text work is rejected instead of silently updated.
+The retained legacy registered-peer successor handoff uses an internal typed
+policy without replacing the observing actor; canonical Monitor and ordinary
+Todo creation remain actor-owned. Unknown owners fail before quota reservation
+or business writes; exact committed receipts retain frozen admission after
+registration changes without granting new execution authority.
 
 Explicit semantic corrections: completed/archived Monitor targets are rejected;
 target-key selection ignores finished history but never guesses between live matches;
@@ -803,8 +1044,15 @@ compatible. Old pending receipts without an admission basis retain current-state
 admission and explicitly report when historical recovery cannot be proven.
 See [Monitor observation and recovery](../../reference/protocols/quota-monitor-observation-receipt-v0.md).
 
-Boundaries still open: cross-owner successor claims are not implicitly authorized;
-unpromoted Goals retain their legacy writer and reject explicit lease proof.
+Boundaries still open: registered-peer legacy assignment does not prove receiver
+adoption or grant a lease; canonical cross-owner claims remain rejected;
+unpromoted Goals retain their storage adapter and reject explicit lease proof.
+New frozen quota plans identify the atomic legacy batch contract. Older pending
+legacy effects without an immutable business receipt require reconciliation;
+their original task identities cannot safely be inferred from mutable text.
+Old canonical business receipts and completed quota receipts remain replayable.
+Inline legacy operation receipts are retained with the state, including after
+archival; their storage cost is not a claim of legacy persistence retirement.
 Quota and business authority remain separate recoverable transactions. Canonical
 commit success is independent of pending Markdown delivery. This does not finish
 all T2 commands or authorize whole-Goal promotion.
@@ -861,9 +1109,34 @@ retry ordering, retiring Python selection/sorting loops. Offset-aware instants
 retain microseconds, canonical archived rejection records remain effective, and
 explicit runtime-root applies to both intent and Todo IO. Frozen editorial
 requests retain their original basis. See [operation and boundaries](../../../loopx/capabilities/periodic_report/README.md#todo-authority-and-report-retries).
+Native Vision-successor milestone staging consumes the existing typed accepted
+replan obligation without requiring an optional monitor frontier identity, and
+binds its ACK to the successor's persisted run, including same-second writes. Explicit frontier
+receipts remain compatible. This qualifies the existing `refresh-state` report
+producer; direct Turn hook adoption and historical frontier recovery remain
+separate [post-writeback hook boundaries](provider-neutral-post-writeback-capability-hooks-v0.md).
 This closes that T3/L5 consumer family, not D1 permanent display freshness,
 D2 durability, D3 whole-Goal qualification or default-provider selection. The
 remaining work is classified in the current reconciled inventory.
+
+Direct Turn post-writeback composition now uses the original canonical Todo
+transaction instead of reconstructing a frontier from the latest Goal state.
+Refresh retains a compact planning-source anchor; TypeScript validates lineage,
+revision and retained history, and terminal closeout resolves its distinct
+operation/completion receipt through the existing owner. Python adapts those
+facts into the existing periodic-report policy and drains hooks on first return
+and replay without another primary effect or quota spend. File/SQLite public
+CLI qualification covers default-off parity, optional-source failure, later
+mutation and rejection of a superseded terminal stage. A genuine milestone is
+qualified through the existing ordered CLI completion/refresh journey, including
+exact recovery after a later Todo without repeating refresh or spend. Direct
+Turn milestone delivery remains partial pending native accepted-successor
+producer integration and its lawful replanning journey. Real PostgreSQL
+qualifies the shared historical read. Large results reuse private snapshot
+transport with its unchanged 64 MiB cap. This advances T3 source adoption, not
+atomic refresh/Todo persistence or full D1–D3: legacy/unanchored source recovery,
+the full PostgreSQL Turn journey and frontend/Lark delivery remain open under
+the existing owners. See the [hook source boundary](../../reference/protocols/periodic-report-v0.md#post-writeback-hook-boundary).
 
 Todo summary lanes and pre-limit work counts now share `todos/summary_lanes.ts`.
 Python's lane classification and hidden-work inference loops are removed; quota
@@ -1151,6 +1424,27 @@ debit. This closes the demonstrated T3 consumer gap, not D1–D3, provider
 promotion, or the remaining Python transaction adapters. See the
 [operating contract](../../quota-allocation.md#receipt-backed-settlement-progress).
 
+**Canonical claim contention.** The TS claim command now retries a conclusive
+provider revision CAS rejection at most twice, using the same operation and
+lease keys. Every attempt rereads the receipt and complete authority and
+revalidates source registration, Todo eligibility, acceptance and lease scopes.
+An explicit provider revision or transfer grant stays pinned; ambiguous writes
+retain existing receipt recovery. Independent claims can both finish while
+same-Todo or overlapping-scope claims still admit one owner. This adopts the
+shared-authority conflict contract at the canonical writer; it does not reserve
+recommendations, change local writer serialization, or qualify sustained
+multi-host throughput. CLI claim callers inherit the behavior; no frontend or
+Lark action contract changes.
+
+**Scoped gate action readback.** The final quota packet now projects the scoped
+User gate/action override through a typed quota rule after selection, capability,
+workspace, receipt and notification decisions. Its optional `selected_action`
+comes only from the final selected Todo when the interaction allows delivery;
+selection-required, repair and settled packets omit it. Admission diagnostics
+and receipt identity remain intact. This corrects misleading CLI JSON readback
+for peer-scoped gates; it does not migrate the remaining route or primary-action
+builders, reserve recommendations, or complete T3/D1–D3.
+
 **Long-history transport boundary.** Replan history still has one TS decision
 owner. Small requests retain the inline codec; larger complete fact snapshots
 travel through a private, digest-bound local file reference. The same reducer
@@ -1176,15 +1470,33 @@ authority. Missing, changed, non-private or over-64-MiB files fail closed.
 After a handler may have committed, an unverifiable response stays ambiguous
 and requires exact receipt readback, never automatic mutation retry.
 
-This removes the immediate transport ceiling, not the cost of projecting a
-complete multi-megabyte basis. The next measured T3 cut should combine the
-canonical source read and checkpoint reduction inside one TypeScript call, then
-offer a versioned manifest with bounded pages for human/Agent inspection.
+Source read and read/check reduction now compose inside one TypeScript request.
+Both context reading and commit preflight use one checkpoint request instead of
+two; the complete authoritative facts no longer return to Python only to be sent
+back for reduction. The existing reducer, full-basis receipt, source locks and
+final provider-fenced commit remain the owners. Reduction follows release of
+the optimistic read fence; the final commit still rereads under its own fence.
+Python retains local source IO and receipt persistence. The unused source-only
+and standalone evaluation effects are retired with their adapter calls; commit
+and replay retain their existing single-request boundaries.
+
+This removes the intermediate full-fact round trip, not the cost of projecting
+and returning a complete multi-megabyte basis. The remaining measured T3 cut is
+a versioned manifest with bounded pages for human/Agent inspection.
 Every page must bind to the same source head and disclose omitted components;
 the receipt must still hash the complete relevant Todo/dependency, User Todo,
 Goal prose, acceptance and vision basis. A display limit must never become a
 settlement limit. Retain the current complete read until that parity and stale-
 head recovery are qualified on legacy, File and SQLite backends.
+
+**Checkpoint repair authoring.** The existing TS vision owner must project only
+repair choices the validator accepts: without a persisted vision, a missing
+checkpoint requires a vision patch; unchanged reasoning is available only with
+that baseline. The authoring contract shares the validator's `todo_delta`
+limits: retain the first eight entries, with at most 80 characters per retained
+entry. Isolated real CLI recovery must preserve the original settlement identity
+and replay fences. This closes a recovery-guidance correctness gap; it does not
+qualify lower context, IO or latency costs.
 
 **Recovery boundary (2026-09-22).** The
 [authority archive command](../../reference/authority-archive.md) places retained
@@ -1217,6 +1529,22 @@ Python writer retirement remain separate exits.
 - Keep permanent Markdown rendering, validated import/export and external
   effect adapters. Every retained bridge names its live caller and exit
   condition. No full TS CLI, daemon or remote service is required.
+- Canonical handoff-mode show/set uses the shared runtime-root resolver and
+  loads compatibility source locks and Todo capture producers only after
+  canonical routing declines. Source-removal CLI validation covers real
+  File/SQLite preview, mutation, original-operation replay after a later mode
+  change, and provider outage without a Markdown fallback. Unpromoted writers,
+  lease capture recovery and the legacy migration window remain separate
+  retirement obligations; this closes the canonical setter's import dependency.
+- Source task-lease facts now use `todos/list_readback.py` directly instead of
+  the historic mutation facade. TypeScript retains acquire/lifecycle decisions;
+  Markdown IO, source capture and public compatibility exports remain live.
+  The CLI distribution counterfactual removes the facade and disables editable
+  install finders, which could otherwise borrow deleted modules from a checkout.
+  Source and installed-wheel coverage includes capture off/on, all three handoff
+  modes, replay, ownership/version rejection, transfer, release and retained
+  history. This removes a reader-to-writer dependency; full writer deletion still
+  needs its remaining callers and migration window qualified.
 
 **Validation and stop rules for every card**
 
@@ -1322,6 +1650,15 @@ server.
 If an authority daemon owns a registry/workspace, a CLI process must connect
 to it instead of opening a second direct writer. Runtime discovery and startup
 are automatic; users do not configure ports or supervise processes.
+
+For the managed loopback runtime, a visible locator is discovery evidence;
+request dispatch and successful replies wait until locator publication and its
+awaited lock cleanup finish. Otherwise an immediate exit after the first reply
+can leave an incomplete cleanup claim and prevent the next retry-safe write
+from restarting within the existing lock budget. The real-Node publication
+regression covers first ping and typed write, then abrupt exit and receipt
+replay. This repair preserves lock reclaim ages, startup deadlines and retry
+classification; broader process/storage recovery remains separately qualified.
 
 ### 2.3 TypeScript owns migrated effects
 
@@ -1938,6 +2275,16 @@ daemon command. CLI and App surfaces consume the same lifecycle projection
 (`running`, `stopped`, or `unavailable`) and stable diagnostic code. Raw stderr,
 tokens, local paths, and private runtime metadata are not projected.
 
+Node launch observation remains in the existing Python transport adapter; it is
+not a second control-plane decision owner. Startup and doctor share its bounded
+probe and distinguish unknown compatibility after a timeout or launch failure
+from a parsed unsupported version. A later cold-start failure during deep doctor
+must retain the same diagnosis and recovery, even after its initial probe
+succeeded; recovery is verified by retrying the actual request. The
+[host diagnostic contract](../../reference/protocols/host-integration-surface-v0.md#managed-node-startup-diagnostics)
+defines the budgets, stable codes and recovery. This repairs readiness diagnosis;
+sustained runtime and whole-task performance require separate evidence.
+
 The runtime fingerprint includes every executed TS module and contract. An
 upgrade starts a runtime for the new fingerprint; an old process can finish
 in-flight work and exits on idle. Requests carry stable effect identities, so a
@@ -2005,6 +2352,31 @@ actual callers have moved. [Operator contract](../../reference/reviewed-coordina
 
 ### Todo summary decision ownership
 
+S7 due-Monitor fairness uses this same typed planning owner: after eligibility,
+claim/profile/priority ranks remain authoritative, while due time now precedes
+display index for equally ranked timed work. Selection precedes the one-row
+transport cap; general presentation and untimed wire compatibility remain.
+Real legacy/File/SQLite CLI journeys cover successive Monitor selection, exact
+poll replay and no extra debit. Per-Turn settlement and owner cadence remain;
+this closes index-based selection starvation, not multi-duty host capacity or
+same-wake continuation. See [the caller contract](../../reference/todo-work-counts.md#due-monitor-selection-before-display-limits).
+
+Adjacent deadline correction: projected Agent/User frontier waits must compare
+UTC instants rather than ISO spelling, preserving the pre-compaction evidence
+and three live callers (quota compaction, monitor wait, scheduler continuation).
+An isolated typed read crossing previously made the measured warm scheduler
+consumer slower, despite preserving its semantics. The existing quota-planning
+batch now discovers addressed gate and Monitor deadlines before display caps,
+correcting earliest-gate loss without an additional crossing. It shares v3
+Monitor due/gap selection and the same observation instant, while preserving
+older planning wire versions. It removes Python's second gate-list filter.
+Keep the remaining Python current-time/raw-summary rule: bounded resume/handoff
+sources and scheduler freshness still need a cohesive already-needed batch,
+with same-load cost and installed File/SQLite negative cases before retirement.
+Do not open a duplicate follow-up or treat rule relocation as optimization.
+Release-default SQLite qualification, full T4 and live host wait qualification
+remain open; the source new-Goal default is recorded in the current frontier above.
+
 One TS summary batch now owns selected-source counts, display allocation,
 recent-completion chronology, orchestration candidate positions and closure
 proofs. Python retains decoding, public field allowlists and rendering. The
@@ -2015,8 +2387,64 @@ relationship evaluation is reused before selection, and source completeness is
 preserved independently of query matching. See [semantics and rollback](../../reference/todo-work-counts.md).
 This advances T3/L5; it does not replace D2/D3 or flip a provider default.
 
+The existing typed frontier owner also classifies claimant/exclusion lanes and
+exact diagnostic floors for wait, fallback and replan readers. One Goal-context
+reduction shares fresh counts with its nested helpers, while standalone calls
+remain fresh. Python retains fact/result codecs and original row identity;
+there is no persisted cache, new packet field or changed execution authority.
+The same real File/SQLite entrypoints must qualify functional parity and the
+original full-CLI cost gate together. Fewer crossings alone do not explain a
+whole-CLI tail regression or complete writer/backup/default-provider retirement.
+
+Fresh public-boundary scanning retains its specialized Python regex / Host IO
+owner. Characterization covers all eleven `splitlines`
+separators, Unicode regex folding, casefold expansion false positives, ordered
+multi-rule hits, credential references, the public-host exception and literal
+metacharacters. These are scanner semantics, not a new decision owner or cache.
+
+A folded-literal union intervention reduced the exact quota scan population's
+median wall / CPU cost by 8.5% / 6.9% with complete scanner payload parity.
+Its fixed 32 alternating full-CLI pairs per provider still produced File p95
+976.33 → 986.84 ms (+10.52 ms / 1.08%) and SQLite p95 936.00 → 962.34 ms
+(+26.33 ms / 2.81%). The latter misses the unchanged unexplained 25 ms target,
+so the runtime candidate was withdrawn. All samples remain evidence; profiler
+observations do not establish the tail cause or waive the qualification.
+Further full-payload controls rejected folded-line reuse and literal regex
+disjunctions; composing the existing direct-loop and line-union interventions
+improved scanner wall time by only 3.6%. An independent fixed 32-pair A/A control
+per provider, with identical runtime bytes and the same complete CLI workload,
+still differed by -8.20 ms / -0.84% File p95 and -85.95 ms / -9.90% SQLite p95
+between checkout contexts. All 128 commands retained the expected selection and
+frontier. This identifies a comparison confound, not its cause or an optimizer
+qualification; the earlier failed candidate and all observations remain.
+A same-checkout cold/warm control then isolated runtime startup: all 32 cold
+samples changed the setup PID and were slower than their warm partner; warm
+samples retained substantial variability. This explains a startup contribution,
+not the historical A/A tail difference.
+
+The next intervention rejects unsupported regular filenames before repeated
+canonical resolution in both Git enumeration and directory traversal. Symlinks
+still resolve before suffix/local-name eligibility; tracked pruned-directory
+files, explicit file roots and fresh retargets retain their original behavior.
+On the unchanged package-root workload it removed 602 of 3,281 resolution calls
+with full payload parity; eight alternating scan pairs improved median wall
+time by 5.1%. Fixed 32-pair full quota CLI comparisons per provider used one
+physical checkout and verified warm setup PID reuse in every sample. File
+p50/p95 was 708.70/891.78 → 689.04/856.32 ms; SQLite was
+758.55/1036.27 → 769.41/1026.34 ms. Both pass the original additive 25 ms and
+5% tail budgets, while SQLite's slightly higher median limits the improvement
+claim. This qualifies this enumeration intervention, not the withdrawn filter,
+the historical frontier/direct-loop holds or a frozen multi-command deadline.
+Preserve those separately from new-Goal defaults, recoverable imports, the
+developer trial and last-caller retirement.
+
 2026-09-24: [Typed complete-source assembly and remaining delivery packages](ledger/shared-goal-authority-state-provider-v0/2026-09-24-source-capture.md) unify source construction, identity rejection and current-graph membership; L7/D2/D3 and provider defaults remain open.
 
 2026-09-24: [Leased continuation and remaining local-default packages](ledger/shared-goal-authority-state-provider-v0/2026-09-24-leased-continuation.md).
 
 Event replay and the reconciled cutover inventory: [2026-09-25](ledger/shared-goal-authority-state-provider-v0/2026-09-25-event-replay.md).
+
+### Settlement-addressed Turn journal readback
+
+The native query now owns recovery lookup and completion capability evidence,
+with shared write/read status-phase checks. See the [2026-10-02 checkpoint](ledger/typescript-control-plane-migration-v0/2026-10-02-turn-journal-readback.md) for compatibility, measured cost, validation boundaries and facade exit.

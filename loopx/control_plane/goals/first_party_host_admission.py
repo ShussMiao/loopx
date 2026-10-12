@@ -10,15 +10,26 @@ from ...file_lock import (
     cross_runtime_lock_witness,
     exclusive_cross_runtime_file_lock,
 )
+from ..coordination.shadow_management import runtime_artifact_lock_target
 from ..effect_runtime import effect_runtime_result
 from ..projects.registry_codec import (
     SOURCE_SESSION_PROFILE_ID,
     load_project_registry,
 )
+from ..effect_program import TurnProviderStepKind
+from .activation import goal_activation_state
 from .source_session_registry_state import (
     exact_goal_ref,
     guard_path,
     require_goal_id,
+)
+from .source_session_turn_effects import (
+    JournalPersist,
+    SourceTurnEffect,
+    SourceTurnEffectRejected,
+    prepare_source_turn_effect,
+    release_source_turn_effect,
+    source_turn_effect_allows_absent_reexecute,
 )
 
 
@@ -33,7 +44,117 @@ class FirstPartyHostRuntimeRejected(RuntimeError):
         self.code = code
 
 
-def _source_authority(registry_path: Path, goal_id: str) -> dict[str, Any]:
+@dataclass(frozen=True, slots=True)
+class FirstPartyHostTurnEffectAdmission:
+    goal_admission: FirstPartyHostGoalAdmission
+    turn_key: str
+    journal_path: Path
+
+    def _effect(
+        self,
+        step_kind: TurnProviderStepKind,
+        effect_ref: str,
+    ) -> SourceTurnEffect:
+        goal_ref = self.goal_admission.planned_goal_ref
+        if not isinstance(goal_ref, Mapping):
+            raise FirstPartyHostRuntimeRejected("goal_instance_id_missing")
+        goal_id = goal_ref.get("goal_id")
+        goal_instance_id = goal_ref.get("goal_instance_id")
+        if not isinstance(goal_id, str) or not isinstance(goal_instance_id, str):
+            raise FirstPartyHostRuntimeRejected("goal_instance_id_missing")
+        return SourceTurnEffect(
+            goal_ref=exact_goal_ref(goal_id, goal_instance_id),
+            turn_key=self.turn_key,
+            step_kind=step_kind,
+            effect_ref=effect_ref,
+            journal_path=self.journal_path,
+        )
+
+    @contextmanager
+    def _runtime_artifact_lifetime(self, *, operation: str) -> Iterator[None]:
+        path = self.journal_path.expanduser().resolve()
+        turns_dir = path.parent
+        goal_dir = turns_dir.parent
+        goals_dir = goal_dir.parent
+        if (
+            turns_dir.name != "turns"
+            or goal_dir.name != self.goal_admission.goal_id
+            or goals_dir.name != "goals"
+        ):
+            raise FirstPartyHostRuntimeRejected("journal_path_mismatch")
+        with exclusive_cross_runtime_file_lock(
+            runtime_artifact_lock_target(
+                goals_dir.parent,
+                self.goal_admission.goal_id,
+            ),
+            operation=operation,
+        ):
+            yield
+
+    def prepare(
+        self,
+        step_kind: TurnProviderStepKind,
+        effect_ref: str,
+        persist_journal: JournalPersist,
+    ) -> None:
+        try:
+            with self._runtime_artifact_lifetime(
+                operation="source_turn_effect_runtime_artifact_admit",
+            ):
+                prepare_source_turn_effect(
+                    registry_path=self.goal_admission.registry_path,
+                    goal_id=self.goal_admission.goal_id,
+                    effect=self._effect(step_kind, effect_ref),
+                    source_admission=self.goal_admission.source_journal_admission_locked,
+                    persist_journal=persist_journal,
+                )
+        except SourceTurnEffectRejected as exc:
+            raise FirstPartyHostRuntimeRejected(exc.code) from exc
+
+    def hold(
+        self,
+        step_kind: TurnProviderStepKind,
+        effect_ref: str,
+        persist_journal: JournalPersist,
+    ) -> None:
+        self.prepare(step_kind, effect_ref, persist_journal)
+
+    def release(
+        self,
+        step_kind: TurnProviderStepKind,
+        effect_ref: str,
+        persist_journal: JournalPersist,
+    ) -> None:
+        try:
+            with self._runtime_artifact_lifetime(
+                operation="source_turn_effect_runtime_artifact_release",
+            ):
+                release_source_turn_effect(
+                    registry_path=self.goal_admission.registry_path,
+                    goal_id=self.goal_admission.goal_id,
+                    effect=self._effect(step_kind, effect_ref),
+                    source_admission=self.goal_admission.source_journal_admission_locked,
+                    persist_journal=persist_journal,
+                )
+        except SourceTurnEffectRejected as exc:
+            raise FirstPartyHostRuntimeRejected(exc.code) from exc
+
+    def allows_absent_reexecute(
+        self,
+        step_kind: TurnProviderStepKind,
+        effect_ref: str,
+    ) -> bool:
+        try:
+            return source_turn_effect_allows_absent_reexecute(
+                registry_path=self.goal_admission.registry_path,
+                goal_id=self.goal_admission.goal_id,
+                effect=self._effect(step_kind, effect_ref),
+            )
+        except SourceTurnEffectRejected as exc:
+            raise FirstPartyHostRuntimeRejected(exc.code) from exc
+
+
+def source_goal_authority(registry_path: Path, goal_id: str) -> dict[str, Any]:
     if not registry_path.is_file():
         return {"kind": "unavailable", "reason": "registry_missing"}
     try:
@@ -55,10 +176,18 @@ def _source_authority(registry_path: Path, goal_id: str) -> dict[str, Any]:
     if len(matches) != 1:
         return {"kind": "absent"}
     goal = matches[0]
+    try:
+        activation_state = goal_activation_state(goal).value
+    except ValueError:
+        return {"kind": "unavailable", "reason": "goal_activation_unreadable"}
     goal_ref = {"goal_id": goal.get("id")}
     if "goal_instance_id" in goal:
         goal_ref["goal_instance_id"] = goal.get("goal_instance_id")
-    return {"kind": "present", "goal_ref": goal_ref}
+    return {
+        "kind": "present",
+        "goal_ref": goal_ref,
+        "activation_state": activation_state,
+    }
 
 
 def capture_first_party_host_goal_ref(
@@ -79,7 +208,7 @@ def capture_first_party_host_goal_ref(
         guard_path(requested_registry, goal_id),
         operation="first_party_host_goal_capture",
     ):
-        authority = _source_authority(requested_registry, goal_id)
+        authority = source_goal_authority(requested_registry, goal_id)
         if authority.get("kind") != "present":
             raise FirstPartyHostRuntimeRejected(
                 "goal_not_registered"
@@ -149,7 +278,7 @@ class FirstPartyHostGoalAdmission:
                 ),
                 "operation": operation,
                 "planned_goal_ref": self.planned_goal_ref,
-                "authority": _source_authority(
+                "authority": source_goal_authority(
                     self.registry_path,
                     self.goal_id,
                 ),
@@ -202,8 +331,24 @@ class FirstPartyHostGoalAdmission:
             self._decision("require_current")
 
     @contextmanager
+    def current_lifetime(self, *, operation: str) -> Iterator[None]:
+        """Keep a source-session side effect inside its planned Goal lifetime."""
+
+        if not self.source_profile:
+            yield
+            return
+        with exclusive_cross_runtime_file_lock(
+            guard_path(self.registry_path, self.goal_id),
+            operation=operation,
+        ):
+            self._decision("require_current")
+            yield
+
+    @contextmanager
     def source_journal_admission(
         self,
+        *,
+        runtime_root: Path,
     ) -> Iterator[dict[str, Any] | None]:
         """Hand one journal mutation to the TS owner under the source guard."""
 
@@ -212,20 +357,43 @@ class FirstPartyHostGoalAdmission:
             return
         target = guard_path(self.registry_path, self.goal_id)
         with exclusive_cross_runtime_file_lock(
-            target,
-            operation="first_party_host_journal_commit",
+            runtime_artifact_lock_target(
+                runtime_root.expanduser().resolve(),
+                self.goal_id,
+            ),
+            operation="first_party_host_journal_runtime_artifact_guard",
         ):
-            yield {
-                "schema_version": "loopx_turn_journal_source_admission_v0",
-                "profile_id": SOURCE_SESSION_PROFILE_ID,
-                "registry_path": str(self.registry_path),
-                "planned_goal_ref": self.planned_goal_ref,
-                "authority": _source_authority(
-                    self.registry_path,
-                    self.goal_id,
-                ),
-                "lock": cross_runtime_lock_witness(target),
-            }
+            with exclusive_cross_runtime_file_lock(
+                target,
+                operation="first_party_host_journal_commit",
+            ):
+                yield self.source_journal_admission_locked()
+
+    def source_journal_admission_locked(self) -> dict[str, Any]:
+        """Build a TS handoff while the caller holds this Goal's source guard."""
+
+        target = guard_path(self.registry_path, self.goal_id)
+        return {
+            "schema_version": "loopx_turn_journal_source_admission_v0",
+            "profile_id": SOURCE_SESSION_PROFILE_ID,
+            "registry_path": str(self.registry_path),
+            "planned_goal_ref": self.planned_goal_ref,
+            "authority": source_goal_authority(
+                self.registry_path,
+                self.goal_id,
+            ),
+            "lock": cross_runtime_lock_witness(target),
+        }
+
+    def turn_effect_admission(
+        self,
+        *,
+        turn_key: str,
+        journal_path: Path,
+    ) -> FirstPartyHostTurnEffectAdmission | None:
+        if not self.source_profile:
+            return None
+        return FirstPartyHostTurnEffectAdmission(self, turn_key, journal_path)
 
     def accept_result(self, commit_result: Callable[[], T]) -> T:
         if not self.source_profile:

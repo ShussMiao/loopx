@@ -78,11 +78,11 @@ inventory-only row for the same provider id.
 
 ## Product surfaces
 
-- CLI: `external-evidence discover|plan|receipt|admit|retire`.
-- Managed Turn: the same five effect-runtime methods.
-- Frontend/Lark: not changed in this Core slice. A companion slice should render
-  the same typed plan/admission projection and readback; it must not invent a
-  second registry or lifecycle.
+- CLI: `external-evidence discover|plan|execute|receipt|admit|readback|retire`.
+- Managed Turn: the same five typed effect-runtime methods; explicit provider
+  execution and ledger projection use the capability's CLI owner.
+- Frontend/Lark: existing conversation answer/report and Markdown transports
+  render the shared validated readback. No independent registry or lifecycle.
 
 ## Acceptance
 
@@ -102,6 +102,8 @@ inventory-only row for the same provider id.
 - retirement waits for downstream coverage of every admitted source;
 - CLI and effect-runtime TypeScript tests pass from the source checkout.
 
+- Checkpoint moved to the execution ledger: [Public GitHub method delivery checkpoint (2026-10-02)](ledger/external-evidence-research-capability-v0/2026-10-02-public-github-method-delivery.md).
+
 ## Non-goals
 
 - a universal browser/search engine;
@@ -110,3 +112,7 @@ inventory-only row for the same provider id.
 - automatic evidence admission;
 - trading, publishing, or other downstream effect authority;
 - treating registration or usage counters as proof of evidence quality.
+
+## Appendix A: Execution ledger
+
+Dated delivery records live in the [per-entry ledger](ledger/external-evidence-research-capability-v0/).

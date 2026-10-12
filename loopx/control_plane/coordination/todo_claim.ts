@@ -13,6 +13,7 @@ import {
 import {validateContinuationNote, computeContinuationTodoFacts} from "./continuation_note.ts";
 import {CoordinationCommandReceipt} from "./command_receipt.ts";
 import {acceptanceWorkGuard} from "../goals/acceptance_contract.ts";
+import {todoExecutionDependencyRejection} from "./todo_execution_dependency.ts";
 import {normalizeRegisteredTodoAgents, normalizeTodoAgent} from "./todo_agents.ts";
 import {
   prepareCoordinationProjectionCommit,
@@ -331,6 +332,23 @@ export async function executeCoordinationTodoClaim(
   rawInput: CoordinationTodoClaimInput,
   authoritySourcesCurrent: AuthoritySourceCheck = uncheckedAuthoritySource,
 ): Promise<CoordinationTodoClaimResult> {
+  // Retry only a conclusive provider CAS rejection. Each attempt rereads the
+  // original receipt and the complete head, then rechecks source authorization,
+  // claim ownership, acceptance and lease/write-scope exclusion. Pinned revisions
+  // (including handoff grants) must return to their caller for a fresh observation.
+  for (let attempt = 0; ; attempt++) {
+    const result = await executeClaimAttempt(store, rawInput, authoritySourcesCurrent);
+    if (attempt >= 2 || rawInput.expected_provider_revision !== undefined ||
+        rawInput.transfer_grant !== undefined || result.status !== "conflict" ||
+        result.conflict_kind !== "provider_revision_mismatch") return result;
+  }
+}
+
+async function executeClaimAttempt(
+  store: AuthorityStore,
+  rawInput: CoordinationTodoClaimInput,
+  authoritySourcesCurrent: AuthoritySourceCheck,
+): Promise<CoordinationTodoClaimResult> {
   let input: CoordinationTodoClaimInput;
   try {
     input = {
@@ -580,6 +598,11 @@ export async function executeCoordinationTodoClaim(
   if (acceptance !== null && !acceptance.allowed) {
     return failure(String(acceptance.reason_code), `${String(acceptance.reason)} Inspect Goal acceptance and ask the owner to configure or rebind this Todo.`,
       {goal_acceptance_guard: acceptance}, "decision_rejection");
+  }
+  if (leaseRequest !== null) {
+    const dependency = todoExecutionDependencyRejection(projection.todos, input.todo_id, input.now);
+    if (dependency !== null) return failure(dependency.code, dependency.reason,
+      {resume_condition: dependency.condition}, "decision_rejection");
   }
 
   const mutationAuthority = canonicalAuthorityObject(

@@ -10,6 +10,7 @@ import sys
 import time
 
 import pytest
+from loopx import paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,45 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import external_scheduler_worker as worker  # noqa: E402
+
+
+def test_default_registry_follows_single_runtime_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    current_root = tmp_path / ".loopx"
+    legacy_root = tmp_path / ".codex" / "loopx"
+    monkeypatch.setattr(paths, "DEFAULT_RUNTIME_ROOT", current_root)
+    monkeypatch.setattr(paths, "LEGACY_RUNTIME_ROOT", legacy_root)
+    selected: list[Path] = []
+    monkeypatch.setattr(
+        worker,
+        "run_worker",
+        lambda args: selected.append(Path(args.registry)) or 0,
+    )
+    argv = ["--goal-id", "goal", "--agent-id", "agent"]
+
+    assert worker.main(argv) == 0
+    assert selected[-1] == current_root / paths.GLOBAL_REGISTRY_FILENAME
+
+    legacy_root.mkdir(parents=True)
+    (legacy_root / paths.GLOBAL_REGISTRY_FILENAME).write_text("{}", encoding="utf-8")
+    assert worker.main(argv) == 0
+    assert selected[-1] == legacy_root / paths.GLOBAL_REGISTRY_FILENAME
+
+    current_root.mkdir()
+    (current_root / paths.GLOBAL_REGISTRY_FILENAME).write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit) as conflict:
+        worker.main(argv)
+    assert conflict.value.code == 2
+    assert "Both default LoopX registries exist" in capsys.readouterr().err
+    assert len(selected) == 2
+
+    assert worker.main(
+        [*argv, "--registry", str(legacy_root / paths.GLOBAL_REGISTRY_FILENAME)]
+    ) == 0
+    assert selected[-1] == legacy_root / paths.GLOBAL_REGISTRY_FILENAME
 
 
 def _write_executable(path: Path, source: str) -> None:
@@ -119,6 +159,39 @@ def _args(
     )
 
 
+@pytest.mark.parametrize("stop_code,expected", [(None, 75), (75, 0), (76, 75)])
+def test_wake_terminal_code_requires_explicit_matching_opt_in(tmp_path, stop_code, expected):
+    cli = tmp_path / "quota"
+    _write_executable(cli, f"#!{sys.executable}\nprint({json.dumps(_hint_payload(should_run=True))!r})\n")
+    args = _args(fake_cli=cli, state_file=tmp_path / "state.json",
+                 wake_cmd=shlex.join([sys.executable, "-c", "raise SystemExit(75)"]),
+                 wake_timeout_seconds=5)
+    args.wake_stop_exit_code = stop_code
+    assert worker.run_worker(args) == expected
+
+
+@pytest.mark.parametrize("failure_kind", ["timeout", "output_limit"])
+def test_wake_terminal_code_does_not_mask_transport_failure(tmp_path, monkeypatch, failure_kind):
+    from loopx.extensions.process_runtime import CappedProcessResult
+
+    monkeypatch.setattr(worker, "run_quota_should_run", lambda *a, **kw: _hint_payload(should_run=True))
+    monkeypatch.setattr(worker, "_run_wake", lambda *a, **kw: CappedProcessResult(
+        returncode=75, stdout=b"", failure_kind=failure_kind,
+    ))
+    args = _args(fake_cli=tmp_path / "unused", state_file=tmp_path / "state.json", wake_cmd="unused")
+    args.wake_stop_exit_code = 75
+    assert worker.run_worker(args) == 2
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["last_wake_failure_kind"] == failure_kind
+
+
+@pytest.mark.parametrize("code", ["0", "-1", "256"])
+def test_wake_terminal_code_rejects_invalid_codes(code):
+    with pytest.raises(SystemExit) as error:
+        worker.main(["--goal-id", "goal", "--agent-id", "agent", "--wake-stop-exit-code", code])
+    assert error.value.code == 2
+
+
 def test_default_invocation_persists_backoff_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -206,6 +279,58 @@ def test_quota_probe_timeout_enters_tick_error(tmp_path: Path) -> None:
     assert time.monotonic() - started < 2.0
 
 
+@pytest.mark.parametrize("expected_sleeps,wake_exit,observe_only,next_state", [
+    ([], 0, False, "terminal"),
+    ([], 0, False, "active"),
+    ([60], 0, False, "waiting"),
+    ([5], 1, False, "terminal"),
+    ([60], 0, True, "terminal"),
+])
+def test_completed_wake_rechecks_admission_without_active_delay(
+    tmp_path: Path,
+    expected_sleeps: list[float], wake_exit: int, observe_only: bool, next_state: str,
+) -> None:
+    # Real worker and child commands, with requested waits captured.
+    # The second quota response revokes admission: a completed wake must never
+    # cause another wake using its old should_run decision.
+    fake_cli = tmp_path / "quota"
+    counter = tmp_path / "quota-count"
+    active = _hint_payload(should_run=True)
+    terminal = _hint_payload(should_run=False, local_scheduler_directive="stop")
+    packets = [active]
+    if next_state == "active":
+        packets.append(active)
+    elif next_state == "waiting":
+        packets.append(_waiting_payload())
+    packets.append(terminal)
+    _write_executable(fake_cli, "#!/usr/bin/env python3\n"
+        "import json\nfrom pathlib import Path\n"
+        f"counter = Path({str(counter)!r})\n"
+        "n = int(counter.read_text()) if counter.exists() else 0\n"
+        "counter.write_text(str(n + 1))\n"
+        f"print(json.dumps({packets!r}[n]))\n")
+    marker = tmp_path / "wake-count"
+    wake_code = ("from pathlib import Path; "
+        f"p=Path({str(marker)!r}); "
+        "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1'); "
+        f"raise SystemExit({wake_exit})")
+    args = _args(fake_cli=fake_cli, state_file=tmp_path / "state.json",
+        wake_cmd=shlex.join([sys.executable, "-c", wake_code]),
+        quota_timeout_seconds=5.0, wake_timeout_seconds=5.0)
+    args.once = False
+    if observe_only:
+        args.wake_cmd = None
+    sleeps: list[float] = []
+
+    assert worker.run_worker(args, sleep=sleeps.append) == 0
+    assert sleeps == expected_sleeps
+    assert counter.read_text() == str(len(packets))
+    if observe_only:
+        assert not marker.exists()
+    else:
+        assert marker.read_text() == ("2" if next_state == "active" else "1")
+
+
 @pytest.mark.parametrize(
     "action",
     ["stop_until_explicit_resume", "return_to_owner_until_material_change"],
@@ -291,3 +416,18 @@ def test_wake_timeout_enters_failed_backoff_and_kills_descendants(
     state = json.loads(state_file.read_text(encoding="utf-8"))
     assert state["last_wake_status"] == "wake_failed"
     assert state["last_wake_failure_kind"] == "timeout"
+
+
+def test_wake_default_has_no_execution_deadline(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(worker, "run_worker", lambda args: seen.append(args) or 0)
+    assert worker.main(["--goal-id", "fixture", "--agent-id", "agent",
+                        "--registry", str(tmp_path / "registry.json")]) == 0
+    assert seen[0].wake_timeout_seconds is None
+    assert seen[0].quota_timeout_seconds == 30.0
+    result = worker._run_wake(
+        shlex.join([sys.executable, "-c", "import time;time.sleep(.1);print('done')"]),
+        timeout_seconds=None,
+    )
+    assert result.returncode == 0
+    assert result.failure_kind is None

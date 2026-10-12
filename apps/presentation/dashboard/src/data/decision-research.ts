@@ -386,6 +386,19 @@ export type PresentationProjectionEnvelope = z.infer<
   typeof presentationProjectionEnvelopeSchema
 >;
 
+/** Lineage comes from the resolved envelope, never the status summary or view. */
+export function publishedResearchLineage(projection?: PresentationProjectionEnvelope | null) {
+  const lineage = projection?.lineage;
+  const source = z.string().min(1).refine(value => value.trim().length > 0).safeParse(lineage?.source_id);
+  const version = z.number().int().positive().safeParse(lineage?.version);
+  const supersedes = z.array(z.string().min(1)).max(20).safeParse(lineage?.supersedes);
+  return {
+    sourceId: source.success ? source.data : null,
+    version: version.success ? version.data : null,
+    supersedes: supersedes.success ? supersedes.data : null,
+  };
+}
+
 export function parsePresentationProjection(
   payload: unknown,
 ): PresentationProjectionEnvelope {
@@ -415,7 +428,14 @@ export async function fetchPresentationProjection(
   target.searchParams.set("payload_sha256", surface.detail_ref.payload_sha256);
   const response = await fetch(target.toString(), { cache: "no-store" });
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status} while loading projection`);
+    let detail = "";
+    try {
+      const failure: unknown = await response.json();
+      if (typeof failure === "object" && failure !== null && "error" in failure && typeof failure.error === "string") {
+        detail = `: ${failure.error.slice(0, 300)}`;
+      }
+    } catch { /* A malformed error response still clears the previous view. */ }
+    throw new Error(`HTTP ${response.status} while loading projection${detail}`);
   }
   const projection = parsePresentationProjection(await response.json());
   const expectedIdentity = surface.detail_ref;
@@ -426,6 +446,9 @@ export async function fetchPresentationProjection(
     || projection.payload_sha256 !== expectedIdentity.payload_sha256
     || projection.view_schema !== surface.view_schema
     || projection.surface_kind !== surface.surface_kind
+    || projection.goal_id !== surface.goal_id
+    || projection.generated_at !== surface.generated_at
+    || projection.review_due_at !== surface.review_due_at
   ) {
     throw new Error("projection response does not match the requested detail_ref");
   }

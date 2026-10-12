@@ -2,6 +2,9 @@ name: Frontstage Pages
 
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: [Desktop Release Artifacts]
+    types: [completed]
   schedule:
     - cron: "37 */6 * * *"
   pull_request:
@@ -30,10 +33,14 @@ on:
       - "examples/blog-bilingual-index-smoke.mjs"
       - "examples/frontstage-share-bundle-smoke.mjs"
       - "examples/dashboard-frontstage-browser-smoke.mjs"
+      - "examples/personal-workspace-browser/**"
+      - "examples/personal-workspace-browser-smoke.mjs"
       - "examples/dev-book-browser-smoke.mjs"
       - "examples/readme-star-history-smoke.py"
       - "examples/frontstage-stargazer-fetch-smoke.py"
       - "examples/dev-book-publication-smoke.py"
+      - "packages/loopx-text-stats/**"
+      - "tests/test_dev_book_reader_checkpoints.py"
       - "examples/dev-book-welcome-wagon-smoke.py"
       - "examples/goal-channel-frontstage-fixture.py"
       - "examples/showcase-catalog-smoke.py"
@@ -69,10 +76,14 @@ on:
       - "examples/blog-bilingual-index-smoke.mjs"
       - "examples/frontstage-share-bundle-smoke.mjs"
       - "examples/dashboard-frontstage-browser-smoke.mjs"
+      - "examples/personal-workspace-browser/**"
+      - "examples/personal-workspace-browser-smoke.mjs"
       - "examples/dev-book-browser-smoke.mjs"
       - "examples/readme-star-history-smoke.py"
       - "examples/frontstage-stargazer-fetch-smoke.py"
       - "examples/dev-book-publication-smoke.py"
+      - "packages/loopx-text-stats/**"
+      - "tests/test_dev_book_reader_checkpoints.py"
       - "examples/dev-book-welcome-wagon-smoke.py"
       - "examples/goal-channel-frontstage-fixture.py"
       - "examples/showcase-catalog-smoke.py"
@@ -89,17 +100,22 @@ permissions:
 
 concurrency:
   group: frontstage-pages-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'deployment' }}
-  # Keep production deploys in one lane, but isolate each pull request so an
-  # unrelated PR or main push cannot cancel its validation run.
-  cancel-in-progress: true
+  # Supersede validation for the same PR, but let an active publication finish.
+  # Frequent main pushes replace the pending deployment instead of starving Pages.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
+    # A completed public release refreshes downloads from trusted current main.
+    # PR validation, foreign runs and failed uploads must never deploy Pages.
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.event == 'release' || github.event.workflow_run.event == 'workflow_dispatch'))
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.repository.default_branch || '' }}
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -121,26 +137,21 @@ jobs:
         working-directory: apps/presentation/site
         run: npm ci --include=dev --no-audit --no-fund --registry=https://registry.npmjs.org
 
+      - name: Validate complete-release selection
+        working-directory: apps/presentation/site
+        run: node --test scripts/desktop-download.test.mjs
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
 
-      - name: Verify packaged Personal Workspace is current
+      # This artifact serves the public site and projection demo, not /chat/.
+      # Python Tests owns packaged Personal Workspace qualification.
+      - name: Install browser for public site checks
         working-directory: apps/presentation/dashboard
-        run: |
-          npm run build:chat
-          python ../../../scripts/chat_bundle.py verify --source
-          ./node_modules/.bin/playwright install --with-deps chromium
-          npm run smoke:personal-workspace-packaged
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: frontstage-chat-bundle-${{ github.sha }}
-          path: loopx/web/chat/
-          if-no-files-found: error
-          retention-days: 7
+        run: ./node_modules/.bin/playwright install --with-deps chromium
 
       - name: Install docs dependencies
         run: |
@@ -159,15 +170,27 @@ jobs:
       - name: Validate Developer Book publication
         run: python3 examples/dev-book-publication-smoke.py
 
+      - name: Validate Developer Book companion provider
+        run: python3 -m unittest discover -s packages/loopx-text-stats/tests -v
+
+      - name: Validate Developer Book reader checkpoints
+        run: python3 -m unittest discover -s tests -p test_dev_book_reader_checkpoints.py -v
+
       - name: Validate bilingual Blog catalog
         run: node examples/blog-bilingual-index-smoke.mjs
 
       - name: Validate public-safe frontstage bundle
         working-directory: apps/presentation/dashboard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOOPX_SITE_RESOLVE_DESKTOP_RELEASE: "1"
         run: npm run smoke:frontstage-share-bundle
 
       - name: Export Pages frontstage artifact
         working-directory: apps/presentation/dashboard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOOPX_SITE_RESOLVE_DESKTOP_RELEASE: "1"
         run: npm run export:frontstage-share -- --base /loopx/ --out-dir ../../../output/frontstage-pages
 
       - name: Fetch complete GitHub stargazer history

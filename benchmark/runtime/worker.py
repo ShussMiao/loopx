@@ -55,6 +55,15 @@ def heartbeat_body(env: dict[str, str], turn_id: str, *, native_goal: bool) -> s
     ]
     if not native_goal:
         command += ["--turn-instance-id", turn_id]
+    if env.get("LOOPX_TURN_ENVELOPE", "0") not in {"0", "1"}:
+        raise ValueError("LOOPX_TURN_ENVELOPE must be 0 or 1")
+    if env.get("LOOPX_TURN_ENVELOPE") == "1":
+        if native_goal:
+            raise ValueError("TurnEnvelope capture requires a host-owned heartbeat Turn")
+        # Wake identity comes from this worker, never from model-authored text.
+        root = Path(env["LOOPX_WAKE_LOG_DIR"]) / turn_id / "decisions"
+        root.mkdir(mode=0o700, exist_ok=False)
+        command += ["--decision-output-root", str(root)]
     result = subprocess.run(
         command,
         cwd=env["LOOPX_PROJECT"],
@@ -134,14 +143,18 @@ def turn_command(
         ),
         "--iteration-context",
         execution.context,
+        "--session-scope",
+        "agent",
+        "--codex-reasoning-effort",
+        env["REASONING_EFFORT"],
         "--codex-bin",
         env["CODEX_BIN"],
         "--codex-model",
         env["MODEL_NAME"],
         "--codex-sandbox",
         execution.sandbox,
-        "--timeout-seconds",
-        str(execution.timeout_seconds),
+        *(["--timeout-seconds", str(execution.timeout_seconds)]
+          if execution.timeout_seconds is not None else []),
         "--validation-command-json",
         json.dumps(execution.validation_command),
         "--available-capability",
@@ -200,14 +213,44 @@ def run_native_goal(
                 receipt["native_goal"] = compact_native_goal_receipt(observed[0])
 
 
+def native_command(env, execution, stage, wake, session_wake):
+    if session_wake is None:
+        # Preserve the baseline/Goal-planning entrypoint and its transport inputs.
+        return [
+            env["CODEX_BIN"], "exec", "--json", "--skip-git-repo-check",
+            "--sandbox", execution.sandbox, "--cd", env["LOOPX_PROJECT"],
+            *(["-c", "features.goals=false", "--output-schema", str(wake / "planning-schema.json"),
+               "--output-last-message", str(wake / "planning-result.json")] if stage == "plan" else []),
+            "-",
+        ]
+    from loopx.control_plane.turn_driver.codex_cli import _codex_command
+
+    command = _codex_command(
+        codex_bin=env["CODEX_BIN"], project=Path(env["LOOPX_PROJECT"]),
+        schema_path=wake / "planning-schema.json" if stage == "plan" else None,
+        output_path=wake / "planning-result.json" if stage == "plan" else None,
+        sandbox=execution.sandbox, model=env["MODEL_NAME"],
+        reasoning_effort=env["REASONING_EFFORT"],
+        session_id=session_wake.session_id if session_wake else None,
+        mcp_server=None,
+    )
+    if stage == "plan":
+        command[-1:-1] = ["-c", "features.goals=false"]
+    return command
+
+
 def run_once(env: dict[str, str]) -> dict:
+    if env.get("LOOPX_TURN_ENVELOPE", "0") not in {"0", "1"}:
+        raise ValueError("LOOPX_TURN_ENVELOPE must be 0 or 1")
     execution = Execution(
         mode=env.get("LOOPX_EXECUTION_MODE", "heartbeat"),
         context=env.get("LOOPX_ITERATION_CONTEXT", "fresh"),
         sandbox=env.get("LOOPX_CODEX_SANDBOX", "danger-full-access"),
-        timeout_seconds=float(env.get("LOOPX_CODEX_TURN_TIMEOUT_SEC", "4700")),
+        timeout_seconds=(float(env["LOOPX_CODEX_TURN_TIMEOUT_SEC"])
+                         if env.get("LOOPX_CODEX_TURN_TIMEOUT_SEC") else None),
         validation_command=json.loads(env.get("LOOPX_VALIDATION_COMMAND_JSON", "[]")),
-        task_entry=env.get("LOOPX_TASK_ENTRY", "seeded-todo"),
+        task_entry=env.get("LOOPX_TASK_ENTRY"),
+        turn_envelope=env.get("LOOPX_TURN_ENVELOPE", "0") == "1",
     )
     stage = env.get("LOOPX_TASK_STAGE", "execute")
     if stage not in {"plan", "execute"} or (stage == "plan" and execution.task_entry != "loopx-planned"):
@@ -224,11 +267,13 @@ def run_once(env: dict[str, str]) -> dict:
         "mode": execution.mode,
         "context": execution.context,
         "task_entry": execution.task_entry,
+        **({"turn_envelope": True} if execution.turn_envelope else {}),
         "stage": stage,
         "home_scope": "trial",
         "ok": False,
         "timed_out": False,
     }
+    session_wake = None
     pending_path = (
         Path(env.get("LOOPX_RUNTIME_ROOT", str(home))) / "benchmark-pending-turn.json"
     )
@@ -241,7 +286,8 @@ def run_once(env: dict[str, str]) -> dict:
                 receipt.update(ok=True, budget_exhausted=True, host_invoked=False)
                 return receipt
             execution = replace(
-                execution, timeout_seconds=min(execution.timeout_seconds, remaining - 160)
+                execution, timeout_seconds=(remaining - 160 if execution.timeout_seconds is None
+                                             else min(execution.timeout_seconds, remaining - 160))
             )
         prepare_codex_home(
             home,
@@ -266,6 +312,11 @@ def run_once(env: dict[str, str]) -> dict:
             body = heartbeat_body(env, turn_id, native_goal=execution.native_goal)
         elif execution.mode == "plain":
             body = Path(env["LOOPX_TASK_DOC"]).read_text(encoding="utf-8")
+        session_wake = None
+        if execution.mode in {"heartbeat", "turn"} and not (execution.mode == "turn" and stage == "execute"):
+            from benchmark.runtime.sessions import BenchmarkSessionWake
+
+            session_wake = BenchmarkSessionWake(env, execution, receipt)
         with (wake / "stderr.log").open("w") as stderr:
             if execution.native_goal and stage == "execute":
                 run_native_goal(env, execution, body, receipt, stderr)
@@ -286,30 +337,22 @@ def run_once(env: dict[str, str]) -> dict:
                         pending.get("resume_turn_key"),
                     )
                     if execution.mode == "turn" and stage == "execute"
-                    else [
-                        env["CODEX_BIN"],
-                        "exec",
-                        "--json",
-                        "--skip-git-repo-check",
-                        "--sandbox",
-                        execution.sandbox,
-                        "--cd",
-                        env["LOOPX_PROJECT"],
-                        *([
-                            "-c", "features.goals=false",
-                            "--output-schema", str(wake / "planning-schema.json"),
-                            "--output-last-message", str(wake / "planning-result.json"),
-                        ] if stage == "plan" else []),
-                        "-",
-                    ]
+                    else native_command(env, execution, stage, wake, session_wake)
                 )
                 with (wake / "stdout.jsonl").open("w") as stdout:
                     with child_process(
                         command, env=env, stdout=stdout, stderr=stderr
                     ) as process:
                         allowance = 150 if execution.mode == "turn" and stage == "execute" else 0
-                        timeout = (float(env["LOOPX_PLANNING_TIMEOUT_SEC"]) if stage == "plan"
-                                   else execution.timeout_seconds + allowance)
+                        if stage == "plan":
+                            limit = env.get("LOOPX_PLANNING_TIMEOUT_SEC")
+                            # SForge planning has no stage cap: the same absolute
+                            # trial deadline bounds this subprocess and its handoff.
+                            timeout = (float(limit) if limit is not None else
+                                       max(0, float(env["LOOPX_PHASE_DEADLINE_EPOCH"]) - time.time()))
+                        else:
+                            timeout = (None if execution.timeout_seconds is None
+                                       else execution.timeout_seconds + allowance)
                         process.communicate(
                             input=body, timeout=timeout
                         )
@@ -347,13 +390,19 @@ def run_once(env: dict[str, str]) -> dict:
         receipt["error_kind"] = type(exc).__name__
         raise
     finally:
-        if (home / "sessions").is_dir():
-            # One authoritative copy per native session; resume must not count
-            # the same prefix again in every wake's aggregate trajectory.
-            shutil.copytree(
-                home / "sessions", log_root.parent / "sessions", dirs_exist_ok=True
-            )
-        (wake / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        try:
+            if session_wake is not None:
+                session_wake.observe(wake / "stdout.jsonl")
+        except BaseException as exc:
+            receipt.update(ok=False, error_kind=type(exc).__name__)
+            raise
+        finally:
+            if (home / "sessions").is_dir():
+                # One authoritative copy; resumed prefixes are never double counted.
+                shutil.copytree(
+                    home / "sessions", log_root.parent / "sessions", dirs_exist_ok=True
+                )
+            (wake / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     return receipt
 
 
@@ -364,6 +413,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, cancelled)
     receipt = run_once(dict(os.environ))
     print(json.dumps(receipt))
+    if receipt.get("budget_exhausted") and receipt["mode"] in {"heartbeat", "turn"}:
+        from benchmark.runtime.scheduler import BUDGET_EXHAUSTED_EXIT_CODE
+
+        return BUDGET_EXHAUSTED_EXIT_CODE
     return 124 if receipt["timed_out"] else (0 if receipt["ok"] else 1)
 
 

@@ -97,6 +97,10 @@ export const SETTLEMENT_STEP_KINDS = [
   "terminal_closeout",
 ] as const;
 export type SettlementStepKind = (typeof SETTLEMENT_STEP_KINDS)[number];
+export type TurnProviderStepKind = Exclude<SettlementStepKind, "validation">;
+export const TURN_PROVIDER_STEP_KINDS = SETTLEMENT_STEP_KINDS.filter(
+  (kind): kind is TurnProviderStepKind => kind !== "validation",
+);
 
 export const SETTLEMENT_BINDING_KINDS = [
   "todo",
@@ -180,12 +184,14 @@ export interface SettlementStep {
   expected_receipt: string;
   command_template?: string;
   command_condition?: "todo_deliverable_complete";
+  vision_authoring?: JsonObject;
   conditional?: true;
 }
 
 export interface SettlementPlan {
   identity: SettlementIdentity;
   steps: readonly SettlementStep[];
+  goal_ref?: JsonObject;
 }
 
 export type SettlementBindGate<Value = unknown> =
@@ -601,6 +607,7 @@ export function settlementStepPayload(step: SettlementStep): JsonObject {
   if (step.command_template) payload.command_template = step.command_template;
   if (step.command_condition) payload.command_condition = step.command_condition;
   if (step.conditional) payload.conditional = true;
+  if (step.vision_authoring) payload.vision_authoring = step.vision_authoring;
   return payload;
 }
 

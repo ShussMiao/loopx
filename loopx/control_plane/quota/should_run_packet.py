@@ -12,9 +12,14 @@ from ...state_projection import (
     next_action_projection_warning,
     state_action_projection_warning as build_state_action_projection_warning,
 )
+from .automation_cadence_readback import (
+    automation_cadence_readback,
+    unavailable_automation_cadence_readback,
+)
 from .. import compact_control_plane_policy
 from ..agents.agent_lane_recommendation import (
     build_agent_lane_next_action,
+    build_explicit_advancement_next_action,
     selected_action_with_agent_lane,
     selected_recommended_action_from_work_lane,
 )
@@ -231,6 +236,7 @@ def _execution_obligation(
     work_lane_contract: dict[str, Any] | None = None,
     external_evidence_observation: dict[str, Any] | None = None,
     user_gate_owns_frontier: bool = False,
+    blocked_retry_wait: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return build_execution_obligation(
         should_run=should_run,
@@ -239,6 +245,7 @@ def _execution_obligation(
         work_lane_contract=work_lane_contract,
         external_evidence_observation=external_evidence_observation,
         user_gate_owns_frontier=user_gate_owns_frontier,
+        blocked_retry_wait=blocked_retry_wait,
         successor_replan_mode=AgentScopeFrontierAction.SUCCESSOR_REPLAN_REQUIRED.value,
     )
 
@@ -555,7 +562,21 @@ def _resolve_agent_lane_delivery_route(
 
     continuity_todo = prepared.delivery_continuity_todo
     delivery_anchor = prepared.delivery_continuity_anchor
-    if not isinstance(delivery_anchor, dict) and fallback is None:
+    replan_candidate = build_explicit_advancement_next_action(
+        agent_identity=prepared.agent_identity,
+        agent_todo_items=prepared.agent_todo_planning_source_items,
+        available_capabilities=prepared.effective_available_capabilities,
+        todo_id=(
+            ((prepared.latest_replan_ack or {}).get("semantic_delta") or {})
+            .get("successor_todo_id")
+        ),
+        selection_binding="",
+    )
+    if (
+        not isinstance(delivery_anchor, dict)
+        and fallback is None
+        and replan_candidate is None
+    ):
         return None
     delivery_route = evaluate_delivery_route(
         agent_id=delivery_agent_id,
@@ -594,6 +615,19 @@ def _resolve_agent_lane_delivery_route(
             )
         ),
         preemptions=delivery_preemptions,
+        replan_todo=replan_candidate,
+        latest_replan_ack=prepared.latest_replan_ack,
+        replan_actionable=bool(
+            isinstance(replan_candidate, dict)
+            and projection_todo_item_is_actionable_open(replan_candidate)
+        ),
+        replan_capability_ready=bool(
+            isinstance(replan_candidate, dict)
+            and not missing_required_capabilities(
+                replan_candidate,
+                available_capabilities=prepared.effective_available_capabilities,
+            )
+        ),
     )
 
     selection = delivery_route["selection"]
@@ -625,6 +659,11 @@ def _resolve_agent_lane_delivery_route(
                 "TypeScript selected delivery continuity without a "
                 "projectable Todo candidate"
             )
+    elif selection == "replan":
+        if replan_candidate is None:
+            raise RuntimeError("TypeScript selected replan without an eligible successor")
+        selected_action = replan_candidate
+        selected_action.pop("selection_binding", None)
     elif selection == "fallback":
         selected_action = fallback
     else:
@@ -688,6 +727,7 @@ def _planning_projections(
     route: _QuotaDecisionRoute,
     *,
     include_detail: bool,
+    turn_instance_id: str | None,
 ) -> dict[str, Any]:
     selection_available = route.normal_delivery_allowed or bool(
         route.workspace_repair_allowed
@@ -718,6 +758,18 @@ def _planning_projections(
         capability_gate=prepared.capability_gate,
         blocked_priority_fallback=prepared.blocked_priority_fallback,
         goal_frontier_projection=prepared.goal_frontier_projection,
+        replan_selection_context=(
+            {
+                "has_turn_identity": bool(turn_instance_id),
+                "should_run": route.should_run,
+                "receipt_bound": bool(
+                    prepared.receipt_bound_todo_id or route.receipt_bound_replan_decision
+                ),
+                "selection_requested": prepared.requested_action_todo_id is not None,
+                "monitor_only": prepared.agent_monitor_only,
+            }
+            if route.replan_decision_allowed else None
+        ),
     )
 
 
@@ -750,6 +802,25 @@ def _resolve_external_evidence_observation(
         ):
             external_evidence_observation = None
     return external_evidence_observation, external_evidence_observation_recent
+
+
+def _with_lane_recommendation(
+    prepared: _QuotaDecisionPreparation, agent_lane_next_action: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Decorate selected work; preserve replay's frozen execution packet."""
+    source = prepared.item.get("recommendation_context")
+    if isinstance(source, dict) and isinstance(agent_lane_next_action, dict) and not prepared.guarded_agent_lane_next_action:
+        from ..goals.goal_frontier.semantic_history import latest_lane_recommendation_from_status
+        from ..work_items.recommendation_source_io import lane_recommendation_context
+        actor = agent_lane_next_action.get("agent_id")
+        task = next((task for task in prepared.agent_todo_planning_source_items
+            if task.get("todo_id") == agent_lane_next_action.get("todo_id")), None)
+        context = lane_recommendation_context(source, agent_id=actor,
+            selected_todo=agent_lane_next_action, task=task,
+            prior_resolution=latest_lane_recommendation_from_status(
+                prepared.status_payload, goal_id=prepared.safe_goal_id, agent_id=actor))
+        agent_lane_next_action = context["selected_todo"]
+    return agent_lane_next_action
 
 
 def _resolve_quota_should_run_route(
@@ -997,13 +1068,22 @@ def _resolve_quota_should_run_route(
         should_run=should_run,
         normal_delivery_allowed=normal_delivery_allowed,
     )
+    agent_lane_next_action = _with_lane_recommendation(prepared, agent_lane_next_action)
     agent_scope_frontier = None
     agent_lane_frontier_hint = None
     if receipt_bound_deferred:
         # The no-spend route and its public next action must describe the
         # same committed binding, even when summaries offer independent work.
         selected_recommended_action = prepared.work_lane_contract["action"]
-    elif not replan_decision_allowed and not receipt_bound_monitor_settled:
+    elif (
+        not replan_decision_allowed
+        and not receipt_bound_monitor_settled
+        and prepared.receipt_bound_todo_id is None
+    ):
+        # The typed receipt owner already selected this Turn's immutable
+        # binding. Frontier discovery is for unbound Turns: a newly ready
+        # successor must not replace an interrupted Turn's Todo/effect after
+        # the receipt-bound delivery route has been resolved above.
         selected_recommended_action = selected_action_with_agent_lane(
             selected_recommended_action,
             agent_lane_next_action=agent_lane_next_action,
@@ -1163,6 +1243,9 @@ def _quota_payload_context(prepared: _QuotaDecisionPreparation, route: _QuotaDec
         "status_health_ok": prepared.goal_health_ok,
         "mode": "should-run",
         "goal_id": prepared.safe_goal_id,
+        "registry": prepared.status_payload.get("registry"),
+        "runtime_root": prepared.status_payload.get("runtime_root"),
+        "goal_state_file": prepared.goal_state_file,
         "quota": route.quota,
         "state": route.state,
         "blocked_action_scope": prepared.boundary_projection_repair.get("blocked_action_scope")
@@ -1199,14 +1282,29 @@ def _build_active_quota_payload(
     route: _QuotaDecisionRoute,
     *,
     include_agent_todo_detail: bool = False,
+    turn_instance_id: str | None = None,
 ) -> dict[str, Any]:
     agent_scope_action = _agent_scope_frontier_action(route.effective_action)
+    retry_deadline = (prepared.agent_todo_summary or {}).get("frontier_deadline") or {}
+    user_summary = prepared.user_todo_summary or {}
+    # Only an explicitly complete, notice-only user lane can replace the user
+    # gate explanation. Genuine gates and unknown scope keep their old route.
+    notice_only = (user_summary.get("user_action_open_count", 0) > 0 and
+                   user_summary.get("all_open_count") == user_summary.get("user_action_open_count"))
+    retry_wait = ((prepared.agent_todo_summary or {}).get("blocked_retry_wait") or
+                  (retry_deadline.get("blocked_retry")
+                   if retry_deadline.get("source") == "turn_settlement" else None)) if notice_only else None
     execution_obligation = _execution_obligation(
         should_run=route.should_run,
         effective_action=route.effective_action,
-        heartbeat_recommendation=route.heartbeat_recommendation,
+        heartbeat_recommendation=(
+            {**route.heartbeat_recommendation, "replan_obligation": prepared.replan_obligation}
+            if route.replan_decision_allowed
+            else route.heartbeat_recommendation
+        ),
         work_lane_contract=route.payload_work_lane_contract,
         external_evidence_observation=route.external_evidence_observation,
+        blocked_retry_wait=retry_wait,
         user_gate_owns_frontier=_user_action_owns_empty_agent_lane(
             prepared.user_todo_summary,
             prepared.agent_todo_summary,
@@ -1317,6 +1415,7 @@ def _build_active_quota_payload(
             prepared,
             route,
             include_detail=include_agent_todo_detail,
+            turn_instance_id=turn_instance_id,
         )
     )
     _attach_truthy_fields(
@@ -1472,23 +1571,28 @@ def _build_quota_should_run_payload(
     turn_instance_id: str | None = None,
     include_agent_todo_detail: bool = False,
     runtime_root: str | Path | None = None,
+    goal_ref: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     if prepared.receipt_bound_replay_phase is ReceiptBoundReplayPhase.SETTLED:
         payload = _build_settled_quota_payload(prepared, route)
     else:
         payload = _build_active_quota_payload(
             prepared, route, include_agent_todo_detail=include_agent_todo_detail,
+            turn_instance_id=turn_instance_id,
         )
+    if goal_ref is not None:
+        payload["goal_ref"] = dict(goal_ref)
     apply_settled_monitor_precedence(payload)
-    cadence_root = _interaction_runtime_root(runtime_root, prepared.status_payload)
-    if cadence_root:
-        cadence = effect_runtime_result("quota.automation_cadence.manage", {
-            "runtime_root": str(cadence_root), "goal_id": prepared.safe_goal_id,
-            "agent_id": quota_decision_agent_id(payload) or prepared.requested_agent_id,
-            "automation_id": prepared.codex_app_automation_id, "operation": "read",
-        })
-        if cadence["enabled"]:
-            payload["automation_cadence"] = cadence
+    _attach_automation_cadence_readback(
+        payload,
+        goal_id=prepared.safe_goal_id,
+        agent_id=quota_decision_agent_id(payload) or prepared.requested_agent_id,
+        automation_id=prepared.codex_app_automation_id,
+        runtime_root=_interaction_runtime_root(
+            runtime_root, prepared.status_payload
+        ),
+        resolved_scheduler_context=prepared.resolved_scheduler_context,
+    )
     payload["automation_liveness"] = build_automation_liveness(payload)
     payload["interaction_contract"] = build_interaction_contract(
         payload,
@@ -1532,7 +1636,159 @@ def _build_quota_should_run_payload(
         interaction_contract=payload.get("interaction_contract"),
         scheduler_hint=payload.get("scheduler_hint"),
     )
+    if prepared.agent_scoped_user_todo_override:
+        # Admission is decided earlier; expose an action only from the final
+        # selected Todo and interaction authority, including cooldown changes.
+        kind = str(prepared.agent_scoped_user_todo_override["kind"])
+        payload[kind] = effect_runtime_result("quota.scoped_override.project", {
+            "override": payload[kind],
+            "selected_todo": payload.get("selected_todo"),
+            "interaction_contract": payload["interaction_contract"],
+        })
     return payload
+
+
+def _apply_automatic_cadence_wait_precedence(
+    payload: dict[str, Any],
+    *,
+    readback: Mapping[str, Any],
+    app_automation_applicable: bool,
+) -> None:
+    """Demote only an otherwise runnable hosted App automation to quiet wait."""
+
+    eligibility = readback.get("eligibility")
+    if (
+        not app_automation_applicable
+        or not isinstance(eligibility, Mapping)
+        or eligibility.get("state") != "waiting"
+        or payload.get("should_run") is not True
+        or payload.get("normal_delivery_allowed") is not True
+        or payload.get("recovery_delivery_allowed") is True
+        or payload.get("self_repair_allowed") is True
+        or payload.get("capability_repair_allowed") is True
+        or payload.get("workspace_repair_allowed") is True
+        or payload.get("requires_user_action") is True
+    ):
+        return
+
+    reason = "automatic execution minimum interval has not elapsed"
+    spend_policy = (
+        "no quota spend while automatic execution waits for the owner minimum interval"
+    )
+    clear_quota_action_projections(
+        payload,
+        additional_keys=(
+            "selected_todo",
+            "todo_write_hint",
+            "work_lane_contract",
+            "task_orchestration_contract",
+        ),
+    )
+    payload.update(
+        {
+            "decision": "wait",
+            "state": "waiting",
+            "should_run": False,
+            "normal_delivery_allowed": False,
+            "recovery_delivery_allowed": False,
+            "self_repair_allowed": False,
+            "capability_repair_allowed": False,
+            "workspace_repair_allowed": False,
+            "effective_action": EffectiveAction.BLOCKED_WAIT.value,
+            "actionable_by_codex": False,
+            "requires_user_action": False,
+            "safe_bypass_allowed": False,
+            "safe_bypass_kind": None,
+            "safe_bypass_policy": None,
+            "reason": reason,
+            "recommended_action": reason,
+            "heartbeat_recommendation": {
+                "source": "quota.should-run",
+                "recommended_mode": EffectiveAction.BLOCKED_WAIT.value,
+                "notify": "DONT_NOTIFY",
+                "reason": reason,
+                "spend_policy": spend_policy,
+                "agent_must_attempt": False,
+            },
+            "execution_obligation": {
+                "must_attempt_work": False,
+                "kind": EffectiveAction.BLOCKED_WAIT.value,
+                "delivery_allowed": False,
+                "notify_is_execution_gate": False,
+                "reason": reason,
+                "spend_policy": spend_policy,
+            },
+        }
+    )
+
+
+def _attach_automation_cadence_readback(
+    payload: dict[str, Any],
+    *,
+    goal_id: str,
+    agent_id: str | None,
+    automation_id: Any,
+    runtime_root: str | Path | None,
+    resolved_scheduler_context: SchedulerExecutionContextResolution,
+) -> None:
+    """Attach one owner observation, then apply its hosted-App wait precedence."""
+
+    automation_id = (
+        str(automation_id).strip()
+        if automation_id
+        else None
+    )
+    cadence_root = str(runtime_root) if runtime_root else None
+    if cadence_root is None:
+        readback = unavailable_automation_cadence_readback(
+            goal_id=goal_id,
+            agent_id=agent_id,
+            automation_id=automation_id,
+            reason="runtime_root_unavailable",
+        )
+    else:
+        try:
+            owner_result = effect_runtime_result(
+                "quota.automation_cadence.manage",
+                {
+                    "runtime_root": cadence_root,
+                    "goal_id": goal_id,
+                    "agent_id": agent_id,
+                    "automation_id": automation_id,
+                    "operation": "read",
+                },
+                retry_safe=True,
+            )
+            if not isinstance(owner_result, Mapping):
+                raise ValueError("automation cadence owner result must be an object")
+            readback = automation_cadence_readback(
+                owner_result,
+                expected_goal_id=goal_id,
+                expected_agent_id=agent_id,
+                expected_automation_id=automation_id,
+            )
+        except (OSError, RuntimeError, ValueError):
+            readback = unavailable_automation_cadence_readback(
+                goal_id=goal_id,
+                agent_id=agent_id,
+                automation_id=automation_id,
+                reason="owner_read_failed",
+            )
+        else:
+            if owner_result.get("enabled") is True:
+                # Existing scheduler consumers still receive the owner result.
+                payload["automation_cadence"] = dict(owner_result)
+    payload["automation_cadence_readback"] = readback
+    context = resolved_scheduler_context
+    _apply_automatic_cadence_wait_precedence(
+        payload,
+        readback=readback,
+        app_automation_applicable=bool(
+            context.ok
+            and context.context is not None
+            and context.context.app_automation_applicable
+        ),
+    )
 
 
 def _build_settled_quota_payload(

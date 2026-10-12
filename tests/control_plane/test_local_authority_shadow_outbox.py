@@ -8,21 +8,35 @@ import pytest
 
 from loopx.control_plane.coordination import local_authority_shadow_adapter as adapter
 from loopx.control_plane.coordination import local_authority_shadow_outbox as outbox
+from loopx.control_plane.coordination.coordination_state_contract_generated import (
+    COORDINATION_RUNTIME_SHADOW_BOOTSTRAP_RESULT_SCHEMA,
+)
 from loopx.control_plane.coordination.local_authority_shadow_projection import (
     ProjectionValueError,
     canonical_bytes,
-    lease_partition_projection,
+    compact_lease,
     partition_digest,
     sha256_digest,
+    source_effect_runtime_result,
     text_digest,
     todo_partition_projection,
 )
 from loopx.control_plane.coordination.runtime_shadow import (
     bootstrap_coordination_runtime_shadow,
     build_runtime_shadow_source_snapshot,
+    RuntimeInvoker,
 )
 from loopx.control_plane.coordination.shadow_goal_scope import shadow_goal_scope
-from loopx.control_plane.coordination.shadow_management import require_shadow_primary_write_allowed
+from loopx.control_plane.coordination.shadow_management import (
+    read_shadow_bootstrap_source_path,
+    read_shadow_management_state,
+    require_shadow_primary_write_allowed,
+    shadow_maintenance_lock_target,
+    shadow_management_directory,
+    shadow_management_state_path,
+)
+from loopx.control_plane.effect_runtime import EffectRuntimeResponseAmbiguous, EffectRuntimeRejected
+from loopx.file_lock import exclusive_mutation_file_lock
 from loopx.history import load_registry
 from loopx.registry import find_registry_goal
 
@@ -35,6 +49,7 @@ def _fixture(
     *,
     bootstrap: bool = True,
     incidental_goal_instance_id: bool = False,
+    runtime_invoker: RuntimeInvoker = source_effect_runtime_result,
 ) -> tuple[Path, Path, Path]:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -82,17 +97,38 @@ def _fixture(
             "schema_version": "loopx_coordination_runtime_shadow_config_v0",
             "enabled": True, "provider": "file_v0",
         }}}
+        def bootstrap_or_receipt(method: str, request: dict) -> dict:
+            try:
+                return runtime_invoker(method, request)
+            except EffectRuntimeResponseAmbiguous:
+                # The RPC deadline still applies. Do not resend an uncertain
+                # write; read its exact completed receipt after the existing
+                # maintenance lock releases, using the normal lock budget.
+                with exclusive_mutation_file_lock(shadow_maintenance_lock_target(runtime_root, GOAL_ID)):
+                    journal = read_shadow_management_state(runtime_root, GOAL_ID)
+                    if journal is None:
+                        raise
+                    assert journal["status"] == "active", journal
+                    assert journal["operation"]["operation_id"] == request["operation_id"], journal
+                    assert journal["operation"]["request_digest"] == sha256_digest(request), journal
+                    binding = require_shadow_primary_write_allowed(runtime_root, GOAL_ID)
+                    assert binding is not None, journal
+                    assert read_shadow_bootstrap_source_path(runtime_root, GOAL_ID, binding) == state.resolve()
+                    receipt = journal["result"]
+                    assert receipt["operation_id"] == request["operation_id"], receipt
+                    assert {key: receipt[key] for key in binding} == binding, receipt
+                    return {"schema_version": COORDINATION_RUNTIME_SHADOW_BOOTSTRAP_RESULT_SCHEMA, **receipt}
+
         with shadow_goal_scope(registry, goal_id=GOAL_ID) as scope:
             result = bootstrap_coordination_runtime_shadow(
                 goal=enabled_goal, runtime_root=runtime_root, goal_id=GOAL_ID,
                 operation_id="bootstrap:outbox-test", source_version="source:initial",
                 projection=projection, source_snapshot=snapshot,
+                runtime_invoker=bootstrap_or_receipt,
                 goal_ref=scope.goal_ref,
             )
-        # The managed Effect runtime may lose the first response after the
-        # durable bootstrap commit and retry the same operation. Windows CI is
-        # slow enough to exercise that path, so the public success contract is
-        # applied/recovered/replayed rather than applied-only.
+        # Outbox assertions require a verified bootstrap, including an exact
+        # durable receipt when the managed RPC response is ambiguous.
         assert result["status"] in {"applied", "recovered", "replayed"}, result
         assert result["operation_id"] == "bootstrap:outbox-test", result
         assert result["cursor"] == "1", result
@@ -189,6 +225,68 @@ def test_legacy_profile_ignores_an_incidental_goal_instance_id(
 
 def _files(directory: Path) -> dict[str, bytes]:
     return {str(path.relative_to(directory)): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+
+def test_outbox_fixture_reads_exact_bootstrap_receipt_after_lost_response(tmp_path: Path) -> None:
+    calls = []
+    committed = {}
+
+    def lose_response(method: str, request: dict) -> dict:
+        result = source_effect_runtime_result(method, request)
+        assert result["status"] in {"applied", "recovered", "replayed"}, result
+        calls.append(request)
+        path = shadow_management_state_path(Path(request["runtime_root"]), GOAL_ID)
+        committed["journal_bytes"] = path.read_bytes()
+        raise EffectRuntimeResponseAmbiguous(method, timeout=10)
+
+    registry, state, runtime_root = _fixture(tmp_path, runtime_invoker=lose_response)
+    assert len(calls) == 1  # A receipt readback must never dispatch another write.
+    assert shadow_management_state_path(runtime_root, GOAL_ID).read_bytes() == committed["journal_bytes"]
+    _record_change(registry, state, runtime_root, "Continue after verified bootstrap readback.")
+    assert _drain(registry, runtime_root).reason_code is None
+
+
+@pytest.mark.parametrize("damage", ["missing", "pending", "other_operation", "changed_request", "changed_manifest"])
+def test_outbox_fixture_rejects_unverified_bootstrap_after_lost_response(tmp_path: Path, damage: str) -> None:
+    calls = []
+
+    def lose_response(method: str, request: dict) -> dict:
+        calls.append(request)
+        if damage != "missing":
+            source_effect_runtime_result(method, request)
+            root = Path(request["runtime_root"])
+            path = shadow_management_state_path(root, GOAL_ID)
+            journal = json.loads(path.read_text(encoding="utf-8"))
+            if damage == "pending":
+                journal.update(status="bootstrapping", binding=None, result=None)
+                journal["operation"]["phase"] = "prepared"
+            elif damage == "other_operation":
+                journal["operation"]["operation_id"] = "bootstrap:another-operation"
+            elif damage == "changed_request":
+                journal["operation"]["request_digest"] = "sha256:" + "0" * 64
+            else:
+                manifest = next((shadow_management_directory(root, GOAL_ID) / "operations").glob("*/manifest.json"))
+                manifest.write_text("{}", encoding="utf-8")
+            path.write_text(json.dumps(journal), encoding="utf-8")
+        raise EffectRuntimeResponseAmbiguous(method, timeout=10)
+
+    with pytest.raises(AssertionError):
+        _fixture(tmp_path, runtime_invoker=lose_response)
+    assert len(calls) == 1
+    assert not _todo_dir(tmp_path / "runtime").exists()
+
+
+def test_outbox_fixture_preserves_semantic_rejection_even_with_a_bootstrap_receipt(tmp_path: Path) -> None:
+    calls = []
+
+    def reject_response(method: str, request: dict) -> dict:
+        source_effect_runtime_result(method, request)
+        calls.append(request)
+        raise EffectRuntimeRejected("deliberate semantic rejection", diagnostic_code="invalid_request")
+
+    with pytest.raises(AssertionError, match="deliberate semantic rejection"):
+        _fixture(tmp_path, runtime_invoker=reject_response)
+    assert len(calls) == 1
 
 
 def test_capture_records_prepared_then_committed_and_skips_prose_only_writes(tmp_path: Path) -> None:
@@ -297,9 +395,12 @@ def test_cursor_allocation_hint_does_not_authorize_a_gap_or_candidate_write(tmp_
     registry, state, runtime_root = _fixture(tmp_path)
     directory = _todo_dir(runtime_root)
     directory.mkdir(parents=True)
-    outbox.write_cursor(directory, partition="todos", last_seq=5,
-                        last_entry_id="local-shadow-tx-" + "a" * 64,
-                        last_partition_digest=None, last_cursor="5", last_provider_revision="rev-5")
+    # Synthetic wire input: only the native drain may publish real cursors.
+    outbox.durable_write_json(outbox.cursor_path(directory), {
+        "schema_version": outbox.DRAIN_CURSOR_SCHEMA, "partition": "todos", "last_seq": 5,
+        "last_entry_id": "local-shadow-tx-" + "a" * 64, "last_partition_digest": None,
+        "last_cursor": "5", "last_provider_revision": "rev-5", "updated_at": "2026-09-05T00:00:00Z",
+    })
     assert outbox.next_seq(directory) == 6
     first = _record_change(registry, state, runtime_root, "Recorded after the cursor hint.")
     second = _record_change(registry, state, runtime_root, "Another source transaction.")
@@ -327,14 +428,12 @@ def test_canonical_projection_rejects_floats_and_bad_lease_identity() -> None:
     assert canonical_bytes({"b": 1, "a": [True, None, "\u00e9"]}) == '{"a":[true,null,"\u00e9"],"b":1}'.encode("utf-8")
     assert sha256_digest({"b": [1, None], "a": "x"}) == sha256_digest({"a": "x", "b": [1, None]})
     with pytest.raises(ProjectionValueError):
-        lease_partition_projection([("todo-a", {"goal_id": "other", "todo_id": "todo-a"})], goal_id=GOAL_ID)
-    projection = lease_partition_projection(
-        [("todo-b", {"goal_id": GOAL_ID, "todo_id": "todo-b", "version": 1, "extra": "retained"}),
-         ("todo-a", {"goal_id": GOAL_ID, "todo_id": "todo-a", "version": 2, "status": "active"})],
-        goal_id=GOAL_ID,
+        compact_lease({"goal_id": "other", "todo_id": "todo-a"}, goal_id=GOAL_ID, file_stem="todo-a")
+    lease = compact_lease(
+        {"goal_id": GOAL_ID, "todo_id": "todo-b", "version": 1, "extra": "retained"},
+        goal_id=GOAL_ID, file_stem="todo-b",
     )
-    assert [lease["todo_id"] for lease in projection["leases"]] == ["todo-a", "todo-b"]
-    assert projection["leases"][1]["extra"] == "retained"
+    assert lease["extra"] == "retained"
 
 
 def test_capture_failure_is_typed_and_preserves_the_primary_result(tmp_path: Path) -> None:
@@ -410,9 +509,12 @@ def test_cursor_residue_is_diagnostic_and_requires_an_exact_receipt(tmp_path: Pa
     directory = _todo_dir(runtime_root)
     first, second = outbox.list_entries(directory)
     assert outbox.retired_residue(directory) == []
-    outbox.write_cursor(directory, partition="todos", last_seq=first.seq,
-                        last_entry_id=first.entry_id, last_partition_digest=first.recorded_partition_digest(),
-                        last_cursor="2", last_provider_revision="file:2:" + "1" * 24)
+    outbox.durable_write_json(outbox.cursor_path(directory), {
+        "schema_version": outbox.DRAIN_CURSOR_SCHEMA, "partition": "todos", "last_seq": first.seq,
+        "last_entry_id": first.entry_id, "last_partition_digest": first.recorded_partition_digest(),
+        "last_cursor": "2", "last_provider_revision": "file:2:" + "1" * 24,
+        "updated_at": "2026-09-05T00:00:00Z",
+    })
     assert [path.name for path in outbox.retired_residue(directory)] == sorted(
         [first.committed_path.name, first.prepared_path.name]
     )
@@ -442,14 +544,3 @@ def test_exact_receipts_allow_cursor_then_residue_cleanup(tmp_path: Path) -> Non
     assert recovered.reason_code is None, recovered.reason_code
     assert outbox.list_entries(directory) == []
     assert outbox.read_cursor(directory) == cursor
-
-
-def test_reclaim_validates_the_complete_batch_before_any_unlink(tmp_path: Path) -> None:
-    first, second = tmp_path / "first.json", tmp_path / "second.json"
-    first.write_bytes(b"first exact receipt bytes")
-    second.write_bytes(b"second changed after proof")
-    proof = [(first, outbox.raw_bytes_digest(first.read_bytes())), (second, outbox.raw_bytes_digest(b"different bytes"))]
-    with pytest.raises(outbox.OutboxError) as raised:
-        outbox.reclaim_verified_files(proof)
-    assert raised.value.reason_code == "outbox_file_changed"
-    assert first.exists() and second.exists()

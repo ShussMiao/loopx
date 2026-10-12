@@ -8,10 +8,12 @@ import os
 from pathlib import Path
 import re
 import tarfile
-from typing import Any
+import tempfile
+from typing import Any, Protocol
 
 from . import __version__
-from .paths import DEFAULT_RUNTIME_ROOT
+from .paths import _is_redirected_path, select_default_runtime_root
+from .control_plane.effect_runtime import effect_runtime_result
 
 
 STATE_BACKUP_SCHEMA_VERSION = "loopx_state_backup_v0"
@@ -77,7 +79,7 @@ def _path_stats(path: Path, exclude_roots: list[Path]) -> tuple[dict[str, int], 
             return
         stats["paths"] += 1
         stats["bytes"] += int(stat.st_size)
-        if item.is_symlink():
+        if _is_redirected_path(item):
             stats["symlinks"] += 1
             return
         if item.is_dir():
@@ -126,6 +128,7 @@ def _discover_targets(
     include_automations: bool,
     include_skills: bool,
     include_registry_projects: bool,
+    configuration_source_registry: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
@@ -151,12 +154,21 @@ def _discover_targets(
         warnings.extend(target_warnings)
 
     add("runtime_root", runtime_root, "runtime-root")
+    # Import must bind the original registry bytes, even when its caller-owned
+    # route lives outside .loopx; configuration projection is not that source.
+    add("configuration_source_registry", configuration_source_registry, "configuration/registry.source.json")
     add("project_loopx", project / ".loopx", "project/.loopx")
     add("project_codex_goals", project / ".codex" / "goals", "project/.codex/goals")
     add("project_claude_goals", project / ".claude" / "goals", "project/.claude/goals")
     add("project_local_goals", project / ".local" / "goals", "project/.local/goals")
 
     global_registry = runtime_root / "registry.global.json"
+    # Current-project scope still owns its registered routes, including files
+    # outside the conventional Goal directories. Keep cross-project discovery
+    # on the global registry; configuration capture uses the same source below.
+    discovery_registry = (
+        global_registry if include_registry_projects else configuration_source_registry
+    )
     registry_goal_count = 0
     registry_project_roots: set[str] = set()
     reachable_project_roots: set[str] = set()
@@ -164,12 +176,18 @@ def _discover_targets(
     registry_active_state_included_count = 0
     registry_source_registry_count = 0
     registry_source_registry_included_count = 0
-    if include_registry_projects:
+    if include_registry_projects or discovery_registry.exists():
         try:
-            goals = _registry_goals(global_registry)
+            goals = _registry_goals(discovery_registry)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             goals = []
-            warnings.append(f"could not discover global registry projects from {global_registry}: {exc}")
+            warnings.append(f"could not discover registry projects from {discovery_registry}: {exc}")
+        if not include_registry_projects:
+            goals = [
+                goal for goal in goals
+                if not str(goal.get("repo") or "").strip()
+                or _resolved(Path(str(goal["repo"]).strip())) == project
+            ]
         registry_goal_count = len(goals)
         for goal in goals:
             goal_id = str(goal.get("id") or "").strip()
@@ -325,7 +343,9 @@ def _category_stats(targets: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
         category = _target_category(str(item.get("key") or ""))
         stats = categories.setdefault(category, {"target_count": 0, **_empty_stats()})
         stats["target_count"] += 1
-        item_stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+        item_stats = item.get("stats")
+        if not isinstance(item_stats, dict):
+            item_stats = {}
         for field in STAT_FIELDS:
             stats[field] += int(item_stats.get(field, 0))
     return categories
@@ -367,13 +387,18 @@ def build_state_backup_plan(
     include_automations: bool = True,
     include_skills: bool = True,
     include_registry_projects: bool = True,
+    registry_path: Path | None = None,
 ) -> dict[str, Any]:
     resolved_project = _resolved(Path(project))
-    resolved_runtime_root = _resolved(Path(runtime_root).expanduser() if runtime_root else DEFAULT_RUNTIME_ROOT)
+    resolved_runtime_root = _resolved(Path(runtime_root).expanduser() if runtime_root else select_default_runtime_root())
     resolved_output_dir = _resolved(Path(output_dir).expanduser() if output_dir else resolved_runtime_root / "backups")
     resolved_backup_id = backup_id or _utc_timestamp()
     archive_path = resolved_output_dir / f"loopx-state-{resolved_backup_id}.tar.gz"
     manifest_path = resolved_output_dir / f"loopx-state-{resolved_backup_id}.manifest.json"
+    configuration_source_registry = registry_path or (
+        resolved_runtime_root / "registry.global.json" if include_registry_projects
+        else resolved_project / ".loopx/registry.json"
+    )
     targets, missing, warnings, registry_discovery = _discover_targets(
         project=resolved_project,
         runtime_root=resolved_runtime_root,
@@ -381,6 +406,7 @@ def build_state_backup_plan(
         include_automations=include_automations,
         include_skills=include_skills,
         include_registry_projects=include_registry_projects,
+        configuration_source_registry=configuration_source_registry,
     )
     total_stats = _sum_target_stats(targets)
     logical_source_bytes = total_stats["bytes"]
@@ -394,6 +420,7 @@ def build_state_backup_plan(
         "backup_id": resolved_backup_id,
         "project": str(resolved_project),
         "runtime_root": str(resolved_runtime_root),
+        "configuration_source_registry": str(configuration_source_registry),
         "registry_discovery": registry_discovery,
         "codex_home": str(_codex_home()),
         "output_dir": str(resolved_output_dir),
@@ -423,14 +450,86 @@ def build_state_backup_plan(
     }
 
 
-def _add_path_to_tar(tar: tarfile.TarFile, source: Path, archive_path: str, exclude_roots: list[Path]) -> None:
+class _BackupReadStream(Protocol):
+    def read(self, size: int = -1, /) -> bytes: ...
+
+
+class _BackupMemberReader:
+    """Witness the stream tarfile copies, without rereading a changing source."""
+
+    def __init__(self, source: _BackupReadStream) -> None:
+        self.source = source
+        self.digest = hashlib.sha256()
+        self.size = 0
+
+    def read(self, size: int = -1, /) -> bytes:
+        data = self.source.read(size)
+        self.digest.update(data)
+        self.size += len(data)
+        return data
+
+
+class _BackupTarFile(tarfile.TarFile):
+    """Retain tarfile's link/metadata behavior and witness every copied member."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.file_members: list[dict[str, Any]] = []
+        super().__init__(*args, **kwargs)
+
+    def addfile(self, tarinfo: tarfile.TarInfo, fileobj: _BackupReadStream | None = None) -> None:
+        # The manifest contains this list; the whole-archive digest covers it.
+        if not tarinfo.isfile() or tarinfo.name == "manifest.json":
+            super().addfile(tarinfo, fileobj)
+            return
+        if fileobj is None:
+            raise ValueError("backup regular member requires its copied byte stream")
+        reader = _BackupMemberReader(fileobj)
+        super().addfile(tarinfo, reader)
+        self.file_members.append({"archive_path": tarinfo.name,
+            "size_bytes": reader.size, "sha256": reader.digest.hexdigest()})
+
+
+def _add_path_to_tar(
+    tar: tarfile.TarFile, source: Path, archive_path: str, exclude_roots: list[Path],
+    staging: Path, snapshots: dict[Path, tuple[Path, dict[str, Any]]],
+) -> None:
     if _should_skip(source, exclude_roots):
         return
+    if not source.is_symlink() and _is_redirected_path(source):
+        return
+    if not source.is_symlink():
+        for suffix in ("-wal", "-shm", "-journal"):
+            if source.name.endswith(suffix) and _resolved(source.with_name(source.name[:-len(suffix)])) in snapshots:
+                return
     if source.is_dir() and not source.is_symlink():
         tar.add(source, arcname=archive_path, recursive=False)
         for child in sorted(source.iterdir(), key=lambda item: item.name):
-            _add_path_to_tar(tar, child, f"{archive_path}/{child.name}", exclude_roots)
+            _add_path_to_tar(tar, child, f"{archive_path}/{child.name}", exclude_roots, staging, snapshots)
         return
+    if source.is_file() and not source.is_symlink():
+        resolved = _resolved(source)
+        snapshot = snapshots.get(resolved)
+        if snapshot is None:
+            with source.open("rb") as handle:
+                is_sqlite = handle.read(16) == b"SQLite format 3\x00"
+            if is_sqlite:
+                snapshot_path = staging / f"sqlite-{len(snapshots)}.db"
+                runtime = effect_runtime_result(
+                    "coordination.sqlite_backup.snapshot",
+                    {"source_path": str(resolved), "destination_path": str(snapshot_path)},
+                    timeout=300.0, retry_safe=False,
+                )
+                snapshot = (snapshot_path, {
+                    "source_path": str(source), "archive_paths": [],
+                    "snapshot_sha256": _sha256_file(snapshot_path),
+                    "snapshot_size_bytes": snapshot_path.stat().st_size,
+                    "runtime_identity": runtime,
+                })
+                snapshots[resolved] = snapshot
+        if snapshot is not None:
+            snapshot[1]["archive_paths"].append(archive_path)
+            tar.add(snapshot[0], arcname=archive_path, recursive=False)
+            return
     tar.add(source, arcname=archive_path, recursive=False)
 
 
@@ -468,47 +567,80 @@ def execute_state_backup_plan(payload: dict[str, Any]) -> dict[str, Any]:
     }
     updated["recommended_action"] = "backup written; keep the archive local and private"
 
-    manifest_for_archive = dict(updated)
-    manifest_bytes = json.dumps(manifest_for_archive, ensure_ascii=False, indent=2).encode("utf-8")
-    with tarfile.open(archive_path, "w:gz", dereference=False) as tar:
-        for item in included:
-            if not isinstance(item, dict):
-                continue
-            source = Path(str(item.get("source_path") or "")).expanduser()
-            archive_name = str(item.get("archive_path") or source.name)
-            if source.exists() or source.is_symlink():
-                _add_path_to_tar(tar, source, archive_name, exclude_roots)
-        info = tarfile.TarInfo("manifest.json")
-        info.size = len(manifest_bytes)
-        info.mtime = int(datetime.now(timezone.utc).timestamp())
-        tar.addfile(info, io.BytesIO(manifest_bytes))
+    # A failed SQLite snapshot must not publish a partial archive or replace an
+    # earlier successful backup. Keep staging private and outside discovery.
+    with tempfile.TemporaryDirectory(prefix=".loopx-state-backup-", dir=output_dir) as temporary:
+        staging = Path(temporary)
+        staged_archive = staging / "archive.tar.gz"
+        snapshots: dict[Path, tuple[Path, dict[str, Any]]] = {}
+        with _BackupTarFile.open(staged_archive, "w:gz", dereference=False) as tar:
+            for item in included:
+                if not isinstance(item, dict):
+                    continue
+                source = Path(str(item.get("source_path") or "")).expanduser()
+                archive_name = str(item.get("archive_path") or source.name)
+                _add_path_to_tar(tar, source, archive_name, exclude_roots, staging, snapshots)
+            from .capabilities.configuration_backup import (
+                capture_configuration_backup,
+                verify_configuration_backup,
+            )
+            configuration = capture_configuration_backup(
+                registry_path=Path(payload["configuration_source_registry"]),
+                runtime_root=Path(payload["runtime_root"]),
+            )
+            configuration_bytes = json.dumps(configuration, ensure_ascii=False, indent=2).encode("utf-8")
+            info = tarfile.TarInfo("configuration-backup.json")
+            info.size, info.mode = len(configuration_bytes), 0o600
+            tar.addfile(info, io.BytesIO(configuration_bytes))
+            updated["execution"]["configuration_backup"] = verify_configuration_backup(configuration)
+            updated["execution"]["sqlite_snapshots"] = [entry[1] for entry in snapshots.values()]
+            # manifest.json is deliberately excluded: it contains this list.
+            # The existing external archive checksum witnesses the whole tar.
+            updated["execution"]["file_members"] = tar.file_members
+            manifest_bytes = json.dumps(updated, ensure_ascii=False, indent=2).encode("utf-8")
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(manifest_bytes)
+            info.mtime = int(datetime.now(timezone.utc).timestamp())
+            tar.addfile(info, io.BytesIO(manifest_bytes))
 
-    execution = dict(updated["execution"])
-    execution["archive_sha256"] = _sha256_file(archive_path)
-    execution["archive_size_bytes"] = archive_path.stat().st_size
-    summary = updated.get("summary") if isinstance(updated.get("summary"), dict) else {}
-    logical_source_bytes = int(summary.get("logical_source_bytes") or 0)
-    if logical_source_bytes:
-        ratio = execution["archive_size_bytes"] / logical_source_bytes
-        execution["archive_to_logical_ratio"] = round(ratio, 6)
-    else:
-        execution["archive_to_logical_ratio"] = None
-    updated["execution"] = execution
-    manifest_path.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        execution = dict(updated["execution"])
+        execution["archive_sha256"] = _sha256_file(staged_archive)
+        execution["archive_size_bytes"] = staged_archive.stat().st_size
+        summary = updated.get("summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        logical_source_bytes = int(summary.get("logical_source_bytes") or 0)
+        execution["archive_to_logical_ratio"] = (
+            round(execution["archive_size_bytes"] / logical_source_bytes, 6)
+            if logical_source_bytes else None
+        )
+        updated["execution"] = execution
+        staged_manifest = staging / "manifest.json"
+        staged_manifest.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        for path in (staged_archive, staged_manifest):
+            path.chmod(0o600)
+            # Windows requires write access for fsync; update mode only permits
+            # the durability flush.
+            with path.open("rb+") as handle:
+                os.fsync(handle.fileno())
+        os.replace(staged_archive, archive_path)
+        os.replace(staged_manifest, manifest_path)
     return updated
 
 
 def render_state_backup_markdown(payload: dict[str, Any]) -> str:
-    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
-    total = summary.get("total_stats") if isinstance(summary.get("total_stats"), dict) else {}
-    category_stats = (
-        summary.get("category_stats") if isinstance(summary.get("category_stats"), dict) else {}
-    )
-    overlap = (
-        summary.get("contained_overlap_stats")
-        if isinstance(summary.get("contained_overlap_stats"), dict)
-        else {}
-    )
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    total = summary.get("total_stats")
+    if not isinstance(total, dict):
+        total = {}
+    category_stats = summary.get("category_stats")
+    if not isinstance(category_stats, dict):
+        category_stats = {}
+    overlap = summary.get("contained_overlap_stats")
+    if not isinstance(overlap, dict):
+        overlap = {}
     logical_source_bytes = summary.get("logical_source_bytes", total.get("bytes"))
     lines = [
         "# LoopX State Backup",
@@ -554,7 +686,9 @@ def render_state_backup_markdown(payload: dict[str, Any]) -> str:
         lines.extend(["", "## Included", ""])
         for item in included:
             if isinstance(item, dict):
-                stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+                stats = item.get("stats")
+                if not isinstance(stats, dict):
+                    stats = {}
                 lines.append(
                     f"- `{item.get('key')}` -> `{item.get('archive_path')}` "
                     f"({stats.get('paths')} paths)"

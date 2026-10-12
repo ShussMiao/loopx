@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from ..control_plane.coordination.local_authority import (
@@ -14,8 +14,9 @@ from ..control_plane.work_items.task_lease import TaskLeaseError
 from ..file_lock import lock_timeout_error_fields
 from ..control_plane.coordination.legacy_writer_fence import LegacyCoordinationWriterFenced
 from ..control_plane.coordination.shadow_management import ShadowManagementError
-from ..control_plane.coordination.runtime_shadow_writer_adapter import ActiveStateAuthorityMutationError
+from ..control_plane.coordination.legacy_writer_fence import ActiveStateAuthorityMutationError
 from ..control_plane.coordination.local_authority import LocalCoordinationAuthorityUnavailable
+from .todo_argument_validation import TodoClaimArgumentError
 
 
 RolloutEventAppender = Callable[..., dict[str, object]]
@@ -30,7 +31,10 @@ TODO_EVENT_KINDS = {
 }
 
 
-def todo_error_payload(args: argparse.Namespace, exc: Exception) -> dict[str, object]:
+def todo_error_payload(
+    args: argparse.Namespace, exc: Exception, *, registry_path: Path,
+    runtime_root_arg: str | None,
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "ok": False,
         "dry_run": not bool(args.execute)
@@ -44,7 +48,12 @@ def todo_error_payload(args: argparse.Namespace, exc: Exception) -> dict[str, ob
         "error": str(exc),
         **lock_timeout_error_fields(exc),
     }
-    if isinstance(exc, (TaskLeaseError, HandoffModeError, LegacyCoordinationWriterFenced, ShadowManagementError, ActiveStateAuthorityMutationError, LocalCoordinationAuthorityUnavailable)):
+    if isinstance(exc, TodoClaimArgumentError):
+        payload["error_code"] = "todo_claim_invalid_arguments"
+        payload["recovery"] = exc.recovery(
+            args, registry_path=registry_path, runtime_root_arg=runtime_root_arg,
+        )
+    elif isinstance(exc, (TaskLeaseError, HandoffModeError, LegacyCoordinationWriterFenced, ShadowManagementError, ActiveStateAuthorityMutationError, LocalCoordinationAuthorityUnavailable)):
         payload["error_code"] = exc.code
         payload.update(exc.payload)
     elif isinstance(exc, LocalCoordinationAuthorityRejection):
@@ -87,11 +96,17 @@ def append_todo_rollout_event(
         or (payload.get("idempotent_replay") and not turn_instance_id)
     ):
         return
+    goal_ref = (
+        payload.get("goal_ref")
+        if isinstance(payload.get("goal_ref"), Mapping)
+        else None
+    )
     append_cli_rollout_event(
         payload,
         registry_path=registry_path,
         runtime_root_arg=runtime_root_arg,
         event_kind=TODO_EVENT_KINDS.get(args.todo_command, "todo_update"),
+        goal_ref=goal_ref,
         agent_id=args.agent_id or args.claimed_by,
         todo_id=args.todo_id or str(payload.get("todo_id") or "").strip() or None,
         run_id=turn_instance_id,
@@ -138,6 +153,7 @@ def append_todo_rollout_event(
                 "agent_id",
                 "todo_id",
                 "run_id",
+                *(["goal_ref"] if goal_ref is not None else []),
                 *(["status"] if terminal_closeout else []),
             ]
             if turn_instance_id

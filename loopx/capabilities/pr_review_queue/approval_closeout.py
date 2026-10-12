@@ -23,9 +23,9 @@ def approval_closeout_contract() -> dict[str, Any]:
         "procedure": [
             "After publishing/readback of APPROVE (including the author-owned COMMENTED fallback), run readback_command. An existing exact-head APPROVE may use this compact closeout without a duplicate audit or review.",
             "For every effective blocking_reviews row, read its full review and inline comments. Independently map EVERY finding to current-head code and decisive validation. Old commit, resolved threads, another account's approval, or green CI alone never proves resolution; same-head findings may also need reconciliation.",
-            "Dismiss only findings verified resolved or independently disproven, with explicit owner authorization for review reconciliation and actual repository/branch dismissal permission. Preserve unresolved or unverified reviews. A COMMENTED self-approval is not GitHub approval or authority over another reviewer.",
-            "Immediately before each dismissal, re-read this plan and target review/comments; stop if the head, approval, target, or findings changed. Use GitHub's native review dismissal, never deletion: gh api --method PUT repos/OWNER/REPO/pulls/NUMBER/reviews/REVIEW_ID/dismissals -f message='PUBLIC_SAFE_FINDING_RESOLUTION_EVIDENCE'. Retain discussion and include evidence in the required dismissal message.",
-            "Read the target back as DISMISSED, verify the approval remains at the unchanged head, and rerun closeout. Report remaining blockers and raw reviewDecision (null is not APPROVED). On a hold, permission failure, or unresolved finding, preserve the earned APPROVE and report the separate closeout/merge hold; do not merge or erase dissent.",
+            "Resolve review-reconciliation authorization from the current user task/session and actual repository/branch dismissal permission. The read-only plan's dismissal_authorized=false and merge_authorized=false mean it grants no authority; they do not revoke or assess independently granted owner authority and are not a reason to stop an authorized reconciliation. Dismiss only findings verified resolved or independently disproven under that authority. Preserve unresolved or unverified reviews. A COMMENTED self-approval is not GitHub approval or authority over another reviewer.",
+            "Immediately before each dismissal, re-read this plan and target review/comments; stop if the head, approval, target, or findings changed. Use GitHub's native review dismissal, never deletion: gh api --method PUT repos/OWNER/REPO/pulls/NUMBER/reviews/REVIEW_ID/dismissals -f message='PUBLIC_SAFE_FINDING_RESOLUTION_EVIDENCE' -f event=DISMISS. Retain discussion and include evidence in the required dismissal message.",
+            "HTTP success is not a dismissal receipt: require the target readback to be DISMISSED. If the state is unchanged, report the failed postcondition instead of claiming success or blindly repeating the mutation. Verify the approval remains at the unchanged head, and rerun closeout. Report remaining blockers and raw reviewDecision (null is not APPROVED). On a hold, permission failure, or unresolved finding, preserve the earned APPROVE and report the separate closeout/merge hold; do not merge or erase dissent.",
         ],
     }
 
@@ -39,6 +39,18 @@ def plan_approval_closeout(request: dict[str, Any]) -> dict[str, Any]:
         raise TypeError("typed approval closeout result mismatch")
     result["execution_contract"] = approval_closeout_contract()
     return result
+
+
+def select_review_conclusion(request: dict[str, Any]) -> int:
+    """Transport qualified bodies to the shared typed history owner."""
+    try:
+        result = effect_runtime_result("capabilities.pr_review.conclusion.select", request)
+    except EffectRuntimeRejected as error:
+        raise ValueError(str(error)) from error
+    index = result.get("index") if isinstance(result, dict) else None
+    if type(index) is not int or not 0 <= index < len(request["reviews"]):
+        raise TypeError("typed review conclusion index mismatch")
+    return index
 
 
 def read_github_approval_closeout(*, repository: str, exact_head: str) -> dict[str, Any]:
@@ -78,25 +90,21 @@ def read_github_approval_closeout(*, repository: str, exact_head: str) -> dict[s
     reviews = [row for page in pages for row in page]
     if any(not isinstance(row, dict) for row in reviews):
         raise ValueError("review readback is malformed")
-    own_reviews = [{"state": row.get("state"), "body": row.get("body"),
-                    "author": row.get("user"), "submittedAt": row.get("submitted_at"),
-                    "commit": {"oid": row.get("commit_id")}}
-                   for row in reviews if isinstance(row.get("user"), dict)
-                   and str(row["user"].get("login", "")).casefold() == login.casefold()]
-    # Reuse the current standalone/exact-head body validator, not a new approval rule.
-    approval = _review_conclusion(pr | {"reviews": own_reviews}, reviewer_login=login,
-        behavior_bearing=bool({row["area"] for row in _files(pr)} & (CODE_AREAS | BEHAVIORAL_POLICY_AREAS)))
-    if approval["valid"]:
-        matching = [row for row in reviews if row.get("submitted_at") == approval["submitted_at"]
-                    and row.get("state") == approval["state"]
-                    and row.get("commit_id") == pr.get("headRefOid")
-                    and str(row.get("user", {}).get("login", "")).casefold() == login.casefold()]
-        if len(matching) != 1:
-            raise ValueError("approval readback identity is ambiguous")
-        approval["review_id"] = matching[0].get("id")
+    # Validate bodies here; the typed owner selects the effective opinion from
+    # the complete history. Authentication permits the read, not reviewer scope.
+    behavior_bearing = bool({row["area"] for row in _files(pr)} & (CODE_AREAS | BEHAVIORAL_POLICY_AREAS))
+    conclusions = []
+    for row in reviews:
+        review = {"state": row.get("state"), "body": row.get("body"),
+                  "author": row.get("user"), "submittedAt": row.get("submitted_at"),
+                  "commit": {"oid": row.get("commit_id")}}
+        reviewer = row.get("user", {}).get("login") if isinstance(row.get("user"), dict) else None
+        conclusion = _review_conclusion(pr | {"reviews": [review]},
+            reviewer_login=reviewer, behavior_bearing=behavior_bearing)
+        conclusions.append(conclusion | {"review_id": row.get("id")})
     after = run_gh_json(args)
     if not isinstance(after, dict) or after.get("number") != number or after.get("state") != pr.get("state"):
         raise ValueError("pull-request identity or lifecycle changed during readback")
     return plan_approval_closeout({"repository": repository, "expected_exact_head": exact_head,
         "pull_request": pr, "readback_head": after.get("headRefOid"), "reviews": reviews,
-        "reviews_complete": True, "approval_conclusion": approval})
+        "reviews_complete": True, "review_conclusions": conclusions})

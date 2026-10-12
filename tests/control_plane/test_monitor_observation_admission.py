@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,77 @@ from tests.control_plane.test_quota_settlement_cli import (
     _spend_run_count,
     _write_fixture,
 )
+from tests.control_plane.test_cli_output_budget import _stable_budget_fixture_root
+
+
+@pytest.fixture
+def settlement_budget_root(tmp_path: Path) -> Iterator[Path]:
+    # Measure the actual output with stable paths, as other CLI budgets do.
+    with _stable_budget_fixture_root(tmp_path) as root:
+        yield root
+
+
+def test_settled_advancement_hold_preserves_independent_monitor(
+    tmp_path: Path,
+) -> None:
+    """A post-settlement hold does not strand a due independent observation."""
+    status = "blocked"
+    project, runtime, registry = _write_fixture(tmp_path)
+    turn = "turn-settled-advancement-hold"
+    binding = ("--goal-id", GOAL_ID, "--agent-id", AGENT_ID,
+               "--turn-instance-id", turn)
+    capabilities = ("--available-capability", "network",
+                    "--available-capability", "external_evidence_poll")
+    guard = ("quota", "should-run", "--codex-app", *binding,
+             *capabilities, "--scan-path", str(project))
+    rc, first = _run_cli(registry, runtime, *guard)
+    assert rc == 0, first
+    _append_newly_due_monitor(project, watch_only=True)
+    rc, admitted = _run_cli(registry, runtime, *guard)
+    assert rc == 0, admitted
+    poll_command = admitted["interaction_contract"]["cli_channel"][
+        "auxiliary_monitor_poll"]["command"]
+    rc, refresh = _run_cli(
+        registry, runtime, "refresh-state", *binding, "--todo-id", TODO_ID,
+        "--classification", "fixture_inflight_validated",
+        "--delivery-batch-scale", "single_surface",
+        "--delivery-outcome", "outcome_progress",
+        "--delivery-boundary", "in_flight_continuation",
+        "--delivery-workspace-path", str(project),
+        "--no-global-sync", "--suppress-external-sinks",
+    )
+    assert rc == 0, refresh
+    rc, spent = _run_cli(registry, runtime, *_projected_cli_args(
+        refresh["settlement_owed"]["command"], turn_instance_id=turn))
+    assert rc == 0, spent
+    rc, held = _run_cli(
+        registry, runtime, "todo", "update", "--goal-id", GOAL_ID,
+        "--todo-id", TODO_ID, "--agent-id", AGENT_ID, "--status", status,
+        "--reason", "Await independent evidence after validated progress",
+    )
+    assert rc == 0, held
+    rc, successor = _run_cli(
+        registry, runtime, "todo", "add", "--goal-id", GOAL_ID,
+        "--role", "agent", "--task-class", "advancement_task",
+        "--claimed-by", AGENT_ID, "--text", "Validate an independent artifact",
+    )
+    assert rc == 0, successor
+    poll_args = tuple("observed-after-hold" if token == "${LOOPX_MONITOR_RESULT_HASH:?}"
+                      else token for token in _projected_cli_args(
+                          poll_command, turn_instance_id=turn)) + ("--scan-path", str(project))
+    for expected_replay in (False, True):
+        rc, poll = _run_cli(registry, runtime, *poll_args)
+        assert rc == 0, (poll.get("error_code"), poll.get("reason"), poll.get("error"))
+        assert poll["replayed"] is expected_replay
+        assert poll["settlement_todo_id"] == TODO_ID
+        assert poll["turn_continuation"]["current_turn_settled"] is True
+        assert poll["turn_continuation"]["same_turn_independent_settlement_allowed"] is False
+        assert poll["settlement_resume"]["next_step"] is None
+    rc, listed = _run_cli(registry, runtime, "todo", "list", "--goal-id", GOAL_ID)
+    assert rc == 0, listed
+    assert next(t for t in listed["todos"] if t["todo_id"] == TODO_ID)["status"] == status
+    assert _classification_count(runtime, "quota_monitor_poll") == 1
+    assert _spend_run_count(runtime) == 1
 
 
 def test_receipt_bound_advancement_allows_one_auxiliary_due_monitor_receipt(
@@ -101,6 +173,15 @@ def test_receipt_bound_advancement_allows_one_auxiliary_due_monitor_receipt(
         poll["after"]["interaction_contract"]["cli_channel"]["spend_after_validation"]
         is True
     )
+    # Pair the shipped instructions with the real auxiliary continuation above.
+    for mode in ("full", "compact", "brief", "thin"):
+        rc, prompt = _run_cli(
+            registry_path, runtime, "heartbeat-prompt", f"--{mode}",
+            "--goal-id", GOAL_ID, "--agent-id", AGENT_ID, "--codex-app",
+        )
+        assert rc == 0, prompt
+        assert "auxiliary poll: continue work" in prompt["task_body"]
+        assert "Exact monitor settlement=no refresh/spend" in prompt["task_body"]
     assert poll_replay_rc == 0, poll_replay
     assert poll_replay["replayed"] is True
     assert _classification_count(runtime, "quota_monitor_poll") == 1
@@ -132,12 +213,13 @@ def test_receipt_bound_advancement_allows_one_auxiliary_due_monitor_receipt(
     ],
 )
 def test_completed_advancement_retains_auxiliary_monitor_admission(
-    tmp_path: Path,
+    settlement_budget_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     provider: str,
     writeback: bool,
     spend_first: bool,
 ) -> None:
+    tmp_path = settlement_budget_root
     from canonical_authority_fixture import (
         initialize_canonical_authority,
         isolate_sqlite_runtime,
@@ -296,7 +378,15 @@ def test_completed_advancement_retains_auxiliary_monitor_admission(
     assert resume["identity"]["turn_instance_id"] == turn
     assert resume["grants_new_delivery"] is False
     assert resume["progress_ref"] == "$.settlement_progress"
-    assert len(json.dumps(resume, ensure_ascii=False, indent=2)) < 2_000
+    # Same stable fixture: v1.3.1 writeback was 1,831 chars; the bounded vision
+    # authoring contract and unavailable-monitor closeout now require 5,328.
+    # Keep useful decision guidance, with 672 chars of measured headroom. Spend
+    # and settled packets retain the original 2,000-character regression budget.
+    resume_budget = (
+        6_000 if (resume["next_step"] or {}).get("kind") == "durable_writeback"
+        else 2_000
+    )
+    assert len(json.dumps(resume, ensure_ascii=False, indent=2)) < resume_budget
     after_cli = poll["after"]["interaction_contract"]["cli_channel"]
     assert after_cli["settlement_resume_ref"] == "$.settlement_resume"
     assert after_cli["spend_after_validation"] is False

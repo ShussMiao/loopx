@@ -103,6 +103,9 @@ def _receipt_row(
         ),
         **{f"{option}_command_route_count": count
            for option, count in semantics.command_route_counts(text).items()},
+        "heartbeat_peer_admission_prompt_revision": (
+            semantics.heartbeat_peer_admission_prompt_revision(text)
+        ),
         "host_prompt_static_safety_revision": semantics.host_prompt_static_safety_revision(text),
         "heartbeat_user_language_prompt_revision": (
             semantics.heartbeat_user_language_prompt_revision(text)
@@ -126,6 +129,8 @@ def _receipt_row(
             if isinstance(payload, dict)
             else []
         ),
+        "next_action_basis_count": semantics.next_action_basis_count(payload),
+        "authoring_inputs": semantics.authoring_input_observations(text),
     }
 
 
@@ -161,6 +166,7 @@ def _default_rows(
     enforce_budget: bool = True,
 ) -> list[dict]:
     rows: list[dict] = []
+    measurements: dict[str, dict[str, dict[str, dict]]] = {}
     for scenario in probe.SCENARIOS:
         # Match _measure_scenario: alias each scenario, not its parent. Otherwise
         # emitted command paths include the scenario suffix only in this runner.
@@ -184,8 +190,17 @@ def _default_rows(
                     measurement = probe.measure_cli_output(
                         text, output_format=output_format
                     )
+                    measurements.setdefault(scenario.name, {}).setdefault(
+                        surface_id, {}
+                    )[output_format] = measurement
                     surface = probe.CLI_OUTPUT_BUDGET_BY_ID[surface_id]
                     if enforce_budget:
+                        if (surface_id, scenario.name, output_format) == (
+                            "loopx_turn_plan", "crowded", "json"
+                        ):
+                            probe._assert_turn_plan_writeback_routes(
+                                measurement, registry_path, runtime
+                            )
                         probe.assert_cli_output_baseline(
                             surface,
                             scenario=scenario.name,
@@ -220,6 +235,8 @@ def _default_rows(
                             ),
                         ),
                     )
+    if enforce_budget:
+        probe._assert_scenario_matrix(measurements)
     return rows
 
 

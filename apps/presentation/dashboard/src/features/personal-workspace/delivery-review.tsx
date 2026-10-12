@@ -1,9 +1,11 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { ArrowRight, Download, ExternalLink, RefreshCw, Search } from "lucide-react";
+import { ArrowRight, CircleAlert, Download, ExternalLink, RefreshCw, Search } from "lucide-react";
 import { deliveryReviewMarkdown, fetchDeliveryReview, filterReviewNodes, reviewCoverageIncomplete, reviewNodeColumn, type DeliveryReviewSnapshot, type ReviewFocus, type ReviewGraph, type ReviewNode } from "../../data/delivery-review";
 import type { WorkspaceDrawerSelection, WorkspaceGoal, WorkspaceModel, WorkspaceTimelineItem } from "./personal-workspace-model";
 import { GoalAcceptanceObservationCard } from "./goal-acceptance-observation-card";
 import { GoalAcceptanceContractSection } from "./goal-acceptance-contract";
+import { GoalWorkMapView } from "./goal-work-map";
+import type { GoalWorkMapNode } from "../../data/goal-work-map";
 import { deliveryReviewCopy } from "./delivery-review-copy";
 import { useWorkspaceI18n } from "./i18n";
 import "./delivery-review.css";
@@ -59,7 +61,9 @@ export function DeliveryReview({ goal, items, userTodos, onSelect, active }: Del
   const [query, setQuery] = useState("");
   const [focus, setFocus] = useState<ReviewFocus>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [mapView, setMapView] = useState(() => window.matchMedia("(min-width: 1024px)").matches);
+  // The work map is the spatial overview; the bounded chain defaults to its list.
+  const [mapView, setMapView] = useState(false);
+  const [mapSelectedId, setMapSelectedId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState("");
   const detailRef = useRef<HTMLElement>(null);
   const scopedAttention = userTodos.filter(todo => todo.goalId === goal.goalId);
@@ -81,6 +85,12 @@ export function DeliveryReview({ goal, items, userTodos, onSelect, active }: Del
   }, [goal.goalId, refresh, active]);
   const snapshot = state.snapshot?.goal_id === goal.goalId ? state.snapshot : null;
   const stale = Boolean(snapshot) && state.sourceKey !== sourceKey;
+  useEffect(() => {
+    // Re-read once workspace facts settle instead of leaving a stale snapshot.
+    if (!active || state.kind !== "ready" || !stale) return;
+    const timer = window.setTimeout(() => setRefresh(value => value + 1), 600);
+    return () => window.clearTimeout(timer);
+  }, [active, state.kind, stale, sourceKey]);
   const usable = Boolean(snapshot) && state.kind === "ready" && !stale;
   const graph = snapshot?.graph;
   const selected = graph?.nodes.find(node => node.node_id === selectedId);
@@ -104,6 +114,22 @@ export function DeliveryReview({ goal, items, userTodos, onSelect, active }: Del
     ];
   }
   const sources = selected ? linkedSources(selected) : [];
+  function mapSource(node: GoalWorkMapNode): WorkspaceDrawerSelection | null {
+    const id = node.refs.todo_ids?.[0];
+    if (!id) return null;
+    if (node.kind === "gate") {
+      const item = scopedAttention.find(todo => todo.todoId === id);
+      return item ? { kind: "attention", item } : null;
+    }
+    // The status window is bounded; its absence cannot revoke exact request reading.
+    const todo = goal.agentTodos.find(item => item.todoId === id) ?? {
+      todoId: id, sourceTodoId: id, detailMode: "request_only" as const,
+      text: node.title, done: node.state === "done", claimedBy: node.owner_agent ?? null,
+      status: node.state === "waiting" ? "deferred" : node.state === "blocked" || node.state === "done" ? node.state : "open",
+      taskDomain: node.task_domain ?? null, taskClass: node.kind === "monitor" ? "continuous_monitor" : null,
+    };
+    return { kind: "todo", item: { ...todo, goalId: goal.goalId, goalTitle: goal.title, ownerLabel: todo.claimedBy } };
+  }
   function download() {
     if (!snapshot || !usable) return;
     let url: string | undefined;
@@ -123,10 +149,15 @@ export function DeliveryReview({ goal, items, userTodos, onSelect, active }: Del
       <div><button type="button" disabled={state.kind === "loading"} onClick={() => setRefresh(value => value + 1)}><RefreshCw size={15} />{copy.refresh}</button><button type="button" disabled={!usable} onClick={download}><Download size={15} />{copy.export}</button></div>
     </header>
     {feedback ? <p role="status">{feedback}</p> : null}
-    {!snapshot ? <p role={state.kind === "error" ? "alert" : "status"} className="delivery-notice">{state.kind === "error" ? copy.error : copy.loading}</p> : <>
-      {state.kind !== "ready" ? <p role={state.kind === "error" ? "alert" : "status"} className="delivery-notice">{state.kind === "error" ? copy.refreshError : copy.loading}</p> : null}
-      <p className="delivery-snapshot-time">{copy.observed} · <time dateTime={snapshot.observed_at}>{new Date(snapshot.observed_at).toLocaleString(locale)}</time></p>
-      {stale ? <p role="alert" className="delivery-notice">{copy.changed}</p> : null}
+    {!snapshot ? state.kind === "error" ? <p role="alert" className="delivery-notice is-error"><CircleAlert aria-hidden size={15} />{copy.error}</p>
+      : <div role="status" className="delivery-loading" aria-label={copy.loading}><i /><i /><i /></div> : <>
+      {state.kind === "error" ? <p role="alert" className="delivery-notice is-error"><CircleAlert aria-hidden size={15} />{copy.refreshError}</p> : null}
+      <p className="delivery-snapshot-time">{copy.observed} · <time dateTime={snapshot.observed_at}>{new Date(snapshot.observed_at).toLocaleString(locale)}</time>
+        {state.kind === "loading" || (stale && state.kind !== "error") ? <span role="status"> · {copy.updating}</span> : null}</p>
+      {stale && state.kind === "error" ? <p role="alert" className="delivery-notice is-error"><CircleAlert aria-hidden size={15} />{copy.changed}</p> : null}
+      {snapshot.goal_map ? <GoalWorkMapView map={snapshot.goal_map} copy={copy.workMap} selectedId={mapSelectedId} onSelect={setMapSelectedId}
+        canOpen={node => usable && mapSource(node) !== null} onOpen={node => { const source = mapSource(node); if (source) onSelect(source); }} />
+        : snapshot.goal_map === null ? <p className="delivery-notice">{copy.workMap.unavailable}</p> : null}
       <p className="delivery-boundary">{copy.scope} {copy.acceptanceBoundary}</p>
       {graph ? <>
         {reviewCoverageIncomplete(graph) ? <details className="delivery-notice"><summary>{copy.incomplete}</summary><dl>

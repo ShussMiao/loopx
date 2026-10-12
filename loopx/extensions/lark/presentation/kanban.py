@@ -43,6 +43,7 @@ from .record_io import (
     todo_record_list_is_authoritative,
     todo_record_entries,
 )
+from .sink_visibility import SINK_VISIBILITY_OWNER_ONLY, SINK_VISIBILITY_SHARED, SINK_VISIBILITIES
 from .sync_receipt import (
     compact_lark_kanban_sync_receipt as compact_lark_kanban_sync_receipt,
     render_lark_kanban_markdown as render_lark_kanban_markdown,
@@ -86,9 +87,6 @@ CLAIM_AGENT = "Agent"
 
 TEXT_LIMIT = 4000
 OUTPUT_LIMIT = 1800
-SINK_VISIBILITY_OWNER_ONLY = "owner-only"
-SINK_VISIBILITY_SHARED = "shared"
-SINK_VISIBILITIES = {SINK_VISIBILITY_OWNER_ONLY, SINK_VISIBILITY_SHARED}
 
 
 CommandRunner = Callable[[list[str], Optional[Path], Optional[float]], dict[str, Any]]
@@ -2197,7 +2195,8 @@ def sync_loopx_todos_to_lark_kanban(
         build_issue_fix_outcome_collection_from_domain_state,
     )
     from ....control_plane.todos.todo_semantics import todo_priority_label
-    from ....todos import resolve_todo_state_path, section_bounds, todo_blocks
+    from ....control_plane.todos.path_resolution import resolve_todo_state_path
+    from ....control_plane.todos.active_state_editing import section_bounds, todo_blocks
 
     resolved_project, resolved_state_file = resolve_todo_state_path(
         registry_path=registry_path,

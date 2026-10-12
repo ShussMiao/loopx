@@ -92,6 +92,8 @@ export const todoItemSchema = z.object({
   required_capabilities: z.array(z.string()).optional(),
   note: z.string().optional().nullable(),
   evidence: z.string().optional().nullable(),
+  // Public-safe blocker cause; producers project it only for blocked work.
+  reason: z.string().optional().nullable(),
   completed_at: z.string().optional().nullable(),
   updated_at: z.string().optional().nullable(),
   completion_validation_required: z.boolean().optional().nullable(),
@@ -113,7 +115,7 @@ export const todoItemSchema = z.object({
 export const todoGroupSchema = z.object({
   source_section: z.string().optional().nullable(),
   total_count: z.number().optional().default(0),
-  open_count: z.number().optional().default(0),
+  open_count: z.number().optional(),
   done_count: z.number().optional().default(0),
   advancement_done_count: z.number().optional(),
   items: z.array(todoItemSchema).optional().default([]),
@@ -232,6 +234,16 @@ export const goalChannelNotificationRowSchema = z.object({
   configured: z.boolean().optional().default(false),
   enabled: z.boolean().optional().default(false),
   human_gate_auto_notify_enabled: z.boolean().optional().default(false),
+  blocked_notice_auto_notify_enabled: z.boolean().optional().default(false),
+  steward_notice_delivery: z.object({
+    pending_count: z.number(),
+    failed_count: z.number(),
+  }).optional(),
+  blocked_notice_delivery: z.object({
+    delivered_count: z.number(),
+    unverified_count: z.number(),
+    resolved_count: z.number(),
+  }).optional(),
   target_ref: z.string().optional().nullable(),
   receipt_count: z.number().optional().default(0),
   last_notified_at: z.string().optional().nullable(),
@@ -245,7 +257,7 @@ export const goalChannelNotificationProjectionSchema = z.object({
 
 export const projectAssetTodoSummarySchema = z.object({
   source_section: z.string().optional().nullable(),
-  open: z.number().optional().default(0),
+  open: z.number().optional(),
   done: z.number().optional().default(0),
   total: z.number().optional().default(0),
   advancement_done_count: z.number().optional(),
@@ -353,8 +365,8 @@ export const projectAssetTodoProjectionGapSchema = z.object({
 
 export const nativeChildActivitySchema = z.object({
   schema_version: z.literal("native_subagent_activity_v0"),
-  observation: z.enum(["unknown", "coordinator_reported"]),
-  host_attested: z.literal(false),
+  observation: z.enum(["unknown", "coordinator_reported", "host_observed", "mixed"]),
+  host_attested: z.boolean(),
   configured_limit: z.number().int().nonnegative(),
   launched_count: z.number().int().nonnegative(),
   skipped_count: z.number().int().nonnegative(),

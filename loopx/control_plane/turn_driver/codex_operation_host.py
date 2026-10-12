@@ -26,15 +26,18 @@ from ..collaboration.operation_handoff import (
 from ..goals.first_party_host_admission import FirstPartyHostGoalAdmission
 from ..effect_runtime import EffectRuntimeRejected
 from .codex_cli import (
-    _lineage,
     _prompt,
+    normalize_codex_stdio_mcp_server,
+    codex_cli_result_schema,
+)
+from .codex_sessions import (
+    _lineage,
     _read_codex_cli_session_document,
     _codex_session_goal_ref,
     _store_codex_cli_session,
     load_codex_cli_session,
-    normalize_codex_stdio_mcp_server,
-    codex_cli_result_schema,
 )
+from ...extensions.codex_native_child import native_child_observer
 from .executor import LOOPX_TURN_HOST_REQUEST_SCHEMA_VERSION
 from .host_failure import BuiltInHostError
 
@@ -239,7 +242,7 @@ def run_codex_operation_host(
     reasoning_effort: str | None = None,
     source_route: Mapping[str, str] | None = None,
     mcp_server: Mapping[str, Any] | None = None,
-    timeout_seconds: float = 115,
+    timeout_seconds: float | None = None,
     goal_admission: FirstPartyHostGoalAdmission | None = None,
     confirmed_operation_id: str | None = None,
 ) -> dict[str, Any]:
@@ -356,9 +359,9 @@ def run_codex_operation_host(
             resume_thread_id=binding["session_id"] if binding else None,
             dynamic_tools=[OPERATION_TOOL],
             host_config=host_config,
-            response_timeout_sec=min(timeout_seconds, 30),
+            response_timeout_sec=30 if timeout_seconds is None else min(timeout_seconds, 30),
             hard_timeout_sec=timeout_seconds,
-            idle_timeout_sec=min(timeout_seconds, 180),
+            idle_timeout_sec=180 if timeout_seconds is None else min(timeout_seconds, 180),
         )
 
         def store_binding():
@@ -428,7 +431,22 @@ def run_codex_operation_host(
                         recovery_kind="resume_session",
                     ) from exc
 
-        return session.send(
+        child_observer = native_child_observer(request, runtime_root=runtime_root, lineage=lineage,
+            registry_path=goal_admission.registry_path if goal_admission is not None else None)
+
+        def observe_child(item: Mapping[str, Any]) -> None:
+            if child_observer is None:
+                return
+            def record_child() -> None:
+                child_observer.observe(item, session_id=session.thread_id,
+                                       invocation_id=session.current_turn_id)
+
+            if goal_admission is None:
+                record_child()
+            else:
+                goal_admission.accept_result(record_child)
+
+        result = session.send(
             _prompt(request)
             + "\nUse loopx_operation for context/pending/prepare/inspect/consume/report. "
             "Source conversations are not executor identity. context/pending/inspect do not require consumption. "
@@ -444,7 +462,9 @@ def run_codex_operation_host(
                if continuations else ""),
             output_schema=codex_cli_result_schema(request),
             on_event=on_event,
+            **({"on_native_item": observe_child} if child_observer is not None else {}),
         )
+        return result
     except CodexChatAgentError as exc:
         raise BuiltInHostError(
             "codex_operation_host_" + exc.error_code,

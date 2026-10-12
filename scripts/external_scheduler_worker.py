@@ -41,6 +41,7 @@ from loopx.extensions.process_runtime import (  # noqa: E402
     CappedProcessResult,
     run_capped_process,
 )
+from loopx.paths import global_registry_path  # noqa: E402
 
 SCHEDULER_DETAIL_KEY = "local_scheduler"
 LOCAL_SCHEDULER_STOP_DIRECTIVE = "stop"
@@ -263,11 +264,11 @@ def _shell_argv(command: str) -> list[str]:
     return ["/bin/sh", "-c", command]
 
 
-def _run_wake(command: str, *, timeout_seconds: float) -> CappedProcessResult:
+def _run_wake(command: str, *, timeout_seconds: float | None) -> CappedProcessResult:
     return run_capped_process(
         _shell_argv(command),
         stdin=b"",
-        timeout_seconds=max(0.01, timeout_seconds),
+        timeout_seconds=None if timeout_seconds is None else max(0.01, timeout_seconds),
         output_limit_bytes=PROCESS_OUTPUT_LIMIT_BYTES,
         termination_grace_seconds=10,
     )
@@ -343,6 +344,7 @@ def run_worker(
             continue
 
         retry_after_error = False
+        wake_completed = False
         while True:
             if decision.reset_token and decision.reset_token != previous_token:
                 unchanged_count = 0
@@ -375,12 +377,18 @@ def run_worker(
                 if args.wake_cmd:
                     wake_result = _run_wake(
                         args.wake_cmd,
-                        timeout_seconds=float(
-                            getattr(args, "wake_timeout_seconds", 600.0)
-                        ),
+                        timeout_seconds=getattr(args, "wake_timeout_seconds", None),
                     )
                     wake_rc = wake_result.returncode
                     wake_failure_kind = wake_result.failure_kind
+                    stop_code = getattr(args, "wake_stop_exit_code", None)
+                    if (stop_code is not None and wake_failure_kind is None
+                            and wake_rc == stop_code):
+                        _log(f"status=wake_requested_stop wake_rc={wake_rc}")
+                        _save_state(state_path, {
+                            "reset_token": decision.reset_token, "unchanged_count": 0,
+                        })
+                        return 0
                     wake_failed = wake_failure_kind is not None or wake_rc != 0
                     wake_status = "wake_failed" if wake_failed else "wake_ok"
                 _log(
@@ -416,6 +424,7 @@ def run_worker(
                     retry_after_error = True
                 else:
                     unchanged_count = 0
+                    wake_completed = bool(args.wake_cmd)
                 break
 
             _log(
@@ -500,7 +509,12 @@ def run_worker(
 
         if once:
             return 0
-        sleep(max(5, interval_minutes * 60))
+        # A completed synchronous wake is an event to recheck admission now,
+        # not a reason to add an idle polling interval. The fresh quota decision
+        # still owns continuation; waiting/observe-only ticks retain their
+        # cadence and failures use the independent backoff path above.
+        if not wake_completed:
+            sleep(max(5, interval_minutes * 60))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -510,8 +524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--cli-bin", default="loopx", help="LoopX CLI binary.")
     parser.add_argument(
         "--registry",
-        default=str(Path.home() / ".codex" / "loopx" / "registry.global.json"),
-        help="Path to the LoopX registry.",
+        help="Path to the LoopX registry; defaults to the selected current or legacy route.",
     )
     parser.add_argument("--runtime-root", help="Override registry common_runtime_root.")
     parser.add_argument(
@@ -533,6 +546,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Without it the worker is observe-only.",
     )
     parser.add_argument(
+        "--wake-stop-exit-code",
+        type=int,
+        help="Opt-in nonzero wake exit code that ends this worker normally. "
+        "Does not complete a Todo or spend quota; transport failures still fail.",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Run a single tick and exit instead of sleeping and looping.",
@@ -552,10 +571,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--wake-timeout-seconds",
         type=float,
-        default=600.0,
-        help="Maximum duration of one configured wake command.",
+        default=None,
+        help="Optional wake execution deadline; default waits for completion or cancellation.",
     )
     args = parser.parse_args(argv)
+    if args.wake_stop_exit_code is not None and not 1 <= args.wake_stop_exit_code <= 255:
+        parser.error("--wake-stop-exit-code must be between 1 and 255")
+    if args.registry is None:
+        try:
+            args.registry = str(global_registry_path())
+        except ValueError as exc:
+            parser.error(str(exc))
     return run_worker(args)
 
 

@@ -8,7 +8,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import __version__
-from .paths import DEFAULT_RUNTIME_ROOT, default_registry_path, global_registry_path
+from .paths import default_registry_path, global_registry_path, select_default_runtime_root
+
+
+HOST_GLOBAL_REGISTRY_SELECTOR = "@host-global"
 
 
 GLOBAL_OPTIONS_WITH_VALUE = frozenset({"--registry", "--runtime-root", "--format"})
@@ -37,10 +40,12 @@ _REGISTRY_OPTIONAL_COMMANDS = frozenset(
 		"codex-cli-visible-driver-run",
 		"codex-cli-visible-driver-plan",
 		"codex-cli-visible-session-proof",
+		"commands",
 		"demo",
 		"doctor",
 		"first-run-report",
 		"usage-ping",
+		"performance-diagnosis",
 		"new-project-prompt",
 		"resolve-agent-thread",
 		"resolve-peer-route",
@@ -55,13 +60,14 @@ _REGISTRY_OPTIONAL_COMMANDS = frozenset(
 		"uninstall-project",
 		"version",
 		"host-mode-plan",
+		"migrate-local-state",
 	}
 )
 
 _STATUS_COMMANDS = frozenset({"check", "status", "diagnose", "review-packet"})
 _SELECTED_COMMANDS = _STATUS_COMMANDS | {
-	"todo", "quota", "change-window", "delegation", "turn", "doctor", "commands",
-	"authority-archive", "extension", "slash-commands",
+	"todo", "quota", "task-lease", "change-window", "delegation", "turn", "doctor", "commands",
+	"authority-archive", "coordination-shadow", "extension", "slash-commands",
 }
 
 
@@ -130,7 +136,7 @@ def build_cli_parser(
 	parser.add_argument(
 		"--registry",
 		default=str(default_registry_path()),
-		help="Path to a project-local registry.",
+		help="Registry path, or @host-global for this host's selected default global registry.",
 	)
 	parser.add_argument("--runtime-root", help="Override registry common_runtime_root.")
 	parser.add_argument("--format", choices=["markdown", "json"])
@@ -151,6 +157,16 @@ def resolve_cli_registry(
 	registry_was_configured = user_supplied_registry(raw_argv) or bool(
 		os.environ.get("LOOPX_REGISTRY")
 	)
+	if str(args.registry) == HOST_GLOBAL_REGISTRY_SELECTOR:
+		try:
+			runtime_root = (
+				Path(args.runtime_root).expanduser()
+				if args.runtime_root
+				else select_default_runtime_root()
+			)
+		except ValueError as exc:
+			raise SystemExit(str(exc)) from exc
+		return global_registry_path(runtime_root), True
 	project_register_uses_default_registry = (
 		args.command == "project"
 		and args.project_command == "register"
@@ -160,15 +176,19 @@ def resolve_cli_registry(
 		registry_path = Path(args.knowledge_root).expanduser() / ".loopx" / "registry.json"
 	if (
 		args.command not in _REGISTRY_OPTIONAL_COMMANDS
+		and not (args.command == "canary" and not getattr(args, "goal_id", None))
 		and not project_register_uses_default_registry
 		and not registry_was_configured
 		and not registry_path.exists()
 	):
-		runtime_root = (
-			Path(args.runtime_root).expanduser()
-			if args.runtime_root
-			else DEFAULT_RUNTIME_ROOT
-		)
+		try:
+			runtime_root = (
+				Path(args.runtime_root).expanduser()
+				if args.runtime_root
+				else select_default_runtime_root()
+			)
+		except ValueError as exc:
+			raise SystemExit(str(exc)) from exc
 		fallback_registry = global_registry_path(runtime_root)
 		if fallback_registry.exists():
 			registry_path = fallback_registry
@@ -219,6 +239,10 @@ def _build_selected_parser(command: str) -> LoopXArgumentParser:
 		from .cli_commands.quota_registration import register_quota_command
 
 		register_quota_command(subparsers)
+	elif command == "task-lease":
+		from .cli_commands.task_lease import register_task_lease_command
+
+		register_task_lease_command(subparsers, add_subcommand_format)
 	elif command == "change-window":
 		from .capabilities.repository_change_window.cli import register_repository_change_window_commands
 
@@ -235,6 +259,10 @@ def _build_selected_parser(command: str) -> LoopXArgumentParser:
 		from .cli_commands.authority_archive import register_authority_archive_command
 
 		register_authority_archive_command(subparsers, add_subcommand_format)
+	elif command == "coordination-shadow":
+		from .cli_commands.coordination_shadow import register_coordination_shadow_command
+
+		register_coordination_shadow_command(subparsers, add_subcommand_format)
 	elif command == "extension":
 		from .cli_commands.extension import register_extension_commands
 
@@ -262,10 +290,24 @@ def _dispatch_common_command(
 	registry_path: Path,
 	allow_missing_registry: bool,
 ) -> int | None:
+	if args.command == "task-lease":
+		from .cli_commands.task_lease import handle_task_lease_command
+
+		return handle_task_lease_command(
+			args, registry_path=registry_path, runtime_root_arg=args.runtime_root,
+			output_format=output_format, print_payload=print_payload,
+		)
 	if args.command == "authority-archive":
 		from .cli_commands.authority_archive import handle_authority_archive_command
 
 		return handle_authority_archive_command(
+			args, registry_path=registry_path, runtime_root_arg=args.runtime_root,
+			output_format=output_format, print_payload=print_payload,
+		)
+	if args.command == "coordination-shadow":
+		from .cli_commands.coordination_shadow import handle_coordination_shadow_command
+
+		return handle_coordination_shadow_command(
 			args, registry_path=registry_path, runtime_root_arg=args.runtime_root,
 			output_format=output_format, print_payload=print_payload,
 		)
@@ -285,7 +327,7 @@ def _dispatch_common_command(
 	if args.command == "doctor":
 		from .cli_commands.doctor import handle_doctor_command
 
-		return handle_doctor_command(args, print_payload)
+		return handle_doctor_command(args, print_payload, registry_path=registry_path)
 	if args.command == "commands":
 		from .help_surface import (
 			build_command_reference_payload, render_command_reference_markdown,
@@ -298,7 +340,7 @@ def _dispatch_common_command(
 		return 0
 	if args.command == "delegation":
 		from .cli_commands.delegation import handle_delegation
-		from .control_plane.coordination.local_authority_shadow_adapter import (
+		from .paths import (
 			effective_runtime_root,
 		)
 
@@ -369,7 +411,7 @@ def _dispatch_common_command(
 		)
 		from .cli_commands.todo import handle_todo_command
 		from .cli_rollout import append_cli_rollout_event
-		from .control_plane.coordination.local_authority_shadow_adapter import (
+		from .paths import (
 			effective_runtime_root,
 		)
 

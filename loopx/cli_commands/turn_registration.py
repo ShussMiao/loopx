@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable
 
 from ..control_plane.operator_provider import operator_provider_environ
+from ..control_plane.turn_driver.driver import SessionBindingScope, SUPPORTED_ITERATION_CONTEXT_POLICIES
 from ..control_plane.turn_driver.host_binding import (
     MANAGED_TURN_HOST,
     resolve_default_turn_host,
@@ -46,6 +47,21 @@ def register_turn_commands(
             "Evaluate an explicit failed-Turn retry, including any current "
             "Host Session binding check."
         ),
+    )
+    inspect_journal.add_argument(
+        "--watch",
+        action="store_true",
+        help=(
+            "Poll the read-only journal projection and emit one progress event "
+            "per changed phase/status until the Turn is terminal. With --format "
+            "json, events are newline-delimited JSON."
+        ),
+    )
+    inspect_journal.add_argument(
+        "--watch-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between journal reads while --watch is active (default: 1).",
     )
 
     plan = command_sub.add_parser(
@@ -310,7 +326,8 @@ def register_turn_commands(
             "run_dsh_turn(...) used instead of the DeepSeek Harness SDK."
         ),
     )
-    run_once.add_argument("--timeout-seconds", type=float, default=120.0)
+    run_once.add_argument("--timeout-seconds", type=float, default=None,
+                          help="Optional execution deadline; by default wait for host completion or cancellation.")
     run_once.add_argument(
         "--retry-failed-turn",
         action="store_true",
@@ -383,13 +400,19 @@ def _add_turn_decision_arguments(
     )
     parser.add_argument(
         "--iteration-context",
-        choices=["fresh", "resume-if-available"],
-        default="resume-if-available",
+        choices=sorted(SUPPORTED_ITERATION_CONTEXT_POLICIES),
+        default="resume",
         help=(
             "Host context policy for this iteration. fresh starts a clean "
             "session even when a compatible prior session exists; "
-            "resume-if-available preserves the existing continuation behavior."
+            "resume continues the recorded session."
         ),
+    )
+    parser.add_argument(
+        "--session-scope",
+        choices=[scope.value for scope in SessionBindingScope],
+        default=SessionBindingScope.AGENT.value,
+        help="Codex exec conversation binding: todo isolates each Todo; agent continues across Todos in the same Goal/Agent. Turn authority and settlement stay Todo-scoped.",
     )
     parser.add_argument(
         "--resume-goal-id",

@@ -1,4 +1,4 @@
-"""Compact, complete revisions for Todo advancement frontiers."""
+"""Lossless source codecs consumed by the typed summary/frontier owners."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import zlib
 from typing import Any
 
-from ..effect_runtime import effect_runtime_result
 # Refs #4447: the todo contract owns this vocabulary; import it instead of
 # restating the literal in every module that classifies a Todo.
 from .contract import (
@@ -15,7 +14,7 @@ from .contract import (
     normalize_todo_claimed_by,
     normalize_todo_excluded_agents,
 )
-from .todo_semantics import todo_item_task_class
+from .todo_semantics import todo_item_is_actionable_open, todo_item_task_class
 
 
 TODO_FRONTIER_REVISION_SCHEMA_VERSION = "todo_frontier_revision_v0"
@@ -69,6 +68,7 @@ def frontier_source_facts(
             "excluded": normalize_todo_excluded_agents(item.get("excluded_agents")),
             "updated": str(item.get("updated_at") or item.get("completed_at") or "").strip(),
             "advancement": todo_item_task_class(item) == TODO_TASK_CLASS_ADVANCEMENT,
+            "actionable": todo_item_is_actionable_open(item),
             "serialized": json.dumps(
                 {key: item[key] for key in FRONTIER_REVISION_FIELDS if item.get(key) is not None},
                 ensure_ascii=True, separators=(",", ":"), sort_keys=True,
@@ -83,53 +83,3 @@ def frontier_source_facts(
         return rows
     return {"encoding": "deflate-base64-json-v0",
             "data": base64.b64encode(zlib.compress(raw)).decode("ascii")}
-
-
-def _request(operation: str, **facts: Any) -> dict[str, Any]:
-    result = effect_runtime_result("todo.frontier_revision.project", {
-        "schema_version": "todo_frontier_revision_request_v0",
-        "operation": operation, **facts,
-    })
-    if not isinstance(result, dict):
-        raise TypeError("typed frontier revision response must be an object")
-    return result
-
-
-def _checkpoint_tuple(value: Any) -> tuple[str | None, str | None, bool] | None:
-    if value is None:
-        return None
-    if value["complete"]:
-        return value["frontier_revision"], value["frontier_updated_at"], True
-    return None, None, False
-
-
-def selectable_advancement_frontier_revision(
-    source_items: list[dict[str, Any]] | None, *, agent_id: str | None,
-) -> tuple[str | None, str | None, bool]:
-    result = _checkpoint_tuple(_request("select", rows=frontier_source_facts(source_items),
-        agent_id=normalize_todo_claimed_by(agent_id))["checkpoint"])
-    assert result is not None
-    return result
-
-
-def build_advancement_frontier_revision_index(
-    source_items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    index = _request("index", rows=frontier_source_facts(source_items)).get("index")
-    if not isinstance(index, dict):
-        raise TypeError("typed frontier revision response index must be an object")
-    return index
-
-
-def attach_advancement_frontier_revision_index(
-    summary: dict[str, Any], source_items: list[dict[str, Any]], *, role: str | None,
-) -> None:
-    if role == "agent":
-        summary["advancement_frontier_revision_index"] = build_advancement_frontier_revision_index(source_items)
-
-
-def advancement_frontier_revision_from_index(
-    value: Any, *, agent_id: str | None,
-) -> tuple[str | None, str | None, bool] | None:
-    return _checkpoint_tuple(_request("read", index=value,
-        agent_id=normalize_todo_claimed_by(agent_id))["checkpoint"])

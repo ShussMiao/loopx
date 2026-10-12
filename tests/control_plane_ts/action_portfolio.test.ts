@@ -182,6 +182,56 @@ test("planning packet preserves bounded horizon completeness", () => {
   assert.equal(completeness.complete, false);
 });
 
+test("unbound hard replans expose planning choices even for a sole candidate", () => {
+  const primary = candidate("todo_primary001", "Review the primary slice.", "P1");
+  for (const alternatives of [[], [candidate("todo_other001", "Another slice.", "P2")]]) {
+    const result = projectQuotaActionPortfolio(planningPacketRequest(primary, alternatives, [], {
+      projection_enabled: false,
+      include_detail: false,
+      replan_selection_context: {
+        has_turn_identity: true, should_run: true, receipt_bound: false, selection_requested: false, monitor_only: false,
+      },
+    }));
+    const portfolio = result?.action_portfolio as Record<string, unknown>;
+    const policy = portfolio.selection_policy as Record<string, unknown>;
+    assert.equal(policy.requires_explicit_turn_binding, true);
+    assert.equal(policy.recommendation_role, "default_not_binding");
+    assert.equal(policy.direct_delivery_before_selection, false);
+    assert.equal("agent_todo_planning_inventory" in (result ?? {}), false);
+  }
+});
+
+test("replan planning does not unbind receipts or override delivery and monitor gates", () => {
+  const primary = candidate("todo_primary001", "Review the primary slice.", "P1");
+  for (const override of [
+    { has_turn_identity: false },
+    { should_run: false }, { receipt_bound: true },
+    { selection_requested: true }, { monitor_only: true },
+  ]) {
+    const result = projectQuotaActionPortfolio(planningPacketRequest(primary, [], [], {
+      projection_enabled: false,
+      include_detail: false,
+      replan_selection_context: {
+        has_turn_identity: true, should_run: true, receipt_bound: false, selection_requested: false, monitor_only: false,
+        ...override,
+      },
+    }));
+    assert.equal("action_portfolio" in (result ?? {}), false);
+  }
+});
+
+test("every supplied replan planning fact is validated without short-circuiting", () => {
+  const primary = candidate("todo_primary001", "Review the primary slice.", "P1");
+  for (const field of ["has_turn_identity", "should_run", "receipt_bound", "selection_requested", "monitor_only"]) {
+    assert.throws(() => projectQuotaActionPortfolio(planningPacketRequest(primary, [], [], {
+      replan_selection_context: {
+        has_turn_identity: false, should_run: false, receipt_bound: true, selection_requested: true, monitor_only: true,
+        [field]: "yes",
+      },
+    })), new RegExp(`replan_selection_context.${field} must be a boolean`));
+  }
+});
+
 test("action portfolio exposes one recommendation and bounded selectable alternatives", () => {
   const primary = candidate("todo_primary001", "Run the primary slice.", "P0");
   const result = projectQuotaActionPortfolio(request(
@@ -359,6 +409,35 @@ test("pending selection qualifies only after current hard-lane arbitration", () 
   });
 });
 
+test("only runnable replan-only deferral permits one inline guard reentry", () => {
+  const selected = candidate("todo_selected001", "Review the selected route.", "P1");
+  const request = {
+    schema_version: ACTION_SELECTION_QUALIFICATION_REQUEST_SCHEMA_VERSION,
+    requested_todo_id: selected.todo_id,
+    candidate: selected,
+    should_run: true,
+    normal_delivery_allowed: false,
+    delivery_preemptions: ["autonomous_replan", "delivery_not_allowed"],
+  };
+  const replan = qualifyActionSelection(request);
+  assert.equal(replan.state, "deferred");
+  assert.equal(replan.inline_reentry_allowed, true);
+  assert.equal(replan.selected_todo, undefined);
+  for (const extra of ["blocking_work_lane", "control_repair", "heartbeat_receipt",
+    "ready_deferred_successor_priority_preemption"]) {
+    assert.equal(qualifyActionSelection({...request,
+      delivery_preemptions: [...request.delivery_preemptions, extra],
+    }).inline_reentry_allowed, undefined);
+  }
+  for (const patch of [
+    {should_run: false}, {candidate: null}, {delivery_preemptions: []},
+    {delivery_preemptions: ["delivery_not_allowed"]},
+    {normal_delivery_allowed: true},
+  ]) {
+    assert.equal(qualifyActionSelection({...request, ...patch}).inline_reentry_allowed, undefined);
+  }
+});
+
 test("pending selection rejects a Todo absent from the current eligible set", () => {
   assert.deepEqual(qualifyActionSelection({
     schema_version: ACTION_SELECTION_QUALIFICATION_REQUEST_SCHEMA_VERSION,
@@ -410,6 +489,7 @@ test("retained explicit selection cannot be replaced by a projected default", ()
     disposition: "preserve_retained_todo",
     retained_todo_id: "todo_explicit001",
     projected_todo_id: "todo_explicit001",
+    clear_fields: ["action_portfolio"],
   });
 
   assert.deepEqual(reconcileRetainedActionSelection({
@@ -422,6 +502,7 @@ test("retained explicit selection cannot be replaced by a projected default", ()
     projected_todo_id: "todo_recommended001",
     replan_obligation_id: "replan-0123456789abcdef",
     continuation: "fresh_turn_after_replan_closeout",
+    clear_fields: ["action_portfolio"],
   });
 
   assert.deepEqual(reconcileRetainedActionSelection({

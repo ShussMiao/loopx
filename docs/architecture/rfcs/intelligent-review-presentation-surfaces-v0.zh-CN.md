@@ -723,6 +723,16 @@ reviewed 路径；远端 SSH 生命周期入口仍使用其自身的绑定与读
 
 ### Stage 2：Attention 与 Disclosure Plan
 
+本地对话接收已在共用 TS presentation owner 中组合当前 blocked-transition 事实
+与具体用户请求；管家/Goal Turn 无须外部 Channel 配置即可获得证据。同一对象
+保留阻塞与决策，确需用户行动的候选优先，省略覆盖保持可见。模型结合后果、已有
+决定与安全续接解释，不照搬 adapter 模板。已有 Channel sender 现通过配置的
+管家生成通知，并跳过已被 verified gate 消息覆盖的同一阻塞版本；这不是完整
+interaction compiler 或本地通知回执；实质变化资格、已呈现/已读/恢复去重与自动唤醒仍待验收，复用
+既有 runtime/预算与投递 owner，不另建 inbox 或 scheduler。Channel renderer
+不能从生成文字推导新授权。见 [共用接收边界](goal-channel-collaboration-v0.zh-CN.md#本地管家接收与可选-channel-投递)。
+
+
 当前 Dashboard 切片：从「需要你」进入事项详情，可查看已有 Todo 投影中的原因、证据、
 目标 Todo/Agent、声明的决策范围和替代关系。只有明确的 `user_gate` 显示为需要决定；
 其他事项不从文案推断阅读或授权含义。已选详情随当前来源更新；来源已无该事项时显示
@@ -756,7 +766,9 @@ reviewed 路径；远端 SSH 生命周期入口仍使用其自身的绑定与读
 成果继续由原成果页展示，不作为验收证据导出。
 概览、任务、对话、成果作为 Goal 的直接导航，配置直接进入既有设置编辑器。
 同一 Goal/来源内保留各页筛选、已完成历史与滚动位置；交付区域直接呈现在概览，
-不作为看板/列表的第三种布局，也不经过嵌套设置弹窗。
+不作为看板/列表的第三种布局，也不经过嵌套设置弹窗。其外围的页面组合（常驻页头、
+指标、方向、按负责人的工作、成果与全部工作侧栏）属于
+[Goal 工作区 RFC](goal-workspace-surface-v0.zh-CN.md)；本区域合同不变。
 
 这是 S5/G2 的有界可见性切片，不代表 G2 资格通过或通用交互编译器完成。
 复用原有 graph、acceptance 和 preview/apply owner，不新增任务、租约、权限或

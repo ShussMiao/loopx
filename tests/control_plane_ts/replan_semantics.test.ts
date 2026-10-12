@@ -105,34 +105,44 @@ test("missing evidence or acceptance cannot manufacture a fresh path outcome", (
   }
 });
 
-test("long-chain review accepts its evidence-linked vision route and retains progress exits", () => {
-  const chain = {triggers: [{kind: "long_todo_chain"}]};
-  const projection = projectReplanSemantics({operation: "requirements", obligation: chain});
-  assert.match(String(projection.cli_semantic_args), /--agent-vision-json/);
-  assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
-    agent_vision: vision}).accepted, true);
-  for (const outcome of ["new_surface", "new_hypothesis", "new_probe_family", "new_runnable_successor"]) {
+for (const reviewKind of ["long_todo_chain", "periodic_review_due"]) {
+  test(`${reviewKind} accepts its evidence-linked vision route and retains progress exits`, () => {
+    const chain = {triggers: [{kind: reviewKind}]};
+    const projection = projectReplanSemantics({operation: "requirements", obligation: chain});
+    assert.match(String(projection.cli_semantic_args), /--agent-vision-json/);
     assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
-      observation_delta: {delta_kinds: [outcome]}}).accepted, true);
-  }
-  for (const incomplete of [{vision_patch: vision.vision_patch},
-    {...vision, path_delta: {outcome: "replan", evidence_refs: []}},
-    {...vision, vision_patch: {}}, {...vision, path_delta: {outcome: "wait", evidence_refs: ["evidence"]}}]) {
+      agent_vision: vision}).accepted, true);
+    // Reusing applicable work evidence can keep the route without inventing
+    // another probe or Todo; a current evidence-linked decision is still needed.
     assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
-      agent_vision: incomplete}).accepted, false);
-  }
-  // A stricter source, mixed vision duty or unrelated trigger keeps its policy.
-  for (const restricted of [
-    {...chain, satisfying_semantic_outcomes: ["new_runnable_successor"]},
-    {triggers: [{kind: "typed_progress_repeat", text: "long_todo_chain"}]},
-  ]) {
-    assert.equal(projectReplanSemantics({operation: "qualify", obligation: restricted,
-      agent_vision: vision}).accepted, false);
-  }
-  assert.equal(projectReplanSemantics({operation: "qualify",
-    obligation: {triggers: [...chain.triggers, ...obligation.triggers]},
-    observation_delta: {delta_kinds: ["new_surface"]}}).accepted, false);
-});
+      agent_vision: {...vision, path_delta: {...vision.path_delta, outcome: "no_change"}},
+      observation_delta: {delta_kinds: [], evidence_novel: false}}).accepted, true);
+    assert.match(String((projection.writeback_contract as JsonObject).rule), /First reuse observed evidence valid for current source\/acceptance/);
+    for (const outcome of ["new_surface", "new_hypothesis", "new_probe_family", "new_runnable_successor"]) {
+      assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
+        observation_delta: {delta_kinds: [outcome]}}).accepted, true);
+    }
+    for (const incomplete of [{vision_patch: vision.vision_patch},
+      {...vision, path_delta: {outcome: "replan", evidence_refs: []}},
+      {...vision, vision_patch: {}}, {...vision, path_delta: {outcome: "wait", evidence_refs: ["evidence"]}}]) {
+      assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
+        agent_vision: incomplete}).accepted, false);
+    }
+    // A stricter source, mixed vision duty or unrelated trigger keeps its policy.
+    for (const restricted of [
+      {...chain, satisfying_semantic_outcomes: ["new_runnable_successor"]},
+      {triggers: [...chain.triggers, {kind: "goal_acceptance_unbound"}]},
+      {triggers: [{kind: "typed_progress_repeat", text: reviewKind}]},
+    ]) {
+      assert.equal(projectReplanSemantics({operation: "qualify", obligation: restricted,
+        agent_vision: vision}).accepted, false);
+    }
+    assert.equal(projectReplanSemantics({operation: "qualify",
+      obligation: {triggers: [...chain.triggers, ...obligation.triggers]},
+      observation_delta: {delta_kinds: ["new_surface"]}}).accepted, false);
+  });
+
+}
 
 test("explicit outcome restriction remains authoritative; trigger prose is not", () => {
   assert.deepEqual(requiredSemanticOutcomes({satisfying_semantic_outcomes: ["new_runnable_successor", "new_runnable_successor"]}), ["new_runnable_successor"]);
@@ -223,6 +233,25 @@ test("external progress review: renamed identifiers discharge only behind new ev
   assert.equal(qualify({delta_kinds: ["new_hypothesis"], evidence_novel: false}, vision).accepted, true);
 });
 
+test("known blockers cannot discharge any replan source; independent vision evidence can", () => {
+  for (const kind of ["vision_acceptance_gap", "typed_progress_repeat", "external_progress_review_drift"]) {
+    const request = {operation: "qualify", obligation: {triggers: [{kind}]},
+      observation_delta: {delta_kinds: ["new_concrete_blocker"], blocker_repeated: true,
+        evidence_novel: true, observation_repeated: false}};
+    const rejected = projectReplanSemantics(request);
+    assert.equal(rejected.accepted, false, kind);
+    assert.equal(rejected.reason_code, "progress_observation_replayed", kind);
+    assert.deepEqual(rejected.outcomes, []);
+    assert.equal(projectReplanSemantics({...request,
+      observation_delta: {...request.observation_delta, blocker_repeated: false}}).accepted, true);
+    if (kind !== "typed_progress_repeat") {
+      const kept = projectReplanSemantics({...request, agent_vision: vision});
+      assert.equal(kept.accepted, true);
+      assert.deepEqual(kept.satisfying_outcomes, ["fresh_vision_path_outcome"]);
+    }
+  }
+});
+
 test("the identity rule is scoped to the external review source", () => {
   const fuse = {triggers: [{kind: "typed_progress_repeat"}]};
   assert.equal(projectReplanSemantics({operation: "qualify", obligation: fuse,
@@ -262,14 +291,135 @@ test("acceptance holds use one typed recovery policy even without a projected ou
 
 test("planning advice cannot discharge a replan or widen source-specific exits", () => {
   for (const kind of ["typed_progress_repeat", "vision_acceptance_gap", "long_todo_chain",
-    "external_progress_review_drift", "goal_acceptance_stale"]) {
+    "external_progress_review_drift", "goal_acceptance_stale", "vision_successor_required"]) {
     const source = {triggers: [{kind}]};
     const projection = projectReplanSemantics({operation: "requirements", obligation: source});
-    assert.equal((projection.planning_guidance as string[]).length, 2);
+    const guidance = projection.planning_guidance as string[];
+    assert.equal(guidance.length, 5);
+    assert.match(guidance[3], /provisional agent-created candidate rules/);
+    assert.match(guidance[3], /Do not relax frozen acceptance/);
+    assert.match(guidance[4], /Compare expected goal\/information gain with full marginal cost/);
+    assert.match(guidance[4], /executed path and current artifact/);
+    assert.match(guidance[4], /scope negative results to tested conditions/);
     const refusal = projectReplanSemantics({operation: "qualify", obligation: source,
       planning_guidance: projection.planning_guidance});
     assert.equal(refusal.accepted, false);
     assert.deepEqual(refusal.required_any_of, requiredSemanticOutcomes(source));
     assert.equal(refusal.planning_guidance, undefined);
   }
+});
+
+
+test("vision ACK freshness covers its durable run, never later gaps or unknown timestamps", () => {
+  const at = "2026-08-13T09:00:00+08:00";
+  const ack = {recorded: true, generated_at: at,
+    semantic_delta: {accepted: true, outcomes: ["fresh_vision_path_outcome"]},
+    delta_contract: {delta_kinds: ["goal_vision_patch"]}};
+  const request = {operation: "vision_ack", ack, acceptance_gaps: [{generated_at: at}]};
+  assert.equal(projectReplanSemantics(request).acknowledged, true);
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{generated_at: "2026-08-13T01:00:00Z"}]}).acknowledged, true);
+  for (const generated_at of ["2026-08-13T09:01:00+08:00", null, "invalid", "2026-08-13T09:00:00"]) {
+    assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{generated_at: at}, {generated_at}]}).acknowledged, false);
+  }
+  for (const invalid of [{recorded: false}, {generated_at: null},
+    {semantic_delta: {accepted: false, outcomes: ["fresh_vision_path_outcome"]}},
+    {semantic_delta: {accepted: true, outcomes: ["new_surface"]}},
+    {semantic_delta: {accepted: true, outcomes: []}}]) {
+    assert.equal(projectReplanSemantics({...request, ack: {...ack, ...invalid}}).acknowledged, false);
+  }
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: []}).acknowledged, false);
+  const completion = {kind: "vision_outcome_checkpoint_required",
+    source: "recent_completed_advancement_todo", completed_at: at};
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: [completion]}).acknowledged, true);
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{...completion,
+    completed_at: "2026-08-13T09:01:00+08:00"}]}).acknowledged, false);
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{completed_at: at}]}).acknowledged, false);
+});
+
+test("vision ACK compares strict calendar timestamps at microsecond precision", () => {
+  const at = "2026-08-01T00:30:00.000100Z";
+  const ack = {recorded: true, generated_at: at,
+    semantic_delta: {accepted: true, outcomes: ["fresh_vision_path_outcome"]}};
+  for (const completed of [false, true]) {
+    const gap = (timestamp: string) => completed
+      ? {kind: "vision_outcome_checkpoint_required", source: "recent_completed_advancement_todo",
+        completed_at: timestamp}
+      : {generated_at: timestamp};
+    for (const [timestamp, covered] of [
+      [at, true], ["2026-08-01T08:30:00.000100+08:00", true],
+      ["2026-08-01T00:30:00.000900Z", false], ["2026-02-30T00:00:00Z", false],
+    ] as const) {
+      assert.equal(projectReplanSemantics({operation: "vision_ack", ack,
+        acceptance_gaps: [gap(timestamp)]}).acknowledged, covered);
+    }
+    assert.equal(projectReplanSemantics({operation: "vision_ack",
+      ack: {...ack, generated_at: "2026-02-30T00:00:00Z"},
+      acceptance_gaps: [gap("2026-02-28T00:00:00Z")]}).acknowledged, false);
+  }
+});
+
+
+test("canonical no-follow-up restores only its exact admitted review and still owes Vision", () => {
+  const id = "replan-1111111111111111", agent = "synthetic-agent";
+  const row = {todo_id: "todo_original", text: "Verify independent source", status: "done", done: true,
+    task_class: "advancement_task", claimed_by: agent, last_actor_agent_id: agent,
+    completed_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:01Z",
+    completion_turn_key: "original-completion", no_followup: true, completion_continuation: "no_followup",
+    completion_recovery: "lifecycle_reentry_terminal_closeout"};
+  const original = {required: true, obligation_id: id, resolution_mode: "todo_lifecycle_settlement",
+    triggers: [{kind: "completed_advancement_without_successor", todo_id: row.todo_id,
+      completion_turn_key: row.completion_turn_key, agent_id: agent}]};
+  const candidate = {obligation: original, source_obligation: original, lifecycle_settled: true,
+    guard_recorded_at: "2026-08-01T00:00:01.123456Z", items: [row]};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true, replay_phase: "open",
+    selected_obligation_id: id, agent_id: agent, current_obligation: null, transition_candidates: [candidate]};
+  const result = projectReplanSemantics(request).obligation as JsonObject;
+  assert.equal(result.obligation_id, id);
+  assert.equal(result.resolution_mode, "receipt_bound_replan_settlement");
+  assert.deepEqual(result.todo_actions, []);
+  const packet = result.settlement_action_packet as JsonObject;
+  assert.equal(packet.settlement_only, true);
+  assert.equal(packet.semantic_delta, null);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: result}).accepted, false);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: result, agent_vision: vision}).accepted, true);
+  const historical = {...row, todo_id: "todo_historical", completion_turn_key: "historical-completion",
+    completed_at: "2026-07-31T23:59:00Z", updated_at: "2026-07-31T23:59:01Z"};
+  for (const items of [[historical, row], [row, historical]]) {
+    assert.equal((projectReplanSemantics({...request,
+      transition_candidates: [{...candidate, items}]}).obligation as JsonObject).obligation_id, id);
+  }
+  // A whole-second timestamp cannot prove which side of admission this row
+  // closed on. The exact trigger/digest check still rejects the ambiguous source.
+  assert.throws(() => projectReplanSemantics({...request, transition_candidates: [{...candidate,
+    items: [row, {...historical, updated_at: row.updated_at}]}]}), /identity conflicts/);
+  for (const change of [{status: "open"}, {done: false}, {claimed_by: "peer"}, {last_actor_agent_id: "peer"},
+    {no_followup: false}, {completion_continuation: "active_goal"}, {completion_recovery: null},
+    {completion_turn_key: "changed"}, {completed_at: "2026-08-01T00:00:02Z"},
+    {successor_todo_ids: ["todo_new"]}, {archive_state: "archived"},
+    {updated_at: "2026-08-01T00:00:00Z"}, {updated_at: "2026-02-30T00:00:02Z"}, {updated_at: null}]) {
+    assert.throws(() => projectReplanSemantics({...request,
+      transition_candidates: [{...candidate, items: [{...row, ...change}]}]}), /identity conflicts/);
+  }
+  assert.throws(() => projectReplanSemantics({...request, guard_scoped: false}), /identity conflicts/);
+  assert.throws(() => projectReplanSemantics({...request,
+    selected_obligation_id: "replan-2222222222222222"}), /identity conflicts/);
+});
+
+test("lifecycle reconstruction restores completion order before its trigger bound", () => {
+  const agent = "synthetic-agent";
+  const rows = [1, 2, 3, 4].map(index => ({todo_id: `todo_${index}`, index,
+    status: "done", done: true, task_class: "advancement_task", claimed_by: agent,
+    last_actor_agent_id: agent, completed_at: `2026-08-01T00:00:0${index}Z`,
+    updated_at: "2026-08-01T00:00:10Z", completion_turn_key: `completion-${index}`,
+    no_followup: true, completion_continuation: "no_followup",
+    completion_recovery: "lifecycle_reentry_terminal_closeout"}));
+  const facts = projectReplanSemantics({operation: "lifecycle_source", agent_id: agent,
+    guard_recorded_at: "2026-08-01T00:00:05Z", items: rows});
+  assert.deepEqual((facts.items as JsonObject[]).map(item => item.todo_id),
+    ["todo_4", "todo_3", "todo_2", "todo_1"]);
+  assert.equal(facts.settled, true);
+  const ties = rows.map(item => ({...item, completed_at: "2026-08-01T00:00:01Z"}));
+  assert.deepEqual((projectReplanSemantics({operation: "lifecycle_source", agent_id: agent,
+    guard_recorded_at: "2026-08-01T00:00:05Z", items: ties}).items as JsonObject[])
+    .map(item => item.todo_id), ["todo_4", "todo_3", "todo_2", "todo_1"]);
 });

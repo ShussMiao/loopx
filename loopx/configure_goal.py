@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .agent_registry import normalize_registered_agents
+from .agent_registry import normalize_registered_agents, registered_agent_ids_for_goal
 from .boundary_authority import (
     build_checkpointed_boundary_authority_entry,
     checkpointed_boundary_authority_summary,
@@ -18,6 +18,7 @@ from .boundary_authority import (
 from .capabilities.pr_review_queue import goal_configuration as pr_review_config
 from .capabilities.change_quality import goal_configuration as change_quality_config
 from .capabilities.progress_review import goal_configuration as progress_review_config
+from .capabilities.goal_capability_organization import goal_configuration as improvement_config
 from .capabilities.change_quality.policy import change_quality_goal_policy_summary
 from .capabilities.machine_configuration.builtins import (
     builtin_machine_inheritable_goal_overrides,
@@ -48,7 +49,7 @@ from .control_plane.agents.runtime_model import (
 )
 from .control_plane.agents.supervisor import normalize_peer_supervisor
 from .control_plane.agents.work_mode import normalize_agent_work_modes
-from .control_plane.coordination import runtime_shadow as shadow
+from .control_plane.coordination import configuration as shadow
 from .control_plane.coordination.configuration import normalize_goal_write_scope
 from .control_plane.operator_inbox_binding import local_private_config_digest
 from .control_plane.projects.registry_codec import (
@@ -65,7 +66,7 @@ from .execution_profile import (
     apply_goal_execution_profile_change,
     compact_execution_profile,
 )
-from .explore_graph import compact_explore_graph_policy
+from .explore_graph import compact_explore_graph_policy, explore_configuration, plan_explore_configuration
 from .orchestration import (
     EXPLORE_HARNESS_PROFILES,
     MULTI_SUBAGENT_ORCHESTRATION_MODE,
@@ -245,9 +246,7 @@ def _settings_summary(goal: dict[str, Any]) -> dict[str, Any]:
         goal.get("coordination") if isinstance(goal.get("coordination"), dict) else {}
     )
     agent_model = agent_runtime_model_for_goal(goal)
-    registered_agents = normalize_registered_agents(
-        coordination.get("registered_agents")
-    )
+    registered_agents = registered_agent_ids_for_goal(goal)
     summary = {
         "execution_profile": compact_execution_profile(goal.get("execution_profile")),
         "quota": {
@@ -263,7 +262,8 @@ def _settings_summary(goal: dict[str, Any]) -> dict[str, Any]:
         "pull_request_review": pr_review_config.configuration_summary(goal),
         "change_quality_qualification": change_quality_goal_policy_summary(goal),
         "progress_review": progress_review_config.configuration_summary(goal),
-        "explore_graph": compact_explore_graph_policy(goal.get("explore_graph")),
+        "goal_capability_organization": improvement_config.configuration_summary(goal),
+        "explore_graph": compact_explore_graph_policy(goal.get("explore_graph"), orchestration.get("explore_harness")),
         "orchestration": orchestration,
         "waiting_on": goal.get("waiting_on"),
         "write_scope": normalize_goal_write_scope(coordination.get("write_scope") or [])
@@ -437,12 +437,15 @@ def configure_goal(
     quota_window_hours: float | None = None,
     execution_turn_granularity: str | None = None,
     execution_replan_after_todos: int | None = None,
+    execution_replan_after_turns: int | None = None,
+    clear_execution_replan_after_turns: bool = False,
     clear_execution_replan_after_todos: bool = False,
     self_repair_enabled: bool | None = None,
     self_repair_health: bool | None = None,
     self_repair_waiting_projection: bool | None = None,
     periodic_report_configuration: Mapping[str, Any] | None = None, clear_periodic_report_configuration: bool = False,
     pull_request_review_configuration: Mapping[str, Any] | None = None,
+    pull_request_review_agent_orders: Mapping[str, str | None] | None = None,
     clear_pull_request_review_configuration: bool = False,
     change_quality_enabled: bool | None = None,
     change_quality_safe_fix: bool | None = None,
@@ -453,6 +456,8 @@ def configure_goal(
     progress_review_drift_threshold: int | None = None,
     progress_review_contract_revision: str | None = None,
     clear_progress_review_configuration: bool = False,
+    capability_improvement_configuration: Mapping[str, Any] | None = None,
+    clear_capability_improvement_configuration: bool = False,
     multi_subagent_feature: str | None = None,
     orchestration_mode: str | None = None,
     spawn_allowed: bool | None = None,
@@ -468,6 +473,7 @@ def configure_goal(
     explore_harness_profile: str | None = None,
     clear_explore_harness_profile: bool = False,
     explore_graph_enabled: bool | None = None,
+    explore_mode: str | None = None,
     registered_agents: list[str] | None = None,
     clear_registered_agents: bool = False,
     peer_task_coordinator: str | None = None,
@@ -819,6 +825,8 @@ def configure_goal(
         goal,
         turn_granularity=execution_turn_granularity,
         replan_after_completed_todos=execution_replan_after_todos,
+        replan_after_effective_turns=execution_replan_after_turns,
+        clear_replan_after_effective_turns=clear_execution_replan_after_turns,
         clear_replan_after_completed_todos=clear_execution_replan_after_todos,
     )
     legacy_hierarchy_before = legacy_agent_hierarchy_present(before_goal)
@@ -891,9 +899,9 @@ def configure_goal(
             )
         control_plane["self_repair"] = self_repair
     periodic_report_config.apply_change(goal, periodic_report_change)
-    pr_review_config.apply_change(goal, pull_request_review_configuration, clear=clear_pull_request_review_configuration)
     change_quality_config.apply_change(goal, change_quality_change)
     progress_review_config.apply_change(goal, progress_review_change)
+    improvement_config.apply_change(goal, capability_improvement_configuration, clear=clear_capability_improvement_configuration)
     if (
         issue_fix_reviewer_notification_config is not None
         or clear_issue_fix_reviewer_notification_config
@@ -960,7 +968,16 @@ def configure_goal(
 
     apply_reward_memory_goal_configuration(goal, reward_memory_plan)
 
-    if explore_graph_enabled is not None:
+    if any(value is not None for value in (explore_mode, explore_graph_enabled, explore_harness_enabled)):
+        existing_harness = (goal.get("spawn_policy") or {}).get("explore_harness")
+        explore_plan = plan_explore_configuration(
+            explore_configuration(goal.get("explore_graph"), existing_harness),
+            {"mode": explore_mode, "evidence_enabled": explore_graph_enabled,
+             "planning_enabled": explore_harness_enabled},
+        )
+        explore_graph_enabled = explore_plan["evidence_enabled"]
+        if explore_mode is not None or explore_harness_enabled is not None or existing_harness:
+            explore_harness_enabled = explore_plan["planning_enabled"]
         goal["explore_graph"] = {"enabled": explore_graph_enabled}
 
     if (
@@ -1247,6 +1264,9 @@ def configure_goal(
 
     shadow.apply_coordination_shadow_changes(
         goal, local_authority_shadow_file, clear_local_authority_shadow, coordination_runtime_shadow_file, clear_coordination_runtime_shadow)
+    pr_review_config.apply_change(goal, pull_request_review_configuration, clear=clear_pull_request_review_configuration,
+                                 agent_order_updates=pull_request_review_agent_orders,
+                                 reconcile_registered_agents=registered_agents is not None or clear_registered_agents)
     after = _settings_summary(goal)
     changed_fields = _changed_fields(before, after)
     if goal != before_goal and not changed_fields:
@@ -1299,6 +1319,7 @@ def configure_goal(
         "pull_request_review": pr_review_config.configuration_summary(goal),
         "change_quality_qualification": change_quality_goal_policy_summary(goal),
         "progress_review": progress_review_config.configuration_summary(goal),
+        "goal_capability_organization": improvement_config.configuration_summary(goal),
         "default": "off",
         "configuration_entry": "multi_subagent_feature",
     }

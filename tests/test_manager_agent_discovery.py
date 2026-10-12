@@ -58,6 +58,56 @@ def test_audience_scope_is_distinct_from_sender_delivery_and_cannot_leak(tmp_pat
     assert reader.read(TOOL_NAME, {"view": "agents", "goal_id": "private"})["error"] == "goal_outside_available_scope"
 
 
+def test_repeated_roles_expose_scoped_binding_context_without_host_access(tmp_path, monkeypatch):
+    registry, reader, records = setup(tmp_path, owner=False, scope=lambda: ["research", "new-work"])
+    data = json.loads(registry.read_text())
+    data["goals"][0]["coordination"] = {
+        "registered_agents": ["operations"],
+        "agent_profiles": {"operations": {"scope_summary": "Existing project operations"}},
+        "thread_agent_bindings": [{"agent_id": "operations", "host_surface": "codex-app",
+                                   "thread_id": "private-host-address"}],
+    }
+    data["goals"].append({"id": "new-work", "registered_agents": ["operations"]})
+    registry.write_text(json.dumps(data))
+
+    def no_host_access(*args, **kwargs):
+        raise AssertionError("directory must not read host stores")
+
+    monkeypatch.setattr("loopx.control_plane.collaboration.peer_host_route.codex_thread_observers", no_host_access)
+    result = reader.read(TOOL_NAME, {"view": "agents", "query": "operations"})
+    assert result["matched"] == 2
+    rows = {row["goal_id"]: row for row in result["rows"]}
+    assert rows["research"]["registered_host_binding"] == {
+        "outcome": "single_candidate", "candidate_count": 1,
+        "address_shared": False, "scope": "goals_supplied",
+    }
+    assert rows["new-work"]["registered_host_binding"]["outcome"] == "no_candidate"
+    assert rows["new-work"]["registered_host_binding"]["candidate_count"] == 0
+    assert all(row["execution_readiness"] == "not_checked" for row in rows.values())
+    assert all(row["context_delivery"] == "not_granted" for row in rows.values())
+    assert "private-host-address" not in json.dumps(result)
+    assert "hidden-worker" not in json.dumps(result)
+    assert records == [result]
+    assert not (tmp_path / "manager-context").exists()
+
+
+def test_directory_binding_summary_keeps_multiple_and_shared_addresses(tmp_path):
+    registry, reader, _ = setup(tmp_path)
+    data = json.loads(registry.read_text())
+    data["goals"][0]["coordination"]["thread_agent_bindings"] = [
+        {"agent_id": agent, "host_surface": "codex-app", "thread_id": thread}
+        for agent, thread in [("worker-00", "shared"), ("worker-34", "shared"),
+                              ("worker-34", "alternative")]
+    ]
+    registry.write_text(json.dumps(data))
+    page = reader.read(TOOL_NAME, {"view": "agents", "query": "worker-34"})
+    assert page["rows"][0]["registered_host_binding"] == {
+        "outcome": "multiple_candidates", "candidate_count": 2,
+        "address_shared": True, "scope": "goals_supplied",
+    }
+    assert page["rows"][0]["execution_readiness"] == "not_checked"
+
+
 def test_stopped_is_historical_not_a_delivery_target(tmp_path):
     _, reader, _ = setup(tmp_path)
     assert reader.read(TOOL_NAME, {"view": "agents", "query": "old-worker"})["matched"] == 0
@@ -116,3 +166,99 @@ def test_real_cli_export_reaches_owner_beyond_old_caps_without_a_live_provider(t
     assert [r["agent_id"] for r in page["rows"]] == ["worker-34"]
     assert page["rows"][0]["context_delivery"] == "not_checked"
     assert not (tmp_path / "runtime" / "chat").exists()
+
+
+@pytest.mark.parametrize("tool", [TOOL_NAME, "loopx_context_read"])
+@pytest.mark.parametrize("source_failure", ["missing", "malformed", "invalid_inventory"])
+def test_conversation_resolves_existing_peer_from_real_read_only_host_store(tmp_path, monkeypatch, tool, source_failure):
+    import sqlite3
+
+    registry, reader, records = setup(tmp_path, owner=False)
+    content = json.loads(registry.read_text())
+    content["goals"][0]["coordination"]["thread_agent_bindings"] = [
+        {"agent_id": "worker-34", "host_surface": "codex-app", "thread_id": name}
+        for name in ("old", "current")
+    ]
+    registry.write_text(json.dumps(content))
+    home = tmp_path / "host"
+    home.mkdir()
+    rollout = home / "current.jsonl"
+    rollout.write_text(json.dumps({"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+        "payload": {"type": "task_complete"}}) + "\n")
+    db = home / "state_5.sqlite"
+    with sqlite3.connect(db) as connection:
+        connection.execute("CREATE TABLE threads(id TEXT, rollout_path TEXT, archived INTEGER)")
+        connection.executemany("INSERT INTO threads VALUES(?,?,?)", [("old", "", 1), ("current", str(rollout), 0)])
+    monkeypatch.setenv("LOOPX_CODEX_HOMES", str(home))
+    before = [p.read_bytes() for p in (registry, db, rollout)]
+    result = reader.read(tool, {"view": "agent_route", "goal_id": "research", "agent_id": "worker-34"})
+    assert result["status"] == "resolved"
+    assert result["selected_route"] == {"host_surface": "codex-app", "thread_id": "current"}
+    assert result["host_observation"]["state"] == "idle"
+    assert result["host_delivery"] == "not_attempted" and result["authority"] == "locator_only"
+    assert records == [result]
+    assert before == [p.read_bytes() for p in (registry, db, rollout)]
+    assert not (tmp_path / "manager-context").exists()
+    if source_failure == "missing":
+        registry.unlink()
+    else:
+        registry.write_text("{" if source_failure == "malformed" else '{"goals": null}')
+    unavailable = reader.read(tool, {"view": "agent_route", "goal_id": "research", "agent_id": "worker-34"})
+    assert unavailable["ok"] is False and unavailable["unknown"] is True
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["reason"] == "agent_inventory_unavailable"
+    assert unavailable["candidate_count"] is None and unavailable["selected_route"] is None
+    assert unavailable["host_delivery"] == "not_attempted" and unavailable["authority"] == "locator_only"
+    assert reader.read(tool, {"view": "agents"})["unknown"] is True
+    registry.write_bytes(before[0])
+    recovered = reader.read(tool, {"view": "agent_route", "goal_id": "research", "agent_id": "worker-34"})
+    assert recovered["status"] == "resolved" and recovered["selected_route"] == result["selected_route"]
+    assert before == [p.read_bytes() for p in (registry, db, rollout)]
+    with sqlite3.connect(db) as connection:
+        connection.execute("UPDATE threads SET archived=0 WHERE id='old'")
+    ambiguous = reader.read(tool, {"view": "agent_route", "goal_id": "research", "agent_id": "worker-34"})
+    # Missing rollout evidence is unknown, not permission to discard the old binding.
+    assert ambiguous["status"] == "ambiguous" and ambiguous["selected_route"] is None
+    exact = reader.read(tool, {"view": "agent_route", "goal_id": "research", "agent_id": "worker-34",
+                               "thread_link": "codex://threads/current"})
+    assert exact["status"] == "resolved" and exact["selected_route"]["thread_id"] == "current"
+    assert exact["host_delivery"] == "not_attempted"
+
+
+def test_route_read_obeys_live_audience_scope_before_observing_host(tmp_path, monkeypatch):
+    _, reader, records = setup(tmp_path, owner=False)
+    def forbidden(*args, **kwargs):
+        pytest.fail("out-of-scope host must not be observed")
+    monkeypatch.setattr("loopx.control_plane.collaboration.peer_host_route.resolve_peer_host_route", forbidden)
+    result = reader.read(TOOL_NAME, {"view": "agent_route", "goal_id": "private", "agent_id": "hidden-worker"})
+    assert result["error"] == "goal_outside_available_scope"
+    assert not records
+
+
+def test_route_read_discards_evidence_after_scope_revocation(tmp_path):
+    checks = iter([True, False])
+    _, reader, records = setup(tmp_path, owner=False, valid=lambda: next(checks))
+    assert reader.read(TOOL_NAME, {"view": "agent_route", "goal_id": "research", "agent_id": "worker-34"}) == {
+        "ok": False, "error": "authorization_changed"}
+    assert not records
+
+
+@pytest.mark.parametrize("arguments", [
+    {"view": "agent_route", "agent_id": "worker-34"},
+    {"view": "agent_route", "goal_id": "research"},
+    {"view": "agents", "agent_id": "worker-34"},
+    {"view": "agents", "thread_link": "codex://threads/current"},
+])
+def test_invalid_route_read_is_repairable_and_effect_free(tmp_path, arguments):
+    _, reader, records = setup(tmp_path)
+    result = reader.read(TOOL_NAME, arguments)
+    assert result["error"] == "invalid_arguments" and result["rejected_arguments"]
+    assert not records
+
+
+def test_remote_route_read_does_not_silently_inspect_local_host(tmp_path):
+    _, reader, records = setup(tmp_path)
+    result = reader.read(TOOL_NAME, {"view": "agent_route", "source_id": "ssh:remote",
+        "goal_id": "research", "agent_id": "worker-34"})
+    assert result["error"] == "remote_agent_route_not_supported"
+    assert not records

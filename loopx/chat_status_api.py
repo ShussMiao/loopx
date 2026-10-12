@@ -11,19 +11,65 @@ from urllib.parse import parse_qs, urlparse
 from .chat import redact_local_paths
 from .chat_goal_subagent_api import goal_subagent_configuration_enabled
 from .chat_workspace_directory import workspace_goal_directory
-from .codex_app_thread_activity import codex_thread_observers
-from .control_plane.agents.host_thread_activity import attach_host_thread_activity
+from .codex_app_thread_activity import (
+    codex_delivery_expectations,
+    codex_thread_observers,
+)
+from .control_plane.agents.host_thread_activity import (
+    attach_host_delivery_windows,
+    attach_host_thread_activity,
+)
 from .control_plane.effect_runtime import (
     EffectRuntimePermanentIOError,
     EffectRuntimeRemoteError,
     EffectRuntimeStartupError,
 )
-from .control_plane.runtime.public_safety import validate_public_safe_value
+from .control_plane.runtime.public_safety import (
+    public_safe_compact_text,
+    validate_public_safe_value,
+)
+from .control_plane.todos.contract import (
+    TODO_STATUS_OPEN,
+    TODO_TASK_CLASS_MONITOR,
+    normalize_todo_status,
+    todo_done_for_status,
+)
+from .control_plane.work_items.task_graph import build_goal_task_map
 from .feedback import validate_goal_id
 from .history import load_registry
 from .registry import registry_goals
 from .status import collect_status
-from .status_server import parse_goal_activation_filter
+from .status_server import (
+    DEFAULT_EXTENSION_PRESENTATION_SURFACES_PATH,
+    DEFAULT_EXTENSION_PROJECTION_PATH,
+    ExtensionPresentationRequestMixin,
+    parse_goal_activation_filter,
+)
+from .control_plane.todos.list_readback import list_goal_todos
+
+
+def _goal_task_map(server: Any, goal_id: str) -> dict[str, Any] | None:
+    runtime_root = server.runtime_root_override
+    try:
+        listed = list_goal_todos(
+            registry_path=server.registry_path,
+            goal_id=goal_id,
+            runtime_root_arg=str(runtime_root) if runtime_root else None,
+        )
+    except (OSError, ValueError):
+        # An unreadable Todo source leaves the rest of the review usable.
+        return None
+    todos = [row for row in listed.get("todos") or [] if isinstance(row, dict)]
+    return build_goal_task_map(
+        goal_id=goal_id,
+        todos=todos,
+        source_truncated=int(listed.get("todo_count") or 0) > len(todos),
+        public_safe_compact_text=public_safe_compact_text,
+        normalize_todo_status=normalize_todo_status,
+        todo_done_for_status=todo_done_for_status,
+        todo_status_open=TODO_STATUS_OPEN,
+        monitor_task_class=TODO_TASK_CLASS_MONITOR,
+    )
 
 
 def _status_access_denied(error: BaseException) -> bool:
@@ -63,7 +109,7 @@ def _status_access_denied(error: BaseException) -> bool:
     return False
 
 
-class ChatStatusRequestMixin:
+class ChatStatusRequestMixin(ExtensionPresentationRequestMixin):
     """Serve the full dashboard status contract through the Chat origin."""
 
     server: Any
@@ -147,8 +193,19 @@ class ChatStatusRequestMixin:
                     "registry_revision"
                 ]
             if not delivery_review:
+                projection["local_dashboard_api"] = {
+                    **(projection.get("local_dashboard_api") or {}),
+                    "source": "chat",
+                    "status_url": "/status.json",
+                    "presentation_surfaces_url": DEFAULT_EXTENSION_PRESENTATION_SURFACES_PATH,
+                    "presentation_detail_url": DEFAULT_EXTENSION_PROJECTION_PATH,
+                }
                 attach_host_thread_activity(
                     projection, observers=codex_thread_observers()
+                )
+                attach_host_delivery_windows(
+                    projection,
+                    expectations=codex_delivery_expectations,
                 )
             if delivery_review:
                 if projection.get("ok") is not True:
@@ -163,10 +220,15 @@ class ChatStatusRequestMixin:
                     "goal_id": goal_id,
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                     "graph": item.get("task_graph_projection"),
+                    "goal_map": _goal_task_map(self.server, goal_id),
                     "acceptance": goal.get("acceptance_observation"),
                 }
                 validate_public_safe_value(projection)
-            protected_paths = [self.server.registry_path, *self.server.scan_roots]
+            protected_paths = [
+                self.server.registry_path,
+                *self.server.scan_roots,
+                self.server.runtime_root,
+            ]
             projection = json.loads(
                 redact_local_paths(
                     json.dumps(projection, ensure_ascii=False),

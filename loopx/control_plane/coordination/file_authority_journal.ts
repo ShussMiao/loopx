@@ -8,7 +8,7 @@ import {AuthorityStoreProtocolError, canonicalAuthorityBytes, canonicalAuthority
   requireAuthorityStoreId} from "./authority_store_codec.ts";
 import {decodeAuthorityTransaction, transactionForRevision,
   type JournalRevision} from "./authority_store_transactions.ts";
-import {applyAuthorityStateDelta, authorityStateCheckpointCursor, authorityStateDelta,
+import {AuthorityStateReplay, applyAuthorityStateDelta, authorityStateCheckpointCursor, authorityStateDelta,
   decodeAuthorityStateDelta, authorityStateDeltaReconstructs, isAuthorityStateCheckpoint, type AuthorityStateDelta} from "./authority_state_log.ts";
 
 export const FILE_AUTHORITY_JOURNAL_SCHEMA = "loopx_file_authority_store_v1";
@@ -88,6 +88,7 @@ export class FileAuthorityJournal {
         parseAuthorityCursor(cursor) !== BigInt(value.committed.length)) return invalid("lineage is invalid");
     const rows: StoredCommit[] = [], operations = new Set<string>();
     let previous: JsonObject | null = null, previousRevision: string | null = null;
+    let replay: AuthorityStateReplay | null = null;
     // Historical verification is CPU work inside the shared Effect server.
     // Yield between complete transactions, never publish a partially verified
     // journal. Promise.resolve() would only drain microtasks and starve sockets.
@@ -99,7 +100,16 @@ export class FileAuthorityJournal {
       }
       const {state: rawState, ...metadata} = raw;
       const state = storedState(rawState, BigInt(index + 1));
-      const transaction = decodeAuthorityTransaction({...metadata, projection: project(state, previous)});
+      if (state.kind === "checkpoint") replay = new AuthorityStateReplay(state.projection);
+      else {
+        if (replay === null) return invalid("delta has no predecessor");
+        replay.apply(state.delta);
+      }
+      // The replay owner already validates and owns the complete projection.
+      // Decode untrusted metadata, then copy the owned state without sorting
+      // every unchanged subtree again. Revision checks still cover every byte.
+      const transaction = {...decodeAuthorityTransaction({...metadata, projection: {}}),
+        projection: replay.snapshot()};
       if (parseAuthorityCursor(transaction.cursor) !== BigInt(index + 1)) return invalid("cursor lineage is invalid");
       if (operations.has(transaction.operation_id)) return invalid("operation identity is duplicated");
       if (transaction.provider_revision !== revisionFor(previousRevision, transactionForRevision(transaction))) {
@@ -121,13 +131,26 @@ export class FileAuthorityJournal {
 
   static append(current: FileAuthorityJournal | null, goal: string, identity: string,
     commit: AuthorityStoreCommit, revisionFor: JournalRevision): FileAuthorityJournal {
-    const transaction = {cursor: (parseAuthorityCursor(current?.cursor ?? null) + 1n).toString(),
-      operation_id: commit.operation_id, events: commit.events, projection: commit.next_projection,
-      receipts: commit.receipts};
-    const row = retain({...transaction,
-      provider_revision: revisionFor(current?.provider_revision ?? null, transaction)}, current?.head ?? null);
-    return new FileAuthorityJournal(goal, identity, commit.next_projection,
-      {rows: [...(current?.history.rows ?? []), row]});
+    return FileAuthorityJournal.appendCommits(current, goal, identity, [commit], revisionFor);
+  }
+
+  /** Provider checks CAS, goal/cursor binding and operation uniqueness before
+   * constructing this journal. A page keeps every logical row; construction
+   * never publishes bytes or grants archive/cutover authority. */
+  static appendCommits(current: FileAuthorityJournal | null, goal: string, identity: string,
+    commits: readonly AuthorityStoreCommit[], revisionFor: JournalRevision): FileAuthorityJournal {
+    const rows = [...(current?.history.rows ?? [])];
+    let previous = current?.head ?? null;
+    let revision = current?.provider_revision ?? null;
+    for (const commit of commits) {
+      const transaction = {cursor: (BigInt(rows.length) + 1n).toString(),
+        operation_id: commit.operation_id, events: commit.events,
+        projection: commit.next_projection, receipts: commit.receipts};
+      revision = revisionFor(revision, transaction);
+      rows.push(retain({...transaction, provider_revision: revision}, previous));
+      previous = transaction.projection;
+    }
+    return new FileAuthorityJournal(goal, identity, previous!, {rows});
   }
 
   /** Migration boundary: callers supply fully verified logical transactions.

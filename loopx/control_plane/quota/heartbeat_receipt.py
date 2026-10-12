@@ -4,7 +4,7 @@ from .effective_action import EffectiveAction
 from collections.abc import Mapping
 from pathlib import Path
 
-from ...file_lock import exclusive_file_lock
+from ...file_lock import exclusive_cross_runtime_file_lock
 from ...rollout_event_log import (
     _append_rollout_event_line,
     build_rollout_event,
@@ -27,7 +27,20 @@ def _heartbeat_receipt_events(
     goal_id: str,
     agent_id: str,
     turn_instance_id: str,
+    goal_ref: Mapping[str, object] | None,
 ) -> list[dict[str, object]]:
+    from ..goals.source_session_registry_state import exact_goal_ref
+
+    expected_goal_ref = (
+        exact_goal_ref(
+            str(goal_ref.get("goal_id") or ""),
+            str(goal_ref.get("goal_instance_id") or ""),
+        )
+        if goal_ref is not None
+        else None
+    )
+    if expected_goal_ref is not None and expected_goal_ref["goal_id"] != goal_id:
+        raise ValueError("heartbeat receipt GoalRef does not match goal_id")
     return [
         event
         for event in events
@@ -35,6 +48,11 @@ def _heartbeat_receipt_events(
         and str(event.get("goal_id") or "") == goal_id
         and str(event.get("agent_id") or "") == agent_id
         and str(event.get("run_id") or "") == turn_instance_id
+        and (
+            event.get("goal_ref") == expected_goal_ref
+            if expected_goal_ref is not None
+            else "goal_ref" not in event
+        )
     ]
 
 
@@ -154,6 +172,7 @@ def find_heartbeat_receipt(
     goal_id: str,
     agent_id: str,
     turn_instance_id: str,
+    goal_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
     events = load_rollout_events(rollout_event_log_path(runtime_root, goal_id))
     return _effective_heartbeat_receipt(
@@ -162,6 +181,7 @@ def find_heartbeat_receipt(
             goal_id=goal_id,
             agent_id=agent_id,
             turn_instance_id=turn_instance_id,
+            goal_ref=goal_ref,
         )
     )
 
@@ -172,6 +192,7 @@ def ensure_turn_heartbeat_settlement_receipt(
     *,
     semantic_replan_guard_scoped: bool,
     semantic_replan_obligation_id: str | None,
+    goal_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Idempotently bind a Turn-created quota guard to its settlement identity.
 
@@ -192,13 +213,16 @@ def ensure_turn_heartbeat_settlement_receipt(
 
     log_path = rollout_event_log_path(runtime_root, identity.goal_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive_file_lock(log_path):
+    with exclusive_cross_runtime_file_lock(
+        log_path, operation="bind_heartbeat_settlement_receipt"
+    ):
         events = load_rollout_events(log_path)
         matching = _heartbeat_receipt_events(
             events,
             goal_id=identity.goal_id,
             agent_id=identity.agent_id,
             turn_instance_id=identity.turn_instance_id,
+            goal_ref=goal_ref,
         )
         effective = _effective_heartbeat_receipt(matching)
         expected = (
@@ -261,6 +285,7 @@ def ensure_turn_heartbeat_settlement_receipt(
         receipt = build_rollout_event(
             goal_id=identity.goal_id,
             event_kind="quota_should_run",
+            goal_ref=goal_ref,
             agent_id=identity.agent_id,
             todo_id=identity.todo_id,
             run_id=identity.turn_instance_id,
@@ -282,6 +307,7 @@ def retain_pending_heartbeat_action_selection(
     turn_instance_id: str,
     todo_id: str,
     reason: str,
+    goal_ref: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Append an identity-less revision retaining one explicit Todo choice.
 
@@ -299,13 +325,16 @@ def retain_pending_heartbeat_action_selection(
     normalized_reason = str(reason or "current_delivery_gate").strip()
     log_path = rollout_event_log_path(runtime_root, goal_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive_file_lock(log_path):
+    with exclusive_cross_runtime_file_lock(
+        log_path, operation="retain_heartbeat_action_selection"
+    ):
         events = load_rollout_events(log_path)
         matching = _heartbeat_receipt_events(
             events,
             goal_id=goal_id,
             agent_id=agent_id,
             turn_instance_id=turn_instance_id,
+            goal_ref=goal_ref,
         )
         effective = _effective_heartbeat_receipt(matching)
         if effective is None:
@@ -341,6 +370,7 @@ def retain_pending_heartbeat_action_selection(
         retained = build_rollout_event(
             goal_id=goal_id,
             event_kind="quota_should_run",
+            goal_ref=goal_ref,
             agent_id=agent_id,
             run_id=turn_instance_id,
             status="action_selection_deferred",
@@ -368,6 +398,7 @@ def upgrade_identityless_heartbeat_receipt(
     status: str,
     summary: str,
     details: Mapping[str, object],
+    goal_ref: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], bool]:
     """Append one settlement-bound receipt after an identity-less same-turn guard.
 
@@ -407,13 +438,16 @@ def upgrade_identityless_heartbeat_receipt(
 
     log_path = rollout_event_log_path(runtime_root, goal_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive_file_lock(log_path):
+    with exclusive_cross_runtime_file_lock(
+        log_path, operation="upgrade_heartbeat_receipt_identity"
+    ):
         events = load_rollout_events(log_path)
         matching = _heartbeat_receipt_events(
             events,
             goal_id=goal_id,
             agent_id=agent_id,
             turn_instance_id=turn_instance_id,
+            goal_ref=goal_ref,
         )
         effective = _effective_heartbeat_receipt(matching)
         if effective is None:
@@ -467,6 +501,7 @@ def upgrade_identityless_heartbeat_receipt(
         corrected = build_rollout_event(
             goal_id=goal_id,
             event_kind="quota_should_run",
+            goal_ref=goal_ref,
             agent_id=agent_id,
             todo_id=normalized_todo_id or None,
             run_id=turn_instance_id,
@@ -475,6 +510,56 @@ def upgrade_identityless_heartbeat_receipt(
             source_event_id=source_event_id,
             caused_by=source_event_id,
             details=corrected_details,
+        )
+        _append_rollout_event_line(log_path, corrected)
+        return corrected, True
+
+
+def requalify_bound_heartbeat_receipt(
+    runtime_root: Path,
+    *,
+    goal_id: str,
+    agent_id: str,
+    turn_instance_id: str,
+    todo_id: str | None,
+    replan_obligation_id: str | None,
+    status: str,
+    details: dict[str, object],
+    registry_path: Path | None,
+    goal_ref: Mapping[str, object] | None,
+) -> tuple[dict[str, object], bool]:
+    """Transport current guard facts; TS owns same-binding work qualification."""
+    from .settlement import read_heartbeat_settlement
+
+    log_path = rollout_event_log_path(runtime_root, goal_id)
+    with exclusive_cross_runtime_file_lock(log_path, operation="requalify_heartbeat_work"):
+        original = _effective_heartbeat_receipt(_heartbeat_receipt_events(
+            load_rollout_events(log_path), goal_id=goal_id, agent_id=agent_id,
+            turn_instance_id=turn_instance_id, goal_ref=goal_ref,
+        ))
+        readback = read_heartbeat_settlement(
+            runtime_root, goal_id=goal_id, agent_id=agent_id, todo_id=todo_id,
+            turn_instance_id=turn_instance_id, replan_obligation_id=replan_obligation_id,
+            registry_path=registry_path, goal_ref=goal_ref, heartbeat_reentry_guard=details,
+        )
+        if original is None or readback is None or readback.identity.value is None:
+            raise ValueError("work requalification requires the original admitted settlement identity")
+        if readback.heartbeat_receipt is None or readback.heartbeat_receipt.get("event_id") != original.get("event_id"):
+            raise ValueError("work requalification receipt readback changed")
+        qualification = readback.heartbeat_reentry_qualification
+        if not isinstance(qualification, Mapping) or not isinstance(qualification.get("append"), bool):
+            raise RuntimeError("TypeScript heartbeat work qualification shape mismatch")
+        if not qualification["append"]:
+            return original, False
+        qualified_details = qualification.get("details")
+        if not isinstance(qualified_details, Mapping):
+            raise RuntimeError("TypeScript heartbeat work qualification details missing")
+        event_id = str(original.get("event_id") or "")
+        corrected = build_rollout_event(
+            goal_id=goal_id, goal_ref=goal_ref, event_kind="quota_should_run",
+            agent_id=agent_id, todo_id=todo_id, run_id=turn_instance_id, status=status,
+            summary="same-Turn work admission requalified without rebinding",
+            source_event_id=event_id, caused_by=event_id, details=dict(qualified_details),
         )
         _append_rollout_event_line(log_path, corrected)
         return corrected, True

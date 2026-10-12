@@ -188,6 +188,36 @@ field or inspecting its value. String keys are classified after case, separator,
 and camelCase normalization; converting a non-string key with `str()` is not a
 safe substitute for a field name.
 
+The typed public-export gate also rejects home-relative references, explicit
+`path:` local references, historical colon/equal-prefixed local references and
+`file://` URLs (including host-qualified and case-insensitive forms), in both
+keys and recursively nested values. It consumes
+`find_public_safe_local_path` from the shared text owner. Ordinary HTTP(S)
+links, other remote URIs and repository-relative references remain subject to
+their destination's existing rules; they are not generically private.
+
+This policy applies to the existing typed-export callers:
+
+| Destination | Behavior at the boundary |
+| --- | --- |
+| Goal lifecycle and acceptance projections | Omit unsafe labels and evidence references before compaction; preserve private source records. |
+| Goal notices, attention and delivery review | Reject unsafe facts or synthesized output, or use the caller's existing fallback. |
+| Research observations and diagnostic envelopes | Reject unsafe structured observations. |
+| Peer routing, child task packets and native-child receipts | Reject unsafe candidates, references and packet fields. |
+| Team plans, governed transition receipts, lane settlements and previews | Reject unsafe public payloads before admission/publication. |
+| Extension capability requests and results | Reject unsafe provider payloads at the existing admission boundary. |
+
+Decision-context packets and material-lifecycle fields already rejected file
+URLs. They now report their field-specific local-path error instead of a raw-URL
+error; their length limits and rejection verdicts remain unchanged. Historical
+absolute-path diagnostics at the typed export gate also remain unchanged.
+
+This is a destination-specific migration under #5136. The internal text-owner
+category policies, TypeScript Vision checkpoint, generic
+`public_safe_compact_text` helper and presentation redactor are unchanged;
+using that compactor alone is not proof that a payload passed the typed export
+gate. Other caller migrations remain separate work.
+
 ## Sub-Agent Data
 
 Sub-agent orchestration increases leakage risk because child prompts often
@@ -218,7 +248,8 @@ The project repo should answer: "What is this specific goal currently doing?"
 The runtime root should answer: "What happened in recent goal ticks?"
 
 Real controller state belongs in ignored local files such as
-`.codex/goals/<goal-id>/ACTIVE_GOAL_STATE.md`,
+`.loopx/goals/<goal-id>/ACTIVE_GOAL_STATE.md`,
+legacy `.codex/goals/<goal-id>/ACTIVE_GOAL_STATE.md`,
 `.local/goals/<goal-id>/ACTIVE_GOAL_STATE.md`, or the shared runtime root. A
 public repository may track sanitized templates, fixtures, and compact
 projections, but not the live file that a controller updates on every turn.

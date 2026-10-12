@@ -13,6 +13,7 @@ from typing import Any
 
 from .agent_registry import registered_agent_ids_for_goal
 from .control_plane.goals.activation import goal_activation_state
+from .control_plane.goals.goal_ref_validation import exact_goal_ref
 from .control_plane.quota.should_run import build_quota_should_run
 from .global_todos import _classify_goal_todos
 from .history import decode_registry_snapshot
@@ -61,6 +62,18 @@ def _identity(value: object) -> str | None:
         and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", value)
         else None
     )
+
+
+def _goal_instance_id(goal: dict[str, Any]) -> str | None:
+    if "goal_instance_id" not in goal:
+        return None
+    try:
+        return exact_goal_ref(
+            str(goal.get("id") or ""),
+            str(goal.get("goal_instance_id") or ""),
+        )["goal_instance_id"]
+    except ValueError:
+        return None
 
 
 def lifecycle_readback_unavailable(goal_id: str, reason: str) -> dict[str, Any]:
@@ -135,6 +148,7 @@ def _read_goal(
     now: datetime,
     max_age_hours: float,
     include_goal_lifecycle: bool = False,
+    include_goal_attention: bool = False,
     shared_status: dict[str, Any] | None = None,
     source_versions_before: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
@@ -155,6 +169,8 @@ def _read_goal(
             "observed_at": now.isoformat(),
         },
     }
+    if include_goal_attention:
+        row["attention"] = {"status": "unavailable", "items": [], "reason": "goal_not_read"}
     if include_goal_lifecycle:
         # Every Goal this reader attempted answers the lifecycle question, so a
         # failed or ambiguous source is named here instead of surfacing as
@@ -176,6 +192,11 @@ def _read_goal(
                 include_public_boundary_scan=False,
             )
         )
+        if include_goal_attention:
+            from .capabilities.manager_context.goal_attention import read_goal_attention
+
+            initial_quota = build_quota_should_run(status, goal_id=goal_id, agent_id=agents[0]) if agents else {}
+            row["attention"] = read_goal_attention(registry_path, runtime_root, goal_id, initial_quota)
         row["source"]["revision"] = _digest(status)
         versions_after = _source_versions(goal, runtime_root)
         row["source"]["file_metadata_revisions"] = versions_after
@@ -214,7 +235,8 @@ def _read_goal(
         partial = not agents or len(agents) > 8
         source_ok = status.get("ok") is True
         for agent_id in agents[:8]:
-            quota = build_quota_should_run(status, goal_id=goal_id, agent_id=agent_id)
+            quota = (initial_quota if include_goal_attention and agent_id == agents[0]
+                     else build_quota_should_run(status, goal_id=goal_id, agent_id=agent_id))
             warnings: list[dict[str, Any]] = []
             todos = _classify_goal_todos(quota, goal_id=goal_id, warnings=warnings)
             row["warnings"].extend(w["reason_code"] for w in warnings)
@@ -315,14 +337,20 @@ def build_goal_portfolio(
     now: datetime | None = None,
     include_stopped: bool = True,
     include_goal_lifecycle: bool = False,
+    include_goal_attention: bool = False,
+    include_goal_instance_id: bool = False,
 ) -> dict[str, Any]:
     """Read only the requested registry scope; never derive inventory from chat."""
     if not 1 <= limit <= 128 or not 0 < max_age_hours <= 8760:
         raise ValueError(
             "limit must be 1..128 and max_age_hours must be positive and at most 8760"
         )
+    if type(include_goal_attention) is not bool:
+        raise ValueError("include_goal_attention must be a boolean")
     if type(include_goal_lifecycle) is not bool:
         raise ValueError("include_goal_lifecycle must be a boolean")
+    if type(include_goal_instance_id) is not bool:
+        raise ValueError("include_goal_instance_id must be a boolean")
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("collection time must include a timezone")
@@ -414,10 +442,15 @@ def build_goal_portfolio(
                     now=now,
                     max_age_hours=max_age_hours,
                     include_goal_lifecycle=include_goal_lifecycle,
+                    include_goal_attention=include_goal_attention,
                     shared_status=shared_status,
                     source_versions_before=before.get(goal_id),
                 )
             )
+        if include_goal_instance_id:
+            instance_id = _goal_instance_id(inventory[goal_id])
+            if instance_id is not None:
+                rows[-1]["goal_instance_id"] = instance_id
         rows[-1]["activation_state"] = activation[goal_id]
         if include_goal_lifecycle and "goal_lifecycle" not in rows[-1]:
             # Omitted, duplicate-identity and stopped rows are excluded before

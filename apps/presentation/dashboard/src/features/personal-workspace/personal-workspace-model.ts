@@ -1,11 +1,14 @@
 import type { GoalDraft } from "../../../../../../loopx/control_plane/collaboration/goal_draft.js";
-import type { CollaborationReadback, LoopXModeSettings } from "../../data/chat-model";
+import type { TurnStep } from "../../data/turn-steps";
+import type { ChatProject, CollaborationReadback, LoopXModeSettings } from "../../data/chat-model";
 import type { TeamPlanAppliedOutcome } from "./team-plan-preview";
 import type { ActionReviewPlan } from "../../../../../../loopx/control_plane/presentation/action_review_plan.js";
 import type { GoalAcceptanceObservation } from "../../data/goal-acceptance-observation";
 import type { AttentionDetails } from "./attention-details";
 import type { WorkspaceLoadError, WorkspaceReadScope } from "../../data/workspace-progressive-status";
+import type { TodoItem } from "../../data/status";
 import { goalWorkKind, type GoalHostThreadActivity, type WorkspaceGoalExecution } from "./goal-activity";
+import type { DigestAttentionSummary } from "../../../../../../loopx/control_plane/presentation/goal_workspace_digest.js";
 export type WorkspaceGoalState =
   | "需修复"
   | "等你"
@@ -34,21 +37,76 @@ export type WorkspaceAgentTodo = {
   completedAt?: string | null;
   resumeWhen?: string | null;
   resumeReady?: boolean | null;
+  resumeInvalidReason?: string | null;
   resumeReceiptId?: string | null;
+  blockedReason?: string | null;
   claimedBy?: string | null;
   dependencies?: string[];
   done: boolean;
   evidence?: string | null;
+  note?: string | null;
   nextTransition?: string | null;
   priority?: string | null;
   status?: string | null;
   taskClass?: string | null;
   taskDomain?: string | null;
+  /** Original request retained when text is shortened for a card. */
+  requestText?: string;
+  /** The authority id, absent when a legacy projection needs a display-only id. */
+  sourceTodoId?: string | null;
+  /** Local map fallback: exact request reading without current-state actions. */
+  detailMode?: "request_only";
   text: string;
   todoId: string;
   validationDigest?: string | null;
   validationRevision?: number | null;
   validationRevisionActor?: string | null;
+};
+
+/** Both active status and retained history carry the same inspector facts. */
+export function workspaceAgentTodoFromItem(todo: Pick<TodoItem,
+  "todo_id" | "text" | "done" | "status" | "claimed_by" | "evidence" | "note" | "reason"
+  | "priority" | "task_class" | "task_domain" | "completed_at" | "resume_when"
+  | "resume_ready" | "resume_condition" | "completion_validation_sha256"
+  | "completion_validation_revision" | "completion_validation_revision_history"
+>, fallbackId: string): WorkspaceAgentTodo {
+  const receipt = todo.resume_condition?.resume_receipt;
+  const receiptId = receipt && typeof receipt === "object" && !Array.isArray(receipt)
+    ? (receipt as Record<string, unknown>).receipt_id : null;
+  return {
+    todoId: todo.todo_id?.trim() || fallbackId,
+    sourceTodoId: todo.todo_id?.trim() || null,
+    requestText: todo.text,
+    text: todo.text,
+    done: todo.status === "deferred" ? false : todo.done,
+    status: todo.status ?? null,
+    blockedReason: todo.status === "blocked" ? todo.reason?.trim() || null : null,
+    claimedBy: todo.claimed_by ?? null,
+    evidence: todo.evidence ?? null,
+    note: todo.note ?? null,
+    priority: todo.priority ?? null,
+    taskClass: todo.task_class ?? null,
+    taskDomain: todo.task_domain ?? null,
+    completedAt: todo.completed_at ?? null,
+    resumeWhen: todo.resume_when ?? null,
+    resumeReady: todo.resume_ready ?? null,
+    resumeInvalidReason: typeof todo.resume_condition?.invalid_state === "string"
+      ? todo.resume_condition.invalid_state : null,
+    resumeReceiptId: typeof receiptId === "string" && receiptId.trim() ? receiptId.trim() : null,
+    validationDigest: todo.completion_validation_sha256 ?? null,
+    validationRevision: todo.completion_validation_revision ?? null,
+    validationRevisionActor: todo.completion_validation_revision_history.at(-1)?.actor_agent_id ?? null,
+  };
+}
+
+/** Host-granted workspaces that can scope the steward conversation without a Goal. */
+export type WorkspaceConversationDirectory = {
+  /** null until the host's workspace grants have been read. */
+  projects: ChatProject[] | null;
+  readFailed: boolean;
+  selectedRef: string | null;
+  /** null returns the conversation to the steward scope. */
+  onSelect: (projectRef: string | null) => void;
 };
 
 export type WorkspaceTodo = WorkspaceAgentTodo & {
@@ -114,6 +172,8 @@ export type WorkspaceGoal = {
   boundHostSurfaces?: string[];
   /** Completed agent Todo count from the status payload; item lists only carry open Todos. */
   doneTodoCount?: number;
+  /** Open agent Todo count projected beside a possibly bounded item list. */
+  openTodoCount?: number;
   execution?: WorkspaceGoalExecution;
   goalId: string;
   /** Bound host threads as observed from the host's own records. */
@@ -121,14 +181,15 @@ export type WorkspaceGoal = {
   latestActivity?: string;
   needsYou?: string | null;
   needsYouBlocking?: boolean;
+  attentionSummary?: DigestAttentionSummary;
   nextSentence: string;
   repository?: WorkspaceRepositoryContext;
   state: WorkspaceGoalState;
   subagentExecution?: WorkspaceGoalSubagentConfiguration;
   nativeChildActivity?: {
     turn_instance_id: string;
-    observation: "unknown" | "coordinator_reported";
-    host_attested: false;
+    observation: "unknown" | "coordinator_reported" | "host_observed" | "mixed";
+    host_attested: boolean;
     launched_count: number;
     skipped_count: number;
     capacity_rejected_count: number;
@@ -141,6 +202,8 @@ export type WorkspaceGoal = {
 
 export type WorkspaceAttention = {
   details?: AttentionDetails;
+  /** A run-level operator gate has no User Todo to record a decision on. */
+  decisionSource?: "todo" | "run_operator_gate";
   sourceId?: string;
   blocking: boolean;
   evidence?: string | null;
@@ -294,8 +357,10 @@ export type WorkspaceActionPreview = {
 };
 
 export type WorkspaceMessage = {
+  createdAt?: string;
   goalDraft?: GoalDraft | null;
   activity?: string[];
+  steps?: TurnStep[];
   collaboration?: CollaborationReadback;
   agentLabel?: string;
   attachments?: WorkspaceImageAttachment[];
@@ -350,6 +415,9 @@ export type WorkspaceGoalNotification = {
   configured: boolean;
   enabled: boolean;
   humanGateAutoNotifyEnabled: boolean;
+  stewardNoticeDelivery?: { pending_count: number; failed_count: number };
+  blockedNoticeAutoNotifyEnabled?: boolean;
+  blockedNoticeDelivery?: { deliveredCount: number; unverifiedCount: number; resolvedCount: number };
   lastNotifiedAt?: string | null;
   receiptCount: number;
   targetRef?: string | null;
@@ -431,6 +499,8 @@ export type PersonalWorkspaceCallbacks = {
   onCorrectRun?: (run: WorkspaceRun, message: string) => void | Promise<void>;
   onCloseRunSession?: (run: WorkspaceRun) => void | Promise<void>;
   onExplainDecision?: (attention: WorkspaceAttention) => void | Promise<void>;
+  /** Open the item's Goal conversation with an editable draft; never sends. */
+  onReplyToAttention?: (attention: WorkspaceAttention, intent: "reply" | "explain") => void;
   onExportOutput?: (output: WorkspaceOutput) => void | Promise<void>;
   onInterruptRun?: (run: WorkspaceRun) => void | Promise<void>;
   onCancelConversationPreparation?: (contextId: string) => void;
@@ -475,7 +545,7 @@ export type PersonalWorkspaceCallbacks = {
   onSendMessage?: (
     message: string,
     agentId: string,
-    goalId: string | null,
+    contextId: string,
     attachments?: WorkspaceImageAttachment[],
   ) => void | WorkspaceSendPreviews | Promise<void | WorkspaceSendPreviews>;
   onPrepareLoopX?: (agentId: string, goalId: string) => Promise<string>;
@@ -488,7 +558,7 @@ export type PersonalWorkspaceCallbacks = {
   onOpenNotificationSettings?: (goalId?: string) => void;
   onFetchNotificationTargets?: () => Promise<Array<{ enabled: boolean; provider: string; target_name: string }>>;
   onSetupGoalChannel?: (options: { execute: boolean; goalId: string; target: string }) => Promise<{ ok: boolean; blocker?: string; public_summary?: string; status?: string }>;
-  onToggleGoalAutoNotify?: (options: { autoNotify: boolean; goalId: string }) => Promise<{ ok: boolean; blocker?: string; public_summary?: string; status?: string }>;
+  onToggleGoalAutoNotify?: (options: { autoNotify: boolean; goalId: string; kind?: "human_gate" | "blocked_notice" }) => Promise<{ ok: boolean; blocker?: string; public_summary?: string; status?: string }>;
 };
 
 // What one send hands back for review: at most one decision the owner reviews

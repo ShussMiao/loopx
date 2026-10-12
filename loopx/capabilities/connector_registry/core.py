@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from ...paths import select_default_runtime_root
+
 
 CONNECTOR_REGISTRY_SCHEMA_VERSION = "connector_registry_v1"
 LAYER_LABELS = {
@@ -86,7 +88,7 @@ BUILTIN_CONNECTOR_CATALOG: list[dict[str, Any]] = [
 
 
 def default_registry_path() -> Path:
-    runtime_root = Path(os.environ.get("LOOPX_RUNTIME_ROOT") or (Path.home() / ".codex" / "loopx"))
+    runtime_root = Path(os.environ.get("LOOPX_RUNTIME_ROOT") or select_default_runtime_root())
     return runtime_root / "connector-registry.json"
 
 
@@ -239,12 +241,15 @@ def record_connector_use(
     entry = next((c for c in connectors if c.get("id") == connector_id), None)
     if entry is None:
         raise KeyError(f"unknown connector: {connector_id}")
+    elapsed_ms = int(ms or 0)
+    if elapsed_ms < 0:
+        raise ValueError("elapsed milliseconds must be non-negative")
     usage = {k: dict(v) for k, v in (state.get("usage", {}) or {}).items()}
     u = usage.setdefault(connector_id, _fresh_usage(entry))
     u["count"] = int(u.get("count") or 0) + 1
     u["ok"] = int(u.get("ok") or 0) + (1 if ok else 0)
     u["fail"] = int(u.get("fail") or 0) + (0 if ok else 1)
-    u["total_ms"] = int(u.get("total_ms") or 0) + int(ms or 0)
+    u["total_ms"] = int(u.get("total_ms") or 0) + elapsed_ms
     u["last_used_at"] = _now_iso()
     if manual_note is not None:
         u["manual_note"] = manual_note

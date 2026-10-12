@@ -11,7 +11,6 @@ from typing import Any
 import pytest
 
 from loopx import windows_install
-from loopx.doctor import REQUIRED_INSTALLED_SKILL_PHRASES
 from loopx.skill_install_readback import PACKAGED_HOST_SKILL_IDS
 
 
@@ -80,6 +79,133 @@ def _restore_windows_user_path(pwsh: str, encoded_path: str) -> None:
         env=env,
         timeout=30,
     )
+
+
+def test_windows_candidate_failure_reports_required_doctor_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "checks": [
+            {
+                "id": "typescript_control_plane_ready",
+                "required": True,
+                "ok": False,
+                "detail": "runtime unavailable",
+                "recommended_action": "Install the supported Node.js runtime.",
+            }
+        ],
+        "release_candidate": {
+            "checks": [
+                {
+                    "id": "representative_cli_commands",
+                    "required": True,
+                    "ok": True,
+                }
+            ]
+        },
+        "diagnostics": "x" * 2500,
+    }
+    monkeypatch.setattr(
+        windows_install.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"doctor\.typescript_control_plane_ready") as exc_info:
+        windows_install._validate_candidate(
+            tmp_path / "release", python=Path(sys.executable), skills_dir=tmp_path / "skills"
+        )
+
+    assert "detail=runtime unavailable" in str(exc_info.value)
+    assert "recommended_action=Install the supported Node.js runtime." in str(
+        exc_info.value
+    )
+    assert "diagnostics" not in str(exc_info.value)
+
+
+def test_windows_candidate_failure_preserves_structured_error_without_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "ok": False,
+        "error": "selected Node.js runtime is unsupported",
+        "recommended_action": "Install Node.js 22 or newer.",
+    }
+    monkeypatch.setattr(
+        windows_install.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        windows_install._validate_candidate(
+            tmp_path / "release", python=Path(sys.executable), skills_dir=tmp_path / "skills"
+        )
+
+    assert "selected Node.js runtime is unsupported" in str(exc_info.value)
+    assert "Install Node.js 22 or newer." in str(exc_info.value)
+    assert "no failed required checks reported" not in str(exc_info.value)
+
+
+def test_windows_candidate_failure_keeps_all_ids_and_late_node_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failures = [
+        {
+            "id": check_id,
+            "required": True,
+            "ok": False,
+            "detail": f"{check_id} detail " + ("x" * 380),
+            "recommended_action": f"Repair {check_id} " + ("y" * 380),
+        }
+        for check_id in (
+            "command_package_same_root",
+            "representative_cli_commands",
+            "representative_cli_imports",
+            "typescript_effect_runtime_ready",
+        )
+    ]
+    monkeypatch.setattr(
+        windows_install.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, stdout=json.dumps({"checks": failures}), stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        windows_install._validate_candidate(
+            tmp_path / "release", python=Path(sys.executable), skills_dir=tmp_path / "skills"
+        )
+
+    message = str(exc_info.value)
+    for check_id in (
+        "command_package_same_root",
+        "representative_cli_commands",
+        "representative_cli_imports",
+        "typescript_effect_runtime_ready",
+    ):
+        assert f"doctor.{check_id}" in message
+    assert "typescript_effect_runtime_ready detail=" in message
+    assert "recommended_action=Repair typescript_effect_runtime_ready" in message
+
+
+def test_doctor_failure_summary_marks_ids_that_exceed_its_budget() -> None:
+    summary = windows_install._doctor_failure_summary(
+        json.dumps(
+            {
+                "checks": [{"id": "x" * 2100, "required": True, "ok": False}],
+            }
+        )
+    )
+
+    assert summary is not None
+    assert len(summary) <= 2000
+    assert "1 required failed check IDs omitted by the summary limit" in summary
 
 
 def test_chat_bundle_preflight_preserves_stdout_with_legacy_pointer(
@@ -305,10 +431,11 @@ def test_windows_installer_promotes_release_and_runs_doctor(tmp_path: Path) -> N
         env=launch_env,
     )
     assert todo.returncode == 0, todo.stderr
-    state_file = project / ".codex" / "goals" / "windows-probe" / "ACTIVE_GOAL_STATE.md"
+    state_file = project / ".loopx" / "goals" / "windows-probe" / "ACTIVE_GOAL_STATE.md"
     assert "[P0] Validate Windows PowerShell state writeback" in state_file.read_text(
         encoding="utf-8"
     )
+    assert not (project / ".codex" / "goals" / "windows-probe").exists()
 
     quota = _run_loopx(
         pwsh=pwsh,
@@ -339,7 +466,7 @@ def test_windows_installer_preserves_externally_managed_skills(tmp_path: Path) -
     home = tmp_path / "home"
     codex_skills = home / ".codex" / "skills"
     agents_skills = home / ".agents" / "skills"
-    for skill_id in REQUIRED_INSTALLED_SKILL_PHRASES:
+    for skill_id in PACKAGED_HOST_SKILL_IDS:
         shutil.copytree(repo_root / "skills" / skill_id, agents_skills / skill_id)
 
     env = dict(os.environ)

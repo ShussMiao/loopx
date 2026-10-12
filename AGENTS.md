@@ -122,16 +122,18 @@ adapters, smoke tests, public docs, or commit/push workflows, use the
    - focused validation or cleanup.
 6. Push a branch and open a PR for reviewable batches.
 
-Control-plane, runtime and product surfaces are never self-merged. A change
-that alters the behavior of `loopx/**`, `apps/**` or `packages/**`, a
-permission or authority boundary, a persisted state or receipt contract, a
-quota/scheduler/todo rule, or a CLI/API contract is proposed, reviewed on its
-exact head, and then left for the maintainer to merge -- including when the
-author has already validated it, its review is published, and its CI is green.
-Admin bypass does not convert one of those changes into a self-mergeable one,
-and neither does a small diff: a validated fix is still a control-plane change
-when it changes control-plane behavior. When the author cannot tell whether a
-change is in that set, it is not self-merged.
+Control-plane, runtime and product surfaces require explicit maintainer
+merge authorization. A change that alters the behavior of `loopx/**`, `apps/**`
+or `packages/**`, a permission or authority boundary, a persisted state or
+receipt contract, a quota/scheduler/todo rule, or a CLI/API contract must be
+proposed and reviewed on its exact head. After the required validation passes
+and exact-head merge readiness returns ready, an agent may use admin bypass
+when the maintainer has explicitly authorized that merge or delivery batch.
+A small diff, successful validation, published review or green CI does not grant
+merge authority by itself. Admin bypass never substitutes for exact-head review,
+required validation or merge readiness. Without explicit authorization, leave
+these changes for the maintainer to merge; when the affected boundary is unclear,
+use the same authorization requirement.
 
 For small, low-risk PRs, maintainers may self-merge after validation when all
 of the following are true:
@@ -180,6 +182,18 @@ set. The PR comment must name the changed surfaces, checks run, failures/skips,
 manual holds, and why the coverage is enough. One hand-picked smoke is not
 enough for runtime, quota/status, scheduler, todo, install, dashboard,
 benchmark-boundary, or public/private evidence changes.
+
+### Personal Feishu Release Guide
+
+Every named public release must include an illustrated Feishu release guide
+owned by the maintainer's verified personal user account. Follow the
+[release guide procedure](docs/product/release-readiness.md#personal-feishu-release-guide)
+before calling release communication complete. Verify account and document
+ownership, use public-safe screenshots of the released UI, teach upgrade and
+capability use, and read back the published text and images. Do not substitute a
+corporate account or bot, claim a candidate is released, or infer authorization
+for chat announcements or other social channels. Keep account identifiers,
+private reference documents, drafts, and validation logs out of the repository.
 
 ### Release Contributor Attribution
 
@@ -249,12 +263,22 @@ while planning. Inspect existing settings and capability editors before calling
 a configuration change backend-only; include necessary companion work in the
 same delivery plan, reusing the existing configuration owner and projection.
 
-Before PR handoff, verify the affected user interaction, state readback and
-feedback, including the packaged frontend when shipped. State which entry
-points changed and the validation performed. If no frontend change is needed,
-give a concrete, verified reason; if companion work remains, label delivery
-partial and link it. These are agent-owned completion checks, not new approval
-gates.
+Every new or materially extended caller-facing capability must enter the
+shipped frontend through an existing appropriate surface: users can discover
+its purpose, perform the authorized user operation, see unavailable/error states,
+and read back the result. A CLI command, catalog row, static description or
+"copy this command" button alone does not complete frontend delivery. Reuse the
+same typed owner; frontend presence does not require a duplicate configuration
+switch or automatic execution of privileged tools. Internal helpers and providers
+belong to their owning capability's interaction rather than a separate screen.
+
+Before PR handoff, validate that journey in the packaged frontend alongside the
+real owning rule/backend, including a relevant failure or recovery case. State
+which frontend/Lark/CLI entrypoints changed and what was verified. A staged CLI
+or backend prerequisite may be proposed as partial, with its remaining frontend
+journey and linked owner; do not mark the capability complete or use "developer
+only" as an automatic exemption. These are agent-owned completion checks, not
+new approval gates.
 
 ## UI Design Standard
 
@@ -358,6 +382,16 @@ compatibility; neither a historical ceiling nor a green revised test is the
 objective. Record the tradeoff in existing PR validation/review evidence, not a
 new approval workflow. Hard limits and frozen experiment/promotion criteria
 retain their owning authority and cannot be reclassified to erase a failure.
+
+LoopX is a semantic control plane: agent-consumed prose is part of its behavior
+contract. Before shortening packet guidance, compare obligations clause by
+clause, including ordering, evidence provenance, modality, scope qualifiers,
+continuation and stop conditions. Stable fields, commands and decision codes
+do not prove that shorter instructions preserve those obligations. A regression
+ceiling is not frozen authority: prefer an evidence-backed limit increase when
+compression would discard useful meaning. Use the existing review capability's
+`observable_semantics.decision_text_assessment`; do not optimize for a green
+size test at the expense of the caller's decision.
 
 ### Refactor Real-Path Validation
 

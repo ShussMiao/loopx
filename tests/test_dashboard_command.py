@@ -336,6 +336,26 @@ def test_probe_existing_chat_rejects_stale_runtime_identity() -> None:
         thread.join(timeout=2)
 
 
+def test_probe_existing_chat_fences_two_wheels_with_the_same_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    from loopx import dashboard_launcher
+
+    expected = {"schema_version": "loopx_runtime_identity_v1", "package_version": "1.2.4",
+                "release_id": None, "source_revision": None, "package_fingerprint": "sha256:new"}
+    monkeypatch.setattr(dashboard_launcher, "release_runtime_identity", lambda _root: expected)
+    class Handler(_CapabilitiesHandler):
+        capabilities = {"ok": True, "schema_version": "loopx_chat_capabilities_v1",
+                        "runtime_identity": {**expected, "package_fingerprint": "sha256:old"}}
+    server, thread = _serve_capabilities(Handler)
+    try:
+        assert dashboard_launcher._probe_existing_chat("127.0.0.1", server.server_address[1]) == "stale"
+        Handler.capabilities["runtime_identity"] = expected
+        assert dashboard_launcher._probe_existing_chat("127.0.0.1", server.server_address[1]) == "matching"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_probe_existing_chat_defers_timeout_to_server_bind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -862,6 +882,11 @@ def test_dashboard_launcher_discovers_agent_bins_outside_restricted_path(
     fake_bin.mkdir()
     npm_global.mkdir(parents=True)
     nvm_bin.mkdir(parents=True)
+    # Keep shell utilities available without admitting host-installed agents.
+    for utility in ("bash", "dirname", "sort", "uniq"):
+        executable = shutil.which(utility)
+        assert executable is not None
+        (fake_bin / utility).symlink_to(executable)
     _copy_dashboard_launcher(scripts_dir)
     (dashboard_dir / "node_modules" / ".bin").mkdir(parents=True)
     (dashboard_dir / "node_modules" / ".bin" / "vite").touch()
@@ -899,7 +924,7 @@ def test_dashboard_launcher_discovers_agent_bins_outside_restricted_path(
         env={
             **os.environ,
             "HOME": str(home),
-            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "PATH": str(fake_bin),
             "NVM_DIR": str(home / ".nvm"),
             "NVM_BIN": str(nvm_bin),
             "LOOPX_COMMAND_LOG": str(command_log),

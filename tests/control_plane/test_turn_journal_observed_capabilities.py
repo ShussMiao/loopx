@@ -25,6 +25,14 @@ TURN_ID = "turn-journal-evidence-7"
 OTHER_TURN = "turn-journal-unrelated-8"
 EFFECT_ID = f"{GOAL_ID}:{AGENT_ID}:{TODO_ID}:{TURN_ID}"
 TURN_KEY = "sha256:" + "c" * 64
+GOAL_REF_A = {
+    "goal_id": GOAL_ID,
+    "goal_instance_id": "ginst_" + "a" * 32,
+}
+GOAL_REF_B = {
+    "goal_id": GOAL_ID,
+    "goal_instance_id": "ginst_" + "b" * 32,
+}
 TRANSACTION_PHASES = [
     "host_execute",
     "typed_result",
@@ -75,6 +83,7 @@ def _journal(
     settlement_turn_instance_id: str | None = TURN_ID,
     settlement_effect_id: str | None = None,
     with_settlement_plan: bool = True,
+    goal_ref: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a committed journal whose binding fields are adjustable."""
 
@@ -107,13 +116,18 @@ def _journal(
                 "turn_instance_id": identity_turn,
             },
         }
+    if goal_ref is not None:
+        transaction["goal_ref"] = dict(goal_ref)
+    plan: dict[str, Any] = {"transaction": transaction, "turn_envelope": envelope}
+    if goal_ref is not None:
+        plan["goal_ref"] = dict(goal_ref)
     return {
         "schema_version": "loopx_turn_journal_v0",
         "turn_key": TURN_KEY,
         "goal_id": GOAL_ID,
         "status": "committed",
         "completed_phases": list(TRANSACTION_PHASES),
-        "plan": {"transaction": transaction, "turn_envelope": envelope},
+        "plan": plan,
     }
 
 
@@ -154,10 +168,14 @@ def _observed(
     runtime: Path,
     *,
     completion: dict[str, Any] | None = None,
+    goal_ref: dict[str, str] | None = None,
 ) -> list[str] | None:
-    return turn_journal_observed_capabilities(
-        runtime, settlement_identity=completion or _completion_identity()
-    )
+    kwargs: dict[str, Any] = {
+        "settlement_identity": completion or _completion_identity(),
+    }
+    if goal_ref is not None:
+        kwargs["goal_ref"] = goal_ref
+    return turn_journal_observed_capabilities(runtime, **kwargs)
 
 
 def test_typescript_committed_journal_lends_boundary_capabilities(
@@ -170,6 +188,43 @@ def test_typescript_committed_journal_lends_boundary_capabilities(
     assert path.exists()
 
     assert _observed(tmp_path) == ["network", "lark_bot_message_write"]
+
+
+def test_capability_evidence_matches_the_current_goal_instance(tmp_path: Path) -> None:
+    _write_journal(
+        tmp_path,
+        _journal(
+            boundary={"available_capabilities": ["network"]},
+            goal_ref=GOAL_REF_A,
+        ),
+    )
+
+    assert _observed(tmp_path, goal_ref=GOAL_REF_A) == ["network"]
+    assert _observed(tmp_path, goal_ref=GOAL_REF_B) is None
+
+
+def test_capability_query_forwards_the_current_goal_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    def observed(method: str, payload: dict[str, Any]) -> dict[str, object]:
+        requests.append((method, payload))
+        return {"observed_capabilities": ["network"]}
+
+    monkeypatch.setattr(journal_store, "effect_runtime_result", observed)
+
+    assert _observed(tmp_path, goal_ref=GOAL_REF_A) == ["network"]
+    assert requests == [
+        (
+            "turn_journal.observed_capabilities",
+            {
+                "runtime_root": str(tmp_path.resolve()),
+                "settlement_identity": _completion_identity(),
+                "goal_ref": GOAL_REF_A,
+            },
+        )
+    ]
 
 
 def test_read_gate_proven_capabilities_when_none_missing(tmp_path: Path) -> None:
@@ -350,9 +405,9 @@ def test_typescript_replay_block_provides_no_evidence(
     )
 
     def blocked(*_args: object, **_kwargs: object) -> dict[str, object]:
-        return {"decision": "replay_blocked", "violations": ["owner_mismatch"]}
+        return {"observed_capabilities": None}
 
-    monkeypatch.setattr(journal_store, "interpret_turn_journal_projection", blocked)
+    monkeypatch.setattr(journal_store, "effect_runtime_result", blocked)
 
     assert _observed(tmp_path) is None
 
@@ -369,7 +424,7 @@ def test_typescript_runtime_failure_fails_closed(
         raise RuntimeError("TypeScript Effect runtime request failed")
 
     monkeypatch.setattr(
-        journal_store, "interpret_turn_journal_projection", unavailable
+        journal_store, "effect_runtime_result", unavailable
     )
 
     assert _observed(tmp_path) is None
@@ -388,4 +443,74 @@ def test_ambiguous_duplicate_bound_journals_fail_closed(tmp_path: Path) -> None:
     duplicate["plan"]["transaction"]["turn_key"] = duplicate["turn_key"]
     _write_journal(tmp_path, duplicate, digest="e" * 64)
 
+    assert _observed(tmp_path) is None
+
+
+@pytest.mark.parametrize("damage", ["unreadable", "owner", "phase", "binding"])
+def test_recovery_lookup_never_turns_uncertain_history_into_a_new_turn(
+    tmp_path: Path, damage: str,
+) -> None:
+    journal = _journal()
+    if damage == "owner":
+        journal["plan"]["turn_envelope"]["agent_id"] = OTHER_AGENT_ID
+    elif damage == "phase":
+        journal["completed_phases"] = ["quota_spend"]
+    elif damage == "binding":
+        journal["plan"]["transaction"]["settlement_plan"]["identity"]["binding_id"] = OTHER_TODO_ID
+    path = _write_journal(tmp_path, journal)
+    if damage == "unreadable":
+        path.write_text("{interrupted", encoding="utf-8")
+    with pytest.raises((ValueError, RuntimeError), match="journal|Journal"):
+        journal_store.find_loopx_turn_key_by_settlement_identity(
+            tmp_path, goal_id=GOAL_ID, agent_id=AGENT_ID,
+            todo_id=TODO_ID, turn_instance_id=TURN_ID,
+        )
+
+
+@pytest.mark.parametrize("status,phase_count", _COMMIT_LADDER)
+def test_recovery_lookup_characterizes_every_durable_prefix(
+    tmp_path: Path, status: str, phase_count: int,
+) -> None:
+    journal = _journal(boundary={"available_capabilities": ["network"]})
+    journal.update(status=status, completed_phases=TRANSACTION_PHASES[:phase_count])
+    _write_journal(tmp_path, journal)
+    assert journal_store.find_loopx_turn_key_by_settlement_identity(
+        tmp_path, goal_id=GOAL_ID, agent_id=AGENT_ID,
+        todo_id=TODO_ID, turn_instance_id=TURN_ID,
+    ) == TURN_KEY
+    # Recoverability of an in-flight journal does not grant completed evidence.
+    assert _observed(tmp_path) == (["network"] if status == "committed" else None)
+
+
+def test_both_readers_use_one_native_query_even_with_same_turn_foreign_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(32):
+        other = _journal(selected_todo_id=f"todo_other_{index}")
+        digest = f"{index:064x}"
+        other["turn_key"] = other["plan"]["transaction"]["turn_key"] = f"sha256:{digest}"
+        _write_journal(tmp_path, other, digest=digest)
+    _write_journal(tmp_path, _journal(boundary={"available_capabilities": ["network"]}))
+    actual = journal_store.effect_runtime_result
+    calls: list[str] = []
+
+    def counted(method: str, *args: Any, **kwargs: Any) -> Any:
+        calls.append(method)
+        return actual(method, *args, **kwargs)
+
+    monkeypatch.setattr(journal_store, "effect_runtime_result", counted)
+    assert _observed(tmp_path) == ["network"]
+    assert calls == ["turn_journal.observed_capabilities"]
+    calls.clear()
+    assert journal_store.find_loopx_turn_key_by_settlement_identity(
+        tmp_path, goal_id=GOAL_ID, agent_id=AGENT_ID,
+        todo_id=TODO_ID, turn_instance_id=TURN_ID,
+    ) == TURN_KEY
+    assert calls == ["turn_journal.find_settlement"]
+
+
+def test_unreadable_neighbor_cannot_lend_capabilities(tmp_path: Path) -> None:
+    _write_journal(tmp_path, _journal(boundary={"available_capabilities": ["network"]}))
+    bad = _write_journal(tmp_path, _journal(), digest="f" * 64)
+    bad.write_text("{lost", encoding="utf-8")
     assert _observed(tmp_path) is None

@@ -14,6 +14,7 @@ import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
 import { parseExactGoalRef } from "../goals/goal_instance_identity.ts";
 import { preparedAttemptViolation } from "./turn_journal_attempt_contract.ts";
 import { recordedTurnEffects, type RecordedTurnEffects } from "./turn_journal_effect_readback.ts";
+import { selectedWorkTodoId } from "../work_items/interaction_contract.ts";
 
 export const TURN_JOURNAL_INSPECTION_SCHEMA_VERSION =
   "loopx_turn_journal_inspection_v1";
@@ -132,6 +133,32 @@ export const supportedJournalStatuses: ReadonlySet<string> = new Set([
   "stopped",
   "failed",
 ]);
+/** Snapshot constraints shared by write admission and historical readback. */
+export function journalPhaseViolation(
+  status: string, completedPhases: readonly string[], failedPhase: string | null,
+): string | null {
+  if (status === "committed" && completedPhases.length !== transactionPhases.length) {
+    return "Committed Turn journal must contain the complete transaction prefix";
+  }
+  if (status === "stopped" && completedPhases.length !== 3) {
+    return "Stopped Turn journal must end after validation";
+  }
+  if (status === "scheduler_action_required" && completedPhases.length !== 5) {
+    return "Scheduler-pending Turn journal must end after quota spend";
+  }
+  if (status === "in_progress" && completedPhases.length > 5) {
+    return "In-progress Turn journal cannot claim scheduler completion";
+  }
+  if (status === "failed") {
+    const nextPhase = transactionPhases[completedPhases.length] ?? null;
+    const terminalCloseoutFailure = failedPhase === "terminal_closeout" && completedPhases.length === 5;
+    if (!failedPhase || (failedPhase !== nextPhase && !terminalCloseoutFailure)) {
+      return "Failed Turn journal must name the next uncompleted phase";
+    }
+  }
+  return null;
+}
+
 const hostFailureKinds: ReadonlySet<string> = new Set([
   "auth_failed",
   "contract_rejected",
@@ -213,23 +240,6 @@ function identityState(
   return [complete, complete && new Set(observed).size === 1];
 }
 
-function selectedTurnTodoId(envelope: JsonObject): string | null {
-  const orchestration = asObject(envelope.task_orchestration_contract);
-  const primaryTodoId = typeof orchestration.primary_todo_id === "string"
-    ? orchestration.primary_todo_id.trim()
-    : "";
-  if (
-    orchestration.schema_version === "task_orchestration_contract_v2" &&
-    orchestration.mode === "adaptive" &&
-    primaryTodoId
-  ) {
-    return primaryTodoId;
-  }
-  const action = asObject(envelope.action);
-  const selectedTodo = asObject(action.selected_todo);
-  return isValidIdentity(selectedTodo.todo_id) ? selectedTodo.todo_id : null;
-}
-
 function typedSettlementIdentityState(
   envelope: JsonObject,
   transaction: JsonObject,
@@ -252,7 +262,10 @@ function typedSettlementIdentityState(
   const expectedTurnInstance = isValidIdentity(transaction.turn_instance_id)
     ? transaction.turn_instance_id
     : transaction.turn_key;
-  const selectedTodoId = selectedTurnTodoId(envelope);
+  const selectedTodoId = selectedWorkTodoId({
+    selected_todo: asObject(envelope.action).selected_todo,
+    task_orchestration_contract: envelope.task_orchestration_contract,
+  });
   return [
     true,
     isValidIdentity(expectedTurnInstance) &&
@@ -661,6 +674,11 @@ export function interpretTurnJournalEffect(
   }
 
   const journalStatus = journal.status ? String(journal.status) : "";
+  const statusViolation = journalPhaseViolation(
+    journalStatus, completedPhases,
+    typeof receipt.failed_phase === "string" ? receipt.failed_phase : null,
+  );
+  if (statusViolation !== null) violations.push("journal_status_phase_mismatch");
   const tombstoneRetained = ["committed", "stopped", "failed"].includes(
     journalStatus,
   );
@@ -683,7 +701,7 @@ export function interpretTurnJournalEffect(
     settlementBindingMatches &&
     turnKeyMatches &&
     phasesFormOrderedPrefix &&
-    supportedJournalStatuses.has(journalStatus);
+    supportedJournalStatuses.has(journalStatus) && statusViolation === null;
   const attemptViolation = preparedAttemptViolation(journal, {
     status: journalStatus,
     completedPhases,

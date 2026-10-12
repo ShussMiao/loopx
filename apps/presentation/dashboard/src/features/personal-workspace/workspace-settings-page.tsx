@@ -5,17 +5,21 @@ import type { WorkspaceLocale } from "./i18n";
 import { useWorkspaceI18n } from "./i18n";
 import { LarkSettingsPage } from "./lark-settings-page";
 import { GoalCapabilitySettings } from "./goal-capability-settings";
+import { GoalOwnershipSettings } from "./goal-ownership-settings";
+import { GoalStorageSettings } from "./goal-storage-settings";
 import { AutomationCadenceSettings } from "./automation-cadence-settings";
 import { MachineConfigurationSettings } from "./machine-configuration-settings";
+import { ConfigurationBackupSettings } from "./configuration-backup-settings";
 import { OperatorCredentialSettings } from "./operator-credential-settings";
 import type { PersonalWorkspaceCallbacks, WorkspaceGoal, WorkspaceGoalNotification } from "./personal-workspace-model";
 import type { WorkspaceTheme } from "./workspace-theme";
 
-type WorkspaceSettingsTab = "steward" | "provider" | "machine" | "capabilities" | "cadence" | "lark" | "appearance" | "language";
+type WorkspaceSettingsTab = "ownership" | "steward" | "provider" | "machine" | "capabilities" | "cadence" | "lark" | "appearance" | "language";
 
 type SettingsPage = Exclude<WorkspaceSettingsTab, "machine">;
 
 const tabIcons: Record<SettingsPage, typeof Settings2> = {
+  ownership: KeyRound,
   appearance: Palette,
   capabilities: ServerCog,
   cadence: Clock3,
@@ -53,6 +57,7 @@ export function WorkspaceSettingsPage({
   const [tab, setTab] = useState<SettingsPage>(initialTab === "machine" ? "capabilities" : initialTab);
   const [capabilityScope, setCapabilityScope] = useState<"machine" | "goal">(initialTab === "capabilities" ? "goal" : "machine");
   const [capabilityGoalId, setCapabilityGoalId] = useState(initialGoalId ?? "");
+  const [ownershipRefresh, setOwnershipRefresh] = useState(0);
   const tabsRef = useRef<HTMLElement>(null);
   useEffect(() => {
     const navigation = tabsRef.current;
@@ -83,7 +88,7 @@ export function WorkspaceSettingsPage({
         // and are edited on different surfaces, so they are separate categories.
         { key: "provider", label: t("settings.modelProvider") },
         { key: "capabilities", label: t("settings.globalCapabilities") },
-        ...(initialGoalId ? [{ key: "cadence" as const, label: t("cadence.title") }] : []),
+        ...(initialGoalId ? [{ key: "cadence" as const, label: t("cadence.title") }, { key: "ownership" as const, label: t("ownership.title") }] : []),
       ],
     },
     {
@@ -106,6 +111,7 @@ export function WorkspaceSettingsPage({
     },
   ];
   const headings: Record<SettingsPage, { title: string }> = {
+    ownership: {title: t("ownership.title")},
     appearance: {
       title: t("settings.appearance"),
     },
@@ -130,7 +136,7 @@ export function WorkspaceSettingsPage({
   };
   const heading = headings[tab];
   const selectedGoal = goals.find((item) => item.goalId === initialGoalId);
-  const goalSettingsTarget = tab === "cadence" && initialGoalId
+  const goalSettingsTarget = (tab === "cadence" || tab === "ownership") && initialGoalId
     ? selectedGoal?.title || initialGoalId
     : null;
 
@@ -217,6 +223,14 @@ export function WorkspaceSettingsPage({
             onChanged={onChanged}
           />
         ) : null}
+        {tab === "ownership" && selectedGoal ? <div key={selectedGoal.goalId}>
+              <GoalOwnershipSettings goalId={selectedGoal.goalId} onChanged={onChanged} refreshKey={ownershipRefresh} />
+              <GoalStorageSettings goalId={selectedGoal.goalId} onChanged={() => {
+                setOwnershipRefresh(value => value + 1);
+                onChanged();
+              }} />
+        </div> : null}
+        {tab === "capabilities" && (capabilityScope === "machine" || capabilityGoalId) ? <ConfigurationBackupSettings key={`${capabilityScope}:${capabilityGoalId}`} goalId={capabilityScope === "goal" ? capabilityGoalId : null} /> : null}
         {tab === "cadence" && selectedGoal ? <AutomationCadenceSettings key={selectedGoal.goalId} goal={selectedGoal} /> : null}
 
         {tab === "appearance" ? (

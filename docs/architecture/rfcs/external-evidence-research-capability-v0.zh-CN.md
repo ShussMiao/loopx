@@ -60,10 +60,11 @@ Connector registry 继续只拥有库存与遥测。`supported` 绝不映射为 
 
 ## 产品入口
 
-- CLI：`external-evidence discover|plan|receipt|admit|retire`；
-- Managed Turn：复用同五个 effect-runtime 方法；
-- Frontend/Lark：本 Core 切片不修改。后续 companion slice 只渲染同源 plan/admission
-  投影与读回，不建立第二个 registry 或生命周期。
+- CLI：`external-evidence discover|plan|execute|receipt|admit|readback|retire`；
+- Managed Turn：复用五个 typed effect-runtime 方法；显式 provider 执行与账本投影
+  使用能力的 CLI owner；
+- Frontend/Lark：现有会话答复/报告和 Markdown 运输渲染同源校验回读，
+  不建立独立 registry 或生命周期。
 
 ## 验收
 
@@ -80,6 +81,8 @@ Connector registry 继续只拥有库存与遥测。`supported` 绝不映射为 
 - 全部被采纳来源完成下游覆盖前不得退休；
 - CLI 与 effect-runtime TypeScript 测试在源码 checkout 中通过。
 
+- 检查点已移至执行账本：[公开 GitHub 方法交付检查点（2026-10-02）](ledger/external-evidence-research-capability-v0/2026-10-02-public-github-method-delivery.zh-CN.md)。
+
 ## 非目标
 
 - 通用浏览器或搜索引擎；
@@ -88,3 +91,7 @@ Connector registry 继续只拥有库存与遥测。`supported` 绝不映射为 
 - 自动采纳证据；
 - 交易、发布或其他下游 effect 权限；
 - 把注册或使用计数当作证据质量证明。
+
+## 附录 A：执行账本
+
+带日期的交付记录见[逐条执行账本](ledger/external-evidence-research-capability-v0/)。

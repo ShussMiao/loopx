@@ -1,27 +1,24 @@
 from __future__ import annotations
 
 import re
+import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
+from pathlib import Path
 
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
 from ..runtime.time import now_utc_iso
 from ..coordination.coordination_state_contract_generated import (
     TODO_RESUME_EVALUATION_REQUEST_SCHEMA,
     TODO_RESUME_EVALUATION_RESULT_SCHEMA,
-    TODO_RESUME_EXTERNAL_WAIT_REQUEST_SCHEMA,
-    TODO_RESUME_EXTERNAL_WAIT_RESULT_SCHEMA,
     TODO_RESUME_NORMALIZE_REQUEST_SCHEMA,
 )
-from .external_wait_contract import TodoExternalWaitAuthoringError
 
 
 TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION = TODO_RESUME_NORMALIZE_REQUEST_SCHEMA
 TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION = TODO_RESUME_EVALUATION_REQUEST_SCHEMA
 TODO_RESUME_EVALUATION_SCHEMA_VERSION = TODO_RESUME_EVALUATION_RESULT_SCHEMA
-TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION = TODO_RESUME_EXTERNAL_WAIT_REQUEST_SCHEMA
-TODO_EXTERNAL_WAIT_TRANSITION_SCHEMA_VERSION = TODO_RESUME_EXTERNAL_WAIT_RESULT_SCHEMA
 
 TODO_RESUME_KIND_TODO_DONE = "todo_done"
 TODO_RESUME_KIND_PR_MERGED = "pr_merged"
@@ -67,7 +64,6 @@ _PR_MERGED_EVENT_KINDS = {
     "pull_request_merge",
     "pull_request_merged",
 }
-_MAX_RESUME_MERGE_EVENTS = 256
 
 _RESUME_ITEM_FIELDS = (
     "todo_id",
@@ -311,17 +307,34 @@ def _compact_resume_rollout_events(
     if not targets:
         return []
     compacted: list[dict[str, Any]] = []
-    for event in reversed(rollout_events or []):
+    # This is transport-only de-duplication. Different references remain visible
+    # to the typed evaluator; no global count may evict another dependency.
+    seen: set[str] = set()
+    for event in rollout_events or []:
         if not isinstance(event, Mapping):
             continue
         compact = _compact_merge_event(event, targets=targets)
         if compact is None:
             continue
+        identity = json.dumps({key: compact[key] for key in ("pr_ref", "code_refs", "source_refs")
+            if key in compact}, sort_keys=True)
+        if identity in seen:
+            continue
+        seen.add(identity)
         compacted.append(compact)
-        if len(compacted) >= _MAX_RESUME_MERGE_EVENTS:
-            break
-    compacted.reverse()
     return compacted
+
+
+class TodoResumeRolloutEvents(list[dict[str, Any]]):
+    """A display snapshot with its local, complete evidence source attached.
+
+    Only the resume adapter consumes this pointer. Other read-model consumers
+    still see the original bounded list, with unchanged counts and ordering.
+    """
+
+    def __init__(self, events: Any, *, runtime_root: Path, goal_id: str) -> None:
+        super().__init__(dict(event) for event in events)
+        self.source = {"runtime_root": str(runtime_root), "goal_id": goal_id}
 
 
 def normalize_todo_resume_when_via_runtime(value: Any) -> str | None:
@@ -361,12 +374,14 @@ def evaluate_todo_resume_conditions(
         "source_items": [
             _compact_item(item) for item in source_items if item.get("todo_id")
         ],
-        # Resume evaluation needs only bounded PR-merge identity evidence.
+        # Resume evaluation needs only compact PR-merge identity evidence.
         # Sending complete rollout rows made long-lived Goals exceed the
         # Effect-runtime transport budget even without a PR-waiting Todo.
         "rollout_events": _compact_resume_rollout_events(items, rollout_events),
         "evaluated_at": evaluated_at or now_utc_iso(),
     }
+    if isinstance(rollout_events, TodoResumeRolloutEvents):
+        request["rollout_event_source"] = rollout_events.source
     if available_capabilities is not None:
         request["available_capabilities"] = sorted(
             {
@@ -393,40 +408,3 @@ def evaluate_todo_resume_conditions(
         if todo_id:
             conditions[todo_id] = dict(row["condition"])
     return conditions
-
-
-def plan_todo_external_wait_transition(
-    *,
-    todo_id: str,
-    resume_when: str,
-    successor_todo_ids: list[str],
-    items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Validate and plan one atomic open-Todo external-wait transition in TS."""
-
-    try:
-        result = effect_runtime_result(
-            "todo.external_wait.plan",
-            {
-                "schema_version": TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
-                "todo_id": todo_id,
-                "resume_when": resume_when,
-                "successor_todo_ids": successor_todo_ids,
-                "items": compact_todo_resume_items(items),
-            },
-        )
-    except EffectRuntimeRejected as exc:
-        resume_kind, _, target_todo_id = resume_when.partition(":")
-        raise TodoExternalWaitAuthoringError(
-            str(exc),
-            code=exc.diagnostic_code,
-            monitor_todo_id=(
-                target_todo_id if resume_kind == TODO_RESUME_KIND_MONITOR_CHANGED else None
-            ),
-            successor_todo_ids=successor_todo_ids,
-        ) from None
-    if not isinstance(result, Mapping) or (
-        result.get("schema_version") != TODO_EXTERNAL_WAIT_TRANSITION_SCHEMA_VERSION
-    ):
-        raise RuntimeError("TypeScript Todo external-wait transition shape mismatch")
-    return dict(result)

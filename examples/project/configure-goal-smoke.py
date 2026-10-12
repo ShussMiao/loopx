@@ -288,13 +288,13 @@ def main() -> int:
         assert catalog["disclosure_policy"]["first_run_configuration_required"] is False
         features = {item["feature_id"]: item for item in catalog["features"]}
         assert set(features) == {
+            "goal_capability_organization",
             "todo_replan_cadence",
             "local_authority_shadow",
             "coordination_runtime_shadow",
             "multi_subagent",
             "peer_task_coordination",
             "progress_review",
-            "explore_graph",
             "explore_harness",
             "change_quality_qualification",
             "reward_memory",
@@ -302,26 +302,39 @@ def main() -> int:
             "lark_kanban_heartbeat_sync",
             "pull_request_review",
             "periodic_report",
+            "content_ops",
         }
+        references = features["content_ops"]
+        assert references["availability"] == "local_artifact_preview", references
+        assert "default" not in references and "current" not in references, references
+        improvement = features["goal_capability_organization"]
+        assert improvement["default"] == {
+            "mode": "off", "discovery_budget_minutes": 5, "max_trials": 1,
+        }, improvement
+        assert "current" not in improvement, improvement
         assert features["pull_request_review"]["availability"] == "supported"
         assert features["progress_review"]["availability"] == "supported_opt_in"
         assert features["progress_review"]["default"]["mode"] == "off"
         assert features["pull_request_review"]["default"] == {
             "wait_for_ci": True,
-            "review_priority": "other-developers-first",
+            "review_order": "forward",
         }
-        assert features["todo_replan_cadence"]["availability"] == "supported_opt_in"
-        assert features["todo_replan_cadence"]["default"] == {"completed_todos": 5}
+        assert features["todo_replan_cadence"]["availability"] == "supported_explicit_override"
+        assert features["todo_replan_cadence"]["default"] == {
+            "count_unit": "effective_turns",
+            "count": 6,
+        }
         # Goal-scoped cadence is omitted when no explicit override is present;
         # the machine default remains discoverable through the default field.
         assert "current" not in features["todo_replan_cadence"], features[
             "todo_replan_cadence"
         ]
         replan_commands = features["todo_replan_cadence"]["commands"]
-        assert "--execution-replan-after-todos 3" in replan_commands["preview_enable"]
+        assert "--execution-replan-after-turns 6" in replan_commands["preview_enable"]
         assert "--execute" not in replan_commands["preview_enable"]
         assert "--execute" in replan_commands["apply_enable"]
         assert "--clear-execution-replan-after-todos" in replan_commands["preview_disable"]
+        assert "--clear-execution-replan-after-turns" in replan_commands["preview_disable"]
         assert "--execute" not in replan_commands["preview_disable"]
         assert "--execute" in replan_commands["apply_disable"]
         assert features["local_authority_shadow"]["availability"] == "retired"
@@ -351,7 +364,7 @@ def main() -> int:
         assert "--peer-task-coordinator" in features[
             "peer_task_coordination"
         ]["commands"]["preview_enable"]
-        assert features["explore_graph"]["current"]["enabled"] is False
+        assert "explore_graph" not in features  # Explore owns one configuration surface
         assert "current" not in features["change_quality_qualification"], features[
             "change_quality_qualification"
         ]
@@ -360,8 +373,8 @@ def main() -> int:
         ]["commands"]["preview_enable"]
         assert "--execute" not in features["explore_harness"]["commands"]["preview_enable"]
         assert "--execute" in features["explore_harness"]["commands"]["apply_enable"]
-        assert "--execute" not in features["explore_graph"]["commands"]["preview_disable"]
-        assert "--execute" in features["explore_graph"]["commands"]["apply_disable"]
+        assert "--execute" not in features["explore_harness"]["commands"]["preview_disable"]
+        assert "--execute" in features["explore_harness"]["commands"]["apply_disable"]
         assert features["lark_event_inbox"]["current"]["enabled"] is True
         assert "--execute" not in features["lark_event_inbox"]["commands"]["preview_enable"]
         assert "--execute" in features["lark_event_inbox"]["commands"]["apply_enable"]

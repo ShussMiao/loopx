@@ -1,10 +1,10 @@
 # RFC: Capable Agent Manager and Semantic Work Handoff (v0)
 
 - **RFC status:** Accepted
-- **Supersedes / closes:** none
+- **Supersedes / closes:** [Personal Follow-through independent proposal](personal-follow-through-v0.md)
 - **Delivery maturity:** Partial; private runtime profile, team-plan confirmation and Todo materialization shipped; complete M1–M4 remain unqualified.
 - **Authors / owners:** LoopX maintainers; manager engineering owner
-- **Created / last normative revision:** 2026-09-13 / 2026-09-15
+- **Created / last normative revision:** 2026-09-13 / 2026-10-04
 - **Implementation baseline:** `7eb4b7bb1661bd5eff63a8725a33169792d5964b`
 - **Language mirror:** [中文版](capable-manager-semantic-handoff-v0.zh-CN.md)
 - **Related contracts:** [Effect interpreter](agent-loop-effect-interpreter-v0.md), [Manager continuity](../../reference/protocols/manager-evidence-and-continuity-v0.md), [Goal Vision/Replan](../../reference/protocols/goal-vision-replan-contract-v0.md), [Desktop frontends](desktop-execution-frontends-v0.md), [Shared authority](shared-goal-authority-state-provider-v0.md), [Shared Goal alignment/amendment](shared-goal-alignment-and-governed-amendment-v0.md), [TS migration](typescript-control-plane-migration-v0.md)
@@ -91,6 +91,17 @@ part of A20 and restart evidence for A5/A13. It does not qualify cross-day manag
 execution, live Lark, frontend journey completion or the remaining M1–M4 work.
 
 ## 4. Current-system contract: audited facts
+
+The review command now projects the exact invoking Codex session's recorded
+model/provider/effort into its existing result template and rereads the metadata
+before publication checking. `control_plane/runtime/execution_identity.ts` owns
+bounded metadata projection and declaration matching; the Python Codex adapter
+only locates the exact thread in the selected home through a read-only store.
+Unknown metadata stays explicit, configuration is not execution evidence, and
+public review text contains no host locator or transcript. This is a GQ03/GQ12
+attribution prerequisite, not evidence of independent review, App adoption,
+receiver execution or R2/G1 completion. Other host adapters and the installed
+conversation journey remain with those existing acceptance owners.
 
 The baseline already has substantial reusable machinery:
 
@@ -192,6 +203,40 @@ Resolve a request from authenticated principal, origin/audience, resource scope 
 
 For a trusted owner-private manager, grant the normal host-agent tool profile that the owner configured. For a shared/untrusted audience, run a restricted context with enforceable resource/tool limits. A broad private process followed only by output filtering is **not** sufficient isolation. A verified owner message in a group may trigger private work with a separately scoped return, when a standing policy permits it; other participants do not inherit that policy.
 
+**Owner-managed authority is inherited, not reduced by the chat surface.** An
+authenticated owner may designate a steward conversation, including a group,
+to manage all of their Agents with their standing authority. Within that managed
+scope, the steward can inspect work and evidence, plan, delegate and exercise
+already-authorized effects; being a group is not itself a reason to hide Todo
+titles/status or ask for permission again. Descendants inherit a verifiable
+reference to that owner grant, with any explicit attenuation or revocation,
+rather than a new grant invented at each message. Future managed Agents inherit
+the same scope. Ordinary ownership, claim/lease and host/provider enforcement
+remain the effect boundary; inherited authority does not fabricate execution.
+Unmanaged resources and unauthenticated participants remain outside the grant.
+The current read adapter reuses the exact audience's existing evidence-Goal
+grant for linked Core details. The shipped managed-Goal context grant below is
+a bounded step; full planning/effect inheritance still needs its typed grant
+chain, installed receiver adoption and original-route acceptance.
+
+**Local context-delivery default.** An operator-configured source with a verified authorized
+sender defaults to all active registered recipients on its selected local registry,
+across Goals and later registrations. `local_delivery_scope=selected` deliberately
+retains an enrollment boundary; an old enrollment list alone no longer restricts
+the default. Explicit Agent and Goal exclusions survive broad restoration and
+apply at direct delivery, replay and each parent-forwarding hop. Missing or
+malformed source provenance cannot activate the default. Context delivery grants
+no evidence-read expansion, remote delivery, execution, claim/lease or protected
+operation. Shared TypeScript `collaboration/source_grants.ts` owns the decision;
+Python observes registration/provenance and persists operator changes. Qualify
+cross-Goal delivery, future registration, revoked replay and original-route return
+through the existing App/Lark conversation, without claiming worker adoption from
+catalog access. The existing local operator commands preview, apply and read back exceptions.
+Restoring a Goal retains its individually revoked Agents; selected scope can
+enroll a whole Goal by omitting `--agent-id`. Editing source policy in packaged
+settings remains an unqualified configuration journey. Native receiver adoption
+and full M1–M3 execution are separate acceptance gates.
+
 LoopX state mutations always use the existing typed command boundary, even if initiated through shell. The manager does not edit registry/authority files behind the control plane. Repository modifications use the project's normal worktree/review practice. Scoped merge/deploy authorization may be reused; unrelated payment or trading authority cannot be inferred from it.
 
 If an approval bridge is needed, it presents the exact operation and existing grant mismatch and waits for a real answer. A noninteractive `approvalPolicy=never` rejection must not be misreported as the user refusing. Host policy, provider rejection and application restrictions remain separate diagnoses. This design does not attempt to bypass an upstream safety decision.
@@ -258,6 +303,36 @@ The user-facing exchange is **received → assessed/working → result**, with m
 | Assessed | Receiver decision, accepted scope, plan/evidence references or specific deferral |
 | Work resolved | Result satisfies the request's completion question, or an explicit rejection/cancellation/terminal inability |
 | Answer delivered | Provider receipt/readback for the original route and answer revision; distinct from resolution |
+
+**Receiver followthrough checkpoint.** Shared CLI/MCP reads now retain each
+request's recorded assessment and fresh explicitly linked Core work, with typed
+advice for assessment, work review, answer return or evidence recovery. Scoped
+workers can link existing work through `link_work`; the Python link adapter is
+shared collaboration code rather than a manager-only owner. Busy unrelated work,
+read receipts and completed linked Todos do not certify the request outcome.
+File/SQLite CLI and real stdio tests qualify this context/tool slice. Receiver
+adoption, actual effects and original-route return remain separate acceptance;
+keep G0/G1 open until the installed ordinary journey proves them.
+
+**Explicit result-file checkpoint (2026-10-08).** The existing CLI `report` and
+scoped MCP `return_result` now accept bounded workspace-relative attachment refs
+for verified bound-owner App requests. The shared typed publication owner binds
+their immutable content identity; the POSIX host snapshots bytes, and Lark returns
+one Markdown post with files to the original conversation. Regressions cover
+workspace edits after publication, revoked return authority, exact Goal-instance
+replacement, lost resource records and download mismatch without a resend. An
+installed private-App journey returned one file post, verified downloaded bytes
+and retained that message across restart. Automatic return recovery remains open.
+The Lark candidate resolves message-scoped resource keys only from the exact post
+and ordered filenames, downloads to fixed local names with explicit suffixes, and
+finishes processing feedback only after byte verification. Read-only validation
+against the original App message passes. A route refusal also preserves the saved
+provider attempt and result identity, without reopening terminal work or resending.
+This does not certify installed automatic recovery or M3 completion. The existing
+manager delivery owner retains that next
+gate. Local-Web file presentation, inline video playback, groups and cross-host
+transfer remain with their surface owners. Explicit refs keep this boundary
+verifiable and reversible without another delivery ledger.
 
 Migrate current inbox/tracking/roundtrip records into the single collaboration owner; preserve their valid effect semantics and receipts, but retire duplicate manager-specific transition logic after cutover. Persist intent before dispatch; use request revision plus effect identity for idempotency. A changed payload cannot reuse an immutable identity; a correction appends a linked revision and the receiver rechecks relevant state before effectful execution. Multiple messages about one job may be explicitly related by the manager, preserving each original obligation and correction. Do not merge independent same-text requests by a content hash alone.
 
@@ -532,6 +607,21 @@ Reuse existing capability instructions, context hooks, memory and scheduling own
 
 Parallel work does not imply isolated execution resources. Reuse runtime serialization/leases for shared browser screens or mutable workspaces, separately from Core work ownership. Separate screens, agent names or conversation tabs are not permission boundaries. If a runtime lacks the required coordination, serialize the affected operation and expose the wait; unrelated evidence work can continue. M1 reports actual resource behavior rather than assuming a shared cloud-computer design.
 
+### 5.11.1 Lark personal follow-through profile
+
+[Lark personal follow-through](../../product/use-cases/office-operations/personal-follow-through.md)
+is a bounded application of this manager contract. Personal commitment interpretation,
+source coverage, deadline evidence and attention-cost evaluation stay in the profile;
+shared lifecycle, standing grants, preparation, recovery and return belong to this
+RFC and its referenced typed owners. The profile explicitly maps to
+A3/A5–A10/A13–A15/A20 and existing M1–M4, superseding the independent personal M1–M3
+plan. Reuse canonical User/Agent Todos, existing proposals and artifact references;
+add no parallel state, scheduler or approval layer. Proactive triggers use the existing
+schedule/event path and actual grants. The profile's TypeScript/Node requirement is
+bounded and does not mandate unrelated repository-wide migration. Scenario CLI code,
+scripted tests and this consolidation close no acceptance; real-source and complete
+packaged journeys still require their own evidence.
+
 ### 5.12 Integration with alignment, authority and the TS kernel
 
 **Classify the requested change before selecting its writer.** Consultation can return evidence without a Todo. An in-intent lane correction uses the receiver's existing Vision/Replan/Todo path. A shared dependency or work-graph change that requires an amendment under the alignment contract uses its proposal/admission path; changing shared objective, acceptance, non-goals, permissions or stop conditions never becomes a lane edit merely because the manager requested it. Stage 2 admission has `canonical_effect: none`. Until the corresponding governed commit class is implemented and qualified, retain the proposal and report that precise execution gap; continue unrelated authorized work. Do not invent a manager commit endpoint, peer vote or additional routine human confirmation. Each amendment class requires its own qualified policy/verifier/commit path. The first Stage 3 `GoalAmendmentAuthority` slice authorizes only intent-preserving `shared_work_graph`; it cannot commit acceptance, non-goal, permission, objective or stop-condition changes. Once a class is separately qualified, reuse that class's commit owner, exact-basis CAS and receipt; peers rebase or receive the specified in-flight-work disposition.
@@ -573,7 +663,36 @@ Qualify worker→worker through this adapter as the concrete second M2 consumer 
 
 ### 5.14 Steward adoption of the reusable conversation work surface
 
+The steward's local attention intake is independent of external channel setup.
+It consumes the same canonical blocker/decision facts as the optional Goal
+Channel, then synthesizes their effect on objectives, prior decisions and safe
+continuation. One Todo's blocker and request form one subject, not two mechanical
+alerts. Semantic grouping preserves distinct request identities and decision
+terms; model prose cannot change authority or certify delivery. See the
+[Goal Channel intake checkpoint](goal-channel-collaboration-v0.md#local-steward-intake-and-optional-channel-delivery).
+The bounded implementation supplies facts to existing Turns and replaces channel
+templates with configured, restricted steward synthesis. Verified gate messages
+cover the matching blocker revision; generation failures remain pending. Local
+autonomous wake, change/read/recovery receipts and sustained model quality remain
+Stage 2/R3 work. The external synthesis transcript is isolated from live owner Turns.
+
+The prompt directory uses the existing bounded attention projection to supply
+short blocker/request excerpts with explicit omission, coverage and exact Todo
+read references. All authorized Goals, Agents and source quality remain visible;
+the existing scoped reader restores complete records before decisions or action.
+The native host's observed context-compaction start/end phases appear through
+the same Chat and Lark progress path, without reasoning text or a completion
+claim. This bounded A20/A22 slice does not qualify end-to-end latency or network
+recovery, and does not change context storage, Session identity or authority.
+
+
 The shared [conversation work surface](intelligent-review-presentation-surfaces-v0.md#88-reusable-conversation-work-surface) owns adaptive reports, truthful event presentation, Turn-scoped stop/steer, reconnect and cross-channel density for all LoopX conversations. This RFC applies those same rules to the steward's owner conversation; it owns recipient selection, receiver assessment and the original-route return. A manager-specific answer format or transport must not become a second presentation authority.
+
+The shared handoff acknowledgement presents a bounded task preview and readable
+result/boundary bullets, with the current delivery or execution observation.
+Selection evidence and historical context remain available in the complete
+receiver brief/readback. This presentation slice does not shorten the receiver
+contract, establish adoption, or qualify the full A21–A24 journey.
 
 Routing uses §5.5 rather than a static Agent name list. For a product-design request addressed to the steward, first inspect authorized current Goal, registration, claimed work and fresh session reachability; then rank eligible receivers by responsibility and context, with model/profile fit and actual capacity as separate constraints. Explain the selected recipient or the exact gap. The receiver must acknowledge and assess the full corrected intent, then either work or defer with an owner and condition. The original conversation receives the assessment and final evidenced result through §5.6; the catalog, a stored inbox request and a spinner are three distinct incomplete states. This must pass with a real active worker plus stopped, registered-only, stale and model-mismatched decoys before advertising automatic delegation.
 
@@ -689,6 +808,49 @@ Target an ingress receipt within two seconds on a healthy local service, indepen
 
 Use existing service recovery and receipt pumps. No manager-specific business automation for each kind of request. Expose configuration and failures through the existing CLI, capability settings and manager conversation. Troubleshooting distinguishes model failure, tool/policy denial, state conflict, unreachable receiver and transport formatting/delivery failure.
 
+**Realtime IM entry (S1/S5/S10):** qualify long-connection reception, durable
+admission, host execution and visible return separately. While one answer is
+blocked, another request or correction must receive bounded, truthful admission
+feedback; Core queue/steering support alone does not qualify the Lark consumer.
+Retain persistent Sessions, provisional progress, exact permission decisions
+and explicit media availability through existing Chat/Turn/operation owners.
+No parallel bridge ledger or scheduler is required. The bundled provider's
+[readiness guide](../../../loopx/extensions/lark/docs/realtime-conversation-readiness.md)
+records bounded cross-conversation dispatch and remaining replacement qualification;
+private DM onboarding, ordinary non-Goal chat, streaming and media remain
+unqualified until the pinned installed journey passes.
+
+**Product boundary:** the Bot is a realtime conversation entry, not another
+steward. Ordinary project chat and direct conversation with a selected existing
+Agent must remain useful without team decomposition or a new Goal/Todo. The
+steward is an explicit recipient when the user needs persistent commitments,
+coordination and acceptance. Share authenticated ingress, Session/Turn,
+execution/progress/attachments, operation decisions and recovery; keep recipient
+purpose, audience, transcript and workspace grants distinct. A channel must not
+inherit the global steward objective or portfolio visibility just to obtain a
+working executor. Shared changes belong to the
+[conversation-entry RFC](app-conversation-and-async-inbox-v0.md), not a second Bot
+execution or approval authority. Replacing a tenant-controlled App on another
+machine requires a freshly authorized App; credentials, source transcripts and
+permission bindings do not travel as a workstation backup.
+
+**Ordinary writable-project prompt checkpoint (S5):** project Turns use their
+authorized workspace, AGENTS and skills without manager Goal discovery, drafting
+or context-delegation instructions. Session, grants and the existing response
+envelope remain unchanged; manager and execution guidance retain their prior
+contract. Native fake-host tests qualify instruction routing and continuity,
+not source-reading success, model latency or sustained installed operation.
+
+Deliver these through M1/M3 and the existing S5 journey, without adding a parallel
+milestone or treating a periodic heartbeat as realtime transport:
+
+| Order | User-visible exit | Existing owner and qualification |
+| --- | --- | --- |
+| First | A slow role does not hold every other conversation on the same Bot; follow-ups remain ordered | Lark transport has bounded workers/buffering, fresh binding checks, reply/ACK readback and stop/drain evidence; Core retains Session admission and budgets |
+| Next | A first DM and explicit role choice continue the intended conversation; busy work promptly reports durable admission or rejection | Chat Session/Turn and typed ingress own continuity, audience and queue/steering; ordinary chat must not require users to manufacture a Goal Topic, and role names alone grant no authority |
+| Then | Progress, images/files and permission answers work for each advertised host | Existing event/attachment/operation owners; bounded provisional cards, explicit unsupported media, authenticated exact-operation callbacks and delivery-only recovery |
+| Switch gate | The installed provider/host journey survives reconnect, duplicates, cancellation and unavailable delivery | Pin versions and run the actual entry/readback; retire an old bridge only after qualification, with one consumer owner per App and no copied credentials or sessions |
+
 **Accepted queue preparation failures (S1/S10, A12/A22/A23):** an accepted
 request owns a terminal outcome even before an adapter starts. A missing runtime
 asset, invalid workspace or failed session restoration must settle the affected
@@ -699,7 +861,36 @@ provider failure where available; unexpected local preparation errors use
 `runtime_unavailable`, with private diagnostics retained locally. Cancellation
 and an already terminal result win over a late preparation error. Restoring the
 runtime must not replay a failed request; the same ingress identity returns the
-same failure, while a fresh explicit request can run after repair.
+same failure, while a fresh explicit request can run after repair. Before
+terminal settlement, the built-in Codex provider may retry startup once for a
+typed `response_timeout` when restoring a known upstream thread. Its failed
+process must be closed first; the same thread, workspace and configured grant
+remain binding, with native configuration/authentication checks reapplied.
+This preparation retry does not dispatch a Turn. Fresh thread creation, host
+approval/authentication failures and already dispatched Turns are not retried;
+an exhausted startup still follows the existing terminal failure contract, and
+a persisted stop must prevent dispatch even if startup later succeeds.
+
+**Model capacity failures (S5/S10):** the Codex adapter preserves the typed
+`serverOverloaded` terminal error as `server_overloaded`; arbitrary upstream
+prose cannot establish that category. Lark private conversations and manager
+replies show a safe busy-model explanation and ask users to check existing
+results before choosing a later retry. The original Session, Turn and delivery
+receipt remain authoritative. This adds no automatic replay, model fallback or
+replacement thread, and does not prove availability or absence of earlier
+effects. Retryable notifications still wait for the actual terminal outcome.
+
+**Stopped workers returning late (A23, GQ08):** context preparation and provider
+reads can outlive the bounded interrupt wait. Before dispatch and when a provider
+returns, consult the persisted Turn status and its exact active Session claim
+through the existing typed turn-driver owner. An in-memory cancellation marker
+is insufficient: it may already have been cleared when the stop receipt commits.
+A stopped worker must neither launch a new provider Turn nor deliver a late
+handoff, and it must not borrow a newer Turn's claim. Validate stop through the
+real HTTP endpoint and file store, let a fresh request complete before releasing
+the old reader, and verify one interrupted outcome with no late dispatch or
+handoff. This qualifies that delayed-read boundary; it does not prove provider
+interrupt fidelity or cancellation of an effect already admitted by its owner.
 
 The bounded Python queue repair uses the existing store's fenced failure and
 claim-release operations for all queue callers; Lark only translates the typed

@@ -151,8 +151,11 @@ export function goalCapabilityCatalog(multiSubagentConfiguration) {
       capabilityId: "todo_replan_cadence",
       displayName: "Goal review cadence",
       editorScopes: ["machine", "goal"],
-      defaultConfiguration: { completed_todos: 5 },
-      fields: [{ key: "completed_todos", label: "Completed Todos between Goal reviews", description: "", input_kind: "number", required: true, minimum: 1, maximum: 5 }],
+      defaultConfiguration: { count_unit: "effective_turns", count: 5 },
+      fields: [
+        { key: "count_unit", label: "Count between reviews", description: "", input_kind: "select", required: true, options: ["completed_todos", "effective_turns"] },
+        { key: "count", label: "Review interval", description: "", input_kind: "number", required: true, minimum: 1, maximum: 5 },
+      ],
     }),
     periodicReportCapability(),
     goalCapability({
@@ -270,24 +273,49 @@ function teamPlanApplyReceipt(proposal) {
   return receipt;
 }
 
-export function startServer() {
+export async function startServer() {
   if (packaged) {
     // An explicit installed interpreter must resolve its own package, not the checkout.
     const isolation = process.env.LOOPX_PYTHON_BIN ? ["-I"] : [];
-    return spawn(resolveTestPython(), [...isolation, "-c", `
+    const server = spawn(resolveTestPython(), [...isolation, "-c", `
+from pathlib import Path
 from loopx.chat_server import ChatHTTPServer, ChatRequestHandler, default_chat_assets_dir
 from loopx.presentation.chat_bundle import validate_bundle
 assets = default_chat_assets_dir()
-validate_bundle(assets)
+validate_bundle(assets, source_root=${process.env.LOOPX_PYTHON_BIN ? "None" : `Path(${JSON.stringify(repoRoot)})`})
 server = ChatHTTPServer(("127.0.0.1", ${port}), ChatRequestHandler)
 server.assets_dir = assets
 server.verbose = False
+print("loopx-packaged-smoke-ready", flush=True)
 server.serve_forever()
 `], {
       cwd: repoRoot,
       env: { ...process.env },
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    // An unrelated process on the same port is not this bundle's readiness.
+    await new Promise((resolveReady, rejectReady) => {
+      let output = "";
+      let diagnostic = "";
+      const timer = setTimeout(() => {
+        server.kill("SIGTERM");
+        rejectReady(new Error("Packaged workspace server did not start within 20 seconds"));
+      }, 20_000);
+      server.stderr.on("data", (chunk) => { diagnostic = (diagnostic + chunk).slice(-8000); });
+      server.stdout.on("data", (chunk) => {
+        output += chunk;
+        if (/loopx-packaged-smoke-ready\r?\n/u.test(output)) {
+          clearTimeout(timer);
+          resolveReady();
+        }
+      });
+      server.once("error", (error) => { clearTimeout(timer); rejectReady(error); });
+      server.once("exit", (code) => {
+        clearTimeout(timer);
+        rejectReady(new Error(`Packaged workspace server exited (${code}): ${diagnostic}`));
+      });
+    });
+    return server;
   }
   return startViteDashboardServer({ dashboardDir, port });
 }
@@ -366,7 +394,7 @@ function filterStatusFixtureToScope(fixture, matchesScope) {
   }
 }
 
-export async function installApi(page, { goalSubagentConfigurationEnabled = true, initialActionProposals = [], managerChannelBinding = null, progressiveWorkspace = false, runtimeAgents = null } = {}) {
+export async function installApi(page, { goalSubagentConfigurationEnabled = true, initialActionProposals = [], managerChannelBinding = null, notificationProjection = null, progressiveWorkspace = false, runtimeAgents = null, userActionAttention = false, presentationApi = false } = {}) {
   let turnCounter = 0;
   const runtime = page.__loopxRuntime ??= { actionProposals: new Map(), goalSubagentConfigurations: new Map(), larkConnections: [], messages: new Map(), sessions: new Map(), turnMessages: new Map() };
   const actionProposals = runtime.actionProposals;
@@ -399,8 +427,12 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
   const actionKinds = new Map(Array.from(actionProposals.values(), (proposal) => [proposal.proposal_id, proposal.action_kind]));
   const state = {
     nextLifecycleProposalPatch: null,
+    deletedGoalIds: new Set(),
     nextLifecycleApplyOutcome: null,
     loseNextTeamPlanResponse: false,
+    failNextActionList: false,
+    failActionListAfterLostTeamPlanResponse: false,
+    failNextTeamPlanAfterCommit: null,
     actionApplies: [],
     actionCancels: [],
     actionPreviews: [],
@@ -453,7 +485,14 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
     },
     operatorCredentialWrites: [],
     turnRequests: [],
+    todoRequestTexts: new Map(),
+    todoRequestReads: [],
+    decidedGateTodoIds: new Set(),
+    // Applied User action outcomes, so the needs-you projection reads back like canonical status.
+    userActionOutcomes: new Map(),
     hostThreadActivity: {},
+    /** Scenario hook applied to every status payload after the shared fixture rules. */
+    transformStatus: null,
     answerForMessage: null,
     loopxModeRequests: [],
     get larkConnections() { return runtime.larkConnections; },
@@ -480,6 +519,7 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
     }
     if (progressiveWorkspace && requestedGoalId) state.goalStatusRequests.push(requestedGoalId);
     const fixture = structuredClone(require(resolve(repoRoot, "examples/status.example.json")));
+    if (notificationProjection) fixture.goal_channel_notification_projection = structuredClone(notificationProjection);
     const defaultSubagentConfiguration = { mode: "default", spawn_allowed: false, max_children: 0, allowed_domains: [] };
     const projectedSubagentConfiguration = (goalId, fallback) => state.freezeGoalSubagentStatusProjection
       ? fallback ?? defaultSubagentConfiguration
@@ -489,8 +529,13 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
       ...(fixture.local_dashboard_api ?? {}),
       periodic_report_index_url: "/periodic-report-workspace",
       periodic_report_detail_url: "/periodic-report-workspace-projection",
+      ...(presentationApi ? {
+        presentation_surfaces_url: `${typeof presentationApi === "string" ? presentationApi : ""}/extension-presentation-surfaces`,
+        presentation_detail_url: `${typeof presentationApi === "string" ? presentationApi : ""}/extension-projection`,
+      } : {}),
     };
     for (const directoryGoal of directoryGoalFixtures) {
+      if (state.deletedGoalIds.has(directoryGoal.id)) continue;
       const activation_state = statusGeneration.get(directoryGoal.id) ?? "active";
       const existingGoal = fixture.run_history.goals.find((goal) => goal.id === directoryGoal.id);
       if (existingGoal) {
@@ -529,13 +574,25 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
       });
     }
     const first = fixture.attention_queue?.items?.[0];
+    if (first && state.nativeChildActivity) {
+      first.project_asset ??= {owner: "codex", gate: "ready", next_action: first.recommended_action ?? "Review the fixture", stop_condition: "Fixture accepted"};
+      first.project_asset.native_child_activity = state.nativeChildActivity;
+    }
     if (first) {
       first.waiting_on = "user_or_controller";
+      const gateDecided = state.decidedGateTodoIds.has("todo-browser-user-gate");
+      const userItems = [{ done: gateDecided, status: gateDecided ? "done" : "open", goal_id: first.goal_id, index: 0, role: "user", task_class: "user_gate", blocks_agent: "codex", text: "确认本轮独立审查范围", todo_id: "todo-browser-user-gate" }];
+      if (userActionAttention) {
+        const outcome = state.userActionOutcomes.get("todo-browser-user-action");
+        userItems.unshift({ done: Boolean(outcome), status: outcome ?? "open", goal_id: first.goal_id, index: 1, role: "user", task_class: "user_action", bound_agent: "codex-delivery",
+          text: "在桌面 App 中手动创建剩余的 3 个角色会话", note: "这是一项不阻塞 Agent 的用户操作提醒，而不是批准请求。", todo_id: "todo-browser-user-action", updated_at: "2026-08-13T00:00:00Z" });
+        userItems.push({ done: false, status: "open", goal_id: first.goal_id, index: 2, role: "user", task_class: "user_action", text: "核对本机备份目录是否可写" });
+      }
       first.user_todos = {
-        items: [{ done: false, goal_id: first.goal_id, index: 0, role: "user", text: "确认本轮独立审查范围", todo_id: "todo-browser-user-gate" }],
-        open_count: 1,
+        items: userItems,
+        open_count: userItems.filter((todo) => !todo.done).length,
         source_section: "User Todo",
-        total_count: 1,
+        total_count: userItems.length,
       };
       const domainTodos = (first.project_asset?.agent_todos?.items ?? first.agent_todos?.items ?? [])
         .filter((todo) => !todo.done)
@@ -694,10 +751,21 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
         },
       );
     }
+    for (const goal of fixture.attention_queue.items) {
+      for (const todo of goal.agent_todos?.items ?? []) {
+        if (todo.todo_id) {
+          const key = JSON.stringify([goal.goal_id, todo.todo_id]);
+          if (!state.todoRequestTexts.has(key)) state.todoRequestTexts.set(key, todo.text);
+          todo.text = state.todoRequestTexts.get(key).slice(0, 500);
+        }
+      }
+    }
     for (const [goalId, activity] of Object.entries(state.hostThreadActivity)) {
       const goal = fixture.run_history.goals.find((item) => item.id === goalId);
       if (goal) goal.host_thread_activity = activity;
     }
+    state.transformStatus?.(fixture);
+    fixture.run_history.goals = fixture.run_history.goals.filter(goal => !state.deletedGoalIds.has(goal.id));
     const goalActivationScope = new URL(route.request().url()).searchParams.get("goal_activation");
     const isActiveScope = goalActivationScope === "active";
     const activeGoalCount = fixture.run_history.goals.filter((goal) => goal.activation_state !== "stopped").length;
@@ -865,13 +933,30 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
   await page.route("**/api/chat/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
+    if (url.pathname === "/api/chat/todo/detail") {
+      const goalId = url.searchParams.get("goal_id");
+      const todoId = url.searchParams.get("todo_id");
+      state.todoRequestReads.push({ goalId, todoId });
+      const text = state.todoRequestTexts.get(JSON.stringify([goalId, todoId]));
+      await route.fulfill({ json: text === undefined ? { ok: false, error: "Task not found" } : {
+        ok: true, goal_id: goalId, todo_id: todoId, text, status: "open", archive_state: "active", updated_at: null,
+      } });
+      return;
+    }
     if (url.pathname === "/api/chat/completed-todos") {
       const total = url.searchParams.get("goal_id") === "progress-projection" ? 4087 : 0;
       const offset = Number(url.searchParams.get("cursor") || 0);
       const items = Array.from({ length: Math.min(40, total - offset) }, (_, position) => {
         const index = offset + position;
-        return { todo_id: `todo_history_${index}`, text: index < 3 ? `Completed ${String.fromCharCode(65 + index)}` : `Completed historical Task ${index + 1}`, claimed_by: "example-agent", evidence: null, priority: null, task_class: "advancement_task" };
+        return { todo_id: `todo_history_${index}`, text: index < 3 ? `Completed ${String.fromCharCode(65 + index)}` : `Completed historical Task ${index + 1}`, claimed_by: "example-agent", evidence: index === 0 ? "Verified retained **completion evidence**." : null, priority: null, task_class: "advancement_task", done: true, status: "done",
+          completed_at: "2026-08-01T00:00:00Z", resume_when: index === 0 ? "todo_done:todo_history_1" : null, resume_ready: index === 0 ? true : null,
+          resume_condition: index === 0 ? { resume_receipt: { receipt_id: "receipt-completed-history" } } : null,
+          completion_validation_sha256: index === 0 ? "a".repeat(64) : null,
+          completion_validation_revision: index === 0 ? 3 : null,
+          completion_validation_revision_history: index === 0 ? [{ revision: 3, previous_declaration_sha256: "b".repeat(64), declaration_sha256: "a".repeat(64), actor_agent_id: "example-reviewer", revised_at: "2026-08-01T00:00:00Z" }] : [],
+        };
       });
+      for (const item of items) state.todoRequestTexts.set(JSON.stringify([url.searchParams.get("goal_id"), item.todo_id]), item.text);
       await route.fulfill({ json: { ok: true, total, items, next_cursor: offset + 40 < total ? String(offset + 40) : null } });
       return;
     }
@@ -960,7 +1045,7 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
             namespace: "todo_replan_cadence",
             title: "Goal review cadence",
             description: "Live review threshold without added turns, quota, or authority.",
-            schema_versions: ["todo_replan_cadence_machine_defaults_v0"],
+            schema_versions: ["todo_replan_cadence_machine_defaults_v0", "todo_replan_cadence_machine_defaults_v1"],
             configuration_template: cadenceConfiguration,
             template_status: "ready",
           },
@@ -1714,6 +1799,11 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
     await route.fulfill({ contentType: "text/event-stream", body: finishTurn(sessionId, turnId, answer, protectedAction, scriptedAnswer?.goal_draft, scriptedAnswer?.proposals ?? []), status: 200 });
   });
   await page.route(/\/api\/actions(?:\?.*)?$/, async (route) => {
+    if (route.request().method() === "GET" && state.failNextActionList) {
+      state.failNextActionList = false;
+      await route.fulfill({ contentType: "application/json", json: { ok: false, error: "Action state is temporarily unavailable", error_code: "action_list_unavailable" }, status: 503 });
+      return;
+    }
     const url = new URL(route.request().url());
     const goalId = url.searchParams.get("goal_id");
     const contextKind = url.searchParams.get("context_kind");
@@ -1779,6 +1869,13 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
         validation_evidence: ["fixture validation"], available_transitions: ["apply", "cancel"],
         status: "preview_ready", receipt: null, stale: null, created_at: "2026-08-13T01:00:00Z", updated_at: "2026-08-13T01:00:00Z",
       };
+      if (body.action_kind === "goal.lifecycle") {
+        // Match the production service boundary: omitting this basis hid the
+        // decoder regression before the owner could reach confirmation.
+        proposal.canonical_update_basis = body.normalized_parameters.operation === "delete"
+          ? { schema_version: "loopx_goal_deletion_source_basis_v1", source_identity: "a".repeat(64), source_content_sha256: "b".repeat(64), route_mode: "source_to_global" }
+          : { schema_version: "loopx_goal_lifecycle_source_basis_v1", source_identity: "a".repeat(64) };
+      }
       if (body.action_kind === "goal.lifecycle" && state.nextLifecycleProposalPatch) {
         Object.assign(proposal, state.nextLifecycleProposalPatch);
         state.nextLifecycleProposalPatch = null;
@@ -1854,10 +1951,13 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
         messages.set(sessionId, sessionMessages);
       }
       if (actionKind === "goal.lifecycle" && preview) {
-        state.goalActivationStates.set(
-          preview.normalized_parameters.goal_id,
-          preview.normalized_parameters.operation === "stop" ? "stopped" : "active",
-        );
+        const goalId = preview.normalized_parameters.goal_id;
+        if (preview.normalized_parameters.operation === "delete") {
+          state.deletedGoalIds.add(goalId);
+          state.goalActivationStates.delete(goalId);
+        } else {
+          state.goalActivationStates.set(goalId, preview.normalized_parameters.operation === "stop" ? "stopped" : "active");
+        }
       }
       const resourceKey = `${actionKind}:${apply[1]}`;
       const replay = state.durableResources.has(resourceKey);
@@ -1869,15 +1969,59 @@ export async function installApi(page, { goalSubagentConfigurationEnabled = true
       // previews, so the plan a confirmed card carries has to be read there.
       const teamPlanReceipt = teamPlanApplyReceipt(actionProposals.get(apply[1]));
       if (teamPlanReceipt && replay) teamPlanReceipt.outcome = "team_plan_commit_recovered";
+      // Mirrors ChatActionService's gate.resolve receipt (tests/control_plane/test_chat_gate_decisions.py).
+      const decisionParameters = actionKind === "gate.resolve" ? preview?.normalized_parameters : null;
+      if (decisionParameters) state.decidedGateTodoIds.add(decisionParameters.todo_id);
+      const userActionParameters = preview?.normalized_parameters?.todo_id === "todo-browser-user-action" ? preview.normalized_parameters : null;
+      if (userActionParameters) state.userActionOutcomes.set(userActionParameters.todo_id,
+        actionKind === "gate.resolve" ? "done" : userActionParameters.operation === "defer" ? "deferred" : "done");
+      const decisionReceipt = decisionParameters ? { projection_verified: true, receipt_id: "fixture-receipt", outcome: "gate_resolved",
+        decision_outcome: decisionParameters.decision,
+        unblock_resume_state: { approve: "resumed", reject: "decision_rejected", cancel: "decision_cancelled" }[decisionParameters.decision] ?? null } : null;
+      const storedProposal = actionProposals.get(apply[1]);
       const proposal = {
         schema_version: "loopx_chat_action_proposal_v1", proposal_id: apply[1], action_kind: actionKind,
-        summary: "已应用", normalized_parameters: preview?.normalized_parameters ?? actionProposals.get(apply[1])?.normalized_parameters ?? {}, context: preview?.context ?? actionProposals.get(apply[1])?.context ?? {}, expected_state_fingerprint: "fixture-r1",
-        permission_classification: "durable_write", validation_evidence: [], available_transitions: ["apply", "cancel"],
-        status: "applied", receipt: teamPlanReceipt ?? { projection_verified: true, receipt_id: "fixture-receipt" }, stale: null, created_at: "2026-08-13T01:00:00Z", updated_at: "2026-08-13T01:00:01Z",
+        summary: actionKind === "team.plan" && storedProposal ? storedProposal.summary : "已应用",
+        normalized_parameters: actionKind === "team.plan" && storedProposal
+          ? storedProposal.normalized_parameters : preview?.normalized_parameters ?? storedProposal?.normalized_parameters ?? {},
+        context: actionKind === "team.plan" && storedProposal
+          ? storedProposal.context : preview?.context ?? storedProposal?.context ?? {},
+        expected_state_fingerprint: actionKind === "team.plan" && storedProposal
+          ? storedProposal.expected_state_fingerprint : "fixture-r1",
+        permission_classification: "durable_write",
+        validation_evidence: actionKind === "team.plan" && storedProposal ? storedProposal.validation_evidence : [],
+        available_transitions: ["apply", "cancel"],
+        status: "applied", receipt: teamPlanReceipt ?? decisionReceipt ?? { projection_verified: true, receipt_id: "fixture-receipt" }, stale: null,
+        created_at: actionKind === "team.plan" && storedProposal
+          ? storedProposal.created_at : "2026-08-13T01:00:00Z",
+        updated_at: "2026-08-13T01:00:01Z",
+        ...(actionProposals.get(apply[1])?.canonical_update_basis
+          ? { canonical_update_basis: actionProposals.get(apply[1]).canonical_update_basis } : {}),
       };
       actionProposals.set(apply[1], proposal);
+      if (actionKind === "team.plan" && state.failNextTeamPlanAfterCommit === apply[1]) {
+        state.failNextTeamPlanAfterCommit = null;
+        const failed = {
+          ...proposal,
+          status: "failed",
+          receipt: null,
+          failure: {
+            error_code: "team_plan_commit_failed",
+            message: "The team plan was committed, but its post-commit readback failed.",
+            failed_at: "2026-08-13T01:00:01Z",
+            retry_safe: true,
+          },
+        };
+        actionProposals.set(apply[1], failed);
+        await route.fulfill({ contentType: "application/json", json: { ok: true, proposal: failed }, status: 200 });
+        return;
+      }
       if (actionKind === "team.plan" && state.loseNextTeamPlanResponse) {
         state.loseNextTeamPlanResponse = false;
+        if (state.failActionListAfterLostTeamPlanResponse) {
+          state.failActionListAfterLostTeamPlanResponse = false;
+          state.failNextActionList = true;
+        }
         await route.fulfill({ contentType: "application/json", status: 503, json: { ok: false, error: "Assignment response unavailable", error_code: "team_plan_response_lost" } });
         return;
       }

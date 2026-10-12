@@ -16,7 +16,11 @@ from loopx.control_plane.testing.control_plane_composition_scenarios import (
 from loopx.control_plane.scheduler.execution_context import (
     GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
 )
-from loopx.control_plane.testing.quota_fixtures import quota_status_payload
+from loopx.control_plane.testing.quota_fixtures import (
+    quota_status_payload,
+    quota_todo_item,
+    quota_todo_summary,
+)
 from loopx.control_plane.work_items.autonomous_replan_obligation import (
     build_autonomous_replan_obligation_payload,
 )
@@ -117,7 +121,7 @@ def test_quota_delivers_coverage_context_and_minimal_replan_action() -> None:
     obligation = payload["autonomous_replan_obligation"]
     context = obligation["replan_context"]
     action = payload["replan_action_packet"]
-    assert context["evidence_source"] == "agent_scoped_evidence_log"
+    assert context["evidence_source"] == "compact_run_history"
     assert context["delivery"] == "host_projected"
     assert context["delivery_receipt"] == {
         "schema_version": "replan_context_delivery_receipt_v0",
@@ -127,7 +131,7 @@ def test_quota_delivers_coverage_context_and_minimal_replan_action() -> None:
         "delivered_by": "quota_host_projection",
     }
     assert context["coverage_ledger"][0]["surface_id"] == "surface-existing"
-    assert len(action["planning_guidance"]) == 2
+    assert len(action["planning_guidance"]) == 5
     assert {key: value for key, value in action.items() if key != "planning_guidance"} == {
         "schema_version": "replan_action_packet_v0",
         "decision": "replan_required",
@@ -146,6 +150,60 @@ def test_quota_delivers_coverage_context_and_minimal_replan_action() -> None:
     ] == "produce one typed outcome from the host-projected replan action packet"
 
 
+def test_replan_obligation_outlives_quiet_monitor_and_scoped_user_gate() -> None:
+    monitor = quota_todo_item(
+        todo_id="todo_waiting_monitor",
+        title="Watch a pending review.",
+        task_class="continuous_monitor",
+        claimed_by=AGENT_ID,
+        target_key="github:example/project:pr:123",
+        cadence="30m",
+        next_due_at="2099-01-01T00:00:00+00:00",
+    )
+    gate = quota_todo_item(
+        todo_id="todo_test_scope_gate",
+        role="user",
+        title="Provide a non-production test scope.",
+        task_class="user_gate",
+        blocks_agent=AGENT_ID,
+    )
+    status = quota_status_payload(
+        goal_id=GOAL_ID,
+        status="active",
+        quota_state="operator_gate",
+        safe_bypass=True,
+        recommended_action="Wait for the test scope.",
+        agent_todos=quota_todo_summary([monitor], role="agent"),
+        user_todos=quota_todo_summary([gate], role="user"),
+        project_asset_extra={"autonomous_replan_obligation": _obligation()},
+        coordination={
+            "agent_model": "peer_v1",
+            "registered_agents": [AGENT_ID],
+        },
+    )
+
+    packet = build_quota_should_run(
+        status,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+    )
+
+    assert packet["decision"] == "autonomous_replan_required"
+    assert packet["work_lane_contract"]["obligation"] == "quiet_until_material_monitor_transition"
+    assert packet["heartbeat_recommendation"]["recommended_mode"] == "ask_operator_gate"
+    assert packet["execution_obligation"]["must_attempt_work"] is True
+    assert packet["execution_obligation"]["kind"] == "autonomous_replan_required"
+    assert packet["execution_obligation"]["stall_threshold"] == 2
+    assert packet["interaction_contract"]["mode"] == "autonomous_replan"
+    assert packet["interaction_contract"]["user_channel"]["notify"] == "NOTIFY"
+    assert packet["interaction_contract"]["user_channel"]["actions"]
+    assert packet["interaction_contract"]["agent_channel"]["must_attempt"] is True
+    assert packet["selected_todo"] is None
+    assert packet["scheduler_hint"]["action"] == "run_now"
+    assert packet["scheduler_hint"].get("consistency_error") is None
+
+
 def test_manual_evidence_read_receipt_cannot_close_replan() -> None:
     payload = _quota_payload(include_legacy_receipt=True)
 
@@ -160,12 +218,26 @@ def test_replan_guidance_survives_cli_and_host_compaction_without_new_authority(
               if vision_gap else _quota_payload())
     guidance = source["replan_action_packet"]["planning_guidance"]
     # These are delivery assertions, not a claim that a model follows the advice.
-    assert len(guidance) == 2
+    assert len(guidance) == 5
     assert "Never shrink requested goals" in guidance[0]
     assert "honor user scope, authority, budget and stops" in guidance[0]
     assert "current authoritative evidence for every requirement" in guidance[1]
     assert "unproven" in guidance[1]
     assert "blocked/exhausted/superseded is not achieved" in guidance[1]
+    assert "review unmet acceptance against the original authorized goal and evidence" in guidance[2]
+    assert "continue or replan without waiting for an assigned successor" in guidance[2]
+    assert "An empty Todo queue is not a scope limit" in guidance[2]
+    assert "do not invent work, exceed authority or consume budget merely to stay active" in guidance[2]
+    assert "requested priorities and optimization direction" in guidance[3]
+    assert "user requirements and hard constraints" in guidance[3]
+    assert "provisional agent-created candidate rules" in guidance[3]
+    assert "Do not relax frozen acceptance, authority, budget or stops" in guidance[3]
+    assert "or rewrite criteria after failure" in guidance[3]
+    assert "Compare expected goal/information gain with full marginal cost" in guidance[4]
+    assert "executed path and current artifact" in guidance[4]
+    assert "probe that distinguishes remaining explanations" in guidance[4]
+    assert "scope negative results to tested conditions and local proxies to their coverage" in guidance[4]
+    assert "Reuse still-applicable evidence" in guidance[4]
     compact = compact_quota_should_run_cli_payload(source)
     envelope = build_turn_envelope(source)
     for packet in (compact, envelope):
@@ -180,9 +252,11 @@ def test_replan_guidance_survives_cli_and_host_compaction_without_new_authority(
     assert turn_envelope_action_signature_document(envelope) == signature
     signature["replan_action_packet"].pop("planning_guidance")
     assert signature == quota_action_signature_document(baseline)
-    # Preserve an existing budget warning; bounded advice adds no more than 360 bytes.
+    # Preserve an existing budget warning. The original three clauses consume
+    # 670 bytes; objective/evidence guidance adds about 660 bytes. Retain all
+    # decision obligations with bounded headroom instead of compressing them.
     assert envelope["compaction"]["within_budget"] == old_envelope["compaction"]["within_budget"]
     assert (envelope["compaction"]["envelope_json_bytes"]
-            - old_envelope["compaction"]["envelope_json_bytes"]) <= 360
+            - old_envelope["compaction"]["envelope_json_bytes"]) <= 1500
     envelope["replan_action_packet"].pop("planning_guidance")
     assert envelope["replan_action_packet"] == old_envelope["replan_action_packet"]

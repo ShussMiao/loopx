@@ -96,7 +96,7 @@ loopx turn run-once \
   --host generic-cli \
   --execution-mode isolated-headless \
   --project "$PWD" \
-  --host-adapter-command-json '["python3", "-m", "loopx.dsh_goal_mode", "--dsh-home", "/path/to/dsh-home", "--cordis", "/path/to/cordis.yml", "--model", "deepseek-v4-flash"]' \
+  --host-adapter-command-json '["python3", "-m", "loopx.dsh_goal_mode", "--dsh-home", "/path/to/dsh-home", "--cordis", "/path/to/cordis.yml", "--model", "deepseek-flash"]' \
   --validation-command-json '["python3", "/path/to/verify-postcondition.py"]' \
   --execute
 ```
@@ -122,7 +122,7 @@ resume behavior for the newly selected id remains owned by the dsh composition.
 
 `--iteration-context fresh` selects a session scoped to the current Turn key;
 retrying that same transaction keeps its identity. The default
-`resume-if-available` retains the Goal/Agent/Todo lineage behavior described
+`resume` retains the Goal/Agent/Todo lineage behavior described
 above. A durable Agent identity is not a reason to reuse another Todo's task
 packet or chat context. Independent questions should select fresh context;
 continuations must keep the exact task lineage and refresh explicit inputs.
@@ -139,7 +139,7 @@ additional permissions. Domain task packages and
 artifact validators must still verify their own task identity and revision.
 
 `fresh` 按本次 Turn 选择新上下文，同一事务重试保持身份；默认
-`resume-if-available` 按 Goal/Agent/Todo 延续。Agent 可以长期存在，但独立
+`resume` 按 Goal/Agent/Todo 延续。Agent 可以长期存在，但独立
 问题应使用新上下文，不能把另一个 Todo 的旧任务包当成交接。宿主将上述四个
 本次调用身份变量传给运行时工具，覆盖陈旧值；无 Todo 时为空。这是覆盖映射，
 不是环境隔离边界：当前 pin 的 SDK 先继承父进程环境，再应用映射，因此父进程
@@ -159,7 +159,7 @@ loopx turn run-once \
   --project "$PWD" \
   --dsh-home /path/to/dsh-home \
   --dsh-cordis /path/to/cordis.yml \
-  --dsh-model deepseek-v4-flash \
+  --dsh-model deepseek-flash \
   --validation-command-json '["python3", "/path/to/verify-postcondition.py"]' \
   --execute
 ```
@@ -183,7 +183,8 @@ credential authenticates it, and `codex-cli` is the default when no credential i
 configured, because an unauthenticated managed host would refuse to run.
 
 What runs on that host is a separate resolution. The managed execution profile
-defaults to `deepseek-official` / `deepseek-v4-flash` / `high`, overridden by
+defaults to `deepseek-official` / `deepseek-flash` / `high`, the canonical
+DeepSeek-V4.1-Flash id, overridden by
 `LOOPX_TURN_PROVIDER` / `LOOPX_TURN_MODEL` / `LOOPX_TURN_REASONING_EFFORT` and, at
 lower precedence, by the legacy `DSH_PROVIDER` / `DSH_MODEL`; an explicit
 `--dsh-provider` / `--dsh-model` / `--dsh-reasoning-effort` wins over both. The
@@ -211,7 +212,7 @@ host id:
   "credential_env": "DEEPSEEK_API_KEY",
   "endpoint_env": "DEEPSEEK_BASE_URL",
   "operator_credential_bound": true,
-  "execution_profile": "deepseek-v4-flash@high",
+  "execution_profile": "deepseek-flash@high",
   "output_token_budget": {
     "schema_version": "dsh_output_token_budget_v0",
     "scope": "per_model_request",
@@ -235,7 +236,7 @@ configured. `available` is `false` only when LoopX can prove the planned host
 cannot launch here, and `null` for executors this projection does not probe
 rather than an unproven claim. Only the credential variable *name* is reported;
 the value is never read back. `execution_profile` is the resolved profile as one
-line, `deepseek-v4-flash@high` in the shipped shape, with the provider prepended
+line, `deepseek-flash@high` in the shipped shape, with the provider prepended
 only when it is not the shipped one -- it is one line because every plan carries
 it, and the agent-facing output budget is a contract.
 
@@ -298,12 +299,13 @@ The repository includes four validation paths. The first three do not require th
 DeepSeek Harness SDK or a real dsh runtime:
 
 ```bash
-python3 examples/dsh-turn-host-adapter-smoke.py
+uv run --extra test python -m pytest tests/test_dsh_goal_mode.py
 python3 examples/loopx-turn-dsh-e2e-smoke.py
 python3 examples/loopx-turn-dsh-builtin-host-e2e-smoke.py
 ```
 
-The first guards adapter translation and result shaping. The second drives the
+The first guards adapter translation, result shaping, and acceptance by the real
+host-result validator. The second drives the
 full `loopx turn run-once -> adapter -> fake dsh -> validator -> writeback ->
 quota spend -> idempotent replay` chain. The third proves the built-in host's
 success path plus three bounded provider-capacity attempts, retry-budget

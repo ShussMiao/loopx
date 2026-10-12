@@ -770,13 +770,27 @@ def test_successful_update_revalidates_enabled_extensions(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows update boundary")
-def test_windows_execute_update_fails_closed_without_launching_bash() -> None:
+@pytest.mark.parametrize("selected_route", [False, True])
+def test_windows_execute_update_fails_closed_without_launching_bash(
+    tmp_path: Path, selected_route: bool,
+) -> None:
     payload = {"ok": True, "source": {}, "plan": {}}
+    route = (
+        {
+            "registry_path": tmp_path / "project/.loopx/registry.json",
+            "runtime_root": str(tmp_path / "selected runtime"),
+        }
+        if selected_route else {}
+    )
 
-    with mock.patch("loopx.self_update.subprocess.run") as run:
-        updated = execute_update_plan(payload)
+    with (
+        mock.patch("loopx.self_update.subprocess.run") as run,
+        mock.patch("loopx.self_update.run_archive_installer") as install,
+    ):
+        updated = execute_update_plan(payload, **route)
 
     run.assert_not_called()
+    install.assert_not_called()
     assert updated["ok"] is False
     assert updated["execution"]["status"] == "unsupported_platform"
     assert "install-windows.ps1" in updated["recommended_action"]
@@ -798,3 +812,106 @@ def test_failed_authority_upgrade_does_not_activate_services_or_continue_host_up
     assert result["execution"]["doctor_status"] == "skipped_prior_step_failed"
     assert run.call_count == 2
     restart.assert_not_called()
+
+
+@pytest.mark.parametrize("driver", [
+    pytest.param(
+        "archive_snapshot",
+        marks=pytest.mark.skipif(os.name == "nt", reason="archive updates require a POSIX host"),
+    ),
+    "python_pip",
+    "python_pipx",
+])
+def test_update_preserves_selected_route_through_install_and_readback(tmp_path, monkeypatch, driver):
+    registry, runtime = tmp_path / "project/.loopx/registry.json", tmp_path / "selected runtime"
+    payload = build_update_plan(action="apply", doctor_payload=doctor_payload())
+    payload["install_lifecycle"].update(execution_driver=driver)
+    calls, installer_env = [], {}
+    monkeypatch.setenv("LOOPX_PYTHON", sys.executable)
+    passed = subprocess.CompletedProcess([], 0, '{"ok":true}', '')
+    def install(_url, *, env, **kwargs):
+        installer_env.update(env)
+        return passed, {"stage": "installer_execution"}
+    def run(command, **kwargs):
+        calls.append(command)
+        return passed
+    monkeypatch.setattr("loopx.self_update.run_archive_installer", install)
+    monkeypatch.setattr("loopx.self_update.subprocess.run", run)
+    monkeypatch.setattr("loopx.runtime_activation.restart_managed_loopx_services", lambda: [])
+    result = execute_update_plan(payload, registry_path=registry, runtime_root=str(runtime))
+    assert result["ok"]
+    followups = calls if driver == "archive_snapshot" else calls[1:]
+    for command in followups:
+        assert command[command.index("--registry") + 1] == str(registry.resolve())
+        assert command[command.index("--runtime-root") + 1] == str(runtime)
+    if driver == "archive_snapshot":
+        assert installer_env["LOOPX_REGISTRY"] == str(registry.resolve())
+        assert installer_env["LOOPX_RUNTIME_ROOT"] == str(runtime)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX archive installation ownership")
+@pytest.mark.parametrize("bin_target", [
+    None, "", "default_alias", "custom", "custom_launcher_link", "relative_custom",
+])
+@pytest.mark.parametrize("extension_returncode", [0, 1])
+def test_archive_readback_and_activation_follow_installer_bin_owner(
+    tmp_path, monkeypatch, bin_target, extension_returncode,
+):
+    default_bin = tmp_path / ".local/bin"
+    custom_bin = tmp_path / "custom/bin"
+    targets = {
+        None: None,
+        "": "",
+        "default_alias": str(default_bin / "../bin"),
+        "custom": str(custom_bin),
+        "custom_launcher_link": str(custom_bin),
+        "relative_custom": "custom/bin",
+    }
+    target = targets[bin_target]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.delenv("LOOPX_BIN_DIR", raising=False)
+    if target is not None:
+        monkeypatch.setenv("LOOPX_BIN_DIR", target)
+    if bin_target == "custom_launcher_link":
+        custom_bin.mkdir(parents=True)
+        # A custom launcher linking to the default runtime still belongs to the
+        # custom installation directory. Resolving the launcher loses ownership.
+        (custom_bin / "loopx").symlink_to(default_bin / "loopx")
+    passed = subprocess.CompletedProcess([], 0, '{"ok":true}', '')
+    extension = subprocess.CompletedProcess([], extension_returncode, '{}', '')
+    with (
+        mock.patch("loopx.self_update.run_archive_installer", return_value=(passed, {})),
+        mock.patch("loopx.self_update.subprocess.run", side_effect=[passed, extension]) as run,
+        mock.patch("loopx.runtime_activation.restart_managed_loopx_services", return_value=["com.loopx.status"]) as restart,
+    ):
+        result = execute_update_plan({"source": {}, "plan": {}})
+    selected_launcher = Path(target or default_bin) / "loopx"
+    assert [call.args[0][0] for call in run.call_args_list] == [str(selected_launcher)] * 2
+    assert result["ok"] is (extension_returncode == 0)
+    assert result["changes_applied"] is True
+    if bin_target in (None, "", "default_alias"):
+        restart.assert_called_once_with()
+        assert result["execution"]["restart_status"] == "restarted"
+    else:
+        restart.assert_not_called()
+        assert result["execution"]["restart_status"] == "skipped_custom_installation"
+        assert result["execution"]["restarted_services"] == []
+    if extension_returncode:
+        assert result["next_action"]["kind"] == "repair_blocked_extensions"
+
+
+@pytest.mark.parametrize("driver", ["python_pip", "python_pipx"])
+def test_python_distribution_activation_ignores_archive_bin_override(tmp_path, monkeypatch, driver):
+    monkeypatch.setenv("LOOPX_BIN_DIR", str(tmp_path / "custom/bin"))
+    payload = build_update_plan(action="apply", doctor_payload=doctor_payload())
+    payload["install_lifecycle"].update(execution_driver=driver)
+    passed = subprocess.CompletedProcess([], 0, '{"ok":true}', '')
+    with (
+        mock.patch("loopx.self_update.subprocess.run", return_value=passed),
+        mock.patch("loopx.runtime_activation.restart_managed_loopx_services", return_value=[]) as restart,
+    ):
+        result = execute_update_plan(payload)
+    assert result["ok"]
+    restart.assert_called_once_with()
+    assert result["execution"]["restart_status"] == "restarted"

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 import {
@@ -13,7 +14,7 @@ import { delegationInventoryQuery } from "../../loopx/control_plane/collaboratio
 import { normalizeCollaborationBrief } from "../../loopx/control_plane/collaboration/semantic_request.ts";
 import { decodeOutboxCursor } from "../../loopx/control_plane/coordination/local_authority_shadow_outbox.ts";
 
-const PACKAGE_ROOT = new URL("../../loopx", import.meta.url).pathname;
+const PACKAGE_ROOT = fileURLToPath(new URL("../../loopx", import.meta.url));
 const OWNER_FILE = "control_plane/content_digest.ts";
 const CANONICAL_EXPORTS = ["BARE_SHA256_PATTERN", "ENVELOPED_SHA256_PATTERN"];
 const HEX_CHARS = [..."0123456789abcdef"];
@@ -73,6 +74,10 @@ const DECLARED_UNFOLDABLE: Record<string, { count: number; reason: string }> = {
     count: 2,
     reason: "whitespace class assembled from a shared character-class constant",
   },
+  "control_plane/presentation/decision_notice.ts": {
+    count: 1,
+    reason: "escaped request identifier with exact-reference boundaries, not a digest matcher",
+  },
   "control_plane/quota/monitor_poll_commit.ts": {
     count: 1,
     reason: "artifact file name grammar keyed by a runtime effect token",
@@ -86,14 +91,21 @@ const DECLARED_UNFOLDABLE: Record<string, { count: number; reason: string }> = {
 /** Every module that reads the owner, pinned so that dropping an import is loud. */
 const CANONICAL_CONSUMERS = [
   "control_plane/agents/supervisor_event_append.ts",
+  "control_plane/capabilities/change_quality_validation.ts",
   "control_plane/capabilities/external_evidence.ts",
+  "control_plane/capabilities/goal_capability_organization.ts",
   "control_plane/collaboration/chat_mode.ts",
   "control_plane/collaboration/delegation.ts",
+  "control_plane/collaboration/delegation_result_use.ts",
   "control_plane/collaboration/goal_instance_lifecycle.ts",
+  "control_plane/collaboration/inbox_receipts.ts",
+  "control_plane/collaboration/result_publication.ts",
   "control_plane/collaboration/return_delivery.ts",
   "control_plane/collaboration/semantic_request.ts",
   "control_plane/coordination/authority_archive_read.ts",
   "control_plane/coordination/authority_source.ts",
+  "control_plane/coordination/cold_source_import.ts",
+  "control_plane/coordination/legacy_writer_fence.ts",
   "control_plane/coordination/local_authority_migration.ts",
   "control_plane/coordination/local_authority_shadow.ts",
   "control_plane/coordination/local_authority_shadow_outbox.ts",
@@ -115,7 +127,9 @@ const CANONICAL_CONSUMERS = [
   "control_plane/goals/shared_goal_alignment.ts",
   "control_plane/goals/source_session_lifetime.ts",
   "control_plane/governed_capability.ts",
+  "control_plane/presentation/action_review_plan.ts",
   "control_plane/quota/refresh_external_delivery.ts",
+  "control_plane/runtime/execution_identity.ts",
   "control_plane/runtime/usage_statistics_cycles.ts",
   "control_plane/runtime/usage_statistics_goal_contract.ts",
   "control_plane/runtime/usage_statistics_goals.ts",
@@ -123,8 +137,12 @@ const CANONICAL_CONSUMERS = [
   "control_plane/todos/completion_validation_revision.ts",
   "control_plane/turn_driver/chat_turn_acceptance.ts",
   "control_plane/work_items/operation_agent_handoff.ts",
+  "control_plane/work_items/interaction_contract.ts",
   "control_plane/work_items/pending_capability_intent.ts",
+  "control_plane/work_items/progress_review_evidence.ts",
+  "control_plane/work_items/replan_context.ts",
   "control_plane/work_items/replan_history_snapshot.ts",
+  "control_plane/work_items/refresh_recommendation.ts",
   "control_plane/work_items/task_lease_acquire.ts",
   "control_plane/work_items/task_lease_lifecycle.ts",
   "control_plane/work_items/task_lease_lifecycle_request.ts",

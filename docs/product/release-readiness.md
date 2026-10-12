@@ -199,6 +199,55 @@ attestation separately binds those bytes to the repository, workflow, commit,
 and build event; neither mechanism claims that the package is vulnerability
 free.
 
+Wheel builds recreate the LoopX package subtrees in `build_lib` and wheel staging
+after verifying the frontend bundle. Reused build or retained staging directories
+must not carry modules, packages or resources deleted from current source.
+Current package data and the bundle's qualified previous asset generation
+remain included; unrelated build output
+and editable setup remain untouched. A build destination overlapping the
+source package is rejected. Explicit `bdist_wheel --skip-build` still packages
+the selected existing build; it is not a fresh-source qualification. Before
+qualifying retirement, inspect the built wheel and run its installed entry
+points outside the source checkout; a source
+test or a manually cleaned build directory alone does not prove this rule.
+
+Before a recovery dispatch, inspect the existing `pypi` environment's allowed
+branch/tag refs as well as the Trusted Publisher and enabled variable:
+
+```bash
+gh api repos/loopx-project/loopx/environments/pypi/deployment-branch-policies
+gh api repos/loopx-project/loopx/actions/variables/PYPI_PUBLISH_ENABLED
+```
+
+The workflow ref must satisfy that existing deployment policy. For a tag-only
+policy, use an explicitly labelled release-tooling tag pinned to the reviewed
+workflow commit, separately from the immutable product tag passed as `tag`.
+Retain the tooling ref for provenance verification; do not move the product tag,
+relax the environment policy, or replace Trusted Publishing with a token.
+
+For a browser-fixture error discovered after an immutable tag was published,
+maintainers may dispatch the release workflow from reviewed tooling with
+`tag` set to that existing release and `browser_fixture_commit` set to a full,
+merged commit SHA. Only the personal-workspace fixture, typed-actions and goal-work-map
+scenario files are extracted from that commit; its other changes are not
+applied to the product checkout. A non-default commit must contain at least
+one correction in these fixture owners. The wheel and sdist are built before
+those test corrections are applied; checksums are verified again after the
+browser and managed-runtime tests, and the fixtures are restored. An empty
+input uses the tagged fixtures. This does not skip browser validation, rebuild
+from `main`, move the tag, or authorize product changes.
+
+`RELEASE-SOURCES.json` records the product tag/commit, browser fixture commit,
+workflow commit/ref, and package/checksum hashes. It is uploaded and attested
+alongside the packages. For a dispatched recovery, the attestation's build
+source identifies the workflow commit; the product source remains the tagged
+commit named in this separately attested record. Verify both, rather than
+assuming the builder and product commits are identical:
+
+```bash
+gh attestation verify RELEASE-SOURCES.json --repo loopx-project/loopx
+```
+
 PyPI publication is an explicit, fail-closed extension of the same build. The
 release workflow publishes only when maintainers have configured all of these:
 
@@ -208,9 +257,11 @@ release workflow publishes only when maintainers have configured all of these:
   Publisher configuration;
 - the repository variable `PYPI_PUBLISH_ENABLED=true`.
 
-Do not add a long-lived PyPI token. Without every condition above, GitHub
-Release packages and their verification material are still produced, while
-the PyPI job remains skipped.
+Do not add a long-lived PyPI token. Without the enabled variable, the PyPI
+job is skipped. With publication enabled, a disallowed workflow ref or invalid
+Trusted Publisher configuration fails closed; it does not become a successful
+or skipped publication. GitHub packages and PyPI publication retain separate
+readbacks.
 
 ## Public Release Timeline
 
@@ -680,6 +731,40 @@ path, and canary route rather than as a user-facing release baseline.
   canary checks; the full Python/public smoke/model-behavior/PostgreSQL matrix
   and a separate Pages check were not run.
 
+- `v1.2.4` on 2026-10-03 20:38 +08:00: scoped Chat coordination, recoverable
+  state migration, explicit local preferences, and handoff ownership at commit
+  `fc42b84cedb21a56c15ca3b4af5eab0407829cf8`. See the
+  [published release](https://github.com/loopx-project/loopx/releases/tag/v1.2.4)
+  for its shipped capability usage and qualification limits.
+
+- `v1.3.0` on 2026-10-06 09:41 +08:00: long-horizon benchmark findings and
+  Astra-assisted semantic control-plane engineering, with continuing-work
+  ownership, evidence-driven replanning and recoverable workspace interaction
+  at commit `e1dd9e519c3057fda4b3765d0c93e7ae793608bf`. The
+  [published release](https://github.com/loopx-project/loopx/releases/tag/v1.3.0)
+  contains bilingual operating instructions and annotated community credits;
+  the [personal illustrated guide](https://my.feishu.cn/docx/Rlg0d9pvAo6zXExWTvWcv0ben0f)
+  was read back with the released UI. Eight source-qualification lanes passed,
+  including the full Python/public smoke suites, installed wheel upgrade and
+  isolated real-model validation. Package checksums, PyPI hashes, hosted
+  attestations, desktop assets, signed update feed and the fast-forwarded
+  `stable` installation were independently verified. The attested source
+  record distinguishes immutable product source from reviewed workflow and
+  browser-fixture corrections. Native desktop builds passed; the maintainer
+  published verified CI outputs after cancelling queued publication jobs.
+  Windows execution, Apple Developer ID/notarization, live Lark/Bot channels
+  and unavailable Harbor/SForge/PostgreSQL/NoKV environments remain unqualified.
+  This release does not claim a paired-version benchmark uplift.
+
+- `v1.3.1` on 2026-10-06 16:10 +08:00: a focused compatibility release at
+  commit `7445ae360aaf330e0067959a5e0084ffd9f76de4`, adapting the renderer to
+  the `linkify-it` 6 named export while preserving user-info URL handling.
+  The [published release](https://github.com/loopx-project/loopx/releases/tag/v1.3.1)
+  records the shipped operating instructions and validation limits. Package,
+  PyPI, desktop assets, signed update feed, `stable` installation and the
+  personal illustrated guide were independently read back. Focused checks
+  passed; full Python/public smoke and paid model matrices were not rerun.
+
 When a new public release is promoted, add it here only after the matching tag,
 release note, stable ref, update path, and focused release canary agree.
 
@@ -854,7 +939,7 @@ host integrations when their focused smokes pass:
 - public slash command names: `/loopx`, `/loopx <goal>`,
   `/loopx-global-summary`, `/loopx-global-gates`, `/loopx-global-todos`, and
   `/loopx-global-risks`;
-- ignored local state boundaries under `~/.codex/loopx`, project-local registry
+- ignored local state boundaries under `~/.loopx`, project-local registry
   files, and project-local active-state workbench files recognized by
   `loopx doctor`, `loopx status`, and `loopx check`.
 
@@ -969,6 +1054,58 @@ also record:
   mirrors the English group structure and material claims in neutral product
   language. Keep each group shorter than its English counterpart while
   preserving direct PR attribution and compatibility boundaries.
+
+### Personal Feishu Release Guide
+
+Each named public release needs a companion illustrated Feishu document in the
+maintainer's personal user account. This is part of completing the release,
+alongside the GitHub release body; a changelog link alone is insufficient.
+Use the existing release-communication and document-authoring workflows when
+available, with the following durable procedure:
+
+1. Verify the personal account through an authoritative account mapping or
+   email, and explicitly use user identity for every document operation. A
+   matching display name or a profile named "personal" is insufficient. Never
+   fall back to a corporate account or bot; if personal access is unavailable,
+   keep the draft and report the access gap.
+2. Find the last substantive release guide in that personal account with a
+   bounded search. Read it and record its URL, date and covered version in the
+   private release checkpoint. Use that covered version as the guide's baseline;
+   do not substitute the previous GitHub tag. Read all intervening release notes
+   and derive cumulative claims from their merged PRs and the verified target
+   snapshot. If history cannot be verified, label an owner-supplied baseline
+   explicitly rather than claiming a complete audit. The GitHub release body
+   retains its own previous-tag-to-release-tag range.
+   Organize the guide around ordinary user tasks: who should
+   upgrade, what they can now do, where to find it, and how to verify the result.
+   Distinguish released behavior, experimental capabilities, simulated examples,
+   and failed or unavailable validation. A candidate draft must remain labeled
+   as such until the release and its artifacts are verified.
+3. Include legible screenshots of the actual released interface with public-safe
+   data. Label isolated demo data and any annotations; retain capture provenance
+   privately. Place concise explanations beside the relevant images and inspect
+   mobile readability. Do not fabricate UI, expose private workspaces, or use
+   an older screenshot as evidence of changed behavior.
+4. Teach the minimum upgrade and readback commands, compatibility or migration
+   behavior, and each highlighted optional capability's activation, validation,
+   disable or rollback path, and authority/privacy boundary. Link canonical
+   documentation at the release tag and the complete GitHub release body.
+   Preserve concrete community contribution credit from the guide's cumulative
+   range, deduplicated across the intervening releases; verify contribution
+   descriptions and first-time labels against merged PR metadata. Screenshot
+   captions must distinguish intervening released features from candidate-only
+   changes and retain their actual capture version.
+5. Create one document under the verified personal user identity, then repair
+   that document in place if content or media fails. Read back its ownership,
+   title, text, image blocks, and rendered presentation before declaring success.
+   Add the verified guide URL to the final GitHub release body in both languages,
+   and repeat the existing remote-body validation after that update.
+
+Record the guide URL and verified ownership/readback in the existing private
+release checkpoint. Credentials, account identifiers, private reference URLs,
+drafts, and raw evidence do not belong in public repository changes. This
+procedure authorizes neither chat/group announcements nor posts to other
+social channels; those retain their own authorization boundaries.
 
 ### Final Release Body Usage Gate
 

@@ -42,6 +42,7 @@ def _build_scheduler_followup_decision(
     | SchedulerExecutionContextResolution
     | None,
     operator_inbox_urgency_projector: Callable[..., dict[str, object]],
+    goal_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Rebuild a scheduler follow-up from the originating receipt-bound Turn."""
 
@@ -74,6 +75,7 @@ def _build_scheduler_followup_decision(
         interaction_projection_hooks=(
             repository_delivery_interaction_hook(repo_path=Path.cwd()),
         ),
+        goal_ref=goal_ref,
     )
 
 
@@ -88,6 +90,7 @@ def build_scheduler_followup_payload(
     | SchedulerExecutionContextResolution
     | None,
     operator_inbox_urgency_projector: Callable[..., dict[str, object]],
+    goal_ref: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Execute one scheduler ACK/failure command against its live decision."""
 
@@ -97,6 +100,7 @@ def build_scheduler_followup_payload(
             goal_id=args.goal_id,
             agent_id=args.agent_id,
             turn_instance_id=turn_instance_id,
+            goal_ref=goal_ref,
         )
         if turn_instance_id
         else None
@@ -142,16 +146,20 @@ def build_scheduler_followup_payload(
         and resolved_context.context.host_surface is HostSurface.CODEX_APP
     )
     if (
-        args.quota_command == "scheduler-fail-current"
-        and not observed_rrule
+        (
+            args.quota_command == "scheduler-fail-current" and not observed_rrule
+            or bool(getattr(args, "host_match_observed", False))
+        )
         and codex_app_host
     ):
         host_observation = resolve_codex_app_automation_rrule(
             goal_id=args.goal_id,
             agent_id=args.agent_id,
         )
-        if host_observation.get("available") is True:
-            observed_rrule = str(host_observation.get("rrule") or "")
+        observed_rrule = (
+            str(host_observation.get("rrule") or "")
+            if host_observation.get("available") is True else ""
+        )
 
     before_decision = _build_scheduler_followup_decision(
         status_payload,
@@ -162,11 +170,12 @@ def build_scheduler_followup_payload(
         turn_instance_id=turn_instance_id,
         codex_app_current_rrule=(
             args.applied_rrule
-            if bool(getattr(args, "host_match_observed", False))
+            if bool(getattr(args, "host_match_observed", False)) and not codex_app_host
             else observed_rrule
         ),
         scheduler_context=scheduler_context,
         operator_inbox_urgency_projector=operator_inbox_urgency_projector,
+        goal_ref=goal_ref,
     )
     receipt_todo_id = (
         heartbeat_receipt_settlement_todo_id(heartbeat_receipt)

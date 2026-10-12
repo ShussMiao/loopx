@@ -13,10 +13,10 @@ from pathlib import Path
 import pytest
 
 from loopx.control_plane.turn_driver.codex_cli import (
-    _lineage,
     load_codex_cli_session,
     run_codex_cli_host,
 )
+from loopx.control_plane.turn_driver.codex_sessions import _lineage
 from loopx.control_plane.turn_driver.codex_operation_host import (
     run_codex_operation_host,
 )
@@ -167,7 +167,7 @@ def test_callback_launch_fence_rejects_drift_before_native_process_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str,
 ) -> None:
     from loopx.control_plane.turn_driver import codex_operation_host as owner
-    from loopx.control_plane.turn_driver.codex_cli import _store_codex_cli_session
+    from loopx.control_plane.turn_driver.codex_sessions import _store_codex_cli_session
 
     store, claimed, request, options = _claimed_native_fixture(tmp_path)
     if drift == "session":
@@ -471,8 +471,9 @@ def test_registered_source_tokens_survive_owned_native_prepare_and_store_readbac
         assert refused["ok"] is False
 
 
+@pytest.mark.parametrize("deadline", [None, 5])
 def test_owned_app_server_process_authenticates_native_metadata_and_resumes_same_profile(
-    tmp_path: Path,
+    tmp_path: Path, deadline,
 ) -> None:
     executable = tmp_path / "fake-codex-operation"
     executable.write_text(FAKE_SERVER)
@@ -485,7 +486,7 @@ def test_owned_app_server_process_authenticates_native_metadata_and_resumes_same
         "model": "test-model",
         "reasoning_effort": "xhigh",
         "source_route": {"host_surface": "codex-app", "thread_id": "source-one"},
-        "timeout_seconds": 5,
+        "timeout_seconds": deadline,
     }
     first = run_codex_operation_host(_request(), **options)
     assert first["result_kind"] == "wait"
@@ -530,7 +531,10 @@ def test_admitted_turn_cli_launches_owned_transport_without_plain_cli_fallback(
     def forbidden_plain_cli(*args, **kwargs):
         pytest.fail("Operation opt-in must not downgrade to plain Codex exec")
 
-    monkeypatch.setattr("loopx.cli_commands.turn.run_codex_cli_host", forbidden_plain_cli)
+    monkeypatch.setattr(
+        "loopx.cli_commands.turn_run_once.run_codex_cli_host",
+        forbidden_plain_cli,
+    )
     selected_route = {"host_surface": "codex-app", "thread_id": "source-thread"}
     observed_routes = []
 

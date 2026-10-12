@@ -137,6 +137,11 @@ uncertainty are `degraded`; otherwise the receipt is `valid`.
 
 ### Diagnostic projection (`reliability_diagnostic_projection_v0`)
 
+Events are ordered by the instant represented by `observed_at`, then by session
+and sequence for equal instants. Different UTC offsets or fractional-second
+formats do not change chronology. Receipt bounds retain the original timestamp
+text; readback does not rewrite the ledger.
+
 | Field | Meaning |
 | --- | --- |
 | `mode`, `authority`, `write_scope`, `worker_influence` | `read_only`, `none`, `diagnostic_ledger_only`, `none` |
@@ -178,7 +183,8 @@ partial records remain integrity failures. See the
 [DSH/Pi assessment](../../../docs/architecture/rfcs/harness-selection-dsh-pi-v0.md)
 before wiring this full-ledger CLI into a polling surface.
 
-The ledger lives at `<runtime-root>/reliability_diagnostics/<goal-id>.ndjson`;
+New ledgers live at `<runtime-root>/reliability_diagnostics/by-goal/<sha256>.ndjson`,
+using the lowercase SHA-256 of the exact UTF-8 Goal id in both Python and DSH;
 the default runtime root is the same one the rest of LoopX uses and the CLI
 prints only the relative `ledger_ref`. `ingest` re-validates every line. A
 clean ingest is a transparent copy; any malformed or rejected input appends a
@@ -199,8 +205,9 @@ ledger bytes and negative integrity evidence, requires a frozen writer and an
 owner-selected finite retention period, and verifies the provider directory
 matches the CLI's canonical runtime layout before operating on a regular file.
 It does not implement automatic TTL or qualify a live deployment. It also
-documents the current filename-alias boundary; ambiguous ownership must hold
-deletion.
+covers legacy readback and an explicit offline upgrade. Legacy files remain
+readable, but block new appends until reconciled; mixed ownership must hold
+deletion. Upgrade CLI and plugin together with writers frozen.
 
 ## Validation
 

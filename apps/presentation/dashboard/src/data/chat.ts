@@ -1,10 +1,14 @@
+import { HANDOFF_MODES, EXECUTION_HANDOFF_MODES } from "../../../../../loopx/control_plane/coordination/handoff_mode_vocabulary.js";
 import { normalizeGoalDraft } from "../../../../../loopx/control_plane/collaboration/goal_draft.js";
+import { parseTurnStep, type TurnStep } from "./turn-steps";
 import { z } from "zod";
+import { actionSourceBasisSchema } from "./action-source-basis.js";
 
 import {
   todoApplyResultMatchesRequest,
   todoPreviewMatchesRequest,
   type AgentResponse,
+  type ChatProject,
   type CollaborationReadback,
   type LoopXModeSettings,
   type TodoApplyResult,
@@ -15,6 +19,23 @@ import type {DelegationPreflight} from "./delegation-preflight.js";
 const configuredChatOrigin = String(import.meta.env?.VITE_LOOPX_CHAT_ORIGIN ?? "")
   .trim()
   .replace(/\/+$/, "");
+
+export type ConfigurationBackupResult = {
+  ok: boolean; status?: string; goal_count: number; machine_configuration_present: boolean;
+  sha256: string; checkpoint_ref?: string;
+};
+
+export function exportConfigurationBackup(goalIds?: string[]) {
+  return requestJson<ConfigurationBackupResult & {backup: Record<string, unknown>}>("/api/chat/configuration-backup/export", {
+    method: "POST", body: JSON.stringify(goalIds === undefined ? {} : {goal_ids: goalIds}),
+  });
+}
+
+export function restoreConfigurationCheckpoint(backup: Record<string, unknown>, execute: boolean) {
+  return requestJson<ConfigurationBackupResult>("/api/chat/configuration-backup/restore", {
+    method: "POST", body: JSON.stringify({backup, expected_sha256: backup.sha256, execute}),
+  });
+}
 
 function chatApiUrl(path: string) {
   if (!configuredChatOrigin || /^https?:\/\//.test(path)) {
@@ -446,12 +467,7 @@ export const typedActionProposalSchema = z.object({
   error: z.record(z.string(), z.unknown()).nullable().optional(),
   checkpoint: z.record(z.string(), z.unknown()).nullable().optional(),
   failure: z.record(z.string(), z.unknown()).nullable().optional(),
-  canonical_update_basis: z.object({
-    schema_version: z.enum(["loopx_chat_canonical_update_basis_v0", "loopx_chat_canonical_terminal_basis_v0"]),
-    provider_revision: z.string().min(1),
-    source_authority: z.enum(["file_v0", "sqlite_v0"]),
-    registry_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  }).optional(),
+  canonical_update_basis: actionSourceBasisSchema.optional(),
   regenerated_from: z.string().nullable().optional(),
   operation: typedOperationEnvelopeSchema.nullable().optional(),
   created_at: z.string(),
@@ -488,10 +504,12 @@ export async function previewTypedAction(request: TypedActionPreviewRequest) {
   return typedActionEnvelopeSchema.parse(payload).proposal;
 }
 
-export async function loadTypedAction(proposalId: string) {
-  return typedActionEnvelopeSchema.parse(
-    await requestJson<unknown>(`/api/actions/${encodeURIComponent(proposalId)}`),
+export async function loadTypedAction(proposalId: string, signal?: AbortSignal) {
+  const proposal = typedActionEnvelopeSchema.parse(
+    await requestJson<unknown>(`/api/actions/${encodeURIComponent(proposalId)}`, { signal }),
   ).proposal;
+  if (proposal.proposal_id !== proposalId) throw new Error("Proposal readback identity mismatch");
+  return proposal;
 }
 
 const typedActionListEnvelopeSchema = z.object({
@@ -543,7 +561,7 @@ export async function transitionTypedAction(
   ).proposal;
 }
 
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+export async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(chatApiUrl(url), {
@@ -612,6 +630,16 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return parsedPayload as T;
 }
 
+export async function readTodoRequest(goalId: string, todoId: string, signal: AbortSignal) {
+  const query = new URLSearchParams({goal_id: goalId, todo_id: todoId});
+  const result = z.object({
+    ok: z.literal(true), goal_id: z.string(), todo_id: z.string(), text: z.string(),
+    status: z.string(), archive_state: z.string(), updated_at: z.string().nullable(),
+  }).parse(await requestJson<unknown>(`/api/chat/todo/detail?${query}`, {signal}));
+  if (result.goal_id !== goalId || result.todo_id !== todoId) throw new Error("Task source changed");
+  return result;
+}
+
 export async function fetchChatStatus() {
   return chatStatusSchema.parse(await requestJson<unknown>("/status.json"));
 }
@@ -643,16 +671,42 @@ export async function recordProjectionExchange(options: {
   );
 }
 
+/** The App's conversation targets; each owns exactly one Core Chat channel. */
+export type ConversationContext =
+  | { kind: "manager" }
+  | { kind: "goal"; goalId: string }
+  | { kind: "project"; projectRef: string };
+
+// Goal ids are single path segments, so a key containing "/" never names a Goal.
+const PROJECT_CONVERSATION_KEY_PREFIX = "project/";
+
+export function conversationContextKey(context: ConversationContext): string {
+  if (context.kind === "manager") return "manager";
+  return context.kind === "goal" ? context.goalId : `${PROJECT_CONVERSATION_KEY_PREFIX}${context.projectRef}`;
+}
+
+export function conversationContextOfKey(key: string): ConversationContext {
+  if (key === "manager") return { kind: "manager" };
+  if (key.startsWith(PROJECT_CONVERSATION_KEY_PREFIX)) {
+    return { kind: "project", projectRef: key.slice(PROJECT_CONVERSATION_KEY_PREFIX.length) };
+  }
+  return { kind: "goal", goalId: key };
+}
+
+export function conversationChannelId(context: ConversationContext): string {
+  if (context.kind === "manager") return "manager";
+  return context.kind === "goal" ? `goal.${context.goalId}` : `project.${context.projectRef}`;
+}
+
 export async function createChatSession(
-  goalId: string,
+  context: ConversationContext,
   agentId?: string,
   mode: "resume_latest" | "new" = "resume_latest",
-  contextKind: "goal" | "manager" = "goal",
   signal?: AbortSignal,
 ) {
   return requestJson<{
     agent_id: string;
-    goal_id: string;
+    goal_id: string | null;
     ok: true;
     resumed: boolean;
     session_id: string;
@@ -662,7 +716,10 @@ export async function createChatSession(
     // An omitted ``agent_id`` means "no explicit executor pick": the channel
     // owner resolves its own default. Sending this client's own default would
     // silently re-point the steward channel away from its configured executor.
-    body: JSON.stringify({ goal_id: goalId, agent_id: agentId, mode, context_kind: contextKind }),
+    // A project Session carries only the host-issued reference, never a Goal.
+    body: JSON.stringify(context.kind === "project"
+      ? { context_kind: "project", project_ref: context.projectRef, agent_id: agentId, mode }
+      : { goal_id: context.kind === "goal" ? context.goalId : "", agent_id: agentId, mode, context_kind: context.kind }),
   });
 }
 
@@ -676,7 +733,8 @@ export type ChatStreamEvent = {
 
 export type ChatSessionSummary = {
   session_id: string;
-  goal_id: string;
+  goal_id: string | null;
+  project_ref?: string | null;
   agent_id: string;
   adapter_kind: string;
   channel_id?: string;
@@ -685,12 +743,20 @@ export type ChatSessionSummary = {
   last_error_code: string | null;
   created_at: string;
   updated_at: string;
+  /** Opaque transcript read hint, independent of execution updated_at. */
+  transcript_revision?: string | null;
   last_activity_at: string;
   resumable: boolean;
   session_mode?: ChatSessionMode;
   host_surface?: string | null;
   manager_runtime?: ManagerRuntimeSessionReadback | null;
 };
+
+export type { ChatProject };
+
+export async function fetchChatProjects(signal?: AbortSignal) {
+  return requestJson<{ok: true; projects: ChatProject[]}>("/api/chat/projects", {signal});
+}
 
 /** ``chat_store`` Session modes; an omitted mode is a managed runtime Session. */
 export type ChatSessionMode = "managed_runtime" | "attached_host";
@@ -1061,7 +1127,7 @@ export function fetchLoopXMode(sessionId: string) {
 export type DelegationInventory = {
   items: Array<{record_id: string; operation_id: string | null; agent_id?: string; todo_id?: string;
     status: string; worker_active?: boolean; recovery_required: boolean | null;
-    artifacts?: Array<{ref: string; sha256: string}>}>;
+    artifacts?: Array<{ref: string; sha256: string}>; current_use?: DelegationReadback["current_use"]}>;
   has_more: boolean; next_cursor: string | null; page_readback_complete: boolean;
 };
 export type {DelegationPreflight} from "./delegation-preflight.js";
@@ -1079,11 +1145,25 @@ export type DelegationReadback = {
   operation_id: string; request_id: string; agent_id: string; todo_id: string;
   status: string; worker_active: boolean; recovery_required: boolean;
   artifacts?: Array<{ref: string; sha256: string; text: string}>; error?: string;
+  validation?: {source: "goal_acceptance" | "todo_validation"; basis_sha256: string;
+    check_count: number; pinned_file_count: number; checked_at?: string;
+    output_versions?: Array<{ref: string; sha256: string}>};
+  task_failure?: {stage: "task_postcondition"; status: "failed" | "inconclusive" | "unavailable";
+    recovery_kind: "repair_required" | "replan_required"; summary: string; validator_kind: string;
+    turn_key: string; resume_mode: "revalidate_cached_result"};
+  current_use?: {state: "current" | "unavailable"; checked_operation_count: number;
+    reason?: "input_unavailable" | "source_unavailable" | "source_version_changed" | "dependency_cycle" | "verification_budget_exhausted";
+    blocking_operation_id?: string; blocking_input_ref?: string; path?: string[]};
   dependencies?: DelegationDependency[]; adoptions?: DelegationAdoption[];
 };
 export function readLoopXTeamWork(sessionId: string, operationId: string) {
   return requestJson<DelegationReadback>(`/api/chat/sessions/${sessionId}/loopx`, {
     method: "POST", body: JSON.stringify({operation: "read", operation_id: operationId}),
+  });
+}
+export function revalidateLoopXTeamWork(sessionId: string, operationId: string) {
+  return requestJson<DelegationReadback>(`/api/chat/sessions/${sessionId}/loopx`, {
+    method: "POST", body: JSON.stringify({operation: "revalidate", operation_id: operationId}),
   });
 }
 export type ManagedGoalResultRow = {
@@ -1109,14 +1189,18 @@ export function readManagedGoalResult(goalId: string, todoId: string) {
   );
 }
 export type DelegationState = "unavailable" | "accepted" | "rejected" | "recovery_required"
-  | "executing" | "validating" | "dispatched" | "unknown";
-type DelegationStateFacts = {status: string; worker_active?: boolean; recovery_required: boolean | null};
+  | "stopped" | "executing" | "validating" | "dispatched" | "unknown";
+type DelegationStateFacts = {status: string; worker_active?: boolean; recovery_required: boolean | null;
+  current_use?: DelegationReadback["current_use"]};
 // Keep inventory and selected-operation labels consistent; unknown states stay unknown.
-// "executing" and "validating" require an active worker observation, never the stored status alone.
 export function delegationState(row: DelegationStateFacts): DelegationState {
   if (row.status === "unavailable") return "unavailable";
-  if (row.status === "accepted") return "accepted";
+  if (row.status === "accepted") return row.current_use?.state === "unavailable" ? "unavailable" : "accepted";
   if (row.status === "rejected") return "rejected";
+  // A recorded stop precedes recovery: only the separate stop receipt proves
+  // the original execution released its Host group, so the stored status alone
+  // must not be read as work still needing recovery.
+  if (row.status === "stopped") return "stopped";
   if (row.recovery_required) return "recovery_required";
   if (row.status === "running" && row.worker_active) return "executing";
   if (row.status === "turn_returned" && row.worker_active) return "validating";
@@ -1127,6 +1211,7 @@ const DELEGATION_STATE_LABELS: Record<DelegationState, {zh: string; en: string}>
   unavailable: {zh: "无法核验", en: "Unavailable"},
   accepted: {zh: "已通过当前验收", en: "Currently accepted"},
   rejected: {zh: "未通过验收", en: "Rejected"},
+  stopped: {zh: "停止已登记", en: "Stop recorded"},
   recovery_required: {zh: "需要恢复原执行", en: "Original execution needs recovery"},
   executing: {zh: "执行中", en: "Executing"},
   validating: {zh: "正在验收", en: "Validating"},
@@ -1165,7 +1250,7 @@ export async function sendChatTurnStreaming(
     attachments?: ChatImageAttachmentInput[];
     clientTurnId?: string;
     onDelta?: (text: string) => void;
-    onActivity?: (label: string) => void;
+    onActivity?: (label: string, step: TurnStep | null) => void;
     onPhase?: (phase: string, turnId: string) => void;
     signal?: AbortSignal;
   } = {},
@@ -1193,7 +1278,7 @@ async function receiveChatTurnStreaming(
   eventsUrl: string,
   options: {
     onDelta?: (text: string) => void;
-    onActivity?: (label: string) => void;
+    onActivity?: (label: string, step: TurnStep | null) => void;
     onPhase?: (phase: string, turnId: string) => void;
     signal?: AbortSignal;
   } = {},
@@ -1213,7 +1298,7 @@ async function receiveChatTurnStreaming(
         }
         if (event.kind === "agent.phase") {
           const label = typeof event.payload.label === "string" ? event.payload.label.trim() : "";
-          if (label) options.onActivity?.(label);
+          if (label) options.onActivity?.(label, parseTurnStep(event.payload.step));
         }
         if (event.kind === "turn.completed") {
           finalResponse = event.payload.response;
@@ -1277,7 +1362,7 @@ export async function resumeChatTurnStreaming(
   turnId: string,
   options: {
     onDelta?: (text: string) => void;
-    onActivity?: (label: string) => void;
+    onActivity?: (label: string, step: TurnStep | null) => void;
     onPhase?: (phase: string, turnId: string) => void;
     signal?: AbortSignal;
   } = {},
@@ -1507,12 +1592,12 @@ export async function setupGoalChannel(options: { execute: boolean; goalId: stri
   );
 }
 
-export async function configureGoalChannelAutoNotify(options: { autoNotify: boolean; goalId: string }) {
+export async function configureGoalChannelAutoNotify(options: { autoNotify: boolean; goalId: string; kind?: "human_gate" | "blocked_notice" }) {
   return goalChannelOperationSchema.parse(
     await requestJson<unknown>("/api/chat/goal-channel/configure", {
       method: "POST",
       body: JSON.stringify({
-        auto_notify_human_gates: options.autoNotify,
+        ...(options.kind === "blocked_notice" ? { auto_notify_blocked_notices: options.autoNotify } : { auto_notify_human_gates: options.autoNotify }),
         goal_id: options.goalId,
       }),
     }),
@@ -1559,7 +1644,8 @@ export const capabilityConfigurationFieldSchema = z.object({
   key: z.string(),
   label: z.string(),
   description: z.string(),
-  input_kind: z.enum(["boolean", "number", "select", "string_list", "text", "periodic_report_schedule"]),
+  input_kind: z.enum(["boolean", "number", "select", "string_list", "text", "periodic_report_schedule", "pr_review_agent_orders"]),
+  agents: z.array(z.string()).optional(),
   nullable: z.boolean().optional(),
   required: z.boolean(),
   minimum: z.number().int().optional(),
@@ -1576,6 +1662,20 @@ export const capabilityConfigurationEditorSchema = z.object({
   read_only_reason: z.string().optional(),
 });
 
+export const progressReviewObservationSchema = z.object({
+  mode: z.string(), read_state: z.enum(["observed", "missing", "unavailable"]), read_error: z.string().optional(),
+  receipt_count: z.number(), rejected_receipts: z.number(), stale_receipts: z.number(),
+  contract_revision: z.string().nullable(), authority: z.literal("none"),
+  latest: z.object({status: z.string(), event_id: z.string(), evidence_id: z.string(),
+    judgments: z.object({choice: z.object({relation: z.string().nullable(), increment: z.string().nullable()}).nullable(),
+      noul: z.object({serves_acceptance: z.number().nullable(), evidence_increment: z.number().nullable(), behavior_change: z.number().nullable()}).nullable()}),
+    criterion_current: z.boolean().optional(),
+    evidence_scope: z.object({coverage: z.literal("declared_file_net_change"), files: z.array(z.string()),
+      criterion_binding: z.object({origin: z.enum(["operator_study", "goal_acceptance"]), criteria_sha256: z.string(),
+        todo_id: z.string().optional(), contract_digest: z.string().optional(), contract_revision: z.number().optional(),
+        criterion_ids: z.array(z.string()).optional()})}).optional(),
+  }).nullable(),
+});
 export const capabilityConfigurationCatalogSchema = z.object({
   schema_version: z.literal("capability_configuration_catalog_v0"),
   capabilities: z.array(z.object({
@@ -1601,6 +1701,7 @@ export const capabilityConfigurationCatalogSchema = z.object({
       effective_revision: z.string(),
     }).optional(),
     documentation: z.record(z.string(), z.unknown()).optional(),
+    observation: progressReviewObservationSchema.optional(),
     context_contribution: z.object({
       supported_phases: z.array(z.enum(["before_plan", "before_delegate", "after_delegate_result"])),
       target: z.literal("coordinator"),
@@ -1816,7 +1917,39 @@ const automationCadenceSourceSchema = z.object({
   agent_id: z.string().nullable(),
   automation_id: z.string().nullable(),
   min_interval_minutes: z.number().int().nonnegative(),
+  revision: z.number().int().nonnegative(),
 });
+
+const automationCadenceEligibilitySchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("unconfigured"),
+    reason: z.literal("unconfigured"),
+    eligible_now: z.null(),
+    next_eligible_at_ms: z.null(),
+  }),
+  z.object({
+    state: z.literal("eligible"),
+    reason: z.literal("owner_minimum_interval"),
+    eligible_now: z.literal(true),
+    next_eligible_at_ms: z.number().int().nonnegative().nullable(),
+  }),
+  z.object({
+    state: z.literal("waiting"),
+    reason: z.literal("minimum_interval_wait"),
+    eligible_now: z.literal(false),
+    next_eligible_at_ms: z.number().int().nonnegative(),
+  }),
+  z.object({
+    state: z.literal("unavailable"),
+    reason: z.enum([
+      "agent_scope_required",
+      "runtime_root_unavailable",
+      "owner_read_failed",
+    ]),
+    eligible_now: z.null(),
+    next_eligible_at_ms: z.null(),
+  }),
+]);
 
 export const automationCadenceSchema = z.object({
   ok: z.literal(true),
@@ -1826,6 +1959,7 @@ export const automationCadenceSchema = z.object({
   automation_id: z.string().nullable(),
   configuration_revision: z.number().int().nonnegative(),
   min_interval_minutes: z.number().int().nonnegative(),
+  eligibility: automationCadenceEligibilitySchema,
   enabled: z.boolean(),
   enforcement: z.string(),
   pre_model_admission: z.string(),
@@ -2107,7 +2241,7 @@ export type LarkPermissionGuidance = {
 
 const larkGroupChatsSchema = z.object({
   ok: z.literal(true),
-  chats: z.array(z.object({ chat_id: z.string(), chat_name: z.string() })),
+  chats: z.array(z.object({ chat_id: z.string(), chat_name: z.string(), selected: z.boolean().default(false) })),
 });
 
 export async function fetchLarkGroupChats(appRef: string, query?: string) {
@@ -2250,6 +2384,7 @@ export async function disconnectLarkGoalTopic(goalId: string, connectionId: stri
   );
 }
 
+export { CONTEXTS as usageContexts } from "../../../../../loopx/control_plane/runtime/usage_statistics_contract";
 const usageStatisticsSchema = z.object({
   consent: z.enum(["default", "enabled", "disabled"]),
   sending: z.boolean(), blocked_by: z.string().nullable(), endpoint: z.string().nullable(),
@@ -2258,12 +2393,18 @@ const usageStatisticsSchema = z.object({
   automatic_notice_required: z.boolean(),
   next_payload: z.unknown(), aggregate_preview: z.unknown(), goal_preview: z.unknown(),
   diagnostic_preview: z.unknown().optional(), diagnostic_dropped: z.number().optional(),
+  stored_context: z.string().optional(), effective_context: z.string().optional(), context_source: z.string().optional(),
+  installation_preview: z.unknown().optional(),
   identity_scope: z.string().optional(), delivery_history: z.array(z.object({
-    day: z.string(), channel: z.enum(["heartbeat", "cli", "goal"]), rows: z.number(),
+    day: z.string(), channel: z.enum(["heartbeat", "cli", "goal", "installation"]), rows: z.number(),
     status: z.enum(["accepted", "rejected", "unavailable"]),
   })).optional(),
 });
 export type UsageStatistics = z.infer<typeof usageStatisticsSchema>;
+export async function setUsageContext(context: string): Promise<UsageStatistics> {
+  return usageStatisticsSchema.parse(await requestJson<unknown>("/api/chat/usage-statistics",
+    { method: "POST", body: JSON.stringify({ context }) }));
+}
 export async function usageStatistics(enabled?: boolean): Promise<UsageStatistics> {
   return usageStatisticsSchema.parse(await requestJson<unknown>("/api/chat/usage-statistics",
     enabled === undefined ? undefined : { method: "POST", body: JSON.stringify({ enabled }) }));
@@ -2272,4 +2413,105 @@ export async function usageStatistics(enabled?: boolean): Promise<UsageStatistic
 export async function acknowledgeUsageNotice(notice: UsageStatistics["notice"]): Promise<UsageStatistics> {
   return usageStatisticsSchema.parse(await requestJson<unknown>("/api/chat/usage-statistics",
     { method: "POST", body: JSON.stringify({ notice }) }));
+}
+
+
+export const goalOwnershipSchema = z.object({
+  ok: z.literal(true), goal_id: z.string(), canonical: z.boolean(),
+  current_mode: z.enum(HANDOFF_MODES).nullable(), provider_revision: z.string().nullable(),
+});
+export const ownershipPreviewSchema = z.object({
+  ok: z.boolean(), goal_id: z.string(), status: z.string(),
+  preview_id: z.string().regex(/^[a-f0-9]{32}$/),
+  plan_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  previous_mode: z.enum(HANDOFF_MODES).optional(), handoff_mode: z.enum(EXECUTION_HANDOFF_MODES).optional(),
+  preserved_claim_count: z.number().int().nonnegative().optional(),
+  retained_lease_count: z.number().int().nonnegative(), conflict_count: z.number().int().nonnegative(),
+  conflicts: z.array(z.object({ todo_id: z.string().optional(), reason_code: z.string().optional() })),
+  backup_verified: z.boolean(), execution_authority_granted: z.literal(false),
+  reason_code: z.string().optional(), current: goalOwnershipSchema.nullable().optional(),
+});
+export type GoalOwnership = z.infer<typeof goalOwnershipSchema>;
+export type OwnershipPreview = z.infer<typeof ownershipPreviewSchema>;
+export type ExecutionOwnershipMode = typeof EXECUTION_HANDOFF_MODES[number];
+
+export async function fetchGoalOwnership(goalId: string) {
+  return goalOwnershipSchema.parse(await requestJson<unknown>(`/api/chat/goal-ownership?${new URLSearchParams({goal_id: goalId})}`));
+}
+export async function updateGoalOwnership(body: { goal_id: string; mode: ExecutionOwnershipMode } | {
+  goal_id: string; preview_id: string; plan_sha256: string;
+}) {
+  const action = "mode" in body ? "preview" : "apply";
+  try {
+    return ownershipPreviewSchema.parse(await requestJson<unknown>(`/api/chat/goal-ownership/${action}`, {
+      method: "POST", body: JSON.stringify(body),
+    }));
+  } catch (error) {
+    if (error instanceof ChatApiError && error.payload.http_status === 409 && error.payload.status === "failed") {
+      return ownershipPreviewSchema.parse(error.payload);
+    }
+    throw error;
+  }
+}
+
+
+const privateAgentSessionSchema = z.object({session_id: z.string(), goal_id: z.string(), agent_id: z.string(), executor_endpoint_id: z.string()});
+const privateAgentTargetSchema = privateAgentSessionSchema.extend({target_ref: z.string(), host_ref: z.string(), goal_instance_id: z.string().nullable()});
+const privateConversationSchema = z.object({
+  binding_id: z.string(), app_ref: z.string(), context_kind: z.enum(["project", "steward"]),
+  project_ref: z.string(), project_title: z.string(), context_available: z.boolean(), executor_endpoint_id: z.string(),
+  grant: z.enum(["workspace_read", "workspace_write", "portfolio_read"]), goal_count: z.number().int().default(0), listener_status: z.string(),
+  goal_scope: z.enum(["all_registered", "selected"]).nullable().optional(),
+  audience: z.enum(["owner", "group"]).default("owner"), group_count: z.number().int().default(0),
+  pending_count: z.number().int(), recovery_count: z.number().int(),
+  agent_candidates: z.array(privateAgentSessionSchema).default([]), agent_targets: z.array(privateAgentTargetSchema).default([]),
+});
+const privateConversationStopRecoverySchema = z.object({binding_id: z.string(), project_ref: z.string(),
+  project_title: z.string(), pending_count: z.number().int().positive()});
+export type PrivateConversationStopRecovery = z.infer<typeof privateConversationStopRecoverySchema>;
+const privateConversationsSchema = z.object({ok: z.literal(true), revision: z.number().int(),
+  connections: z.array(privateConversationSchema), stop_recoveries: z.array(privateConversationStopRecoverySchema).default([])});
+export type PrivateConversation = z.infer<typeof privateConversationSchema>;
+export async function fetchPrivateConversations() {
+  return privateConversationsSchema.parse(await requestJson<unknown>("/api/chat/lark/private-conversations"));
+}
+export async function connectPrivateConversation(appRef: string, projectRef: string, executor: string, contextKind: "project" | "steward" = "project", projectGrant: "workspace_read" | "workspace_write" = "workspace_write", groupIds?: string[]) {
+  return privateConversationsSchema.parse(await requestJson<unknown>("/api/chat/lark/private-conversations", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({app_ref: appRef, project_ref: projectRef, executor_endpoint_id: executor, context_kind: contextKind, project_grant: projectGrant,
+      ...(contextKind === "steward" ? {goal_scope: "all_registered"} : {}),
+      ...(groupIds !== undefined ? {audience: "group", group_ids: groupIds} : {})}),
+  }));
+}
+export async function disconnectPrivateConversation(bindingId: string, revision: number) {
+  return privateConversationsSchema.parse(await requestJson<unknown>("/api/chat/lark/private-conversations", {
+    method: "DELETE", headers: {"Content-Type": "application/json"}, body: JSON.stringify({binding_id: bindingId, revision}),
+  }));
+}
+
+export async function changePrivateAgentTarget(bindingId: string, revision: number, target: {session_id: string} | {target_ref: string}) {
+  return privateConversationsSchema.parse(await requestJson<unknown>("/api/chat/lark/private-conversations/agent-targets", {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({binding_id: bindingId, revision, ...target}),
+  }));
+}
+
+// Display validation only; finding status semantics remain owned by Explore.
+const exploreResultPageSchema = z.object({
+  ok: z.literal(true), goal_id: z.string(), total: z.number().int().nonnegative(),
+  next_cursor: z.string().nullable(),
+  items: z.array(z.object({
+    finding_id: z.string(), finding: z.string(), summary: z.string(), status: z.string(),
+    node_id: z.string(), question: z.string(), scope: z.string(), agent_id: z.string(),
+    evidence_refs: z.array(z.string()), last_updated_at: z.string(),
+    linked_todos: z.array(z.object({
+      todo_id: z.string(), text: z.string(), status: z.string(), claimed_by: z.string(),
+    })),
+  })),
+});
+export type ExploreResultPage = z.infer<typeof exploreResultPageSchema>;
+export async function fetchExploreResults(goalId: string, cursor?: string) {
+  const query = new URLSearchParams({goal_id: goalId, ...(cursor ? {cursor} : {})});
+  const page = exploreResultPageSchema.parse(await requestJson<unknown>(`/api/chat/explore-results?${query}`));
+  if (page.goal_id !== goalId) throw new Error("Explore result Goal mismatch");
+  return page;
 }

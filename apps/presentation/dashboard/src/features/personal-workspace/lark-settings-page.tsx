@@ -1,3 +1,4 @@
+import {PrivateConversationPanel} from "./private-conversation-panel";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
@@ -241,6 +242,7 @@ export function LarkSettingsPage({
   const [setupError, setSetupError] = useState<string | null>(null);
   const setupPopup = useRef<Window | null>(null);
   const openedSetupUrl = useRef<string | null>(null);
+  const desktopHost = Boolean((window as Window & { __TAURI__?: unknown }).__TAURI__);
   const focusedGoalOpened = useRef(false);
 
   async function refresh() {
@@ -320,7 +322,11 @@ export function LarkSettingsPage({
           setSetupSnapshot(snapshot);
           if (snapshot.verification_url && openedSetupUrl.current !== snapshot.verification_url) {
             openedSetupUrl.current = snapshot.verification_url;
-            if (setupPopup.current && !setupPopup.current.closed) {
+            if (desktopHost) {
+              // Native new-window requests launch the system browser and return
+              // no Window proxy. Open the provider URL only once it is available.
+              window.open(snapshot.verification_url, "_blank");
+            } else if (setupPopup.current && !setupPopup.current.closed) {
               setupPopup.current.location.href = snapshot.verification_url;
             }
           }
@@ -342,7 +348,7 @@ export function LarkSettingsPage({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [setupOpen, setupSnapshot]);
+  }, [setupOpen, setupSnapshot, desktopHost]);
 
   const selectedGoal = goals.find((goal) => goal.goalId === goalId);
   const fallbackGoalAgents = selectedGoal?.agentId
@@ -440,7 +446,9 @@ export function LarkSettingsPage({
     setSetupStarting(true);
     setSetupError(null);
     openedSetupUrl.current = null;
-    setupPopup.current = window.open(window.location.href, "_blank");
+    // Browsers need a synchronous placeholder to preserve the user gesture.
+    // The desktop host opens external destinations without a popup blocker.
+    setupPopup.current = desktopHost ? null : window.open(window.location.href, "_blank");
     try {
       const snapshot = await startLarkAppSetup({ appRef: setupAppRef, brand: setupBrand });
       setSetupSnapshot(snapshot);
@@ -532,6 +540,7 @@ export function LarkSettingsPage({
         </header>
       )}
 
+      <PrivateConversationPanel />
       <nav className="personal-lark-tabs" aria-label={t("lark.management")}>
         <button aria-current={tab === "apps" ? "page" : undefined} onClick={() => setTab("apps")} type="button">{t("lark.apps")} <span>{loading ? "…" : apps.length}</span></button>
         <button aria-current={tab === "connections" ? "page" : undefined} onClick={() => setTab("connections")} type="button">{t("lark.connections")} <span>{loading ? "…" : connections.length}</span></button>

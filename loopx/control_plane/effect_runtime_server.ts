@@ -1,6 +1,7 @@
 import { writeSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
-import { chmod, readFile, rm, type FileHandle } from "node:fs/promises";
+import { flushCompileCache } from "node:module";
+import { readFile, rm, type FileHandle } from "node:fs/promises";
 
 import type { JsonObject } from "./effect_program.ts";
 import {
@@ -27,10 +28,13 @@ const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_INLINE_RESPONSE_BYTES = 2 * 1024 * 1024;
 // Explicit opt-in: ordinary effects retain the 2 MiB request/response wire.
 const LOCAL_SNAPSHOT_METHODS = new Set([
-  "goal.checkpoint_read_context.source",
-  "goal.checkpoint_read_context.evaluate",
+  "coordination.local_authority.todo_source",
+  "todo.context.page",
+  "work_item.context.project",
+  "goal.checkpoint_read_context.resolve",
   "goal.checkpoint_read_context.commit",
   "goal.checkpoint_read_context.inspect_replay",
+  "performance_diagnosis.inspect",
 ]);
 const DEFAULT_IDLE_MS = 5 * 60 * 1_000;
 // Bounds for LOOPX_EFFECT_RUNTIME_IDLE_MS. The upper bound is the largest
@@ -104,6 +108,11 @@ const fingerprint = parseArg("--fingerprint");
 const token = requiredString(process.env.LOOPX_EFFECT_RUNTIME_TOKEN, "runtime token");
 const idleMs = parseIdleMs(process.env.LOOPX_EFFECT_RUNTIME_IDLE_MS);
 let idleTimer: NodeJS.Timeout;
+let pendingRequests = 0;
+let resolveDrain: (() => void) | undefined;
+let publicationComplete = false;
+let resolvePublication: () => void;
+const publicationReady = new Promise<void>((resolve) => { resolvePublication = resolve; });
 const handlers = createEffectRuntimeHandlers({
   fingerprint,
   requestShutdown: () => {
@@ -113,6 +122,8 @@ const handlers = createEffectRuntimeHandlers({
 
 function resetIdleTimer(server: ReturnType<typeof createServer>): void {
   clearTimeout(idleTimer);
+  // Idleness starts after effects finish, not when their sockets connect.
+  if (!publicationComplete || pendingRequests > 0 || shutdownRequested || !server.listening) return;
   idleTimer = setTimeout(() => server.close(), idleMs);
   idleTimer.unref();
 }
@@ -164,11 +175,17 @@ const server = createServer((socket) => {
     raw += chunk;
     if (!raw.includes("\n")) return;
     socket.pause();
+    pendingRequests += 1;
+    clearTimeout(idleTimer);
     void (async () => {
       let requestId = "unknown";
       let sink: FileHandle | null = null;
       let dispatched = false;
       try {
+        // The locator becomes visible inside the publication lock. A first
+        // response must wait for its release: otherwise an immediate process
+        // death can strand an incomplete cleanup claim before the next write.
+        await publicationReady;
         let parsed: unknown;
         try {
           parsed = JSON.parse(
@@ -218,7 +235,6 @@ const server = createServer((socket) => {
           ok: true,
           result,
         }, sink);
-        if (shutdownRequested) setImmediate(() => server.close());
       } catch (error) {
         if (dispatched) socket.destroy();
         else {
@@ -232,45 +248,73 @@ const server = createServer((socket) => {
           } catch { socket.destroy(); }
         }
       } finally {
-        await sink?.close();
+        try {
+          await sink?.close();
+        } finally {
+          pendingRequests -= 1;
+          if (pendingRequests === 0) resolveDrain?.();
+          // Stop accepting new work immediately on shutdown, but drain every
+          // already accepted handler, including those whose caller disconnected.
+          if (shutdownRequested && server.listening) server.close();
+          resetIdleTimer(server);
+        }
       }
     })();
   });
 });
 
 server.on("close", () => {
-  void withFileMutationLock(infoPath, async () => {
-    let published: Record<string, unknown>;
-    try {
-      published = JSON.parse(await readFile(infoPath, "utf8"));
-    } catch {
-      return;
+  void (async () => {
+    // TCP close does not wait for a handler after its client times out.
+    if (pendingRequests > 0) {
+      await new Promise<void>((resolve) => { resolveDrain = resolve; });
     }
-    // A timed-out client may have published a replacement server. The old
-    // server must never erase that server's locator when it finally exits.
-    if (published.token === token && published.pid === process.pid &&
-        published.fingerprint === fingerprint) {
-      await rm(infoPath, { force: true });
-    }
-  }).finally(() => process.exit(0));
+    // Retiring the locator lets a fixture remove the private namespace. Flush
+    // compiled code first, so Node's exit does not recreate a cleaned cache.
+    // This optional optimization never decides whether shutdown is permitted.
+    flushCompileCache();
+    await withFileMutationLock(infoPath, async () => {
+      let published: Record<string, unknown>;
+      try {
+        published = JSON.parse(await readFile(infoPath, "utf8"));
+      } catch {
+        return;
+      }
+      // A timed-out client may have published a replacement server. The old
+      // server must never erase that server's locator when it finally exits.
+      if (published.token === token && published.pid === process.pid &&
+          published.fingerprint === fingerprint) {
+        await rm(infoPath, { force: true });
+      }
+    });
+  })().finally(() => process.exit(0));
 });
 
 server.listen(0, "127.0.0.1", async () => {
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("invalid address");
-  await withFileMutationLock(infoPath, async () => {
-    await atomicWriteJson(infoPath, {
-      schema_version: INFO_SCHEMA,
-      fingerprint,
-      pid: process.pid,
-      host: "127.0.0.1",
-      port: address.port,
-      token,
-      // A managed runtime is reused per source revision, so the Node/SQLite pair
-      // serving a goal is not necessarily the one the caller resolves from PATH.
-      runtime_identity: sqliteRuntimeIdentity(),
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("invalid address");
+    await withFileMutationLock(infoPath, async () => {
+      await atomicWriteJson(infoPath, {
+        schema_version: INFO_SCHEMA,
+        fingerprint,
+        pid: process.pid,
+        host: "127.0.0.1",
+        port: address.port,
+        token,
+        // A managed runtime is reused per source revision, so the Node/SQLite pair
+        // serving a goal is not necessarily the one the caller resolves from PATH.
+        runtime_identity: sqliteRuntimeIdentity(),
+      });
     });
-    await chmod(infoPath, 0o600);
-  });
-  resetIdleTimer(server);
+    publicationComplete = true;
+    resolvePublication();
+    resetIdleTimer(server);
+  } catch (error) {
+    // Reuse the shared error owner's safe codes, never the raw Node error,
+    // locator path, token or stack. The launcher already consumes this startup
+    // envelope; publication failure must not collapse into a bare exit code.
+    const { code } = effectRuntimeErrorPayload(error);
+    failStartup(code, `TypeScript Effect runtime could not publish its startup locator (${code})`);
+  }
 });

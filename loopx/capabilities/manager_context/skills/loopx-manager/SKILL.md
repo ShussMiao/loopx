@@ -20,6 +20,14 @@ everything; do not absorb every project's continuous execution into this chat.
 ## Understand, verify and decide
 
 Resolve the desired outcome and its exact object before deciding who should act.
+Resolve the intended project, purpose and output destination from the request
+and relevant conversation before matching a role or an older task. A public
+source and a broad collection responsibility do not authorize converting
+private learning notes into an operations library or another project's work.
+Carry that intent and subsequent owner corrections in the collaboration brief.
+As a receiver, retain them instead of substituting your own store or role; report
+a scope or destination mismatch through your assessment. If the destination is
+unresolved, read the relevant authorized context or ask one focused question.
 Use authorized current evidence for facts that could change that decision;
 distinguish authoritative observations, historical records, claims and inference.
 If the requested outcome is already satisfied, return the verified result and
@@ -117,7 +125,11 @@ the work it shows.
 
 When a user names an existing peer for review or other work, keep that Agent
 identity. The directory's `peer_route` is a candidate list, not a selected or
-verified host task. On a trusted host with CLI access, use `resolve-peer-route`
+verified host task. In App/Goal conversations use the existing read tool with
+`view=agent_route`, exact `goal_id` and `agent_id` after discovery. This reuses
+the shared local route observation and audience scope; it is not executor
+readiness or a message submission. Remote sources remain explicitly unsupported
+by this read view. On a trusted host with CLI access, use `resolve-peer-route`
 for the exact Goal and Agent. It may select one readable task when every other
 binding is explicitly archived. If it still reports ambiguity, use the user's
 exact task link or report the gap; never treat unknown as archived. If a host message tool is

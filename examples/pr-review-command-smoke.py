@@ -260,7 +260,7 @@ def main() -> int:
     assert request["command"] == "/loopx-pr-review", request
     assert (
         request["cli_command"]
-        == "loopx pr-review [--repo owner/repo] [--target-exact-head NUMBER@HEAD_OID] [--state open|merged|all] [--review-priority other-developers-first|owner-first] [--since ISO]"
+        == "loopx pr-review [--goal-id GOAL --agent-id AGENT] [--repo owner/repo] [--target-exact-head NUMBER@HEAD_OID] [--state open|merged|all] [--review-order forward|reverse] [--since ISO]"
     ), request
     assert request["privacy_mode"] == "public_safe_github_metadata", request
     assert request["dry_run"] is True, request
@@ -581,7 +581,7 @@ def main() -> int:
             item["number"] for item in approval_packet["review_sequence"]
         ) == [4111, 4112], approval_packet["review_sequence"]
         for number, expected_blockers in (
-            (4111, ("merge_state_requires_update", "status_checks_failed")),
+            (4111, ("merge_state_unverified", "status_checks_failed")),
             (4112, ()),
         ):
             readiness = json.loads(

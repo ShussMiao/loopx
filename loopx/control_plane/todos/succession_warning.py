@@ -103,8 +103,9 @@ def build_todo_succession_warning_lanes(
         "recommended_action": warning.get(
             "recommended_action",
             (
-                "run loopx todo complete --no-follow-up for the completed Todo, "
-                "or add/link a successor Todo; do not invent a user gate"
+                "Review remaining authorized Goal acceptance and the runnable frontier; "
+                "follow the current quota settlement/replan contract. "
+                "A summary warning does not authorize terminal action."
             ),
         ),
     }
@@ -157,6 +158,9 @@ class _EvaluatedTodo(dict[str, Any]):
 
 def succession_facts(item: dict[str, Any]) -> dict[str, Any]:
     resume = normalize_todo_resume_when(item.get("resume_when")) or ""
+    handoff = bool(normalize_todo_excluded_agents(item.get("excluded_agents"))) \
+        and bool(normalize_todo_id(item.get("unblocks_todo_id")))
+    route_flag = item.get("route_continuation_replan_required")
     return {
         "todo_id": normalize_todo_id(item.get("todo_id")),
         "status": normalize_todo_status(item.get("status")) or ("done" if item.get("done") else "open"),
@@ -168,14 +172,22 @@ def succession_facts(item: dict[str, Any]) -> dict[str, Any]:
         "superseded_by": normalize_todo_id(item.get("superseded_by")),
         "unblocks": normalize_todo_id(item.get("unblocks_todo_id")),
         "resumes": normalize_todo_id(resume.partition(":")[2]) if resume.startswith("todo_done:") else None,
-        "handoff": bool(normalize_todo_excluded_agents(item.get("excluded_agents")))
-            and bool(normalize_todo_id(item.get("unblocks_todo_id"))),
+        "handoff": handoff,
+        "done": item.get("done") is True,
+        "route_flag": route_flag if isinstance(route_flag, bool) else None,
+        # Carry prose only for historical handoff rows without a typed flag.
+        # The existing TS owner decides whether it is a replan advisory.
+        "legacy_route_label": " ".join(str(item.get(key) or "")
+            for key in ("action_kind", "title", "text")
+            if str(item.get(key) or "").strip())
+            if handoff and not isinstance(route_flag, bool) else "",
         "context_fields": sorted(key for key, value in item.items()
             if value is not None and key != "succession_evaluation"),
     }
 
 
-def project_succession(items: list[dict[str, Any]], *, reuse: bool = False) -> list[dict[str, Any]]:
+def succession_request(items: list[dict[str, Any]], *, reuse: bool = False) -> dict[str, Any]:
+    """Encode the existing owner request; do not validate or decide in Python."""
     rows = [succession_facts(item) for item in items]
     # Archived histories repeat field-presence shapes thousands of times. Intern
     # those shapes, preserving the complete graph inside the existing RPC budget.
@@ -196,7 +208,25 @@ def project_succession(items: list[dict[str, Any]], *, reuse: bool = False) -> l
         request["evaluations"] = [
             [item.succession_evaluation.get(name) for name in SUCCESSION_EVALUATION_COLUMNS]
             if isinstance(item, _EvaluatedTodo) else None for item in items]
-    result = effect_runtime_result("todo.succession.project", request)
+    return request
+
+
+def succession_evaluations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Carry ephemeral evidence to a fused owner; it must still validate it."""
+    evaluations = []
+    for item in items:
+        if not isinstance(item, _EvaluatedTodo):
+            raise ValueError("Todo display requires a matching full-source succession evaluation")
+        evaluations.append(item.succession_evaluation)
+    return evaluations
+
+
+def project_succession(items: list[dict[str, Any]], *, reuse: bool = False) -> list[dict[str, Any]]:
+    if items == []:
+        # No graph/evidence is supplied and no row can be returned. Empty
+        # summary closure still goes through its ordinary typed projection.
+        return []
+    result = effect_runtime_result("todo.succession.project", succession_request(items, reuse=reuse))
     if (not isinstance(result, dict) or result.get("schema_version") != _SUCCESSION_WIRE["result_schema"]
             or result.get("evaluation_columns") != list(SUCCESSION_EVALUATION_COLUMNS)):
         raise ValueError("invalid typed Todo succession result")

@@ -407,7 +407,7 @@ def test_refresh_state_run_atomic_blocker_delta_persists_repair_and_semantic_evi
     assert semantic_delta.get("satisfying_outcomes") == ["new_concrete_blocker"]
 
 
-def test_refresh_state_run_rejects_maintenance_writeback(tmp_path: Path) -> None:
+def test_legacy_material_run_cadence_rejects_maintenance_writeback(tmp_path: Path) -> None:
     project = tmp_path / "project"
     state = (
         project
@@ -426,6 +426,7 @@ def test_refresh_state_run_rejects_maintenance_writeback(tmp_path: Path) -> None
                     {
                         "id": GOAL_ID,
                         "status": "active",
+                        "execution_profile": {"replan_after_completed_todos": 5},
                         "repo": str(project),
                         "state_file": str(state.relative_to(project)),
                         "coordination": {
@@ -914,6 +915,32 @@ def test_rotated_vision_obligation_accepts_terminal_progress(
 
     assert semantic_delta is not None
     assert semantic_delta["satisfying_outcomes"] == [expected_outcome]
+
+
+def test_writeback_gate_rejects_known_blocker_from_projected_history() -> None:
+    observation = {
+        "schema_version": "typed_progress_observation_v0",
+        "result_class": "blocked",
+        "surface_id": "surface-current-path",
+        "work_item_id": "todo-current-path",
+        "blocker_id": "blocker-current-path",
+        "evidence_ids": ["evidence-current-blocker"],
+    }
+    runs = [{
+        "agent_id": AGENT_ID,
+        "generated_at": "2026-08-13T11:28:00+08:00",
+        "progress_observation": observation,
+    }, *_rotated_vision_runs()]
+    with pytest.raises(ReplanWritebackRejected, match="blocker already recorded"):
+        enforce_open_replan_writeback(
+            newest_first_runs=runs,
+            state_text=_completed_advancement_chain_state(),
+            agent_id=AGENT_ID, goal_id=GOAL_ID,
+            progress_observation={
+                **observation, "work_item_id": "replan-0123456789abcdef",
+                "evidence_ids": ["evidence-new-readback"],
+            },
+        )
 
 
 def test_semantic_no_followup_cannot_replace_todo_lifecycle_settlement() -> None:

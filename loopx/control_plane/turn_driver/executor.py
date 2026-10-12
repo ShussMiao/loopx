@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -58,16 +59,16 @@ from .session_recovery import (
     build_host_recovery_record,
 )
 from .settlement import (
+    SourceJournalPersist,
     TurnEffectResolver,
+    TurnSettlementEffectAdmission,
     TurnSettlementJournalAdapter,
-    completion_writeback_outcome,
     execute_turn_driver_settlement,
     invoke_result_effect,
     terminal_closeout_requirement,
     turn_settlement_failure_outcome,
     turn_settlement_outcome,
     turn_effect_resolvers,
-    verified_terminal_closeout_effect,
 )
 from .transaction import (
     LOOPX_TURN_RESULT_SCHEMA_VERSION,
@@ -131,6 +132,42 @@ HostRunner = Callable[[Mapping[str, Any]], dict[str, Any]]
 JournalPersist = Callable[[Mapping[str, Any]], None]
 
 
+def reward_memory_automation_enabled(
+    payload: Mapping[str, Any] | None, *, operation: str,
+) -> bool:
+    """Project verified capability automation into the host IO contract.
+
+    The experiment resolver owns enablement, config/receipt verification and
+    provider policy. A recall packet's presence or old context is not opt-in.
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    recall = payload.get("reward_memory_recall")
+    if not isinstance(recall, Mapping):
+        return False
+    experiment = recall.get("experiment")
+    envelope = payload.get("turn_envelope")
+    if not isinstance(experiment, Mapping) or not isinstance(envelope, Mapping):
+        return False
+    boundary = envelope.get("boundary")
+    capabilities = boundary.get("capabilities") if isinstance(boundary, Mapping) else None
+    memory = capabilities.get("reward_memory") if isinstance(capabilities, Mapping) else None
+    return (
+        isinstance(memory, Mapping)
+        and memory.get(operation) is True
+        # Recall resolves the binding again after admission. A stale envelope
+        # must not resurrect a now unavailable or disabled binding.
+        and experiment.get("enabled") is True
+        and experiment.get("available") is True
+        and experiment.get("configured_for_agent") is True
+        and bool(envelope.get("goal_id"))
+        and experiment.get("goal_id") == envelope.get("goal_id")
+        and bool(envelope.get("agent_id"))
+        and experiment.get("agent_id") == envelope.get("agent_id")
+        and experiment.get(operation) is True
+    )
+
+
 def build_loopx_turn_host_request(plan: Mapping[str, Any]) -> dict[str, Any]:
     transaction = (
         plan.get("transaction") if isinstance(plan.get("transaction"), dict) else {}
@@ -157,9 +194,17 @@ def build_loopx_turn_host_request(plan: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(goal_ref, Mapping):
         request["goal_ref"] = dict(goal_ref)
     reward_memory_recall = plan.get("reward_memory_recall")
-    if isinstance(reward_memory_recall, Mapping):
+    recall_enabled = reward_memory_automation_enabled(plan, operation="automatic_recall")
+    ingest_enabled = reward_memory_automation_enabled(plan, operation="automatic_ingest")
+    if isinstance(reward_memory_recall, Mapping) and (recall_enabled or ingest_enabled):
         request["reward_memory_recall"] = dict(reward_memory_recall)
+        if not recall_enabled:
+            request["reward_memory_recall"]["context"] = None
     request.update(subagent.subagent_host_request_projection(plan))
+    from ...extensions.codex_native_child import configured_native_child_limit
+
+    if configured_native_child_limit(request) is not None:
+        request["turn_instance_id"] = transaction.get("turn_instance_id") or turn_key
     return request
 
 
@@ -195,10 +240,20 @@ def _normalize_host_path_delta(
     unchanged_reason: str,
     errors: list[str],
 ) -> tuple[str, dict[str, Any] | None]:
-    path_delta_mode = str(result.get("path_delta_mode") or "").strip()
+    raw_path_delta_mode = result.get("path_delta_mode")
+    path_delta_mode = ""
+    if raw_path_delta_mode is None and "path_delta_mode" in result:
+        errors.append("path_delta_mode must be a string")
+    elif raw_path_delta_mode is not None and not isinstance(raw_path_delta_mode, str):
+        path_delta_mode = ""
+        errors.append("path_delta_mode must be a string")
+    else:
+        path_delta_mode = str(raw_path_delta_mode or "").strip()
     raw_agent_vision = result.get("agent_vision_json")
     if raw_agent_vision is None:
         agent_vision_json = ""
+        if "agent_vision_json" in result:
+            errors.append("agent_vision_json must be a JSON string")
     elif isinstance(raw_agent_vision, str):
         agent_vision_json = raw_agent_vision.strip()
     else:
@@ -234,7 +289,7 @@ def _normalize_host_path_delta(
                     goal_id=str(envelope.get("goal_id") or ""),
                     agent_id=str(envelope.get("agent_id") or "") or None,
                 )
-            except (json.JSONDecodeError, ValueError) as exc:
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 errors.append(f"invalid agent_vision_json: {exc}")
 
     if path_delta_mode == "material_replan":
@@ -318,12 +373,18 @@ def validate_loopx_turn_host_result(
         )
         if text:
             normalized[field] = text
-    reflection_json = _bounded_public_text(
-        result,
-        "reward_memory_reflection_json",
-        limit=HOST_REWARD_MEMORY_REFLECTION_JSON_MAX_CHARS,
-        required=False,
-        errors=errors,
+    # Old/custom hosts may still return this field. Ignore it while disabled:
+    # ordinary work must not gain a memory validation gate or retain the content.
+    reflection_json = (
+        _bounded_public_text(
+            result,
+            "reward_memory_reflection_json",
+            limit=HOST_REWARD_MEMORY_REFLECTION_JSON_MAX_CHARS,
+            required=False,
+            errors=errors,
+        )
+        if reward_memory_automation_enabled(plan, operation="automatic_ingest")
+        else None
     )
     if reflection_json:
         if material:
@@ -369,7 +430,7 @@ def validate_loopx_turn_host_result(
         or str(result.get("agent_vision_json") or "").strip()
     ):
         errors.append(
-            "wait and user_action_required results cannot declare a path delta"
+            "non-material host results cannot declare path_delta_mode or agent_vision_json"
         )
     if subagent.subagent_execution_topology(plan) is not None:
         subagent.observe_subagent_host_result(plan, result, normalized, errors)
@@ -657,7 +718,7 @@ def _run_host(
     *,
     argv: Sequence[str],
     project: Path,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
 ) -> dict[str, Any]:
     stdout: list[str] = []
     stderr_chars = 0
@@ -667,21 +728,42 @@ def _run_host(
         stderr_chars += len(text)
 
     try:
-        observed = run_host_process(argv, project=project,
+        observed = run_host_process(
+            argv,
+            project=project,
             input_text=json.dumps(request, ensure_ascii=False, separators=(",", ":")),
-            timeout_seconds=timeout_seconds, stdout_limit_bytes=HOST_RESULT_MAX_BYTES,
-            on_stdout=stdout.append, on_stderr=count_stderr)
+            timeout_seconds=timeout_seconds,
+            stdout_limit_bytes=HOST_RESULT_MAX_BYTES,
+            on_stdout=stdout.append,
+            on_stderr=count_stderr,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         return {"ok": False, "reason": type(exc).__name__, "returncode": None}
     if observed["outcome"] == "output_limit":
-        return {"ok": False, "reason": "host stdout exceeded the result budget", "returncode": observed["returncode"]}
+        return {
+            "ok": False,
+            "reason": "host stdout exceeded the result budget",
+            "returncode": observed["returncode"],
+        }
     if observed["outcome"] != "exited":
-        return {"ok": False, "reason": "host process " + observed["outcome"], "returncode": observed["returncode"]}
+        return {
+            "ok": False,
+            "reason": "host process " + observed["outcome"],
+            "returncode": observed["returncode"],
+        }
     if not observed["output_complete"]:
-        return {"ok": False, "reason": "host output observation incomplete", "returncode": observed["returncode"]}
+        return {
+            "ok": False,
+            "reason": "host output observation incomplete",
+            "returncode": observed["returncode"],
+        }
     if observed["returncode"] != 0:
-        return {"ok": False, "reason": "host command returned non-zero",
-                "returncode": observed["returncode"], "stderr_chars": stderr_chars}
+        return {
+            "ok": False,
+            "reason": "host command returned non-zero",
+            "returncode": observed["returncode"],
+            "stderr_chars": stderr_chars,
+        }
     try:
         value = json.loads("".join(stdout))
     except json.JSONDecodeError:
@@ -758,7 +840,7 @@ def _host_result_stage(
     argv: Sequence[str] | None,
     completion_lifecycle_configured: bool,
     project: Path,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
     journal: dict[str, Any],
     persist_journal: JournalPersist,
     effects: dict[str, bool],
@@ -775,12 +857,22 @@ def _host_result_stage(
     if "typed_result" not in completed_phases:
         journal["host_attempt_count"] = int(journal.get("host_attempt_count") or 0) + 1
         persist_journal(journal)
+        from ...extensions.codex_native_child import configured_native_child_limit
+        if configured_native_child_limit(request) is not None:
+            # Reuse the journal's durable attempt identity; replay never creates
+            # another identity, and a real host retry always advances it.
+            request = {**request, "host_attempt": journal["host_attempt_count"]}
         # The attempt is durable now, so a later restart must not resume this
         # reservation. Confirmation failure stops before the host starts.
         if confirm_start is not None:
             confirm_start()
         from ...usage_goal import observe_goal_execution
-        with observe_goal_execution(usage_runtime_root or project, usage_goal_id, host=str((plan.get("host") or {}).get("kind") or "unknown")):
+
+        with observe_goal_execution(
+            usage_runtime_root or project,
+            usage_goal_id,
+            host=str((plan.get("host") or {}).get("kind") or "unknown"),
+        ):
             host_observation = (
                 _run_host_runner(request, runner=host_runner)
                 if host_runner is not None
@@ -995,8 +1087,12 @@ def _ensure_turn_settlement_plan(
         execution_mode=str(host_fields.get("execution_mode") or "isolated-headless"),
         session_action=str(host_fields.get("session_action") or "resume"),
         turn_instance_id=(
-            transaction_plan.get("turn_instance_id")
-            or transaction_plan.get("turn_key")
+            transaction_plan.get("turn_instance_id") or transaction_plan.get("turn_key")
+        ),
+        goal_ref=(
+            plan.get("goal_ref")
+            if isinstance(plan.get("goal_ref"), Mapping)
+            else None
         ),
     )
     settlement_plan = built.get("settlement_plan")
@@ -1020,6 +1116,8 @@ def _typed_settlement_stage(
     effect_resolvers: Mapping[SettlementStepKind, TurnEffectResolver],
     scheduler: Scheduler,
     post_settlement: PostSettlement | None,
+    source_effects: TurnSettlementEffectAdmission | None,
+    persist_source_journal: SourceJournalPersist | None,
 ) -> dict[str, Any]:
     transaction_plan = (
         plan.get("transaction") if isinstance(plan.get("transaction"), Mapping) else {}
@@ -1061,46 +1159,30 @@ def _typed_settlement_stage(
                 raise ValueError(
                     "validated_completion requires a todo lifecycle adapter"
                 )
-            callback_payload = invoke_result_effect(
-                completion_writeback, result, effect_ref
-            )
-            completion_outcome = completion_writeback_outcome(
-                callback_payload,
-                plan=plan,
-            )
-            if completion_outcome is None:
-                return {
-                    "ok": False,
-                    "appended": False,
-                    "reason": str(
-                        callback_payload.get("reason")
-                        or callback_payload.get("error")
-                        or (
-                            "todo lifecycle adapter returned an invalid "
-                            "completion outcome"
-                        )
-                    ),
-                }
-            return {
-                **callback_payload,
-                "completion": completion_outcome,
-            }
+            return invoke_result_effect(completion_writeback, result, effect_ref)
         return invoke_result_effect(writeback, result, effect_ref)
 
     journal_adapter = TurnSettlementJournalAdapter(
-        journal,
-        effects,
-        lambda: persist_journal(journal),
-        _compact_callback,
+        journal=journal,
+        effects=effects,
+        persist=lambda: persist_journal(journal),
+        compact_payload=_compact_callback,
+        source_effects=source_effects,
+        persist_source=persist_source_journal,
+        deferred_release_step=(
+            SettlementStepKind.TERMINAL_CLOSEOUT
+            if source_effects is not None and terminal_closeout_required
+            else (
+                SettlementStepKind.QUOTA_SPEND if source_effects is not None else None
+            )
+        ),
     )
 
     terminal_effect = None
     terminal_checkpoint = None
     if terminal_closeout_required:
         assert terminal_closeout is not None
-        terminal_effect = verified_terminal_closeout_effect(
-            terminal_closeout, result=result, plan=plan
-        )
+        terminal_effect = partial(invoke_result_effect, terminal_closeout, result)
         terminal_checkpoint = journal_adapter.checkpoint_terminal
 
     settlement_result = execute_turn_driver_settlement(
@@ -1130,7 +1212,9 @@ def _typed_settlement_stage(
         terminal_closeout=terminal_effect,
         terminal_checkpoint=terminal_checkpoint,
         prepare=journal_adapter.prepare,
+        resume_prepare=journal_adapter.prepare if source_effects is not None else None,
         abort=journal_adapter.abort,
+        allow_absent_reexecute=journal_adapter.allows_absent_reexecute,
         effect_attempts=journal_adapter.effect_attempts,
         effect_resolvers=effect_resolvers,
         turn_result_kind=str(result.get("result_kind") or "") or None,
@@ -1174,7 +1258,29 @@ def _typed_settlement_stage(
     result = {**result, "result_kind": outcome["result_kind"]}
     completed_phases = [str(phase) for phase in outcome["completed_phases"]]
     spend_payload = dict(settlement_state.quota_spend)
-    persist_journal(journal)
+    tail_effect: tuple[SettlementStepKind, str] | None = None
+    if source_effects is None:
+        persist_journal(journal)
+    else:
+        effect_id = _journal_committed_effect_id(journal)
+        if effect_id is None or persist_source_journal is None:
+            raise RuntimeError("source Turn tail admission identity is unavailable")
+        tail_step = (
+            SettlementStepKind.TERMINAL_CLOSEOUT
+            if terminal_closeout_required
+            else SettlementStepKind.QUOTA_SPEND
+        )
+        tail_effect = (tail_step, f"{effect_id}#{tail_step.value}")
+        journal_adapter.hold_tail(tail_effect[0], tail_effect[1])
+
+    def persist_tail_checkpoint(*, release: bool) -> None:
+        if tail_effect is None:
+            persist_journal(journal)
+            return
+        if release:
+            journal_adapter.release_tail(tail_effect[0], tail_effect[1])
+        else:
+            journal_adapter.hold_tail(tail_effect[0], tail_effect[1])
 
     scheduler_payload = scheduler(spend_payload)
     journal["scheduler"] = scheduler_payload
@@ -1190,7 +1296,7 @@ def _typed_settlement_stage(
             status="scheduler_action_required",
             receipt=_receipt(plan, result, completed_phases=completed_phases),
         )
-        persist_journal(journal)
+        persist_tail_checkpoint(release=False)
         return execution_payload(
             plan,
             journal,
@@ -1206,7 +1312,7 @@ def _typed_settlement_stage(
         completed_phases=completed_phases,
         receipt=_receipt(plan, result, completed_phases=completed_phases),
     )
-    persist_journal(journal)
+    persist_tail_checkpoint(release=True)
     return execution_payload(
         plan,
         journal,
@@ -1226,7 +1332,7 @@ def run_loopx_turn_once(
     project: Path,
     runtime_root: Path,
     goal_id: str,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
     execute: bool,
     retry_failed: bool = False,
     task_validator: TaskValidator | None = None,
@@ -1304,7 +1410,9 @@ def run_loopx_turn_once(
             _write_journal(journal_path, snapshot)
             return
         try:
-            with goal_admission.source_journal_admission() as source_admission:
+            with goal_admission.source_journal_admission(
+                runtime_root=runtime_root,
+            ) as source_admission:
                 if source_admission is None:
                     raise RuntimeError("source journal admission was not produced")
                 _write_journal(
@@ -1321,6 +1429,13 @@ def run_loopx_turn_once(
             }:
                 raise FirstPartyHostRuntimeRejected(exc.diagnostic_code) from exc
             raise
+
+    def persist_source_journal(source_admission: Mapping[str, Any]) -> None:
+        _write_journal(
+            journal_path,
+            journal,
+            source_admission=source_admission,
+        )
 
     with exclusive_file_lock(journal_path):
         journal = _load_journal(journal_path)
@@ -1373,24 +1488,31 @@ def run_loopx_turn_once(
             and receipt.get("failed_phase") == "validation"
             and journal.get("validation_stage") != "task_postcondition"
         )
-        needs_host = validation_reinvokes_host or journal is None or "typed_result" not in list(
-            journal.get("completed_phases") or []
+        needs_host = (
+            validation_reinvokes_host
+            or journal is None
+            or "typed_result" not in list(journal.get("completed_phases") or [])
         )
         if needs_host and goal_admission is not None:
             goal_admission.require_current()
         admission = None
         if needs_host and admit_start is not None:
-            admission = admit_start({
-                "turn_key": turn_key,
-                "attempt": int(journal.get("host_attempt_count") or 0) + 1
-                if journal is not None else 1,
-            })
+            admission = admit_start(
+                {
+                    "turn_key": turn_key,
+                    "attempt": int(journal.get("host_attempt_count") or 0) + 1
+                    if journal is not None
+                    else 1,
+                }
+            )
             if admission.get("admitted") is not True:
                 waiting = {
                     "status": "interval_wait",
                     "host": host_projection,
                     "completed_phases": [],
-                    "reason": str(admission.get("reason") or "automatic start not admitted"),
+                    "reason": str(
+                        admission.get("reason") or "automatic start not admitted"
+                    ),
                     "admission": admission,
                 }
                 return execution_payload(
@@ -1398,7 +1520,10 @@ def run_loopx_turn_once(
                 )
         if journal is not None and recovery_decision is not None:
             journal["recovery_audit"] = build_turn_recovery_audit(
-                recovery_decision, journal, status="started", host_invoked=None,
+                recovery_decision,
+                journal,
+                status="started",
+                host_invoked=None,
             )
             persist_journal(journal)
 
@@ -1516,5 +1641,18 @@ def run_loopx_turn_once(
             ),
             scheduler=scheduler,
             post_settlement=post_settlement,
+            source_effects=(
+                goal_admission.turn_effect_admission(
+                    turn_key=turn_key,
+                    journal_path=journal_path,
+                )
+                if goal_admission is not None
+                else None
+            ),
+            persist_source_journal=(
+                persist_source_journal
+                if goal_admission is not None and goal_admission.enabled
+                else None
+            ),
         )
         return finish_recovery(settled)

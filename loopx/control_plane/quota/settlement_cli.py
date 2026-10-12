@@ -19,6 +19,7 @@ from .error_codes import HeartbeatReceiptIdentityConflictError
 from .heartbeat_receipt import (
     heartbeat_receipt_view,
     upgrade_identityless_heartbeat_receipt,
+    requalify_bound_heartbeat_receipt,
 )
 from .settlement import (
     attach_settlement_progress,
@@ -38,8 +39,9 @@ def reconcile_existing_heartbeat_receipt(
     runtime_root: Path,
     turn_instance_id: str,
     existing: dict[str, object],
+    goal_ref: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], str, bool, str]:
-    """Bind an identity-less same-turn receipt without changing a bound receipt."""
+    """Bind or qualify same-Turn work without replacing its settlement identity."""
 
     receipt = existing
     receipt_status = "replayed"
@@ -108,6 +110,20 @@ def reconcile_existing_heartbeat_receipt(
                         "current="
                         f"{rollout_todo_id or rollout_replan_obligation_id}"
                     )
+                rollout_details = quota_rollout_details(payload, args,
+                    todo_id=rollout_todo_id, replan_obligation_id=rollout_replan_obligation_id)
+                rollout_details["settlement_effect_id"] = expected_effect_id
+                receipt, qualified = requalify_bound_heartbeat_receipt(
+                    runtime_root, goal_id=args.goal_id, agent_id=args.agent_id,
+                    turn_instance_id=turn_instance_id, todo_id=rollout_todo_id,
+                    replan_obligation_id=rollout_replan_obligation_id,
+                    status=str(payload.get("effective_action") or payload.get("decision") or "should-run"),
+                    details=rollout_details,
+                    registry_path=Path(str(payload["registry"])) if payload.get("registry") else None,
+                    goal_ref=goal_ref,
+                )
+                if qualified:
+                    receipt_status, receipt_appended = "upgraded", True
         else:
             rollout_details = quota_rollout_details(
                 payload,
@@ -130,6 +146,7 @@ def reconcile_existing_heartbeat_receipt(
                 ),
                 summary=f"heartbeat quota receipt upgraded for turn={turn_instance_id}",
                 details=rollout_details,
+                goal_ref=goal_ref,
             )
             if upgraded:
                 receipt_status = "upgraded"
@@ -149,6 +166,7 @@ def reconcile_existing_heartbeat_receipt_for_turn(
     runtime_root: Path,
     turn_instance_id: str,
     existing: dict[str, object],
+    goal_ref: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], str, bool, str, bool]:
     """Reconcile an existing receipt and report whether the turn is receipt-ready."""
 
@@ -158,6 +176,7 @@ def reconcile_existing_heartbeat_receipt_for_turn(
         runtime_root=runtime_root,
         turn_instance_id=turn_instance_id,
         existing=existing,
+        goal_ref=goal_ref,
     )
     return receipt, status, appended, stall_observation, True
 
@@ -409,7 +428,11 @@ def attach_spend_settlement_result(
     todo_id: str | None,
     turn_instance_id: str,
     replan_obligation_id: str | None = None,
+    goal_ref: Mapping[str, object] | None = None,
 ) -> None:
+    registry_path = (
+        Path(str(payload["registry"])) if payload.get("registry") else None
+    )
     readback = read_heartbeat_settlement(
         runtime_root,
         goal_id=goal_id,
@@ -417,12 +440,15 @@ def attach_spend_settlement_result(
         todo_id=todo_id,
         turn_instance_id=turn_instance_id,
         replan_obligation_id=replan_obligation_id,
+        registry_path=registry_path,
+        goal_ref=goal_ref,
     )
     if readback is None:
         raise RuntimeError("exact settlement readback unexpectedly returned not-found")
     attach_settlement_progress(
         payload, readback, runtime_root=runtime_root,
-        registry_path=Path(str(payload["registry"])) if payload.get("registry") else None,
+        registry_path=registry_path,
+        goal_ref=goal_ref,
     )
     identity = readback.identity.value
     if identity is None:
